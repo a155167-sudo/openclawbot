@@ -53,27 +53,39 @@ except Exception as e:
     gc = None
 
 # ==========================================
-# 2. 菜單資料載入 
+# 2. 菜單資料載入 (🔥 新增：主餐/單品精準分類與熱更新)
 # ==========================================
 MAIN_DISHES = []
-try:
-    with open("menu.csv", mode="r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            row_clean = {k.strip() if isinstance(k, str) else k: v for k, v in row.items()}
-            name = row_clean.get("品項", "").strip()
-            if not name: continue
-            try:
-                cal = float(row_clean.get("熱量(kcal)", "0").strip() or 0.0)
-                pro = float(row_clean.get("蛋白質(g)", "0").strip() or 0.0)
-                price = int(row_clean.get("價錢", row_clean.get("價格", "150")).strip() or 150)
-                ingredients = row_clean.get("內容物", "新鮮食材製作").strip() 
-                category = "lunch" if "便當" in name or "麵" in name else "dinner"
-                MAIN_DISHES.append({"name": name, "cal": cal, "pro": pro, "price": price, "category": category, "ingredients": ingredients})
-            except Exception: pass
-    print(f"✅ 成功載入 {len(MAIN_DISHES)} 項主餐！")
-except Exception:
-    MAIN_DISHES = [{"name": "雞肉便當", "cal": 484.4, "pro": 35.3, "price": 150, "category": "lunch", "ingredients": "特選雞肉與時蔬"}]
+def load_menu():
+    global MAIN_DISHES
+    MAIN_DISHES.clear()
+    try:
+        with open("menu.csv", mode="r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                row_clean = {k.strip() if isinstance(k, str) else k: v for k, v in row.items()}
+                name = row_clean.get("品項", "").strip()
+                if not name: continue
+                try:
+                    cal = float(row_clean.get("熱量(kcal)", "0").strip() or 0.0)
+                    pro = float(row_clean.get("蛋白質(g)", "0").strip() or 0.0)
+                    price = int(row_clean.get("價錢", row_clean.get("價格", "150")).strip() or 150)
+                    ingredients = row_clean.get("內容物", "新鮮食材製作").strip()
+                    # 🔥 關鍵濾網：區分主餐與加購單品 🔥
+                    main_keywords = ["便當", "麵", "食蔬", "低碳", "沙拉"]
+                    if any(kw in name for kw in main_keywords):
+                        category = "main"  # 這是正餐，會進入排餐抽籤池
+                    else:
+                        category = "side"  # 這是單品/飲料，排餐不抽，但 AI 可以推銷
+                    MAIN_DISHES.append({"name": name, "cal": cal, "pro": pro, "price": price, "category": category, "ingredients": ingredients})
+                except Exception: pass
+        print(f"✅ 成功載入 {len(MAIN_DISHES)} 項餐點！")
+        return f"✅ 菜單更新成功！共載入 {len(MAIN_DISHES)} 項餐點。"
+    except Exception as e:
+        return f"⚠️ 菜單更新失敗: {e}"
+
+# 伺服器啟動時，先自動讀取一次
+load_menu()
 
 # ==========================================
 # 3. 資料庫初始化 (🔥 融合版：包含老闆綁定與使用紀錄)
@@ -134,8 +146,8 @@ async def receive_form_data(request: Request):
             protein = weight * 2.0
         else: tdee = tdee_base
         
-        base_lunch_pool = [d for d in MAIN_DISHES if d.get('category') == 'lunch']
-        base_dinner_pool = [d for d in MAIN_DISHES if d.get('category') == 'dinner']
+        base_lunch_pool = [d for d in MAIN_DISHES if d.get('category') == 'main']
+        base_dinner_pool = [d for d in MAIN_DISHES if d.get('category') == 'main']
         
         if restrictions:
             noise_words = ['跟', '和', '與', '、', '，', ' ', '不吃', '不要', '不能', '不能吃', '過敏', '類', '我對', '另外']
