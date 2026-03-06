@@ -449,6 +449,10 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 老闆好！系統已成功綁定。\n客人的【換餐通知】都會私訊給您！"))
         return
+    elif msg == "#更新菜單":
+        reply_msg = load_menu()
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
+        return
     elif msg == "#今日出餐完成":
         weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
         today_str = weekdays[datetime.date.today().weekday()]
