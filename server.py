@@ -251,12 +251,21 @@ async def receive_form_data(request: Request):
                 main_sheet.append_row(row_data)
                 
                 try:
-                    user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="8")
+                    # 🔥 霸氣寫入法：如果有舊分頁就清空，沒有就建新的！
+                    try:
+                        user_sheet = sheet.worksheet(safe_name)
+                        user_sheet.clear() # 找到舊分頁，直接清空準備重寫
+                    except:
+                        user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="8")
+                        
                     profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}"], [""]]
                     menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
                     tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
+                    
                     user_sheet.append_rows(profile_data + menu_title + schedule_sheet_rows + tracking_headers)
-                except Exception: pass
+                    print(f"✅ 成功將菜單完美寫入 {safe_name} 專屬分頁！")
+                except Exception as e: 
+                    print(f"⚠️ 寫入專屬分頁失敗: {e}")
                 print(f"📝 成功寫入總表，並為【{name}】建立含菜單的專屬分頁！")
             except Exception as e:
                 print(f"⚠️ 寫入 Google 表單失敗: {e}")
