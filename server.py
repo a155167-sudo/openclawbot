@@ -42,14 +42,28 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 user_memory = {}
 processed_messages = set()
 
-# 喚醒 Google 虛擬助理
+# 喚醒 Google 虛擬助理 (🔥 雲端安全修復版)
 try:
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_file("service_account.json", scopes=scopes)
+    
+    # 1. 從 Railway 保險箱拿出金鑰字串
+    creds_str = os.environ.get("GOOGLE_CREDENTIALS")
+    if not creds_str:
+        raise ValueError("Railway 裡面找不到 GOOGLE_CREDENTIALS 金鑰！")
+        
+    # 2. 把字串轉成字典
+    creds_dict = json.loads(creds_str)
+    
+    # 3. 🔥 神級修復：強制把壞掉的換行符號變回原狀！
+    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+    
+    # 4. 正式拿鑰匙開門
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
     print("✅ Google 雲端虛擬助理已上線！")
+    
 except Exception as e:
-    print(f"⚠️ Google 助理連線失敗，請檢查 service_account.json: {e}")
+    print(f"⚠️ Google 助理連線失敗: {e}")
     gc = None
 
 # ==========================================
