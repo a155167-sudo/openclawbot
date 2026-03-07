@@ -236,7 +236,9 @@ async def receive_form_data(request: Request):
                    f"【總金額】: 預估主餐總價 {total_price} 元\n\n"
                    f"📋【您的排餐菜單與每日剩餘建議】\n{schedule_text}")
         
-        safe_name = f"{name}_{user_id[-4:]}"
+        # 🔥 升級版：加入日期戳記，完美保留每一次的續約歷史！
+        today_str_for_sheet = datetime.datetime.now().strftime("%Y%m%d")
+        safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
 
         conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO health_profile (user_id, name, tdee, protein, goal, restrictions, summary_text, active_days, today_extra_cal, today_date, sheet_name) VALUES (?,?,?,?,?,?,?,?,0,'',?)", (user_id, name, int(tdee), protein, goal, restrictions, summary, ",".join(list(active_days)), safe_name))
@@ -251,14 +253,16 @@ async def receive_form_data(request: Request):
                 main_sheet.append_row(row_data)
                 
                 try:
-                    # 🔥 霸氣寫入法：如果有舊分頁就清空，沒有就建新的！
+                    # 🔥 建立全新的續約分頁 (因為檔名有加日期，舊資料不會被洗掉！)
                     try:
-                        user_sheet = sheet.worksheet(safe_name)
-                        user_sheet.clear() # 找到舊分頁，直接清空準備重寫
-                    except:
                         user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="8")
+                    except:
+                        # 萬一客人同一天填了兩次表單，才覆蓋今天的
+                        user_sheet = sheet.worksheet(safe_name)
+                        user_sheet.clear()
                         
-                    profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}"], [""]]
+                    # 🔥 第一行直接補上「體重」欄位，方便老闆追蹤！
+                    profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}"], [""]]
                     menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
                     tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
                     
