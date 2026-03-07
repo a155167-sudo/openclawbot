@@ -115,6 +115,8 @@ init_db()
 async def receive_form_data(request: Request):
     try:
         data = await request.json()
+        print(f"📦 [表單測試] 收到 Google 傳來的大禮包：{data}")
+        
         def get_val(keyword):
             for k, v in data.items():
                 if keyword in k and v: 
@@ -122,7 +124,11 @@ async def receive_form_data(request: Request):
             return ""
         
         user_id = get_val("UID")
-        if not user_id or user_id == "UID_REPLACE_ME": return {"status": "ignored"}
+        print(f"🔍 [表單測試] 抓到的 UID 是：'{user_id}'")
+        
+        if not user_id or user_id == "UID_REPLACE_ME": 
+            print("❌ [表單拒絕] 找不到有效的 UID，這張表單我直接丟掉！")
+            return {"status": "ignored"}
         if user_id in user_memory: del user_memory[user_id]
 
         name, goal, restrictions = get_val("稱呼"), get_val("目標"), get_val("禁忌")
@@ -245,7 +251,9 @@ async def receive_form_data(request: Request):
         push_msg = f"🎉 {name} 填表成功！\nAI 營養師已為您精算：\n🔥 TDEE: {int(tdee)} kcal\n🥩 蛋白質: {int(protein)} g\n\n現在請點擊選單的『查看菜單』，我將為您列出每一天的詳細餐點與價格！"
         line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
         return {"status": "success"}
-    except Exception as e: return {"status": "error", "msg": str(e)}
+    except Exception as e: 
+        print(f"💥 [表單崩潰致命錯誤] 老闆救命啊：{str(e)}")
+        return {"status": "error", "msg": str(e)}
 
 # ==========================================
 # 5. AI 對話引擎 (🔥 融合版：換餐通知老闆 + 熱量精準追蹤)
