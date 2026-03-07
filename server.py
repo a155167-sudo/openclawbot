@@ -407,9 +407,13 @@ def redeem_code(uid, code):
 async def callback(request: Request):
     sig = request.headers.get("X-Line-Signature", "")
     body = await request.body()
-    try: handler.handle(body.decode("utf-8"), sig)
-    except InvalidSignatureError: raise HTTPException(status_code=400, detail="Invalid signature")
-    except Exception: pass
+    try: 
+        handler.handle(body.decode("utf-8"), sig)
+    except InvalidSignatureError: 
+        print("⚠️ LINE 簽章錯誤！請檢查 Railway 的 LINE_CHANNEL_SECRET 是否填錯或有空格！")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception as e: 
+        print(f"⚠️ LINE 訊息處理發生嚴重錯誤: {e}")
     return "OK"
 
 @handler.add(MessageEvent, message=TextMessage)
