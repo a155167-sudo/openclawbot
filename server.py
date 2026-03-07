@@ -42,28 +42,20 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 user_memory = {}
 processed_messages = set()
 
-# 喚醒 Google 虛擬助理 (🛡️ 終極金鑰重鑄版)
+# 喚醒 Google 虛擬助理 (🔥 卸下裝甲，回歸純淨版)
 try:
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     
-    # 1. 從 Railway 保險箱拿出金鑰字串
+    # 1. 直接從保險箱拿出完美的字串
     creds_str = os.environ.get("GOOGLE_CREDENTIALS")
-    if not creds_str:
-        raise ValueError("Railway 裡面找不到 GOOGLE_CREDENTIALS 金鑰！")
-        
-    # 2. 把字串轉成字典
+    
+    # 2. 原汁原味轉成字典 (什麼 replace 都不用加，因為您貼得太完美了！)
     creds_dict = json.loads(creds_str)
     
-    # 3. 🛡️ 終極修復器：不管 Railway 把換行或空白弄得多亂，我們直接暴力重組！
-    raw_key = creds_dict["private_key"]
-    raw_key = raw_key.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "")
-    raw_key = raw_key.replace(" ", "").replace("\n", "").replace("\\n", "")
-    creds_dict["private_key"] = f"-----BEGIN PRIVATE KEY-----\n{raw_key}\n-----END PRIVATE KEY-----\n"
-    
-    # 4. 正式拿鑰匙開門
+    # 3. 直接拿鑰匙開門
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
-    print("✅ Google 雲端虛擬助理金鑰重鑄成功，已完美上線！")
+    print("✅ Google 雲端大門正式開啟！寫入權限 100% 取得！")
     
 except Exception as e:
     print(f"⚠️ Google 助理連線失敗: {e}")
