@@ -55,13 +55,13 @@ def run_all_tests():
     print("✅ [測試 1] 導入表單、TDEE計算、菜單配菜、菜色過敏源過濾")
     # 模擬表單傳進來的資料 (測試過敏原：海鮮、牛)
     form_data = {
-        "UID": [uid], "稱呼": ["測試總監"], "體重": ["75"], "身高": ["175"], "年齡": ["30"], 
-        "性別": ["男"], "活動量": ["中度"], "目標": ["減脂"], "禁忌": ["海鮮, 牛"], 
+        "UID": [uid], "稱呼": ["測試總監"], "體重": ["75"], "身高": ["175"], "年齡": ["30"],
+        "性別": ["男"], "活動量": ["中度"], "目標": ["減脂"], "禁忌": ["海鮮, 牛"],
         "第一週": ["週一,週二"]
     }
     # 執行表單接收功能
     asyncio.run(server.receive_form_data(MockRequest(form_data)))
-    
+
     # 驗證資料庫
     conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
     c.execute("SELECT tdee, active_days, sheet_name FROM health_profile WHERE user_id=?", (uid,))
@@ -91,9 +91,9 @@ def run_all_tests():
     conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO usage VALUES (?, 50, 10, ?, 'vip', '2099-12-31', 50)", (uid, datetime.date.today().isoformat()))
     conn.commit(); conn.close()
-    
+
     server.handle_message(DummyEvent("我剛剛吃了一塊 350 大卡的起司蛋糕", uid))
-    
+
     conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
     c.execute("SELECT today_extra_cal FROM health_profile WHERE user_id=?", (uid,))
     extra = c.fetchone()
@@ -107,7 +107,7 @@ def run_all_tests():
     admin_uid = "BOSS_999"
     print("   👑 老闆輸入：#綁定老闆")
     server.handle_message(DummyEvent("#綁定老闆", admin_uid))
-    
+
     print("   👤 客人輸入：蛋糕太罪惡，明天幫我換成低碳豆腐餐贖罪！")
     server.handle_message(DummyEvent("蛋糕太罪惡，明天幫我換成低碳豆腐餐贖罪！", uid))
     print("-" * 60)
@@ -122,7 +122,7 @@ def run_all_tests():
     today_str = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][datetime.date.today().weekday()]
     c.execute("UPDATE health_profile SET active_days=? WHERE user_id=?", (today_str, uid))
     conn.commit(); conn.close()
-    
+
     server.handle_message(DummyEvent("#今日出餐完成", admin_uid))
     print("-" * 60)
 
@@ -130,13 +130,13 @@ def run_all_tests():
     print("✅ [測試 7] 老闆權限：清空熱量、重置額度、刪除檔案")
     print("   👑 老闆輸入：#清空熱量")
     server.handle_message(DummyEvent("#清空熱量", uid))
-    
+
     print("   👑 老闆輸入：#重置")
     server.handle_message(DummyEvent("#重置", uid))
-    
+
     print("   👑 老闆輸入：#刪除檔案")
     server.handle_message(DummyEvent("#刪除檔案", uid))
-    
+
     # 最終 DB 驗證
     conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
     c.execute("SELECT * FROM health_profile WHERE user_id=?", (uid,))
@@ -144,20 +144,30 @@ def run_all_tests():
     if not final_check:
         print("   -> 🗑️ DB 驗證：客戶資料已徹底刪除清空！")
     print("-" * 60)
-    
+
+    # ------------------------------------------
+    print("✅ [測試 8] 菜單熱更新與副餐推坑測試")
+    # 1. 模擬老闆更新菜單 (測試熱更新指令)
+    print("   👑 老闆輸入：#更新菜單")
+    server.handle_message(DummyEvent("#更新菜單", admin_uid))
+    # 2. 模擬客人剛跑完步，看 AI 會不會從副餐(side)裡抓出洋芋泥或豆漿來推銷
+    print("   👤 客人輸入：我剛跑完 10 公里，好累喔，有推薦補充什麼嗎？")
+    server.handle_message(DummyEvent("我剛跑完 10 公里，好累喔，有推薦補充什麼嗎？", uid))
+    print("-" * 60)
+
+    # ------------------------------------------
+    print("✅ [測試 9] 明日取餐提醒與副餐推坑測試")
+    # 1. 為了確保測試能成功，我們先去資料庫把客人的取餐日加上「明天」
+    tomorrow_str = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][(datetime.date.today() + datetime.timedelta(days=1)).weekday()]
+    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    c.execute("UPDATE health_profile SET active_days=? WHERE user_id=?", (f"週一,{tomorrow_str}", uid))
+    conn.commit(); conn.close()
+    # 2. 模擬老闆按下發送提醒的指令
+    print(f"   👑 老闆輸入：#發送明日提醒 (系統應自動尋找 {tomorrow_str} 取餐的客人)")
+    server.handle_message(DummyEvent("#發送明日提醒", admin_uid))
+    print("-" * 60)
+
     print("\n🎉🎉🎉 [測試總結] 所有系統功能正常！準備迎接大量訂單！ 🎉🎉🎉\n")
 
 if __name__ == "__main__":
     run_all_tests()
-    # ------------------------------------------
-    print("✅ [測試 8] 菜單熱更新與副餐推坑測試")
-    
-    # 1. 模擬老闆更新菜單 (測試熱更新指令)
-    print("   👑 老闆輸入：#更新菜單")
-    server.handle_message(DummyEvent("#更新菜單", admin_uid))
-    
-    # 2. 模擬客人剛跑完步，看 AI 會不會從副餐(side)裡抓出洋芋泥或豆漿來推銷
-    print("   👤 客人輸入：我剛跑完 10 公里，好累喔，有推薦補充什麼嗎？")
-    # 給系統一點對話記憶
-    server.handle_message(DummyEvent("我剛跑完 10 公里，好累喔，有推薦補充什麼嗎？", uid))
-    print("-" * 60)
