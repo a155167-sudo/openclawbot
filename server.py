@@ -346,6 +346,28 @@ def check_permission_and_quota(user_id):
         c.execute("UPDATE usage SET remaining_chat_quota=?, last_date=? WHERE user_id=?", (q-1, today, user_id))
         conn.commit(); conn.close()
         return True, f"(剩{m}餐 | 諮詢:{q-1})"
+
+def send_tomorrow_reminders():
+    # 計算明天是星期幾
+    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+    tomorrow_str = weekdays[tomorrow.weekday()]
+    
+    # 去資料庫把明天有排餐的客人抓出來
+    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{tomorrow_str}%",))
+    users = c.fetchall(); conn.close()
+    
+    count = 0
+    for uid, name in users:
+        # 🔥 這裡可以偷偷塞入您的 Upsell 加購單品
+        msg = f"🌙 {name} 晚安！\n明天 ({tomorrow_str}) 是您的專屬取餐日喔！\n\n💪 營養師溫馨提醒：\n為確保您的營養達標，明天需要幫您額外準備【洋芋泥】或【燕麥豆漿】來回補體力嗎？\n(直接回覆需要的品項，店長明天就會幫您準備好！)"
+        try:
+            line_bot_api.push_message(uid, TextSendMessage(text=msg))
+            count += 1
+        except Exception as e:
+            pass
+    return f"✅ 報告老闆：成功發送了 {count} 封【{tomorrow_str}】的明日取餐提醒推播！"
     conn.close(); return False, ""
 
 def send_tomorrow_reminders():
