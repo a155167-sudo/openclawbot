@@ -291,9 +291,14 @@ def get_ai_response_with_memory(user_id, user_msg):
     ⚠️ 絕對不要輸出「隱藏標籤」這四個字，直接輸出中括號即可！
     """
     
-    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
-    res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2000, temperature=0.3)
-    ans = res.choices[0].message.content
+    # === 替換這段 ===
+    try:
+        messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
+        res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2000, temperature=0.3)
+        ans = res.choices[0].message.content
+    except Exception as e:
+        return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}\n\n👉 老闆，這通常是因為 Railway 後台的 Variables 沒有設定好 OPENAI_API_KEY，或是設定完沒有重新 Deploy (部署) 喔！"
+    # === 替換到這裡 ===
     
     # 處理熱量紀錄
     match = re.search(r'\[LOG_CAL:\s*(\d+)\]', ans)
