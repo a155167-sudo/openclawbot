@@ -193,19 +193,23 @@ async def receive_form_data(request: Request):
         plan_requests = []
         week_dict = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7}
         
-        for k, v in data.items():
-            if "週" in k and isinstance(v, list) and v[0]:
-                days = [d.strip() for d in v[0].split(',')]
-                w_num = 99
+        # 🔥 終極日期解析器：不管 Google 傳什麼格式，直接精準抓出天數並自動分週！
+        date_str = get_val("日期") or get_val("取餐") or get_val("勾選")
+        if date_str:
+            days = [d.strip() for d in date_str.split(',') if "週" in d]
+            week_tracker = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0} # 紀錄星期幾出現過幾次
+            
+            for d in days:
+                d_num = 99
                 for zh, num in week_dict.items():
-                    if zh in k: w_num = num; break
-                    
-                for d in days:
-                    if not d: continue
-                    d_num = 99
-                    for zh, num in week_dict.items():
-                        if zh in d: d_num = num; break
-                    plan_requests.append((w_num, d_num, k, d))
+                    if zh in d: 
+                        d_num = num
+                        break
+                
+                if d_num != 99:
+                    week_tracker[d_num] += 1
+                    w_num = week_tracker[d_num] # 第一次出現就是第1週，第二次就是第2週
+                    plan_requests.append((w_num, d_num, f"第{w_num}週", d))
                     
         plan_requests.sort(key=lambda x: (x[0], x[1]))
         
