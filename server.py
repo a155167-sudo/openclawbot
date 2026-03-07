@@ -515,9 +515,11 @@ def handle_message(event):
     elif msg == "#重置":
         if uid in user_memory: del user_memory[uid]
         conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
-        c.execute("UPDATE usage SET remaining_chat_quota=50 WHERE user_id=?", (uid,))
+        # 🔥 強制寫入一筆無限期、50次額度的紀錄！就算資料庫被洗白也能救回來
+        today = datetime.date.today().isoformat()
+        c.execute("INSERT OR REPLACE INTO usage (user_id, remaining_chat_quota, remaining_meals, last_date, status, expiry_date, daily_chat_limit) VALUES (?, 50, 99, ?, 'vip', '2099-12-31', 50)", (uid, today))
         conn.commit(); conn.close()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🔄 系統已重置！補滿 50 次額度。"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="👑 老闆特權啟動！系統已強制為您開通 VIP 檔案並補滿 50 次額度！現在請問我熱量！"))
         return
         
     # 🗺️ 智能測距與順風車 🗺️
