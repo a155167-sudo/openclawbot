@@ -97,7 +97,7 @@ def load_menu():
 load_menu()
 
 # ==========================================
-# 3. 資料庫初始化 (🔥 融合版：包含老闆綁定與使用紀錄)
+# 3. 資料庫初始化 (🔥 升級版：支援蛋白質追蹤)
 # ==========================================
 def init_db():
     conn = sqlite3.connect('user_quota.db')
@@ -106,14 +106,12 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER DEFAULT 0)''')
     c.execute('''CREATE TABLE IF NOT EXISTS health_profile (user_id TEXT PRIMARY KEY, name TEXT, tdee INTEGER, protein REAL, goal TEXT, restrictions TEXT, summary_text TEXT, active_days TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS admin_settings (key TEXT PRIMARY KEY, value TEXT)''')
-    
-    try:
-        c.execute("ALTER TABLE health_profile ADD COLUMN today_extra_cal INTEGER DEFAULT 0")
-        c.execute("ALTER TABLE health_profile ADD COLUMN today_date TEXT DEFAULT ''")
-        c.execute("ALTER TABLE health_profile ADD COLUMN sheet_name TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass 
-        
+
+    # 安全新增欄位，避免舊資料庫報錯
+    for col, dtype in [("today_extra_cal", "INTEGER DEFAULT 0"), ("today_date", "TEXT DEFAULT ''"), ("sheet_name", "TEXT DEFAULT ''"), ("today_extra_pro", "INTEGER DEFAULT 0")]:
+        try: c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError: pass
+
     conn.commit(); conn.close()
 init_db()
 
@@ -339,27 +337,32 @@ async def receive_form_data(request: Request):
         return {"status": "error", "msg": str(e)}
 
 # ==========================================
-# 5. AI 對話引擎 (🔥 升級版：精準判斷今日是否有排餐)
+# 5. AI 對話引擎 (🔥 升級版：熱量與蛋白質雙軌追蹤)
 # ==========================================
 def get_ai_response_with_memory(user_id, user_msg):
     conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
-    # 🔥 這裡多抓一個 active_days (取餐日) 來做比對
-    c.execute("SELECT summary_text, tdee, active_days FROM health_profile WHERE user_id=?", (user_id,))
+    
+    # 🔥 抓取客人資料 (保留 active_days，並多抓 protein)
+    c.execute("SELECT summary_text, tdee, active_days, protein FROM health_profile WHERE user_id=?", (user_id,))
     hp = c.fetchone()
     
     today_str = datetime.date.today().isoformat()
-    c.execute("SELECT today_extra_cal, today_date, sheet_name, name FROM health_profile WHERE user_id=?", (user_id,))
+    # 🔥 抓取今日外食紀錄 (多抓 today_extra_pro)
+    c.execute("SELECT today_extra_cal, today_date, sheet_name, name, today_extra_pro FROM health_profile WHERE user_id=?", (user_id,))
     daily_rec = c.fetchone()
     
+    # 判斷是不是新的一天，如果是就歸零
     if daily_rec and daily_rec[1] != today_str:
-        c.execute("UPDATE health_profile SET today_extra_cal=0, today_date=? WHERE user_id=?", (today_str, user_id))
-        extra_cal = 0
+        c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0, today_date=? WHERE user_id=?", (today_str, user_id))
+        extra_cal, extra_pro = 0, 0
     else:
         extra_cal = daily_rec[0] if daily_rec else 0
+        extra_pro = daily_rec[4] if (daily_rec and len(daily_rec) > 4 and daily_rec[4] is not None) else 0
 
     report = f"\n【絕對參考報告內容】:\n{hp[0]}" if hp else "\n檔案未填，請引導客人填表。"
     tdee_val = hp[1] if hp else 2000
     active_days = hp[2] if hp else ""
+    protein_val = hp[3] if hp else 100
     history = user_memory.get(user_id, [])[-6:]
     ingredients_memo = "\n".join([f"- {d['name']}: {d.get('ingredients', '新鮮食材')}" for d in MAIN_DISHES])
     
@@ -368,66 +371,72 @@ def get_ai_response_with_memory(user_id, user_msg):
     today_str_zh = weekdays[datetime.date.today().weekday()]
     
     if today_str_zh in active_days:
-        today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】！系統已經為他預留了本店便當的熱量。"
+        today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】！系統已經為他預留了本店便當的熱量與蛋白質。"
         calc_formula = f"""
-        2. 先查看上方報告中，他當天的「👉 當日熱量剩餘」(這是幫他扣除便當後的數字)。
-           【真正餘額】 = 【當日熱量剩餘】 - {extra_cal} - 【你剛估算的熱量】。
-        3. 告訴他：「系統已為您預留了一日樂食的便當熱量。扣除您今日紀錄的外食後，您今天還剩下 OOO 大卡的額度！」
+        2. 先查看上方報告中，他當天的「👉 當日熱量剩餘」與「蛋白質需補」。
+           【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} - 【你剛估算的熱量】。
+           【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} - 【你剛估算的蛋白質】。
+        3. 告訴他：「系統已為您預留了一日樂食便當。扣除外食後，您今天還剩下 OOO 大卡的額度，並且還需要補充 OOO 克蛋白質喔！」
         """
     else:
-        today_status = f"❌ 今天 ({today_str_zh}) 是顧客的【無排餐日】！他今天沒有吃本店的便當，所以擁有完整的 TDEE 額度 ({tdee_val} kcal)。"
+        today_status = f"❌ 今天 ({today_str_zh}) 是顧客的【無排餐日】！他擁有完整的 TDEE 額度 ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g)。"
         calc_formula = f"""
-        2. 因為今天沒有排餐，請直接用他完整的 TDEE ({tdee_val} kcal) 來計算！
-           【真正餘額】 = {tdee_val} - {extra_cal} - 【你剛估算的熱量】。
-        3. 告訴他：「今天雖然沒有一日樂食的專屬餐點，但扣除您今日紀錄的外食後，您的總 TDEE 還剩下 OOO 大卡的額度！請繼續保持喔！」
+        2. 因為今天沒有排餐，請直接用他完整的 TDEE ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g) 來計算！
+           【真正熱量餘額】 = {tdee_val} - {extra_cal} - 【你剛估算的熱量】。
+           【真正蛋白需求】 = {int(protein_val)} - {extra_pro} - 【你剛估算的蛋白質】。
+        3. 告訴他：「今天雖然沒有本店餐點，但扣除外食後，您的總 TDEE 還剩下 OOO 大卡，距離蛋白質目標還差 OOO 克！請繼續保持喔！」
         """
 
-    system_prompt = f""" 你是「一日樂食」的專屬 AI 營養師。你是一位充滿熱情、幽默、且專業的健康顧問！
+    system_prompt = f"""你是「一日樂食」的專屬 AI 營養師。你是一位充滿熱情、幽默、且專業的健康顧問！
     {report}
     
     【本店餐點內容物 - 機密小抄】(僅供內部參考)：
     {ingredients_memo}
     
-    【🔥 外食熱量計算嚴格規則 🔥】
+    【🔥 外食計算嚴格規則 🔥】
     顧客今天的「外食累積熱量」為：{extra_cal} 大卡。
+    顧客今天的「外食累積蛋白質」為：{extra_pro} 克。
     {today_status}
     
     當顧客回報他剛吃了什麼時，請嚴格按照以下步驟回覆：
-    1. 估算他剛吃的外食熱量。
+    1. 估算他剛吃的外食「熱量」與「蛋白質」。
     {calc_formula}
-    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 `[LOG_CAL: 估算的熱量數字]`。
+    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 熱量數字, 蛋白質數字]。 (例如：[LOG_NUTRITION: 450, 20])
     
     【🚨 換餐最高指令 🚨】
     只要顧客「確定答應」要更換未來的餐點，請在你整段回覆的最底部，直接加上 [CHANGE_MEAL: 將OOO替換為XXX]。
     ⚠️ 絕對不要輸出「隱藏標籤」這四個字，直接輸出中括號即可！
     """
     
-    # === 替換這段 ===
+    # 呼叫大腦
     try:
         messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
         res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2000, temperature=0.3)
         ans = res.choices[0].message.content
     except Exception as e:
+        # ✅ 保留您原本的貼心報錯提示
         return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}\n\n👉 老闆，這通常是因為 Railway 後台的 Variables 沒有設定好 OPENAI_API_KEY，或是設定完沒有重新 Deploy (部署) 喔！"
-    # === 替換到這裡 ===
-    
-    # 處理熱量紀錄
-    match = re.search(r'\[LOG_CAL:\s*(\d+)\]', ans)
+        
+    # 🔥 處理紀錄 (升級為：熱量 + 蛋白質雙擷取)
+    match = re.search(r'\[LOG_NUTRITION:\s*(\d+),\s*(\d+)\]', ans)
     if match:
         logged_cal = int(match.group(1))
-        new_extra = extra_cal + logged_cal
-        c.execute("UPDATE health_profile SET today_extra_cal=? WHERE user_id=?", (new_extra, user_id))
+        logged_pro = int(match.group(2))
+        new_extra_cal = extra_cal + logged_cal
+        new_extra_pro = extra_pro + logged_pro
+        c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=? WHERE user_id=?", (new_extra_cal, new_extra_pro, user_id))
         conn.commit()
-        ans = re.sub(r'\[LOG_CAL:\s*\d+\]', '', ans).strip()
+        ans = re.sub(r'\[LOG_NUTRITION:\s*\d+,\s*\d+\]', '', ans).strip()
         
+        # ✅ 保留寫入 Google Sheet，並加上蛋白質數據！
         if daily_rec and daily_rec[2] and gc:
             try:
                 sheet = gc.open_by_url(SHEET_URL)
                 now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                sheet.worksheet(daily_rec[2]).append_row([now_str, "外食熱量打卡", user_msg, f"+{logged_cal}"])
+                sheet.worksheet(daily_rec[2]).append_row([now_str, "外食熱量與蛋白打卡", user_msg, f"+{logged_cal} kcal / +{logged_pro} g"])
             except Exception: pass
 
-    # 處理換餐通知 (發送給老闆)
+    # ✅ 處理換餐通知 (發送給老闆) (完整保留)
     match_change = re.search(r'\[CHANGE_MEAL:\s*(.+?)\]', ans)
     if match_change:
         change_req = match_change.group(1)
@@ -443,6 +452,7 @@ def get_ai_response_with_memory(user_id, user_msg):
             except Exception: pass
 
     conn.close()
+    # 更新記憶
     user_memory[user_id] = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": ans}]
     return ans
 
@@ -612,9 +622,9 @@ def handle_message(event):
         return
     elif msg == "#清空熱量":
         conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
-        c.execute("UPDATE health_profile SET today_extra_cal=0 WHERE user_id=?", (uid,))
+        c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0 WHERE user_id=?", (uid,))
         conn.commit(); conn.close()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🔄 報告老闆，今日偷吃紀錄已歸零！"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🔄 報告老闆，今日偷吃紀錄（含熱量與蛋白質）已歸零！"))
         return
     elif msg == "#刪除檔案":
         if uid in user_memory: del user_memory[uid]
