@@ -197,22 +197,33 @@ async def receive_form_data(request: Request):
         date_str = get_val("日期") or get_val("取餐") or get_val("勾選")
         user_restrictions = restrictions.lower() # 顧客禁忌 (小寫化方便比對)
         
-        # 2. 抓取顧客喜好標籤 (對應您在表單新增的題目關鍵字)
+        # 2. 抓取顧客喜好標籤
         pref_staple = get_val("主食偏好") or ""
         pref_protein = get_val("蛋白質") or ""
-        user_prefs = (pref_staple + pref_protein).lower()
+        
+        # 🔥 定義真正喜歡的關鍵字 (解決「沒有飯」卻抓到「飯」的 Bug)
+        liked_staples = []
+        if "飯食派" in pref_staple: liked_staples.append("飯")
+        if "原型" in pref_staple: liked_staples.extend(["地瓜", "南瓜", "馬鈴薯"])
+        if "低碳" in pref_staple: liked_staples.extend(["低碳", "菜"])
+        if "麵" in pref_staple: liked_staples.append("麵")
+        if "沙拉" in pref_staple: liked_staples.append("沙拉")
+
+        liked_proteins = []
+        if "素食" in pref_protein: liked_proteins.extend(["素", "豆腐", "鷹嘴豆", "鮮蔬"])
+        if "雞" in pref_protein: liked_proteins.append("雞")
+        if "豬" in pref_protein: liked_proteins.append("豬")
+        if "牛" in pref_protein: liked_proteins.append("牛")
+        if "海鮮" in pref_protein: liked_proteins.extend(["海鮮", "魚", "鱸魚", "鮭魚"])
         
         # 3. 建立「絕對安全菜單池」 (先過濾掉禁忌，且只挑主餐)
         safe_menu = []
         for dish in MAIN_DISHES:
-            # 🔥 關鍵防線：只抓分類是「main (主餐)」的餐點，把單點和飲料直接踢掉！
             if dish.get('category') != 'main':
                 continue
-                
             dish_name = dish['name'].lower()
-            # 🛡️ 絕對防護罩：只要菜名包含禁忌關鍵字，直接封殺！
             is_safe = True
-            forbidden_keywords = ["牛", "豬", "雞", "魚", "海鮮", "蝦"] # 常見禁忌詞
+            forbidden_keywords = ["牛", "豬", "雞", "魚", "海鮮", "蝦"]
             for word in forbidden_keywords:
                 if word in user_restrictions and word in dish_name:
                     is_safe = False
@@ -220,10 +231,10 @@ async def receive_form_data(request: Request):
             if is_safe:
                 safe_menu.append(dish)
 
-        # 4. 解析取餐日期並進行「紅娘配對」
+        # 4. 解析取餐日期並進行「超級紅娘配對 (雙重嚴格過濾)」
         if date_str:
             days = [d.strip() for d in date_str.split(',') if "週" in d]
-            active_days = set(days)  # 🔥 新增這行：讓系統記住客人的取餐星期！
+            active_days = set(days)
             week_tracker = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
             
             for d in days:
@@ -232,12 +243,36 @@ async def receive_form_data(request: Request):
                     week_tracker[d_num] += 1
                     w_num = week_tracker[d_num]
                     
-                    # ❤️ 紅娘配對：從安全池裡找最符合喜好的菜
-                    # 優先級：符合喜好的菜 > 隨機安全菜
-                    pref_matches = [dish for dish in safe_menu if any(p in dish['name'].lower() for p in ["飯", "地瓜", "南瓜", "馬鈴薯", "低碳", "麵", "沙拉", "素", "雞", "豬", "牛", "海鮮", "鱸魚", "鮭魚"] if p in user_prefs)]
+                    perfect_matches = []
+                    good_matches = []
                     
-                    # 抽午餐、抽晚餐 (確保不重複)
-                    pool = pref_matches if len(pref_matches) >= 2 else safe_menu
+                    for dish in safe_menu:
+                        name = dish['name'].lower()
+                        
+                        # 檢查蛋白質與主食是否命中 (如果選都不挑食，就視為 True)
+                        has_pro = any(p in name for p in liked_proteins) if liked_proteins and "都不挑食" not in pref_protein else True
+                        has_sta = any(s in name for s in liked_staples) if liked_staples and "都不挑食" not in pref_staple else True
+                        
+                        # 💣 地雷蛋白質濾網：如果這道菜有客人「沒勾選」的肉類，直接判出局！
+                        # 例如：客人沒勾「海鮮」，那名字有「鱸魚」或「鮭魚」的餐點就會被踢掉。
+                        unliked_proteins = [p for p in ["素", "雞", "豬", "牛", "魚", "海鮮", "鱸魚", "鮭魚", "豆腐", "鷹嘴豆"] if p not in liked_proteins and "都不挑食" not in pref_protein]
+                        if any(up in name for up in unliked_proteins):
+                            has_pro = False # 強制不合格
+                            
+                        # 依據符合程度放入池子
+                        if has_pro and has_sta:
+                            perfect_matches.append(dish) # 蛋白質跟主食都對
+                        elif has_pro: 
+                            good_matches.append(dish) # 至少蛋白質是對的
+                            
+                    # 優先級：完美命中 > 蛋白質命中 > 隨機安全菜
+                    if len(perfect_matches) >= 2:
+                        pool = perfect_matches
+                    elif len(good_matches) >= 2:
+                        pool = good_matches
+                    else:
+                        pool = safe_menu
+                        
                     daily_pick = random.sample(pool, 2)
                     
                     plan_requests.append((w_num, d_num, f"第{w_num}週", d, daily_pick[0], daily_pick[1]))
