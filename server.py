@@ -90,8 +90,8 @@ def load_menu():
                 except Exception: pass
         print(f"✅ 成功載入 {len(MAIN_DISHES)} 項餐點！")
         return f"✅ 菜單更新成功！共載入 {len(MAIN_DISHES)} 項餐點。"
-    except Exception as e:
-        return f"⚠️ 菜單更新失敗: {e}"
+    except Exception as e: 
+                    print(f"⚠️ 跳過餐點【{name}】: 數字格式有誤，原因：{e}")
 
 # 伺服器啟動時，先自動讀取一次
 load_menu()
