@@ -219,6 +219,7 @@ async def receive_form_data(request: Request):
         # 4. 解析取餐日期並進行「紅娘配對」
         if date_str:
             days = [d.strip() for d in date_str.split(',') if "週" in d]
+            active_days = set(days)  # 🔥 新增這行：讓系統記住客人的取餐星期！
             week_tracker = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
             
             for d in days:
