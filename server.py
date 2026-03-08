@@ -229,7 +229,7 @@ async def receive_form_data(request: Request):
                     
                     # ❤️ 紅娘配對：從安全池裡找最符合喜好的菜
                     # 優先級：符合喜好的菜 > 隨機安全菜
-                    pref_matches = [dish for dish in safe_menu if any(p in dish['name'].lower() for p in ["飯", "麵", "雞", "豬", "牛", "魚", "地瓜", "沙拉"] if p in user_prefs)]
+                    pref_matches = [dish for dish in safe_menu if any(p in dish['name'].lower() for p in ["飯", "地瓜", "南瓜", "馬鈴薯", "低碳", "麵", "沙拉", "素", "雞", "豬", "牛", "海鮮", "鱸魚", "鮭魚"] if p in user_prefs)]
                     
                     # 抽午餐、抽晚餐 (確保不重複)
                     pool = pref_matches if len(pref_matches) >= 2 else safe_menu
