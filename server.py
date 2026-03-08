@@ -246,7 +246,7 @@ async def receive_form_data(request: Request):
         
         for w_num, d_num, w_label, day_name, lunch, dinner in plan_requests:
             day_tdee_left = int(tdee) - lunch['cal'] - dinner['cal']
-            day_p_need = int(protein) - lunch['p'] - dinner['p']
+            day_p_need = int(protein) - lunch['pro'] - dinner['pro']
             
             schedule_text += f"\n【{w_label}-{day_name}】\n☀️午：{lunch['name']} ({lunch['cal']}kcal)\n🌙晚：{dinner['name']} ({dinner['cal']}kcal)\n👉 當日熱量剩餘: {day_tdee_left}kcal\n"
             schedule_sheet_rows.append([f"{w_label}-{day_name}", lunch['name'], dinner['name'], f"剩 {day_tdee_left}kcal / 補 {day_p_need}g"])
