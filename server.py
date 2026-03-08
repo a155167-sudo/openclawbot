@@ -202,9 +202,13 @@ async def receive_form_data(request: Request):
         pref_protein = get_val("蛋白質") or ""
         user_prefs = (pref_staple + pref_protein).lower()
         
-        # 3. 建立「絕對安全菜單池」 (先過濾掉禁忌)
+        # 3. 建立「絕對安全菜單池」 (先過濾掉禁忌，且只挑主餐)
         safe_menu = []
         for dish in MAIN_DISHES:
+            # 🔥 關鍵防線：只抓分類是「main (主餐)」的餐點，把單點和飲料直接踢掉！
+            if dish.get('category') != 'main':
+                continue
+                
             dish_name = dish['name'].lower()
             # 🛡️ 絕對防護罩：只要菜名包含禁忌關鍵字，直接封殺！
             is_safe = True
@@ -279,7 +283,8 @@ async def receive_form_data(request: Request):
                         user_sheet.clear()
                         
                     # 🔥 第一行直接補上「體重」欄位，方便老闆追蹤！
-                    profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}"], [""]]
+                    # 🔥 第一行直接補上所有客戶資訊，包含最新的「飲食喜好」！
+                    profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}"], [""]]
                     menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
                     tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
                     
