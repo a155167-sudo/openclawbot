@@ -258,7 +258,7 @@ async def receive_form_data(request: Request):
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
 
         conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO health_profile (user_id, name, tdee, protein, goal, restrictions, summary_text, active_days, today_extra_cal, today_date, sheet_name) VALUES (?,?,?,?,?,?,?,?,0,'',?)", (user_id, name, int(tdee), protein, goal, restrictions, summary, ",".join(list(active_days)), safe_name))
+        c.execute("INSERT OR REPLACE INTO health_profile (user_id, name, tdee, protein, goal, restrictions, summary_text, active_days, today_extra_cal, today_date, sheet_name) VALUES (?,?,?,?,?,?,?,?,0,'',?)", (user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(list(active_days)), safe_name))
         conn.commit(); conn.close()
 
         if gc:
