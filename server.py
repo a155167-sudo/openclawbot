@@ -38,7 +38,7 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "#GEN_CODES")
 DB_DIR = os.path.join(os.getcwd(), 'data')
-DB_PATH = os.path.join(DB_DIR, 'DB_PATH')
+DB_PATH = os.path.join(DB_DIR, 'user_quota.db')
 
 if not os.path.exists(DB_DIR):
     os.makedirs(DB_DIR, exist_ok=True)
@@ -132,7 +132,7 @@ def load_menu():
 def init_db():
     # 🎯 1. 自動定位：確保路徑絕對正確
     db_dir = os.path.join(os.getcwd(), 'data')
-    db_path = os.path.join(db_dir, 'DB_PATH')
+    db_path = os.path.join(db_dir, 'user_quota.db')
 
     # 📂 2. 防撞檢查：如果保險箱資料夾不存在，就立刻建一個
     if not os.path.exists(db_dir):
