@@ -630,6 +630,13 @@ def handle_message(event):
         form_link = f"https://docs.google.com/forms/d/e/1FAIpQLSdVY7Zf-E2zSpsOFmItYHI0YtTujX6Ucux4QTQ3gjg5wcomgA/viewform?usp=pp_url&entry.1461831832={uid}"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📝 請點擊下方專屬連結，填寫您的體質評估表單：\n\n{form_link}\n\n(系統已為您自動帶入 LINE 帳號，請直接填寫即可喔！)"))
         return
+    elif msg == "填寫滿意度問卷":
+        # 👉 老闆注意：請把下面這串網址，換成您剛剛在 Google 表單產生的那串「最後面有 {uid} 的黃金連結」！
+        survey_link = f"https://docs.google.com/forms/d/e/1FAIpQLScF6Va_sdq6KMaKFd8BUVB2x5SyLji3JqX28-Z7h-tuLnpB-Q/viewform?usp=pp_url&entry.1048958109={uid}"
+        
+        reply_text = f"🎁 感謝您對一日樂食的支持！\n請點擊下方專屬連結填寫滿意度調查 (約1分鐘)。\n\n完成填寫後，系統將自動發送【1 點集點卡點數】給您喔！👇\n\n{survey_link}"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
     elif msg == "查看菜單":
         conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
         c.execute("SELECT summary_text FROM health_profile WHERE user_id=?", (uid,))
