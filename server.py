@@ -5,13 +5,11 @@ import sqlite3
 import datetime
 from zoneinfo import ZoneInfo
 
-# ?? ?�灣?��?工具?�數
+# 台灣時區工具函數
 TW_TZ = ZoneInfo("Asia/Taipei")
 def tw_today():
-    """?��??�灣今天?�日??(date ?�件)"""
     return datetime.datetime.now(TW_TZ).date()
 def tw_now():
-    """?��??�灣?�在?��???(datetime ?�件)"""
     return datetime.datetime.now(TW_TZ)
 import secrets
 import string
@@ -28,20 +26,20 @@ from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from contextlib import asynccontextmanager
 
-# --- 保險箱�?始�?設�? ---
-# ?�們�?建�?資�?夾�??�輯移到 init_db 裡面?�更安全�?
-# ?�裡?�以?�註�???��??��?�??�?init_db 一定�??�用?��?對路徑」�??��?
+# --- 保險箱初始化設定 ---
+# 我們把建立資料夾的邏輯移到 init_db 裡面會更安全，
+# 這裡可以先註解掉或保持原樣，但 init_db 一定要改用「絕對路徑」版本。
 # -----------------------
 # ==========================================
-# 1. 設�??� (?�� 安全?�護?��??�鑰?�由 Railway 後台讀??
+# 1. 設定區 (🔥 安全防護版：金鑰改由 Railway 後台讀取)
 # ==========================================
-STORE_ADDRESS = "?��?市松山�??�京?�路?�段133�?�???
+STORE_ADDRESS = "台北市松山區南京東路四段133巷4弄5號"
 HUBS = [
-    {"name": "Anytime Fitness 信義�?, "address": "?��?市信義�??��?�?9??},
-    {"name": "?�身工�? 中山�?, "address": "?��?市中山�??�京?�路二段8??}
+    {"name": "Anytime Fitness 信義店", "address": "台北市信義區松仁路89號"},
+    {"name": "健身工廠 中山廠", "address": "台北市中山區南京東路二段8號"}
 ]
 
-# ?��? ?�裡已�??�部?�為安全寫�?，�???Railway ??Variables 後台填寫?�鑰�?
+# ⚠️ 這裡已經全部改為安全寫法，請至 Railway 的 Variables 後台填寫金鑰！
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
@@ -52,30 +50,30 @@ DB_PATH = os.path.join(DB_DIR, 'user_quota.db')
 
 if not os.path.exists(DB_DIR):
     os.makedirs(DB_DIR, exist_ok=True)
-# Google 試�?表設�?(網�??��?安全，�? service_account 保護)
+# Google 試算表設定 (網址公開安全，靠 service_account 保護)
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1cf0QhWeYynk9nqsoqMIM-Lkxk_bP57zcd-ES7Sufkqg/edit?gid=0#gid=0"
 
-# ?�� 設�? FastAPI ?��??�週�??�隱形�??��?�?
+# 🔥 設定 FastAPI 的生命週期與隱形店長排程
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 伺�??��??��?，�??�隱形�???
+    # 伺服器啟動時，喚醒隱形店長
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
     
-    # ???��??�表：�?�?14:00 ?��?????�催繳�?�?
+    # ⏰ 排定班表：每天 14:00 自動扣餐與催繳續約
     scheduler.add_job(auto_daily_meal_deduction, 'cron', hour=14, minute=0)
     
-    # ???��??�表：�?�?20:00 ?��??�送�??��?餐�??�購?��?
+    # ⏰ 排定班表：每天 20:00 自動發送明日取餐與加購提醒
     scheduler.add_job(auto_send_tomorrow_reminders_to_boss, 'cron', hour=20, minute=0)
     
     scheduler.start()
-    print("???�自?��??�器已�??��?系統?�入?�人駕�?模�? ON�?)
+    print("✅ 全自動定時器已啟動！系統進入無人駕駛模式 ON！")
     
     yield
     
-    # 伺�??��??��?，�?店長下班
+    # 伺服器關閉時，讓店長下班
     scheduler.shutdown()
 
-# �??建�??�用了�??�器??FastAPI ?�用程�?
+# 正式建立啟用了定時器的 FastAPI 應用程式
 app = FastAPI(lifespan=lifespan)
 client = OpenAI(api_key=OPENAI_API_KEY)
 line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
@@ -83,27 +81,27 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 user_memory = {}
 processed_messages = set()
 
-# ?��? Google ?�擬?��? (?�� ?��?裝甲，�?歸�?淨�?)
+# 喚醒 Google 虛擬助理 (🔥 卸下裝甲，回歸純淨版)
 try:
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     
-    # 1. ?�接從�??�箱?�出完�??��?�?
+    # 1. 直接從保險箱拿出完美的字串
     creds_str = os.environ.get("GOOGLE_CREDENTIALS")
     
-    # 2. ?��??�味轉�?字典 (什�?replace ?��??��?，�??�您貼�?太�?美�?�?
+    # 2. 原汁原味轉成字典 (什麼 replace 都不用加，因為您貼得太完美了！)
     creds_dict = json.loads(creds_str)
     
-    # 3. ?�接?�鑰?��??�
+    # 3. 直接拿鑰匙開門
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
-    print("??Google ?�端大�?�???��?！寫?��???100% ?��?�?)
+    print("✅ Google 雲端大門正式開啟！寫入權限 100% 取得！")
     
 except Exception as e:
-    print(f"?��? Google ?��????失�?: {e}")
+    print(f"⚠️ Google 助理連線失敗: {e}")
     gc = None
 
 # ==========================================
-# 2. ?�單資�?載入 (?�� ?��?：主�??��?精�??��??�熱?�新)
+# 2. 菜單資料載入 (🔥 新增：主餐/單品精準分類與熱更新)
 # ==========================================
 MAIN_DISHES = []
 def load_menu():
@@ -114,53 +112,53 @@ def load_menu():
             reader = csv.DictReader(f)
             for row in reader:
                 row_clean = {k.strip() if isinstance(k, str) else k: v for k, v in row.items()}
-                name = row_clean.get("?��?", "").strip()
+                name = row_clean.get("品項", "").strip()
                 if not name: continue
                 try:
-                    cal = float(row_clean.get("?��?(kcal)", "0").strip() or 0.0)
-                    pro = float(row_clean.get("?�白�?g)", "0").strip() or 0.0)
-                    price = int(row_clean.get("?�錢", row_clean.get("?�格", "150")).strip() or 150)
-                    ingredients = row_clean.get("?�容??, "?�鮮食�?製�?").strip()
-                    main_keywords = ["便當", "�?, "食蔬", "低碳", "沙�?"]
+                    cal = float(row_clean.get("熱量(kcal)", "0").strip() or 0.0)
+                    pro = float(row_clean.get("蛋白質(g)", "0").strip() or 0.0)
+                    price = int(row_clean.get("價錢", row_clean.get("價格", "150")).strip() or 150)
+                    ingredients = row_clean.get("內容物", "新鮮食材製作").strip()
+                    main_keywords = ["便當", "麵", "食蔬", "低碳", "沙拉"]
                     if any(kw in name for kw in main_keywords):
                         category = "main"  
                     else:
                         category = "side"  
                     MAIN_DISHES.append({"name": name, "cal": cal, "pro": pro, "price": price, "category": category, "ingredients": ingredients})
                 except Exception as e:
-                    # ?�� ?�蟲程�?碼�??�放?�這裡，�?齊內?��? try�?
-                    print(f"?��? 跳�?餐�??�{name}?? ?��??��??�誤，�??��?{e}")
+                    # 🔥 抓蟲程式碼必須放在這裡，對齊內部的 try！
+                    print(f"⚠️ 跳過餐點【{name}】: 數字格式有誤，原因：{e}")
                     
-        print(f"???��?載入 {len(MAIN_DISHES)} ?��?點�?")
-        return f"???�單?�新?��?！共載入 {len(MAIN_DISHES)} ?��?點�?
+        print(f"✅ 成功載入 {len(MAIN_DISHES)} 項餐點！")
+        return f"✅ 菜單更新成功！共載入 {len(MAIN_DISHES)} 項餐點。"
     except Exception as e: 
-        print(f"?��? 讀??menu.csv 失�?: {e}")
-        return "???�單?�新失�?，�?檢查檔�???
+        print(f"⚠️ 讀取 menu.csv 失敗: {e}")
+        return "❌ 菜單更新失敗，請檢查檔案。"
 # ==========================================
-# 3. 資�?庫�?始�? (?�� ?��??��??�援點數網�??�發?��???
+# 3. 資料庫初始化 (🔥 升級版：支援點數網址與發放紀錄)
 # ==========================================
 def init_db():
-    # ?�� 1. ?��?定�?：確保路徑�?對正�?
+    # 🎯 1. 自動定位：確保路徑絕對正確
     db_dir = os.path.join(os.getcwd(), 'data')
     db_path = os.path.join(db_dir, 'user_quota.db')
 
-    # ?? 2. ?��?檢查：�??��??�箱資�?夾�?存在，就立刻建�???
+    # 📂 2. 防撞檢查：如果保險箱資料夾不存在，就立刻建一個
     if not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
-        print(f"?? 已自?�建立�??�夾: {db_dir}")
+        print(f"📁 已自動建立資料夾: {db_dir}")
 
     try:
-        # ?? 3. 安全???
+        # 🔗 3. 安全連線
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
         
-        # --- 以�??�您?��??�表?��?�?(保�?不�?) ---
+        # --- 以下是您的原本表格定義 (保持不變) ---
         c.execute('''CREATE TABLE IF NOT EXISTS usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)''')
         c.execute('''CREATE TABLE IF NOT EXISTS vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER DEFAULT 0)''')
         c.execute('''CREATE TABLE IF NOT EXISTS health_profile (user_id TEXT PRIMARY KEY, name TEXT, tdee INTEGER, protein REAL, goal TEXT, restrictions TEXT, summary_text TEXT, active_days TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS admin_settings (key TEXT PRIMARY KEY, value TEXT)''')
         
-        # ?�� 行銷?�卷專用?��??�表
+        # 🔥 行銷問卷專用的資料表
         c.execute('''CREATE TABLE IF NOT EXISTS reward_links (link TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
         c.execute('''CREATE TABLE IF NOT EXISTS survey_records (user_id TEXT PRIMARY KEY, claim_date TEXT)''')
 
@@ -169,25 +167,25 @@ def init_db():
                 c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
             except sqlite3.OperationalError: 
                 pass
-        # --- 以�?結�? ---
+        # --- 以上結束 ---
 
         conn.commit()
         conn.close()
-        print(f"??保險箱�??�庫????��?！路�? {db_path}")
+        print(f"✅ 保險箱資料庫連線成功！路徑: {db_path}")
 
     except Exception as e:
-        print(f"???��?保險箱失?��??�誤?��?: {e}")
+        print(f"❌ 啟動保險箱失敗，錯誤原因: {e}")
 init_db()
-load_menu()  # ?�� 伺�??��??��??��?載入?�單
+load_menu()  # 🔥 伺服器啟動時自動載入菜單
 
 # ==========================================
-# 4. ?�收表單?��?�?(?��??�雷??+ 完�??��?)
+# 4. 接收表單與配餐 (過敏原雷達 + 完美排序)
 # ==========================================
 @app.post("/form-data")
 async def receive_form_data(request: Request):
     try:
         data = await request.json()
-        print(f"?�� [表單測試] ?�到 Google ?��??�大禮�?：{data}")
+        print(f"📦 [表單測試] 收到 Google 傳來的大禮包：{data}")
         
         def get_val(keyword):
             for k, v in data.items():
@@ -196,30 +194,30 @@ async def receive_form_data(request: Request):
             return ""
         
         user_id = get_val("UID")
-        print(f"?? [表單測試] ?�到??UID ?��?'{user_id}'")
+        print(f"🔍 [表單測試] 抓到的 UID 是：'{user_id}'")
         
         if not user_id or user_id == "UID_REPLACE_ME": 
-            print("??[表單?��?] ?��??��??��? UID，這張表單?�直?��??��?")
+            print("❌ [表單拒絕] 找不到有效的 UID，這張表單我直接丟掉！")
             return {"status": "ignored"}
         if user_id in user_memory: del user_memory[user_id]
 
-        name, goal, restrictions = get_val("稱呼"), get_val("?��?"), get_val("禁�?")
-        weight, height, age, gender = float(get_val("體�?") or 70), float(get_val("身�?") or 170), float(get_val("年齡") or 30), get_val("?�別")
-        activity = get_val("活�???)
+        name, goal, restrictions = get_val("稱呼"), get_val("目標"), get_val("禁忌")
+        weight, height, age, gender = float(get_val("體重") or 70), float(get_val("身高") or 170), float(get_val("年齡") or 30), get_val("性別")
+        activity = get_val("活動量")
         
-        bmr = (10 * weight + 6.25 * height - 5 * age - 161) if "�? in gender else (10 * weight + 6.25 * height - 5 * age + 5)
+        bmr = (10 * weight + 6.25 * height - 5 * age - 161) if "女" in gender else (10 * weight + 6.25 * height - 5 * age + 5)
         act_mult = 1.2
-        if "�? in activity: act_mult = 1.375
-        elif "�? in activity: act_mult = 1.55
-        elif "�? in activity: act_mult = 1.725
-        elif "�? in activity: act_mult = 1.9
+        if "輕" in activity: act_mult = 1.375
+        elif "中" in activity: act_mult = 1.55
+        elif "高" in activity: act_mult = 1.725
+        elif "極" in activity: act_mult = 1.9
         tdee_base = bmr * act_mult
         
         protein = weight * 1.6
-        if "減�?" in goal: 
+        if "減脂" in goal: 
             tdee = tdee_base - 300
             protein = weight * 2.0
-        elif "增�?" in goal: 
+        elif "增肌" in goal: 
             tdee = tdee_base + 300
             protein = weight * 2.0
         else: tdee = tdee_base
@@ -228,7 +226,7 @@ async def receive_form_data(request: Request):
         base_dinner_pool = [d for d in MAIN_DISHES if d.get('category') == 'main']
         
         if restrictions:
-            noise_words = ['�?, '??, '??, '??, '�?, ' ', '不�?', '不�?', '不能', '不能??, '?��?', '�?, '?��?', '?��?']
+            noise_words = ['跟', '和', '與', '、', '，', ' ', '不吃', '不要', '不能', '不能吃', '過敏', '類', '我對', '另外']
             clean_res = restrictions
             for noise in noise_words:
                 clean_res = clean_res.replace(noise, ',')
@@ -236,7 +234,7 @@ async def receive_form_data(request: Request):
             bad_words = [w.strip() for w in clean_res.split(',')]
             bad_words = [w for w in bad_words if w]
             
-            major_allergens = ['??, '�?, '??, '�?, '海鮮', '�?, '??, '??, '?��?', '?��?', '起司', '�?]
+            major_allergens = ['牛', '豬', '雞', '羊', '海鮮', '魚', '蝦', '蟹', '堅果', '花生', '起司', '豆']
             for ma in major_allergens:
                 if ma in restrictions and ma not in bad_words:
                     bad_words.append(ma)
@@ -251,42 +249,42 @@ async def receive_form_data(request: Request):
             dinner_pool = base_dinner_pool
         
         schedule_lines, total_price, active_days = [], 0, set()
-        schedule_sheet_rows = [["?��??��???, "?��?安�?", "?��?安�?", "?��??��? / ?�白質�?�?]]
+        schedule_sheet_rows = [["週期與星期", "午餐安排", "晚餐安排", "熱量剩餘 / 蛋白質需補"]]
         
         plan_requests = []
-        week_dict = {"一": 1, "�?: 2, "�?: 3, "??: 4, "�?: 5, "??: 6, "??: 7}
+        week_dict = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7}
         
-        # 1. ?��?表單中�??�鍵資�?
-        date_str = get_val("?��?") or get_val("?��?") or get_val("?�選")
-        user_restrictions = restrictions.lower() # 顧客禁�? (小寫?�方便�?�?
+        # 1. 抓取表單中的關鍵資訊
+        date_str = get_val("日期") or get_val("取餐") or get_val("勾選")
+        user_restrictions = restrictions.lower() # 顧客禁忌 (小寫化方便比對)
         
-        # 2. ?��?顧客?�好標籤
-        pref_staple = get_val("主�??�好") or ""
-        pref_protein = get_val("?�白�?) or ""
+        # 2. 抓取顧客喜好標籤
+        pref_staple = get_val("主食偏好") or ""
+        pref_protein = get_val("蛋白質") or ""
         
-        # ?�� 定義?�正?�歡?��??��? (�?��?��??�飯?�卻?�到?�飯?��? Bug)
+        # 🔥 定義真正喜歡的關鍵字 (解決「沒有飯」卻抓到「飯」的 Bug)
         liked_staples = []
-        if "飯�?�? in pref_staple: liked_staples.append("�?)
-        if "?��?" in pref_staple: liked_staples.extend(["?��?", "?��?", "馬鈴??])
-        if "低碳" in pref_staple: liked_staples.extend(["低碳", "??])
-        if "�? in pref_staple: liked_staples.append("�?)
-        if "沙�?" in pref_staple: liked_staples.append("沙�?")
+        if "飯食派" in pref_staple: liked_staples.append("飯")
+        if "原型" in pref_staple: liked_staples.extend(["地瓜", "南瓜", "馬鈴薯"])
+        if "低碳" in pref_staple: liked_staples.extend(["低碳", "菜"])
+        if "麵" in pref_staple: liked_staples.append("麵")
+        if "沙拉" in pref_staple: liked_staples.append("沙拉")
 
         liked_proteins = []
-        if "素�?" in pref_protein: liked_proteins.extend(["�?, "豆�?", "鷹嘴�?, "鮮蔬"])
-        if "?? in pref_protein: liked_proteins.append("??)
-        if "�? in pref_protein: liked_proteins.append("�?)
-        if "?? in pref_protein: liked_proteins.append("??)
-        if "海鮮" in pref_protein: liked_proteins.extend(["海鮮", "�?, "鱸�?", "鮭�?"])
+        if "素食" in pref_protein: liked_proteins.extend(["素", "豆腐", "鷹嘴豆", "鮮蔬"])
+        if "雞" in pref_protein: liked_proteins.append("雞")
+        if "豬" in pref_protein: liked_proteins.append("豬")
+        if "牛" in pref_protein: liked_proteins.append("牛")
+        if "海鮮" in pref_protein: liked_proteins.extend(["海鮮", "魚", "鱸魚", "鮭魚"])
         
-        # 3. 建�??��?對�??��??��???(?��?濾�?禁�?，�??��?主�?)
+        # 3. 建立「絕對安全菜單池」 (先過濾掉禁忌，且只挑主餐)
         safe_menu = []
         for dish in MAIN_DISHES:
             if dish.get('category') != 'main':
                 continue
             dish_name = dish['name'].lower()
             is_safe = True
-            forbidden_keywords = ["??, "�?, "??, "�?, "海鮮", "??]
+            forbidden_keywords = ["牛", "豬", "雞", "魚", "海鮮", "蝦"]
             for word in forbidden_keywords:
                 if word in user_restrictions and word in dish_name:
                     is_safe = False
@@ -294,9 +292,9 @@ async def receive_form_data(request: Request):
             if is_safe:
                 safe_menu.append(dish)
 
-        # 4. �???��??��?並進�??��?級�?娘�?�?(?��??�格?�濾)??
+        # 4. 解析取餐日期並進行「超級紅娘配對 (雙重嚴格過濾)」
         if date_str:
-            days = [d.strip() for d in date_str.split(',') if "?? in d]
+            days = [d.strip() for d in date_str.split(',') if "週" in d]
             active_days = set(days)
             week_tracker = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
             
@@ -312,23 +310,23 @@ async def receive_form_data(request: Request):
                     for dish in safe_menu:
                         name = dish['name'].lower()
                         
-                        # 檢查?�白質�?主�??�否?�中 (如�??�都不�?食�?就�???True)
-                        has_pro = any(p in name for p in liked_proteins) if liked_proteins and "?��??��?" not in pref_protein else True
-                        has_sta = any(s in name for s in liked_staples) if liked_staples and "?��??��?" not in pref_staple else True
+                        # 檢查蛋白質與主食是否命中 (如果選都不挑食，就視為 True)
+                        has_pro = any(p in name for p in liked_proteins) if liked_proteins and "都不挑食" not in pref_protein else True
+                        has_sta = any(s in name for s in liked_staples) if liked_staples and "都不挑食" not in pref_staple else True
                         
-                        # ?�� ?�雷?�白質濾網�?如�??��??��?客人?��??�選?��??��?，直?�判?��?�?
-                        # 例�?：客人�??�「海鮮」�????字�??�鱸魚」�??�鮭魚」�?餐�?就�?被踢?��?
-                        unliked_proteins = [p for p in ["�?, "??, "�?, "??, "�?, "海鮮", "鱸�?", "鮭�?", "豆�?", "鷹嘴�?] if p not in liked_proteins and "?��??��?" not in pref_protein]
+                        # 💣 地雷蛋白質濾網：如果這道菜有客人「沒勾選」的肉類，直接判出局！
+                        # 例如：客人沒勾「海鮮」，那名字有「鱸魚」或「鮭魚」的餐點就會被踢掉。
+                        unliked_proteins = [p for p in ["素", "雞", "豬", "牛", "魚", "海鮮", "鱸魚", "鮭魚", "豆腐", "鷹嘴豆"] if p not in liked_proteins and "都不挑食" not in pref_protein]
                         if any(up in name for up in unliked_proteins):
-                            has_pro = False # 強制不�???
+                            has_pro = False # 強制不合格
                             
-                        # 依�?符�?程度?�入池�?
+                        # 依據符合程度放入池子
                         if has_pro and has_sta:
-                            perfect_matches.append(dish) # ?�白質�?主�??��?
+                            perfect_matches.append(dish) # 蛋白質跟主食都對
                         elif has_pro: 
-                            good_matches.append(dish) # ?��??�白質是對�?
+                            good_matches.append(dish) # 至少蛋白質是對的
                             
-                    # ?��?級�?完�??�中 > ?�白質命�?> 安全??> ?�部主�? (保�?)
+                    # 優先級：完美命中 > 蛋白質命中 > 安全菜 > 全部主餐 (保底)
                     if len(perfect_matches) >= 2:
                         pool = perfect_matches
                     elif len(good_matches) >= 2:
@@ -336,35 +334,35 @@ async def receive_form_data(request: Request):
                     elif len(safe_menu) >= 2:
                         pool = safe_menu
                     else:
-                        # ?�終�?底�??�?�主餐�?確�?不�??��?
+                        # 最終保底：所有主餐，確保不會炸掉
                         pool = [d for d in MAIN_DISHES if d.get('category') == 'main']
                     
-                    # 安全?�樣：pool 不�? 2 ?��??�許?��???
+                    # 安全取樣：pool 不夠 2 道時允許重複取
                     if len(pool) >= 2:
                         daily_pick = random.sample(pool, 2)
                     elif len(pool) == 1:
                         daily_pick = [pool[0], pool[0]]
                     else:
-                        continue  # ?��?沒�?，跳?�這天
+                        continue  # 真的沒菜，跳過這天
                     
-                    plan_requests.append((w_num, d_num, f"第{w_num}??, d, daily_pick[0], daily_pick[1]))
+                    plan_requests.append((w_num, d_num, f"第{w_num}週", d, daily_pick[0], daily_pick[1]))
 
         plan_requests.sort(key=lambda x: (x[0], x[1]))
 
-        # 5. ?��??�覽?��??�試算表資�?
+        # 5. 生成預覽文字與試算表資料
         schedule_text = ""
-        schedule_sheet_rows = [["?��??��???, "?��?安�?", "?��?安�?", "?��??��? / ?�白質�?�?]]
+        schedule_sheet_rows = [["週期與星期", "午餐安排", "晚餐安排", "熱量剩餘 / 蛋白質需補"]]
         total_price = 0
         
         for w_num, d_num, w_label, day_name, lunch, dinner in plan_requests:
             day_tdee_left = int(tdee) - lunch['cal'] - dinner['cal']
             day_p_need = int(protein) - lunch['pro'] - dinner['pro']
             
-            schedule_text += f"\n?�{w_label}-{day_name}?�\n?�️�?：{lunch['name']} ({lunch['cal']}kcal)\n???��?{dinner['name']} ({dinner['cal']}kcal)\n?? ?�日?��??��?: {day_tdee_left}kcal\n"
-            schedule_sheet_rows.append([f"{w_label}-{day_name}", lunch['name'], dinner['name'], f"??{day_tdee_left}kcal / �?{day_p_need}g"])
+            schedule_text += f"\n【{w_label}-{day_name}】\n☀️午：{lunch['name']} ({lunch['cal']}kcal)\n🌙晚：{dinner['name']} ({dinner['cal']}kcal)\n👉 當日熱量剩餘: {day_tdee_left}kcal\n"
+            schedule_sheet_rows.append([f"{w_label}-{day_name}", lunch['name'], dinner['name'], f"剩 {day_tdee_left}kcal / 補 {day_p_need}g"])
             total_price += (lunch['price'] + dinner['price'])
         
-        # ?�� ?��??��??�入?��??��?，�?美�??��?一次�?續�?歷史�?
+        # 🔥 升級版：加入日期戳記，完美保留每一次的續約歷史！
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
 
@@ -381,44 +379,44 @@ async def receive_form_data(request: Request):
                 main_sheet.append_row(row_data)
                 
                 try:
-                    # ?�� 建�??�新?��?約�???(?�為檔�??��??��?，�?資�?不�?被�??��?)
+                    # 🔥 建立全新的續約分頁 (因為檔名有加日期，舊資料不會被洗掉！)
                     try:
                         user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="8")
                     except:
-                        # ?��?客人?��?天填了兩次表?��??��??��?天�?
+                        # 萬一客人同一天填了兩次表單，才覆蓋今天的
                         user_sheet = sheet.worksheet(safe_name)
                         user_sheet.clear()
                         
-                    # ?�� 第�?行直?��?上「�??�」�?位�??�便?��?追蹤�?
-                    # ?�� 第�?行直?��?上�??�客?��?訊�??�含?�?��??�飲食�?好」�?
-                    profile_data = [["?�VIP 客戶檔�???, f"姓�?: {name}", f"?��?體�?: {weight} kg", f"?��?: {goal}", f"TDEE: {int(tdee)} kcal", f"?�白�? {int(protein)} g", f"禁�?: {restrictions}", f"?�好: {pref_staple} + {pref_protein}"], [""]]
-                    menu_title = [["?��?屬�?餐�???(�??�~�?????]]
-                    tracking_headers = [[""], ["================================================================="], ["?�日常飲食�??��?追蹤??], ["紀?��???, "紀?��???, "客人?�送內�?, "?�值�???kcal)"]]
+                    # 🔥 第一行直接補上「體重」欄位，方便老闆追蹤！
+                    # 🔥 第一行直接補上所有客戶資訊，包含最新的「飲食喜好」！
+                    profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}"], [""]]
+                    menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
+                    tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
                     
                     user_sheet.append_rows(profile_data + menu_title + schedule_sheet_rows + tracking_headers)
-                    print(f"???��?將�??��?美寫??{safe_name} 專屬?��?�?)
+                    print(f"✅ 成功將菜單完美寫入 {safe_name} 專屬分頁！")
                 except Exception as e: 
-                    print(f"?��? 寫入專屬?��?失�?: {e}")
-                print(f"?? ?��?寫入總表，並?�【{name}?�建立含?�單?��?屬�??��?")
+                    print(f"⚠️ 寫入專屬分頁失敗: {e}")
+                print(f"📝 成功寫入總表，並為【{name}】建立含菜單的專屬分頁！")
             except Exception as e:
-                print(f"?��? 寫入 Google 表單失�?: {e}")
+                print(f"⚠️ 寫入 Google 表單失敗: {e}")
 
-        push_msg = f"?? {name} 填表?��?！\nAI ?��?師已?�您精�?：\n?�� TDEE: {int(tdee)} kcal\n?�� ?�白�? {int(protein)} g\n\n?�在請�??�選?��??�查?��??�』�??��??�您?�出每�?天�?詳細餐�??�價?��?"
+        push_msg = f"🎉 {name} 填表成功！\nAI 營養師已為您精算：\n🔥 TDEE: {int(tdee)} kcal\n🥩 蛋白質: {int(protein)} g\n\n現在請點擊選單的『查看菜單』，我將為您列出每一天的詳細餐點與價格！"
         line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
         return {"status": "success"}
     except Exception as e: 
-        print(f"?�� [表單崩潰?�命?�誤] ?��??�命?��?{str(e)}")
+        print(f"💥 [表單崩潰致命錯誤] 老闆救命啊：{str(e)}")
         return {"status": "error", "msg": str(e)}
 # ==========================================
-# ?�� 滿�?度�??�接?�器 (?��??�放不�?複�???
+# 🔥 滿意度問卷接收器 (自動發放不重複點數)
 # ==========================================
 @app.post("/survey-data")
 async def receive_survey_data(request: Request):
     try:
         data = await request.json()
-        print(f"?? [?�卷測試] ?�到?�卷資�?：{data}")
+        print(f"📝 [問卷測試] 收到問卷資料：{data}")
         
-        # ?��?表單裡�? UID
+        # 抓取表單裡的 UID
         user_id = ""
         for k, v in data.items():
             if "UID" in k.upper():
@@ -426,61 +424,61 @@ async def receive_survey_data(request: Request):
                 break
                 
         if not user_id or user_id == "UID_REPLACE_ME":
-            return {"status": "ignored", "msg": "?��???UID"}
+            return {"status": "ignored", "msg": "無效的 UID"}
 
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         
-        # 1. 檢查?�個人?��??�已經�??��??��?�??�貪小便�?
+        # 1. 檢查這個人是不是已經領過點數了？(防貪小便宜)
         c.execute("SELECT claim_date FROM survey_records WHERE user_id=?", (user_id,))
         if c.fetchone():
             conn.close()
-            # 已�??��?，�??�發網�?，�??�以?�個�?謝�???
-            try: line_bot_api.push_message(user_id, TextSendMessage(text="?��? ?��??��?次填寫�??��??��??�已經�??��??��??��??��?，�??��?食�??��?美好?��?天�?"))
+            # 已經領過，不再發網址，但可以回個感謝訊息
+            try: line_bot_api.push_message(user_id, TextSendMessage(text="❤️ 感謝您再次填寫問卷！您之前已經領取過集點卡點數囉，一日樂食祝您有美好的一天！"))
             except: pass
             return {"status": "already_claimed"}
 
-        # 2. 從�??�箱?�出一張「�?沒被使用?��?點數網�?
+        # 2. 從保險箱抽出一張「還沒被使用」的點數網址
         c.execute("SELECT link FROM reward_links WHERE is_used=0 LIMIT 1")
         row = c.fetchone()
         
         if row:
             reward_link = row[0]
-            # 標�??�已使用，並記�??�個人已�??��?
+            # 標記為已使用，並記錄這個人已經領過
             c.execute("UPDATE reward_links SET is_used=1 WHERE link=?", (reward_link,))
             c.execute("INSERT INTO survey_records (user_id, claim_date) VALUES (?, ?)", (user_id, tw_today().isoformat()))
             conn.commit()
             
-            # 3. ?��?屬�??�網?�私�?給客�?
-            push_msg = f"?? ?��??��?寶貴?��?！\n\n?�是答�??��?專屬?�勵，�?點�?下方????��??��??��?食�?點卡 1 點】�?�\n\n{reward_link}\n\n(?��? 注�?：此????��?屬�?次性�??，�??��??�失?��?請勿轉發給�?人�?�?"
+            # 3. 把專屬點數網址私訊給客人
+            push_msg = f"🎉 感謝您的寶貴回饋！\n\n這是答應您的專屬獎勵，請點擊下方連結領取【一日樂食集點卡 1 點】👇\n\n{reward_link}\n\n(⚠️ 注意：此連結為專屬一次性連結，點擊後即失效，請勿轉發給他人喔！)"
             line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
         else:
-            # 點數?��?了�??�知?��?�?
+            # 點數發光了，通知老闆！
             c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
             admin_row = c.fetchone()
             if admin_row:
-                line_bot_api.push_message(admin_row[0], TextSendMessage(text="?�� ?��?緊急通知：填?�卷?��??��??��??�網?�?�已經被?��??��?請盡快�?後台?��??��?網�?並用 #上傳點數 補貨�?))
+                line_bot_api.push_message(admin_row[0], TextSendMessage(text="🚨 老闆緊急通知：填問卷送點數的「點數網址」已經被抽光啦！請盡快上後台產生新的網址並用 #上傳點數 補貨！"))
         
         conn.close()
         return {"status": "success"}
     except Exception as e:
-        print(f"?��? ?�卷?��??�誤: {e}")
+        print(f"⚠️ 問卷處理錯誤: {e}")
         return {"status": "error"}
 # ==========================================
-# 5. AI 對話引�? (?�� ?��??��??��??��??�質?��?追蹤)
+# 5. AI 對話引擎 (🔥 升級版：熱量與蛋白質雙軌追蹤)
 # ==========================================
 def get_ai_response_with_memory(user_id, user_msg):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     
-    # ?�� ?��?客人資�? (保�? active_days，並多�? protein)
+    # 🔥 抓取客人資料 (保留 active_days，並多抓 protein)
     c.execute("SELECT summary_text, tdee, active_days, protein FROM health_profile WHERE user_id=?", (user_id,))
     hp = c.fetchone()
     
     today_str = tw_today().isoformat()
-    # ?�� ?��?今日外�?紀??(多�? today_extra_pro)
+    # 🔥 抓取今日外食紀錄 (多抓 today_extra_pro)
     c.execute("SELECT today_extra_cal, today_date, sheet_name, name, today_extra_pro FROM health_profile WHERE user_id=?", (user_id,))
     daily_rec = c.fetchone()
     
-    # ?�斷?��??�新?��?天�?如�??�就歸零
+    # 判斷是不是新的一天，如果是就歸零
     if daily_rec and daily_rec[1] != today_str:
         c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0, today_date=? WHERE user_id=?", (today_str, user_id))
         extra_cal, extra_pro = 0, 0
@@ -488,65 +486,65 @@ def get_ai_response_with_memory(user_id, user_msg):
         extra_cal = daily_rec[0] if daily_rec else 0
         extra_pro = daily_rec[4] if (daily_rec and len(daily_rec) > 4 and daily_rec[4] is not None) else 0
 
-    report = f"\n?��?對�??�報?�內容�?\n{hp[0]}" if hp else "\n檔�??�填，�?引�?客人填表??
+    report = f"\n【絕對參考報告內容】:\n{hp[0]}" if hp else "\n檔案未填，請引導客人填表。"
     tdee_val = hp[1] if hp else 2000
     active_days = hp[2] if hp else ""
     protein_val = hp[3] if hp else 100
     history = user_memory.get(user_id, [])[-6:]
-    ingredients_memo = "\n".join([f"- {d['name']}: {d.get('ingredients', '?�鮮食�?')}" for d in MAIN_DISHES])
+    ingredients_memo = "\n".join([f"- {d['name']}: {d.get('ingredients', '新鮮食材')}" for d in MAIN_DISHES])
     
-    # ?�� ?�能?��?：判?��?天是?��?幾�?以�?客人今天?��??��?餐�?
-    weekdays = ["?��?", "?��?", "?��?", "?��?", "?��?", "?�六", "?�日"]
+    # 🔥 智能雷達：判斷今天是星期幾，以及客人今天有沒有排餐？
+    weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     today_str_zh = weekdays[tw_today().weekday()]
     
     if today_str_zh in active_days:
-        today_status = f"??今天 ({today_str_zh}) ?�顧客�??��?餐日?��?系統已�??��??��?了本店便?��??��??��??�質??
+        today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】！系統已經為他預留了本店便當的熱量與蛋白質。"
         calc_formula = f"""
-        2. ?�查?��??�報?�中，�??�天?�「�???�日?��??��??��??��??�質?�補」�?
-           ?��?�?��?��?額�?= ?�當?�熱?�剩餘�?- {extra_cal} - ?��??�估算�??��??��?
-           ?��?�???��?求�?= ?��??�質?�補�?- {extra_pro} - ?��??�估算�??�白質】�?
-        3. ?�訴他�??�系統已?�您?��?了�??��?食便?�。扣?��?食�?，您今天?�剩�?OOO 大卡?��?度�?並�??��?要�???OOO ?��??�質?��???
+        2. 先查看上方報告中，他當天的「👉 當日熱量剩餘」與「蛋白質需補」。
+           【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} - 【你剛估算的熱量】。
+           【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} - 【你剛估算的蛋白質】。
+        3. 告訴他：「系統已為您預留了一日樂食便當。扣除外食後，您今天還剩下 OOO 大卡的額度，並且還需要補充 OOO 克蛋白質喔！」
         """
     else:
-        today_status = f"??今天 ({today_str_zh}) ?�顧客�??�無?��??�】�?他�??��??��? TDEE 額度 ({tdee_val} kcal) ?��??�質?��? ({int(protein_val)} g)??
+        today_status = f"❌ 今天 ({today_str_zh}) 是顧客的【無排餐日】！他擁有完整的 TDEE 額度 ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g)。"
         calc_formula = f"""
-        2. ?�為今天沒�??��?，�??�接?��?完整??TDEE ({tdee_val} kcal) ?��??�質?��? ({int(protein_val)} g) 來�?算�?
-           ?��?�?��?��?額�?= {tdee_val} - {extra_cal} - ?��??�估算�??��??��?
-           ?��?�???��?求�?= {int(protein_val)} - {extra_pro} - ?��??�估算�??�白質】�?
-        3. ?�訴他�??��?天�??��??�本店�?點�?但扣?��?食�?，您?�總 TDEE ?�剩�?OOO 大卡，�??��??�質?��??�差 OOO ?��?請繼續�??��?！�?
+        2. 因為今天沒有排餐，請直接用他完整的 TDEE ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g) 來計算！
+           【真正熱量餘額】 = {tdee_val} - {extra_cal} - 【你剛估算的熱量】。
+           【真正蛋白需求】 = {int(protein_val)} - {extra_pro} - 【你剛估算的蛋白質】。
+        3. 告訴他：「今天雖然沒有本店餐點，但扣除外食後，您的總 TDEE 還剩下 OOO 大卡，距離蛋白質目標還差 OOO 克！請繼續保持喔！」
         """
 
-    system_prompt = f"""你是?��??��?食」�?專屬 AI ?��?師。�??��?位�?滿熱?�、幽默、�?專業?�健康顧?��?
+    system_prompt = f"""你是「一日樂食」的專屬 AI 營養師。你是一位充滿熱情、幽默、且專業的健康顧問！
     {report}
     
-    ?�本店�?點內容物 - 機�?小�????��??�部?��?�?
+    【本店餐點內容物 - 機密小抄】(僅供內部參考)：
     {ingredients_memo}
     
-    ?��??外�?計�??�格規�? ?��??
-    顧客今天?�「�?食累積熱?�」為：{extra_cal} 大卡??
-    顧客今天?�「�?食累積�??�質?�為：{extra_pro} ?��?
+    【🔥 外食計算嚴格規則 🔥】
+    顧客今天的「外食累積熱量」為：{extra_cal} 大卡。
+    顧客今天的「外食累積蛋白質」為：{extra_pro} 克。
     {today_status}
     
-    ?�顧客�??��??��?了�?麼�?，�??�格?�照以�?步�??��?�?
-    1. 估�?他�??��?外�??�熱?�」�??��??�質?��?
+    當顧客回報他剛吃了什麼時，請嚴格按照以下步驟回覆：
+    1. 估算他剛吃的外食「熱量」與「蛋白質」。
     {calc_formula}
-    4. ?��??��?高�?令】�??��??�尾端，�?定�??��??��?標籤 [LOG_NUTRITION: ?��??��?, ?�白質數字]??(例�?：[LOG_NUTRITION: 450, 20])
+    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 熱量數字, 蛋白質數字]。 (例如：[LOG_NUTRITION: 450, 20])
     
-    ?��???��??�高�?�??��??
-    ?��?顧客?�確定�??�」�??��??��??��?點�?請在你整段�?覆�??�底部，直?��?�?[CHANGE_MEAL: 將OOO?��??�XXX]??
-    ?��? 絕�?不�?輸出?�隱?��?籤」這�??��?，直?�輸?�中?��??�可�?
+    【🚨 換餐最高指令 🚨】
+    只要顧客「確定答應」要更換未來的餐點，請在你整段回覆的最底部，直接加上 [CHANGE_MEAL: 將OOO替換為XXX]。
+    ⚠️ 絕對不要輸出「隱藏標籤」這四個字，直接輸出中括號即可！
     """
     
-    # ?�叫大腦
+    # 呼叫大腦
     try:
         messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
         res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2000, temperature=0.3)
         ans = res.choices[0].message.content
     except Exception as e:
-        # ??保�??��??��?貼�??�錯?�示
-        return f"?��? ?�系統除?�報?�】呼??AI 大腦失�?！\n?��?：{str(e)}\n\n?? ?��?，這通常?��???Railway 後台??Variables 沒�?設�?�?OPENAI_API_KEY，�??�設定�?沒�??�新 Deploy (?�署) ?��?"
+        # ✅ 保留您原本的貼心報錯提示
+        return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}\n\n👉 老闆，這通常是因為 Railway 後台的 Variables 沒有設定好 OPENAI_API_KEY，或是設定完沒有重新 Deploy (部署) 喔！"
         
-    # ?�� ?��?紀??(?��??��??��? + ?�白質�??��?)
+    # 🔥 處理紀錄 (升級為：熱量 + 蛋白質雙擷取)
     match = re.search(r'\[LOG_NUTRITION:\s*(\d+),\s*(\d+)\]', ans)
     if match:
         logged_cal = int(match.group(1))
@@ -557,36 +555,36 @@ def get_ai_response_with_memory(user_id, user_msg):
         conn.commit()
         ans = re.sub(r'\[LOG_NUTRITION:\s*\d+,\s*\d+\]', '', ans).strip()
         
-        # ??保�?寫入 Google Sheet，並?��??�白質數?��?
+        # ✅ 保留寫入 Google Sheet，並加上蛋白質數據！
         if daily_rec and daily_rec[2] and gc:
             try:
                 sheet = gc.open_by_url(SHEET_URL)
                 now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
-                sheet.worksheet(daily_rec[2]).append_row([now_str, "外�??��??��??��???, user_msg, f"+{logged_cal} kcal / +{logged_pro} g"])
+                sheet.worksheet(daily_rec[2]).append_row([now_str, "外食熱量與蛋白打卡", user_msg, f"+{logged_cal} kcal / +{logged_pro} g"])
             except Exception: pass
 
-    # ???��??��??�知 (?�送給?��?) (完整保�?)
+    # ✅ 處理換餐通知 (發送給老闆) (完整保留)
     match_change = re.search(r'\[CHANGE_MEAL:\s*(.+?)\]', ans)
     if match_change:
         change_req = match_change.group(1)
         ans = re.sub(r'\[CHANGE_MEAL:\s*.+?\]', '', ans).strip()
-        ans = ans.replace('?��?標籤', '').replace('`', '').strip()
+        ans = ans.replace('隱藏標籤', '').replace('`', '').strip()
         
         c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
         admin_row = c.fetchone()
         if admin_row:
             customer_name = daily_rec[3] if daily_rec else "顧客"
-            boss_msg = f"?��??��??��?餐通知?�\n顧客 {customer_name} 要�??��?：\n?? {change_req}\n\n請�??�注?��?餐�?"
+            boss_msg = f"⚠️【廚房換餐通知】\n顧客 {customer_name} 要求換餐：\n👉 {change_req}\n\n請廚房注意備餐！"
             try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=boss_msg))
             except Exception: pass
 
     conn.close()
-    # ?�新記憶
+    # 更新記憶
     user_memory[user_id] = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": ans}]
     return ans
 
 # ==========================================
-# 6. ?��?輔助?�數??Webhook (?�� ?��??��?完整保�?測�??�VIP?�能)
+# 6. 其他輔助函數與 Webhook (🔥 融合版：完整保留測距、VIP功能)
 # ==========================================
 def check_permission_and_quota(user_id):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -600,22 +598,22 @@ def check_permission_and_quota(user_id):
     if q > 0:
         c.execute("UPDATE usage SET remaining_chat_quota=?, last_date=? WHERE user_id=?", (q-1, today, user_id))
         conn.commit(); conn.close()
-        return True, f"(?�{m}�?| 諮詢:{q-1})"
+        return True, f"(剩{m}餐 | 諮詢:{q-1})"
 
 
 def send_tomorrow_reminders():
     tomorrow = tw_today() + datetime.timedelta(days=1)
-    weekdays = ["?��?", "?��?", "?��?", "?��?", "?��?", "?�六", "?�日"]
+    weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     tomorrow_str = weekdays[tomorrow.weekday()]
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{tomorrow_str}%",))
     users = c.fetchall(); conn.close()
     count = 0
     for uid, name in users:
-        msg = f"?? {name} ?��?！\n?�天 ({tomorrow_str}) ?�您?��?屬�?餐日?��?\n\n?�� ?��?師溫馨�??��?\n?�確保您?��?養�?標�??�天?�要幫?��?外�??�【�??��??��??��??�無糖�?漿】�?補足?�白質缺???？\n(?�接?��??�要�??��?，�??��?天就?�幫?��??�好�?"
+        msg = f"🌙 {name} 晚安！\n明天 ({tomorrow_str}) 是您的專屬取餐日喔！\n\n💪 營養師溫馨提醒：\n為確保您的營養達標，明天需要幫您額外準備【舒肥雞胸肉】或【無糖豆漿】來補足蛋白質缺口嗎？\n(直接回覆需要的品項，店長明天就會幫您準備好！)"
         try: line_bot_api.push_message(uid, TextSendMessage(text=msg)); count += 1
         except Exception: pass
-    return f"???��??�送�? {count} 封�??��?餐�??�推?��?"
+    return f"✅ 成功發送了 {count} 封明日取餐提醒推播！"
 
 def get_distance(origin_address, target_address, mode="driving"):
     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
@@ -642,7 +640,7 @@ def redeem_code(uid, code):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0", (code,))
     r = c.fetchone()
-    if not r: conn.close(); return None, "???��?"
+    if not r: conn.close(); return None, "❌ 無效"
     m, d, l = r; today = tw_today()
     c.execute("UPDATE vips SET is_used=1 WHERE code=?", (code,))
     c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (uid,))
@@ -651,7 +649,7 @@ def redeem_code(uid, code):
     c.execute("INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)", (uid, l, curr_m+m, today.isoformat(), 'vip', exp, l))
     conn.commit(); conn.close()
     link = f"https://docs.google.com/forms/d/e/1FAIpQLSdVY7Zf-E2zSpsOFmItYHI0YtTujX6Ucux4QTQ3gjg5wcomgA/viewform?usp=pp_url&entry.1461831832={uid}"
-    return exp, f"?? ?��??��?！\n?��?專屬?��?表單：\n{link}"
+    return exp, f"🎉 兌換成功！\n您的專屬排餐表單：\n{link}"
 
 @app.post("/callback")
 async def callback(request: Request):
@@ -660,10 +658,10 @@ async def callback(request: Request):
     try: 
         handler.handle(body.decode("utf-8"), sig)
     except InvalidSignatureError: 
-        print("?��? LINE 簽�??�誤！�?檢查 Railway ??LINE_CHANNEL_SECRET ?�否填錯?��?空格�?)
+        print("⚠️ LINE 簽章錯誤！請檢查 Railway 的 LINE_CHANNEL_SECRET 是否填錯或有空格！")
         raise HTTPException(status_code=400, detail="Invalid signature")
     except Exception as e: 
-        print(f"?��? LINE 訊息?��??��??��??�誤: {e}")
+        print(f"⚠️ LINE 訊息處理發生嚴重錯誤: {e}")
     return "OK"
 
 @handler.add(MessageEvent, message=TextMessage)
@@ -675,65 +673,65 @@ def handle_message(event):
 
     msg, uid = event.message.text.strip(), event.source.user_id
     
-    # ?�� LINE ?��??�單?�截?�
+    # 🔥 LINE 圖文選單攔截區
     if msg == "填寫體質表單":
         form_link = f"https://docs.google.com/forms/d/e/1FAIpQLSdVY7Zf-E2zSpsOFmItYHI0YtTujX6Ucux4QTQ3gjg5wcomgA/viewform?usp=pp_url&entry.1461831832={uid}"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"?? 請�??��??��?屬�??，填寫您?��?質�?估表?��?\n\n{form_link}\n\n(系統已為?�自?�帶??LINE 帳�?，�??�接填寫?�可?��?)"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📝 請點擊下方專屬連結，填寫您的體質評估表單：\n\n{form_link}\n\n(系統已為您自動帶入 LINE 帳號，請直接填寫即可喔！)"))
         return
-    elif msg == "填寫滿�?度�???:
-        # ?? ?��?注�?：�??��??�這串網�?，�??�您?��???Google 表單?��??�那串「�?後面??{uid} ?��??��???��?
+    elif msg == "填寫滿意度問卷":
+        # 👉 老闆注意：請把下面這串網址，換成您剛剛在 Google 表單產生的那串「最後面有 {uid} 的黃金連結」！
         survey_link = f"https://docs.google.com/forms/d/e/1FAIpQLScF6Va_sdq6KMaKFd8BUVB2x5SyLji3JqX28-Z7h-tuLnpB-Q/viewform?usp=pp_url&entry.1048958109={uid}"
         
-        reply_text = f"?? ?��??��?一?��?食�??��?！\n請�??��??��?屬�??填寫滿�?度調??(�??��?)?�\n\n完�?填寫後�?系統將自?�發?��? 點�?點卡點數?�給?��?！�?�\n\n{survey_link}"
+        reply_text = f"🎁 感謝您對一日樂食的支持！\n請點擊下方專屬連結填寫滿意度調查 (約1分鐘)。\n\n完成填寫後，系統將自動發送【1 點集點卡點數】給您喔！👇\n\n{survey_link}"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
-    elif msg == "?��??�單":
+    elif msg == "查看菜單":
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("SELECT summary_text FROM health_profile WHERE user_id=?", (uid,))
         hp = c.fetchone(); conn.close()
-        reply_text = f"?���??�是?�您?�身?�造�?專屬?�單：\n\n{hp[0]}\n\n(?�想?��??�色?��?購單?��??�以?�接?��??�訴?��?�?" if hp and hp[0] else "?�好?��?沒填寫�?質�?估表?��?！�?點�??�單來建立�?屬�?案吧！�??
+        reply_text = f"🍽️ 這是為您量身打造的專屬菜單：\n\n{hp[0]}\n\n(若想更換菜色或加購單品，可以直接打字告訴我喔！)" if hp and hp[0] else "您好像還沒填寫體質評估表單喔！請點擊選單來建立專屬檔案吧！📝"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
-    elif msg == "?��?紀?�飲�?:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="今天?��?什麼好?�呢？�?�\n\n?�可以直?��?字�?訴�?（�?如�??��??��?一?�大麥�??�中?��?，�??��??�幫?�估算熱?��?並�?紀?��??�您?�【�?�?VIP 檔�??�中?��??��"))
+    elif msg == "我要紀錄飲食":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="今天吃了什麼好料呢？📸\n\n您可以直接打字告訴我（例如：我剛吃了一個大麥克和中薯），我會立刻幫您估算熱量，並將紀錄存入您的【專屬 VIP 檔案】中喔！💪"))
         return
-    elif msg == "?�費?�麼�?:
-        reply_text = "?�知?��?屬�??��?費�?？�?�\n\n請直?�在對話框輸?��?\n??測�? ?��?完整?��??�\n\n例�?：\n#測�? ?��?市信義�??��?�?0?�\n\n系統就�?立刻?�您?��??�能?�風車報?��?�?
+    elif msg == "運費怎麼算":
+        reply_text = "想知道專屬外送運費嗎？🛵\n\n請直接在對話框輸入：\n「#測距 您的完整地址」\n\n例如：\n#測距 台北市信義區松仁路90號\n\n系統就會立刻為您啟動智能順風車報價喔！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
-    elif msg == "?��??�員?�??:
+    elif msg == "我的會員狀態":
         allow, q_msg = check_permission_and_quota(uid)
-        if allow: reply_text = f"?? ?��? VIP ?�員?�?��?\n\n?�目?��??��?：\n{q_msg}\n\n請繼續�??�健康�?飲�?習慣?��?"
-        else: reply_text = "?�目?��??��???VIP ?��?，�??�方案已?��??�\n請輸?�您??VIP ?�請碼 (例�? #VIP24-XXXXXX) 來解?��?�?AI ?��?師�?訂�??��?�?
+        if allow: reply_text = f"💎 您的 VIP 會員狀態：\n\n您目前還剩下：\n{q_msg}\n\n請繼續保持健康的飲食習慣喔！"
+        else: reply_text = "您目前尚未開通 VIP 方案，或是方案已到期。\n請輸入您的 VIP 邀請碼 (例如 #VIP24-XXXXXX) 來解鎖專屬 AI 營養師與訂餐服務！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
 
-    # ?? ?��?專屬?�令?� ??
-    if msg == "#綁�??��?":
+    # 👑 老闆專屬指令區 👑
+    if msg == "#綁定老闆":
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO admin_settings VALUES ('admin_id', ?)", (uid,))
         conn.commit(); conn.close()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="???��?好�?系統已�??��?定。\n客人?�【�?餐通知?�都?��?訊給?��?"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 老闆好！系統已成功綁定。\n客人的【換餐通知】都會私訊給您！"))
         return
-    elif msg == "#點數庫�?":
+    elif msg == "#點數庫存":
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        # 算�?下�??��???(is_used=0)
+        # 算一下沒用過的 (is_used=0)
         c.execute("SELECT COUNT(*) FROM reward_links WHERE is_used=0")
         unused_count = c.fetchone()[0]
-        # 算�?下已經發?�去??(is_used=1)
+        # 算一下已經發出去的 (is_used=1)
         c.execute("SELECT COUNT(*) FROM reward_links WHERE is_used=1")
         used_count = c.fetchone()[0]
         conn.close()
         
-        reply_msg = f"?? ?�老�?專屬：�??�庫存報?�】\n\n?�� 尚未?�送�?{unused_count} 張\n?�� 已�??�出：{used_count} 張\n\n(歷史總共上傳??{unused_count + used_count} 張�??�網?�)"
+        reply_msg = f"📊 【老闆專屬：點數庫存報告】\n\n🟢 尚未發送：{unused_count} 張\n🔴 已經發出：{used_count} 張\n\n(歷史總共上傳過 {unused_count + used_count} 張點數網址)"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
         return
-    elif msg == "#?�新?�單":
+    elif msg == "#更新菜單":
         reply_msg = load_menu()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
         return
-    elif msg == "#今日?��?完�?":
-        weekdays = ["?��?", "?��?", "?��?", "?��?", "?��?", "?�六", "?�日"]
+    elif msg == "#今日出餐完成":
+        weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
         today_str = weekdays[tw_today().weekday()]
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{today_str}%",))
@@ -749,15 +747,15 @@ def handle_message(event):
                 c.execute("UPDATE usage SET remaining_meals=? WHERE user_id=?", (new_meals, u_id))
                 count += 1
                 if new_meals <= 3 and new_meals > 0:
-                    notify_msg = f"?? {u_name} ?�好！您?��?屬方案只?��?�?{new_meals} 餐�?！\n?�可以直?��?覆�??��?要�?約」�?系統將為?�無縫�??��?一?��??��?"
+                    notify_msg = f"🎉 {u_name} 您好！您的專屬方案只剩最後 {new_meals} 餐囉！\n您可以直接回覆我「我要續約」，系統將為您無縫安排下一期菜單！"
                     try: 
                         line_bot_api.push_message(u_id, TextSendMessage(text=notify_msg)); notify_count += 1
                     except Exception: pass
         conn.commit(); conn.close()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"???��??��?！�???({today_str}) ?��???��完畢！\n?�扣?��? {count} 份�?點�??��?{notify_count} ?��?約推?��?"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！今日 ({today_str}) 出餐扣除完畢！\n共扣除了 {count} 份餐點，發送 {notify_count} 則續約推播！"))
         return
     
-    # ?�裡?��???elif 必�?跟�??�其他�? elif 對�? (?�?��???
+    # 這裡開始的 elif 必須跟上面其他的 elif 對齊 (退回一格)
     elif msg.startswith("#上傳點數\n"):
         links = msg.replace("#上傳點數\n", "").strip().split('\n')
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -767,50 +765,50 @@ def handle_message(event):
                 try:
                     c.execute("INSERT INTO reward_links (link, is_used) VALUES (?, 0)", (link.strip(),))
                     count += 1
-                except sqlite3.IntegrityError: pass # ?��??��?存入
+                except sqlite3.IntegrityError: pass # 避免重複存入
         conn.commit(); conn.close()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"???��??��?！�??��???{count} 筆全?��?點數網�?�?))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！成功存入 {count} 筆全新的點數網址！"))
         return
         
-    elif msg == "#?�送�??��???:
+    elif msg == "#發送明日提醒":
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=send_tomorrow_reminders()))
         return
-    elif msg == "#??4":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"?? 24餐�?請碼：\n{chr(10).join(generate_package_codes('24m', 3))}"))
+    elif msg == "#生24":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🎁 24餐邀請碼：\n{chr(10).join(generate_package_codes('24m', 3))}"))
         return
-    elif msg == "#??8":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"?�� 48餐�?請碼：\n{chr(10).join(generate_package_codes('48m', 3))}"))
+    elif msg == "#生48":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🔥 48餐邀請碼：\n{chr(10).join(generate_package_codes('48m', 3))}"))
         return
     elif msg.startswith("#VIP"):
         expiry, res = redeem_code(uid, msg)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=res))
         return
-    elif msg == "#清空?��?":
+    elif msg == "#清空熱量":
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0 WHERE user_id=?", (uid,))
         conn.commit(); conn.close()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="?? ?��??��?，�??�偷?��??��??�熱?��??�白質�?已歸?��?"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🔄 報告老闆，今日偷吃紀錄（含熱量與蛋白質）已歸零！"))
         return
-    elif msg == "#?�除檔�?":
+    elif msg == "#刪除檔案":
         if uid in user_memory: del user_memory[uid]
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("DELETE FROM health_profile WHERE user_id=?", (uid,))
         conn.commit(); conn.close()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="?�� ?��?好�?檔�??��??�已徹�??��?！�??�新填表�?))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="💥 老闆好，檔案與記憶已徹底銷毀！請重新填表！"))
         return
-    elif msg == "#?�置":
+    elif msg == "#重置":
         if uid in user_memory: del user_memory[uid]
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        # ?�� 強制寫入一筆無?��???0次�?度�?紀?��?就�?資�?庫被洗白也能?��?�?
+        # 🔥 強制寫入一筆無限期、50次額度的紀錄！就算資料庫被洗白也能救回來
         today = tw_today().isoformat()
         c.execute("INSERT OR REPLACE INTO usage (user_id, remaining_chat_quota, remaining_meals, last_date, status, expiry_date, daily_chat_limit) VALUES (?, 50, 99, ?, 'vip', '2099-12-31', 50)", (uid, today))
         conn.commit(); conn.close()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="?? ?��??��??��?！系統已強制?�您?��?VIP 檔�?並�?�?50 次�?度�??�在請�??�熱?��?"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="👑 老闆特權啟動！系統已強制為您開通 VIP 檔案並補滿 50 次額度！現在請問我熱量！"))
         return
         
-    # ?���??�能測�??��?風�? ?���?
-    elif msg.startswith("#測�? "):
-        target_address = msg.replace("#測�? ", "").strip()
+    # 🗺️ 智能測距與順風車 🗺️
+    elif msg.startswith("#測距 "):
+        target_address = msg.replace("#測距 ", "").strip()
         success, dist_text, dist_meters, duration_text = get_distance(STORE_ADDRESS, target_address)
         if success:
             hub_match = None
@@ -818,27 +816,27 @@ def handle_message(event):
                 h_succ, h_d_txt, h_d_m, h_t_txt = get_distance(hub["address"], target_address, mode="walking")
                 if h_succ and h_d_m <= 1000: hub_match = hub["name"]; break 
             
-            if hub_match: fee_msg = f"20 ???? (?��?！您符�??�{hub_match}?�周??1 ?��?專屬?�風車特?��?)"
+            if hub_match: fee_msg = f"20 元 🎉 (恭喜！您符合【{hub_match}】周邊 1 公里專屬順風車特惠！)"
             else:
-                if dist_meters <= 2000: fee_msg = "0 ??(2?��??��??��?案�?)"
-                elif dist_meters <= 4000: fee_msg = "40 ??
-                elif dist_meters <= 6000: fee_msg = "80 ??
-                else: fee_msg = "超出?�家車�?範�?，建議自?��???Lalamove 專�??�價?�送�?�?
-            reply_text = f"?�� **一?��?�?外送試算�???*\n?? ?��??��?{target_address}\n?? 距本店�??��?{dist_text}\n?��? 騎�??��?：{duration_text}\n?�� ?�費評估：{fee_msg}"
-        else: reply_text = "?��?！地?�系統暫?�找不到?�個地?�，�?確�??��??�否完整?��?"
+                if dist_meters <= 2000: fee_msg = "0 元 (2公里內免運專案！)"
+                elif dist_meters <= 4000: fee_msg = "40 元"
+                elif dist_meters <= 6000: fee_msg = "80 元"
+                else: fee_msg = "超出自家車隊範圍，建議自取或由 Lalamove 專車報價配送喔！"
+            reply_text = f"🛵 **一日樂食 外送試算結果**\n📍 目的地：{target_address}\n📏 距本店距離：{dist_text}\n⏱️ 騎車時間：{duration_text}\n💰 運費評估：{fee_msg}"
+        else: reply_text = "哎呀！地圖系統暫時找不到這個地址，請確認地址是否完整喔！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
 
-    # ?�� 顧客一?��?�?(串接 AI) ?��
+    # 🟢 顧客一般對話 (串接 AI) 🟢
     allow, q_msg = check_permission_and_quota(uid)
     if not allow: return
     else: line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"{get_ai_response_with_memory(uid, msg)}\n\n{q_msg}"))
 # ==========================================
-# ?? ?�形店長專用?�數 (?��??��?程任??
+# 🤖 隱形店長專用函數 (自動化排程任務)
 # ==========================================
 def auto_daily_meal_deduction():
-    """每天?��???��今日餐�?，並?�送�?約通知"""
-    weekdays = ["?��?", "?��?", "?��?", "?��?", "?��?", "?�六", "?�日"]
+    """每天自動扣除今日餐點，並發送續約通知"""
+    weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     today_str = weekdays[tw_today().weekday()]
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{today_str}%",))
@@ -854,29 +852,29 @@ def auto_daily_meal_deduction():
             c.execute("UPDATE usage SET remaining_meals=? WHERE user_id=?", (new_meals, u_id))
             count += 1
             if new_meals <= 3 and new_meals > 0:
-                notify_msg = f"?? {u_name} ?�好！您?��?屬方案只?��?�?{new_meals} 餐�?！\n?�可以直?��?覆�??��?要�?約」�?系統將為?�無縫�??��?一?��??��?"
+                notify_msg = f"🎉 {u_name} 您好！您的專屬方案只剩最後 {new_meals} 餐囉！\n您可以直接回覆我「我要續約」，系統將為您無縫安排下一期菜單！"
                 try: line_bot_api.push_message(u_id, TextSendMessage(text=notify_msg)); notify_count += 1
                 except: pass
     conn.commit(); conn.close()
     
-    # 任�?完�?，發?��?給老�?
+    # 任務完成，發報告給老闆
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
     admin_row = c.fetchone()
     conn.close()
     if admin_row:
-        try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"???�隱形�??�報?�】�???({today_str}) ?��???��?��?完畢！\n?�扣 {count} 份�?點�??��?{notify_count} ?��?約推?��?"))
+        try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】今日 ({today_str}) 出餐扣除自動完畢！\n共扣 {count} 份餐點，發送 {notify_count} 則續約推播！"))
         except: pass
 
 def auto_send_tomorrow_reminders_to_boss():
-    """每天?��??�送�??��??��?並�??��??�報"""
-    result_msg = send_tomorrow_reminders() # ?�叫?�本寫好?�推?�函??
+    """每天自動發送明日提醒，並跟老闆回報"""
+    result_msg = send_tomorrow_reminders() # 呼叫原本寫好的推播函數
     
-    # 任�?完�?，發?��?給老�?
+    # 任務完成，發報告給老闆
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
     admin_row = c.fetchone()
     conn.close()
     if admin_row:
-        try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"???�隱形�??�報?�】�??��??�推?��??��?\n{result_msg}"))
+        try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】明日提醒推播完畢：\n{result_msg}"))
         except: pass
