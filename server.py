@@ -317,15 +317,24 @@ async def receive_form_data(request: Request):
                         elif has_pro: 
                             good_matches.append(dish) # 至少蛋白質是對的
                             
-                    # 優先級：完美命中 > 蛋白質命中 > 隨機安全菜
+                    # 優先級：完美命中 > 蛋白質命中 > 安全菜 > 全部主餐 (保底)
                     if len(perfect_matches) >= 2:
                         pool = perfect_matches
                     elif len(good_matches) >= 2:
                         pool = good_matches
-                    else:
+                    elif len(safe_menu) >= 2:
                         pool = safe_menu
-                        
-                    daily_pick = random.sample(pool, 2)
+                    else:
+                        # 最終保底：所有主餐，確保不會炸掉
+                        pool = [d for d in MAIN_DISHES if d.get('category') == 'main']
+                    
+                    # 安全取樣：pool 不夠 2 道時允許重複取
+                    if len(pool) >= 2:
+                        daily_pick = random.sample(pool, 2)
+                    elif len(pool) == 1:
+                        daily_pick = [pool[0], pool[0]]
+                    else:
+                        continue  # 真的沒菜，跳過這天
                     
                     plan_requests.append((w_num, d_num, f"第{w_num}週", d, daily_pick[0], daily_pick[1]))
 
