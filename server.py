@@ -686,7 +686,9 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！今日 ({today_str}) 出餐扣除完畢！\n共扣除了 {count} 份餐點，發送 {notify_count} 則續約推播！"))
         return
-   elif msg.startswith("#上傳點數\n"):
+    
+    # 這裡開始的 elif 必須跟上面其他的 elif 對齊 (退回一格)
+    elif msg.startswith("#上傳點數\n"):
         links = msg.replace("#上傳點數\n", "").strip().split('\n')
         conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
         count = 0
@@ -699,6 +701,7 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！成功存入 {count} 筆全新的點數網址！"))
         return
+        
     elif msg == "#發送明日提醒":
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=send_tomorrow_reminders()))
         return
