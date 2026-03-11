@@ -37,7 +37,11 @@ LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "#GEN_CODES")
+DB_DIR = os.path.join(os.getcwd(), 'data')
+DB_PATH = os.path.join(DB_DIR, 'user_quota.db')
 
+if not os.path.exists(DB_DIR):
+    os.makedirs(DB_DIR, exist_ok=True)
 # Google 試算表設定 (網址公開安全，靠 service_account 保護)
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1cf0QhWeYynk9nqsoqMIM-Lkxk_bP57zcd-ES7Sufkqg/edit?gid=0#gid=0"
 
