@@ -53,17 +53,14 @@ def run_all_tests():
 
     # ------------------------------------------
     print("✅ [測試 1] 導入表單、TDEE計算、菜單配菜、菜色過敏源過濾")
-    # 模擬表單傳進來的資料 (測試過敏原：海鮮、牛)
     form_data = {
         "UID": [uid], "稱呼": ["測試總監"], "體重": ["75"], "身高": ["175"], "年齡": ["30"],
         "性別": ["男"], "活動量": ["中度"], "目標": ["減脂"], "禁忌": ["海鮮, 牛"],
         "第一週": ["週一,週二"]
     }
-    # 執行表單接收功能
     asyncio.run(server.receive_form_data(MockRequest(form_data)))
 
-    # 驗證資料庫
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect(server.DB_PATH); c = conn.cursor()
     c.execute("SELECT tdee, active_days, sheet_name FROM health_profile WHERE user_id=?", (uid,))
     hp = c.fetchone(); conn.close()
     if hp:
@@ -87,14 +84,13 @@ def run_all_tests():
     # ------------------------------------------
     print("✅ [測試 4] 處理熱量紀錄、熱量扣除公式、諮詢額扣除計算")
     print("   👤 客人輸入：我剛剛吃了一塊 350 大卡的起司蛋糕")
-    # 給系統預設一點額度
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect(server.DB_PATH); c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO usage VALUES (?, 50, 10, ?, 'vip', '2099-12-31', 50)", (uid, datetime.date.today().isoformat()))
     conn.commit(); conn.close()
 
     server.handle_message(DummyEvent("我剛剛吃了一塊 350 大卡的起司蛋糕", uid))
 
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect(server.DB_PATH); c = conn.cursor()
     c.execute("SELECT today_extra_cal FROM health_profile WHERE user_id=?", (uid,))
     extra = c.fetchone()
     c.execute("SELECT remaining_chat_quota FROM usage WHERE user_id=?", (uid,))
@@ -115,10 +111,8 @@ def run_all_tests():
     # ------------------------------------------
     print("✅ [測試 6] 老闆權限：扣除餐點數量與續約推坑")
     print("   👑 老闆輸入：#今日出餐完成")
-    # 為了觸發推坑，我們偷偷把客人的剩餘餐點改為 4，扣完剩 3 就會發推播
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect(server.DB_PATH); c = conn.cursor()
     c.execute("UPDATE usage SET remaining_meals=4 WHERE user_id=?", (uid,))
-    # 偷偷把客人的出餐日改成今天
     today_str = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][datetime.date.today().weekday()]
     c.execute("UPDATE health_profile SET active_days=? WHERE user_id=?", (today_str, uid))
     conn.commit(); conn.close()
@@ -137,8 +131,7 @@ def run_all_tests():
     print("   👑 老闆輸入：#刪除檔案")
     server.handle_message(DummyEvent("#刪除檔案", uid))
 
-    # 最終 DB 驗證
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect(server.DB_PATH); c = conn.cursor()
     c.execute("SELECT * FROM health_profile WHERE user_id=?", (uid,))
     final_check = c.fetchone(); conn.close()
     if not final_check:
@@ -147,22 +140,18 @@ def run_all_tests():
 
     # ------------------------------------------
     print("✅ [測試 8] 菜單熱更新與副餐推坑測試")
-    # 1. 模擬老闆更新菜單 (測試熱更新指令)
     print("   👑 老闆輸入：#更新菜單")
     server.handle_message(DummyEvent("#更新菜單", admin_uid))
-    # 2. 模擬客人剛跑完步，看 AI 會不會從副餐(side)裡抓出洋芋泥或豆漿來推銷
     print("   👤 客人輸入：我剛跑完 10 公里，好累喔，有推薦補充什麼嗎？")
     server.handle_message(DummyEvent("我剛跑完 10 公里，好累喔，有推薦補充什麼嗎？", uid))
     print("-" * 60)
 
     # ------------------------------------------
     print("✅ [測試 9] 明日取餐提醒與副餐推坑測試")
-    # 1. 為了確保測試能成功，我們先去資料庫把客人的取餐日加上「明天」
     tomorrow_str = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][(datetime.date.today() + datetime.timedelta(days=1)).weekday()]
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect(server.DB_PATH); c = conn.cursor()
     c.execute("UPDATE health_profile SET active_days=? WHERE user_id=?", (f"週一,{tomorrow_str}", uid))
     conn.commit(); conn.close()
-    # 2. 模擬老闆按下發送提醒的指令
     print(f"   👑 老闆輸入：#發送明日提醒 (系統應自動尋找 {tomorrow_str} 取餐的客人)")
     server.handle_message(DummyEvent("#發送明日提醒", admin_uid))
     print("-" * 60)
