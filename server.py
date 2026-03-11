@@ -481,6 +481,7 @@ def get_ai_response_with_memory(user_id, user_msg):
     # 判斷是不是新的一天，如果是就歸零
     if daily_rec and daily_rec[1] != today_str:
         c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0, today_date=? WHERE user_id=?", (today_str, user_id))
+        conn.commit()  # 修復重點1：確保換日歸零有被成功存檔！
         extra_cal, extra_pro = 0, 0
     else:
         extra_cal = daily_rec[0] if daily_rec else 0
@@ -521,14 +522,16 @@ def get_ai_response_with_memory(user_id, user_msg):
     {ingredients_memo}
     
     【🔥 外食計算嚴格規則 🔥】
-    顧客今天的「外食累積熱量」為：{extra_cal} 大卡。
-    顧客今天的「外食累積蛋白質」為：{extra_pro} 克。
+    👉 系統目前的「今日已累積外食」紀錄為：熱量 {extra_cal} 大卡、蛋白質 {extra_pro} 克。
+    (系統已自動記憶稍早的對話，請「不要」重複計算顧客過去吃過的食物！只需針對「這次最新回報」的食物估算！)
     {today_status}
     
     當顧客回報他剛吃了什麼時，請嚴格按照以下步驟回覆：
-    1. 估算他剛吃的外食「熱量」與「蛋白質」。
+    1. 估算他「這次新吃」的外食「熱量」與「蛋白質」。
     {calc_formula}
-    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 熱量數字, 蛋白質數字]。 (例如：[LOG_NUTRITION: 450, 20])
+    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 本次熱量, 本次蛋白質]。
+    💡 注意：只能填「這次新吃」的數值！只能填純數字，絕對不要加單位，也不要填入總和！
+    (正確範例：[LOG_NUTRITION: 450, 20])
     
     【🚨 換餐最高指令 🚨】
     只要顧客「確定答應」要更換未來的餐點，請在你整段回覆的最底部，直接加上 [CHANGE_MEAL: 將OOO替換為XXX]。
@@ -545,7 +548,7 @@ def get_ai_response_with_memory(user_id, user_msg):
         return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}\n\n👉 老闆，這通常是因為 Railway 後台的 Variables 沒有設定好 OPENAI_API_KEY，或是設定完沒有重新 Deploy (部署) 喔！"
         
     # 🔥 處理紀錄 (升級為：熱量 + 蛋白質雙擷取)
-    match = re.search(r'\[LOG_NUTRITION:\s*(\d+),\s*(\d+)\]', ans)
+    match = re.search(r'\[LOG_NUTRITION:\s*(\d+)[^\d,]*,\s*(\d+)', ans)  # 修復重點2：容錯，就算AI加單位也能抓
     if match:
         logged_cal = int(match.group(1))
         logged_pro = int(match.group(2))
@@ -553,7 +556,7 @@ def get_ai_response_with_memory(user_id, user_msg):
         new_extra_pro = extra_pro + logged_pro
         c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=? WHERE user_id=?", (new_extra_cal, new_extra_pro, user_id))
         conn.commit()
-        ans = re.sub(r'\[LOG_NUTRITION:\s*\d+,\s*\d+\]', '', ans).strip()
+        ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans).strip()  # 修復重點3：清除整段標籤
         
         # ✅ 保留寫入 Google Sheet，並加上蛋白質數據！
         if daily_rec and daily_rec[2] and gc:
