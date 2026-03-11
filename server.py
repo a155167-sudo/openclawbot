@@ -15,7 +15,8 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextSendMessage, TextMessage
 from openai import OpenAI
-
+from apscheduler.schedulers.background import BackgroundScheduler
+from contextlib import asynccontextmanager
 # ==========================================
 # 1. 設定區 (🔥 安全防護版：金鑰改由 Railway 後台讀取)
 # ==========================================
@@ -35,7 +36,28 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "#GEN_CODES")
 # Google 試算表設定 (網址公開安全，靠 service_account 保護)
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1cf0QhWeYynk9nqsoqMIM-Lkxk_bP57zcd-ES7Sufkqg/edit?gid=0#gid=0"
 
-app = FastAPI()
+# 🔥 設定 FastAPI 的生命週期與隱形店長排程
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 伺服器啟動時，喚醒隱形店長
+    scheduler = BackgroundScheduler(timezone="Asia/Taipei")
+    
+    # ⏰ 排定班表：每天 14:00 自動扣餐與催繳續約
+    scheduler.add_job(auto_daily_meal_deduction, 'cron', hour=14, minute=0)
+    
+    # ⏰ 排定班表：每天 20:00 自動發送明日取餐與加購提醒
+    scheduler.add_job(auto_send_tomorrow_reminders_to_boss, 'cron', hour=20, minute=0)
+    
+    scheduler.start()
+    print("✅ 全自動定時器已啟動！系統進入無人駕駛模式 ON！")
+    
+    yield
+    
+    # 伺服器關閉時，讓店長下班
+    scheduler.shutdown()
+
+# 正式建立啟用了定時器的 FastAPI 應用程式
+app = FastAPI(lifespan=lifespan)
 client = OpenAI(api_key=OPENAI_API_KEY)
 line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -739,3 +761,50 @@ def handle_message(event):
     allow, q_msg = check_permission_and_quota(uid)
     if not allow: return
     else: line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"{get_ai_response_with_memory(uid, msg)}\n\n{q_msg}"))
+# ==========================================
+# 🤖 隱形店長專用函數 (自動化排程任務)
+# ==========================================
+def auto_daily_meal_deduction():
+    """每天自動扣除今日餐點，並發送續約通知"""
+    weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+    today_str = weekdays[datetime.date.today().weekday()]
+    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{today_str}%",))
+    users = c.fetchall()
+    
+    count, notify_count = 0, 0
+    for u in users:
+        u_id, u_name = u
+        c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (u_id,))
+        res = c.fetchone()
+        if res and res[0] > 0:
+            new_meals = res[0] - 1
+            c.execute("UPDATE usage SET remaining_meals=? WHERE user_id=?", (new_meals, u_id))
+            count += 1
+            if new_meals <= 3 and new_meals > 0:
+                notify_msg = f"🎉 {u_name} 您好！您的專屬方案只剩最後 {new_meals} 餐囉！\n您可以直接回覆我「我要續約」，系統將為您無縫安排下一期菜單！"
+                try: line_bot_api.push_message(u_id, TextSendMessage(text=notify_msg)); notify_count += 1
+                except: pass
+    conn.commit(); conn.close()
+    
+    # 任務完成，發報告給老闆
+    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+    admin_row = c.fetchone()
+    conn.close()
+    if admin_row:
+        try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】今日 ({today_str}) 出餐扣除自動完畢！\n共扣 {count} 份餐點，發送 {notify_count} 則續約推播！"))
+        except: pass
+
+def auto_send_tomorrow_reminders_to_boss():
+    """每天自動發送明日提醒，並跟老闆回報"""
+    result_msg = send_tomorrow_reminders() # 呼叫原本寫好的推播函數
+    
+    # 任務完成，發報告給老闆
+    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+    admin_row = c.fetchone()
+    conn.close()
+    if admin_row:
+        try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】明日提醒推播完畢：\n{result_msg}"))
+        except: pass
