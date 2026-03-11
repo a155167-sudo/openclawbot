@@ -665,6 +665,19 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 老闆好！系統已成功綁定。\n客人的【換餐通知】都會私訊給您！"))
         return
+    elif msg == "#點數庫存":
+        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        # 算一下沒用過的 (is_used=0)
+        c.execute("SELECT COUNT(*) FROM reward_links WHERE is_used=0")
+        unused_count = c.fetchone()[0]
+        # 算一下已經發出去的 (is_used=1)
+        c.execute("SELECT COUNT(*) FROM reward_links WHERE is_used=1")
+        used_count = c.fetchone()[0]
+        conn.close()
+        
+        reply_msg = f"📊 【老闆專屬：點數庫存報告】\n\n🟢 尚未發送：{unused_count} 張\n🔴 已經發出：{used_count} 張\n\n(歷史總共上傳過 {unused_count + used_count} 張點數網址)"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
+        return
     elif msg == "#更新菜單":
         reply_msg = load_menu()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
