@@ -38,7 +38,7 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "#GEN_CODES")
 DB_DIR = os.path.join(os.getcwd(), 'data')
-DB_PATH = os.path.join(DB_DIR, 'user_quota.db')
+DB_PATH = os.path.join(DB_DIR, 'DB_PATH')
 
 if not os.path.exists(DB_DIR):
     os.makedirs(DB_DIR, exist_ok=True)
@@ -132,7 +132,7 @@ def load_menu():
 def init_db():
     # 🎯 1. 自動定位：確保路徑絕對正確
     db_dir = os.path.join(os.getcwd(), 'data')
-    db_path = os.path.join(db_dir, 'user_quota.db')
+    db_path = os.path.join(db_dir, 'DB_PATH')
 
     # 📂 2. 防撞檢查：如果保險箱資料夾不存在，就立刻建一個
     if not os.path.exists(db_dir):
@@ -348,7 +348,7 @@ async def receive_form_data(request: Request):
         today_str_for_sheet = datetime.datetime.now().strftime("%Y%m%d")
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
 
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO health_profile (user_id, name, tdee, protein, goal, restrictions, summary_text, active_days, today_extra_cal, today_date, sheet_name) VALUES (?,?,?,?,?,?,?,?,0,'',?)", (user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(list(active_days)), safe_name))
         conn.commit(); conn.close()
 
@@ -408,7 +408,7 @@ async def receive_survey_data(request: Request):
         if not user_id or user_id == "UID_REPLACE_ME":
             return {"status": "ignored", "msg": "無效的 UID"}
 
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         
         # 1. 檢查這個人是不是已經領過點數了？(防貪小便宜)
         c.execute("SELECT claim_date FROM survey_records WHERE user_id=?", (user_id,))
@@ -449,7 +449,7 @@ async def receive_survey_data(request: Request):
 # 5. AI 對話引擎 (🔥 升級版：熱量與蛋白質雙軌追蹤)
 # ==========================================
 def get_ai_response_with_memory(user_id, user_msg):
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
     
     # 🔥 抓取客人資料 (保留 active_days，並多抓 protein)
     c.execute("SELECT summary_text, tdee, active_days, protein FROM health_profile WHERE user_id=?", (user_id,))
@@ -569,7 +569,7 @@ def get_ai_response_with_memory(user_id, user_msg):
 # 6. 其他輔助函數與 Webhook (🔥 融合版：完整保留測距、VIP功能)
 # ==========================================
 def check_permission_and_quota(user_id):
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
     today = datetime.date.today().isoformat()
     c.execute("SELECT remaining_chat_quota, remaining_meals, last_date, status, expiry_date, daily_chat_limit FROM usage WHERE user_id=?", (user_id,))
     record = c.fetchone()
@@ -587,7 +587,7 @@ def send_tomorrow_reminders():
     tomorrow = datetime.date.today() + datetime.timedelta(days=1)
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     tomorrow_str = weekdays[tomorrow.weekday()]
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
     c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{tomorrow_str}%",))
     users = c.fetchall(); conn.close()
     count = 0
@@ -611,7 +611,7 @@ def get_distance(origin_address, target_address, mode="driving"):
     except: return False, "", 0, ""
 
 def generate_package_codes(t, n):
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor(); codes = []
+    conn = sqlite3.connect('DB_PATH'); c = conn.cursor(); codes = []
     m, d, l, p = (24,31,20,"#VIP24-") if t=="24m" else (48,31,30,"#VIP48-")
     for _ in range(n):
         c_str = p + ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
@@ -619,7 +619,7 @@ def generate_package_codes(t, n):
     conn.commit(); conn.close(); return codes
 
 def redeem_code(uid, code):
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
     c.execute("SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0", (code,))
     r = c.fetchone()
     if not r: conn.close(); return None, "❌ 無效"
@@ -668,7 +668,7 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
     elif msg == "查看菜單":
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         c.execute("SELECT summary_text FROM health_profile WHERE user_id=?", (uid,))
         hp = c.fetchone(); conn.close()
         reply_text = f"🍽️ 這是為您量身打造的專屬菜單：\n\n{hp[0]}\n\n(若想更換菜色或加購單品，可以直接打字告訴我喔！)" if hp and hp[0] else "您好像還沒填寫體質評估表單喔！請點擊選單來建立專屬檔案吧！📝"
@@ -690,13 +690,13 @@ def handle_message(event):
 
     # 👑 老闆專屬指令區 👑
     if msg == "#綁定老闆":
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO admin_settings VALUES ('admin_id', ?)", (uid,))
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 老闆好！系統已成功綁定。\n客人的【換餐通知】都會私訊給您！"))
         return
     elif msg == "#點數庫存":
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         # 算一下沒用過的 (is_used=0)
         c.execute("SELECT COUNT(*) FROM reward_links WHERE is_used=0")
         unused_count = c.fetchone()[0]
@@ -715,7 +715,7 @@ def handle_message(event):
     elif msg == "#今日出餐完成":
         weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
         today_str = weekdays[datetime.date.today().weekday()]
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{today_str}%",))
         users = c.fetchall()
         
@@ -740,7 +740,7 @@ def handle_message(event):
     # 這裡開始的 elif 必須跟上面其他的 elif 對齊 (退回一格)
     elif msg.startswith("#上傳點數\n"):
         links = msg.replace("#上傳點數\n", "").strip().split('\n')
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         count = 0
         for link in links:
             if link.strip():
@@ -766,21 +766,21 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=res))
         return
     elif msg == "#清空熱量":
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0 WHERE user_id=?", (uid,))
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🔄 報告老闆，今日偷吃紀錄（含熱量與蛋白質）已歸零！"))
         return
     elif msg == "#刪除檔案":
         if uid in user_memory: del user_memory[uid]
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         c.execute("DELETE FROM health_profile WHERE user_id=?", (uid,))
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="💥 老闆好，檔案與記憶已徹底銷毀！請重新填表！"))
         return
     elif msg == "#重置":
         if uid in user_memory: del user_memory[uid]
-        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
         # 🔥 強制寫入一筆無限期、50次額度的紀錄！就算資料庫被洗白也能救回來
         today = datetime.date.today().isoformat()
         c.execute("INSERT OR REPLACE INTO usage (user_id, remaining_chat_quota, remaining_meals, last_date, status, expiry_date, daily_chat_limit) VALUES (?, 50, 99, ?, 'vip', '2099-12-31', 50)", (uid, today))
@@ -820,7 +820,7 @@ def auto_daily_meal_deduction():
     """每天自動扣除今日餐點，並發送續約通知"""
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     today_str = weekdays[datetime.date.today().weekday()]
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
     c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{today_str}%",))
     users = c.fetchall()
     
@@ -840,7 +840,7 @@ def auto_daily_meal_deduction():
     conn.commit(); conn.close()
     
     # 任務完成，發報告給老闆
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
     c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
     admin_row = c.fetchone()
     conn.close()
@@ -853,7 +853,7 @@ def auto_send_tomorrow_reminders_to_boss():
     result_msg = send_tomorrow_reminders() # 呼叫原本寫好的推播函數
     
     # 任務完成，發報告給老闆
-    conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+    conn = sqlite3.connect('DB_PATH'); c = conn.cursor()
     c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
     admin_row = c.fetchone()
     conn.close()
