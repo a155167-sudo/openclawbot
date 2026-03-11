@@ -97,7 +97,7 @@ def load_menu():
 load_menu()
 
 # ==========================================
-# 3. 資料庫初始化 (🔥 升級版：支援蛋白質追蹤)
+# 3. 資料庫初始化 (🔥 升級版：支援點數網址與發放紀錄)
 # ==========================================
 def init_db():
     conn = sqlite3.connect('user_quota.db')
@@ -106,8 +106,11 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER DEFAULT 0)''')
     c.execute('''CREATE TABLE IF NOT EXISTS health_profile (user_id TEXT PRIMARY KEY, name TEXT, tdee INTEGER, protein REAL, goal TEXT, restrictions TEXT, summary_text TEXT, active_days TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS admin_settings (key TEXT PRIMARY KEY, value TEXT)''')
+    
+    # 🔥 新增：行銷問卷專用的資料表
+    c.execute('''CREATE TABLE IF NOT EXISTS reward_links (link TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS survey_records (user_id TEXT PRIMARY KEY, claim_date TEXT)''')
 
-    # 安全新增欄位，避免舊資料庫報錯
     for col, dtype in [("today_extra_cal", "INTEGER DEFAULT 0"), ("today_date", "TEXT DEFAULT ''"), ("sheet_name", "TEXT DEFAULT ''"), ("today_extra_pro", "INTEGER DEFAULT 0")]:
         try: c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
         except sqlite3.OperationalError: pass
@@ -335,7 +338,62 @@ async def receive_form_data(request: Request):
     except Exception as e: 
         print(f"💥 [表單崩潰致命錯誤] 老闆救命啊：{str(e)}")
         return {"status": "error", "msg": str(e)}
+# ==========================================
+# 🔥 滿意度問卷接收器 (自動發放不重複點數)
+# ==========================================
+@app.post("/survey-data")
+async def receive_survey_data(request: Request):
+    try:
+        data = await request.json()
+        print(f"📝 [問卷測試] 收到問卷資料：{data}")
+        
+        # 抓取表單裡的 UID
+        user_id = ""
+        for k, v in data.items():
+            if "UID" in k.upper():
+                user_id = str(v).strip()
+                break
+                
+        if not user_id or user_id == "UID_REPLACE_ME":
+            return {"status": "ignored", "msg": "無效的 UID"}
 
+        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        
+        # 1. 檢查這個人是不是已經領過點數了？(防貪小便宜)
+        c.execute("SELECT claim_date FROM survey_records WHERE user_id=?", (user_id,))
+        if c.fetchone():
+            conn.close()
+            # 已經領過，不再發網址，但可以回個感謝訊息
+            try: line_bot_api.push_message(user_id, TextSendMessage(text="❤️ 感謝您再次填寫問卷！您之前已經領取過集點卡點數囉，一日樂食祝您有美好的一天！"))
+            except: pass
+            return {"status": "already_claimed"}
+
+        # 2. 從保險箱抽出一張「還沒被使用」的點數網址
+        c.execute("SELECT link FROM reward_links WHERE is_used=0 LIMIT 1")
+        row = c.fetchone()
+        
+        if row:
+            reward_link = row[0]
+            # 標記為已使用，並記錄這個人已經領過
+            c.execute("UPDATE reward_links SET is_used=1 WHERE link=?", (reward_link,))
+            c.execute("INSERT INTO survey_records (user_id, claim_date) VALUES (?, ?)", (user_id, datetime.date.today().isoformat()))
+            conn.commit()
+            
+            # 3. 把專屬點數網址私訊給客人
+            push_msg = f"🎉 感謝您的寶貴回饋！\n\n這是答應您的專屬獎勵，請點擊下方連結領取【一日樂食集點卡 1 點】👇\n\n{reward_link}\n\n(⚠️ 注意：此連結為專屬一次性連結，點擊後即失效，請勿轉發給他人喔！)"
+            line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
+        else:
+            # 點數發光了，通知老闆！
+            c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+            admin_row = c.fetchone()
+            if admin_row:
+                line_bot_api.push_message(admin_row[0], TextSendMessage(text="🚨 老闆緊急通知：填問卷送點數的「點數網址」已經被抽光啦！請盡快上後台產生新的網址並用 #上傳點數 補貨！"))
+        
+        conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        print(f"⚠️ 問卷處理錯誤: {e}")
+        return {"status": "error"}
 # ==========================================
 # 5. AI 對話引擎 (🔥 升級版：熱量與蛋白質雙軌追蹤)
 # ==========================================
@@ -606,6 +664,19 @@ def handle_message(event):
                     except Exception: pass
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！今日 ({today_str}) 出餐扣除完畢！\n共扣除了 {count} 份餐點，發送 {notify_count} 則續約推播！"))
+        return
+        elif msg.startswith("#上傳點數\n"):
+        links = msg.replace("#上傳點數\n", "").strip().split('\n')
+        conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
+        count = 0
+        for link in links:
+            if link.strip():
+                try:
+                    c.execute("INSERT INTO reward_links (link, is_used) VALUES (?, 0)", (link.strip(),))
+                    count += 1
+                except sqlite3.IntegrityError: pass # 避免重複存入
+        conn.commit(); conn.close()
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！成功存入 {count} 筆全新的點數網址！"))
         return
     elif msg == "#發送明日提醒":
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=send_tomorrow_reminders()))
