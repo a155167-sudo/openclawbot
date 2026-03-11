@@ -121,7 +121,7 @@ def load_menu():
 # 3. 資料庫初始化 (🔥 升級版：支援點數網址與發放紀錄)
 # ==========================================
 def init_db():
-    conn = sqlite3.connect('user_quota.db')
+    conn = sqlite3.connect('data/user_quota.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER DEFAULT 0)''')
