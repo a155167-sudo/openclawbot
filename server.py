@@ -102,22 +102,21 @@ def load_menu():
                     pro = float(row_clean.get("蛋白質(g)", "0").strip() or 0.0)
                     price = int(row_clean.get("價錢", row_clean.get("價格", "150")).strip() or 150)
                     ingredients = row_clean.get("內容物", "新鮮食材製作").strip()
-                    # 🔥 關鍵濾網：區分主餐與加購單品 🔥
                     main_keywords = ["便當", "麵", "食蔬", "低碳", "沙拉"]
                     if any(kw in name for kw in main_keywords):
-                        category = "main"  # 這是正餐，會進入排餐抽籤池
+                        category = "main"  
                     else:
-                        category = "side"  # 這是單品/飲料，排餐不抽，但 AI 可以推銷
+                        category = "side"  
                     MAIN_DISHES.append({"name": name, "cal": cal, "pro": pro, "price": price, "category": category, "ingredients": ingredients})
-                except Exception: pass
+                except Exception as e:
+                    # 🔥 抓蟲程式碼必須放在這裡，對齊內部的 try！
+                    print(f"⚠️ 跳過餐點【{name}】: 數字格式有誤，原因：{e}")
+                    
         print(f"✅ 成功載入 {len(MAIN_DISHES)} 項餐點！")
         return f"✅ 菜單更新成功！共載入 {len(MAIN_DISHES)} 項餐點。"
     except Exception as e: 
-                    print(f"⚠️ 跳過餐點【{name}】: 數字格式有誤，原因：{e}")
-
-# 伺服器啟動時，先自動讀取一次
-load_menu()
-
+        print(f"⚠️ 讀取 menu.csv 失敗: {e}")
+        return "❌ 菜單更新失敗，請檢查檔案。"
 # ==========================================
 # 3. 資料庫初始化 (🔥 升級版：支援點數網址與發放紀錄)
 # ==========================================
@@ -687,7 +686,7 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！今日 ({today_str}) 出餐扣除完畢！\n共扣除了 {count} 份餐點，發送 {notify_count} 則續約推播！"))
         return
-        elif msg.startswith("#上傳點數\n"):
+   elif msg.startswith("#上傳點數\n"):
         links = msg.replace("#上傳點數\n", "").strip().split('\n')
         conn = sqlite3.connect('user_quota.db'); c = conn.cursor()
         count = 0
