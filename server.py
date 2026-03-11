@@ -17,6 +17,11 @@ from linebot.models import MessageEvent, TextSendMessage, TextMessage
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from contextlib import asynccontextmanager
+
+# --- 保險箱初始化設定 ---
+# 我們把建立資料夾的邏輯移到 init_db 裡面會更安全，
+# 這裡可以先註解掉或保持原樣，但 init_db 一定要改用「絕對路徑」版本。
+# -----------------------
 # ==========================================
 # 1. 設定區 (🔥 安全防護版：金鑰改由 Railway 後台讀取)
 # ==========================================
@@ -121,22 +126,43 @@ def load_menu():
 # 3. 資料庫初始化 (🔥 升級版：支援點數網址與發放紀錄)
 # ==========================================
 def init_db():
-    conn = sqlite3.connect('data/user_quota.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER DEFAULT 0)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS health_profile (user_id TEXT PRIMARY KEY, name TEXT, tdee INTEGER, protein REAL, goal TEXT, restrictions TEXT, summary_text TEXT, active_days TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS admin_settings (key TEXT PRIMARY KEY, value TEXT)''')
-    
-    # 🔥 新增：行銷問卷專用的資料表
-    c.execute('''CREATE TABLE IF NOT EXISTS reward_links (link TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS survey_records (user_id TEXT PRIMARY KEY, claim_date TEXT)''')
+    # 🎯 1. 自動定位：確保路徑絕對正確
+    db_dir = os.path.join(os.getcwd(), 'data')
+    db_path = os.path.join(db_dir, 'user_quota.db')
 
-    for col, dtype in [("today_extra_cal", "INTEGER DEFAULT 0"), ("today_date", "TEXT DEFAULT ''"), ("sheet_name", "TEXT DEFAULT ''"), ("today_extra_pro", "INTEGER DEFAULT 0")]:
-        try: c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
-        except sqlite3.OperationalError: pass
+    # 📂 2. 防撞檢查：如果保險箱資料夾不存在，就立刻建一個
+    if not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        print(f"📁 已自動建立資料夾: {db_dir}")
 
-    conn.commit(); conn.close()
+    try:
+        # 🔗 3. 安全連線
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        
+        # --- 以下是您的原本表格定義 (保持不變) ---
+        c.execute('''CREATE TABLE IF NOT EXISTS usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER DEFAULT 0)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS health_profile (user_id TEXT PRIMARY KEY, name TEXT, tdee INTEGER, protein REAL, goal TEXT, restrictions TEXT, summary_text TEXT, active_days TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS admin_settings (key TEXT PRIMARY KEY, value TEXT)''')
+        
+        # 🔥 行銷問卷專用的資料表
+        c.execute('''CREATE TABLE IF NOT EXISTS reward_links (link TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS survey_records (user_id TEXT PRIMARY KEY, claim_date TEXT)''')
+
+        for col, dtype in [("today_extra_cal", "INTEGER DEFAULT 0"), ("today_date", "TEXT DEFAULT ''"), ("sheet_name", "TEXT DEFAULT ''"), ("today_extra_pro", "INTEGER DEFAULT 0")]:
+            try: 
+                c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
+            except sqlite3.OperationalError: 
+                pass
+        # --- 以上結束 ---
+
+        conn.commit()
+        conn.close()
+        print(f"✅ 保險箱資料庫連線成功！路徑: {db_path}")
+
+    except Exception as e:
+        print(f"❌ 啟動保險箱失敗，錯誤原因: {e}")
 init_db()
 
 # ==========================================
