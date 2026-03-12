@@ -195,6 +195,8 @@ async def receive_form_data(request: Request):
         
         user_id = get_val("UID")
         print(f"🔍 [表單測試] 抓到的 UID 是：'{user_id}'")
+        print(f"🔑 [DEBUG] 表單所有欄位 keys：{list(data.keys())}")
+        print(f"📝 [DEBUG] 稱呼欄位比對結果：{ {k: v for k, v in data.items() if '稱呼' in str(k)} }")
         
         if not user_id or user_id == "UID_REPLACE_ME": 
             print("❌ [表單拒絕] 找不到有效的 UID，這張表單我直接丟掉！")
@@ -264,8 +266,8 @@ async def receive_form_data(request: Request):
         
         # 🔥 定義真正喜歡的關鍵字 (解決「沒有飯」卻抓到「飯」的 Bug)
         liked_staples = []
-        if "飯食派" in pref_staple: liked_staples.append("飯")
-        if "原型" in pref_staple: liked_staples.extend(["地瓜", "南瓜", "馬鈴薯"])
+        if "飯食" in pref_staple: liked_staples.append("飯")   # 修正：原本錯寫成「飯食派」
+        if "原型" in pref_staple: liked_staples.extend(["地瓜", "南瓜", "馬鈴薯", "原型"])  # 加入「原型」本身
         if "低碳" in pref_staple: liked_staples.extend(["低碳", "菜"])
         if "麵" in pref_staple: liked_staples.append("麵")
         if "沙拉" in pref_staple: liked_staples.append("沙拉")
@@ -279,16 +281,22 @@ async def receive_form_data(request: Request):
         
         # 3. 建立「絕對安全菜單池」 (先過濾掉禁忌，且只挑主餐)
         safe_menu = []
+        # 🔥 修正：說「不要海鮮」時，擴展過濾所有魚蝦蟹相關關鍵字
+        seafood_sub_words = ["魚", "蝦", "蟹", "花枝", "透抽", "章魚", "牡蠣", "鮭", "鱸", "鮪", "鯖"]
         for dish in MAIN_DISHES:
             if dish.get('category') != 'main':
                 continue
             dish_name = dish['name'].lower()
             is_safe = True
-            forbidden_keywords = ["牛", "豬", "雞", "魚", "海鮮", "蝦"]
+            forbidden_keywords = ["牛", "豬", "雞", "魚", "海鮮", "蝦", "蟹"]
             for word in forbidden_keywords:
                 if word in user_restrictions and word in dish_name:
                     is_safe = False
                     break
+            # 特殊處理：用戶寫「海鮮」禁忌時，同步過濾菜名含魚蝦蟹字樣的餐點
+            if is_safe and "海鮮" in user_restrictions:
+                if any(sw in dish_name for sw in seafood_sub_words):
+                    is_safe = False
             if is_safe:
                 safe_menu.append(dish)
 
