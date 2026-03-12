@@ -302,13 +302,26 @@ async def receive_form_data(request: Request):
 
         # 4. 解析取餐日期並進行「超級紅娘配對 (雙重嚴格過濾)」
         if date_str:
-            days = [d.strip() for d in date_str.split(',') if "週" in d]
-            active_days = set(days)
+            # 移除 if "週" in d 的限制，避免吃掉純寫「星期四」的選項
+            days = [d.strip() for d in date_str.split(',')]
+            active_days = set()
             week_tracker = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
+            
+            # 🔥 修復問題 1：完整字串比對，絕不會把「第四週」誤認為「星期四」
+            week_dict = {
+                "星期一": 1, "週一": 1, 
+                "星期二": 2, "週二": 2, 
+                "星期三": 3, "週三": 3, 
+                "星期四": 4, "週四": 4, 
+                "星期五": 5, "週五": 5, 
+                "星期六": 6, "週六": 6, 
+                "星期日": 7, "週日": 7
+            }
             
             for d in days:
                 d_num = next((num for zh, num in week_dict.items() if zh in d), 99)
                 if d_num != 99:
+                    active_days.add(d) # 確定是日期才加進去
                     week_tracker[d_num] += 1
                     w_num = week_tracker[d_num]
                     
@@ -316,16 +329,17 @@ async def receive_form_data(request: Request):
                     good_matches = []
                     
                     for dish in safe_menu:
-                        dish_name_lower = dish['name'].lower()  # 修正：不再用 name，避免蓋掉顧客姓名變數
+                        dish_name_lower = dish['name'].lower()
+                        # 🔥 修復問題 2：把內容物也抓出來一起比對！
+                        dish_ing_lower = dish.get('ingredients', '').lower()
                         
-                        # 檢查蛋白質與主食是否命中 (如果選都不挑食，就視為 True)
-                        has_pro = any(p in dish_name_lower for p in liked_proteins) if liked_proteins and "都不挑食" not in pref_protein else True
-                        has_sta = any(s in dish_name_lower for s in liked_staples) if liked_staples and "都不挑食" not in pref_staple else True
+                        # 檢查蛋白質與主食是否命中 (同時檢查菜名 與 內容物)
+                        has_pro = any(p in dish_name_lower or p in dish_ing_lower for p in liked_proteins) if liked_proteins and "都不挑食" not in pref_protein else True
+                        has_sta = any(s in dish_name_lower or s in dish_ing_lower for s in liked_staples) if liked_staples and "都不挑食" not in pref_staple else True
                         
                         # 💣 地雷蛋白質濾網：如果這道菜有客人「沒勾選」的肉類，直接判出局！
-                        # 例如：客人沒勾「海鮮」，那名字有「鱸魚」或「鮭魚」的餐點就會被踢掉。
                         unliked_proteins = [p for p in ["素", "雞", "豬", "牛", "魚", "海鮮", "鱸魚", "鮭魚", "豆腐", "鷹嘴豆"] if p not in liked_proteins and "都不挑食" not in pref_protein]
-                        if any(up in dish_name_lower for up in unliked_proteins):
+                        if any(up in dish_name_lower or up in dish_ing_lower for up in unliked_proteins):
                             has_pro = False # 強制不合格
                             
                         # 依據符合程度放入池子
@@ -342,16 +356,14 @@ async def receive_form_data(request: Request):
                     elif len(safe_menu) >= 2:
                         pool = safe_menu
                     else:
-                        # 最終保底：所有主餐，確保不會炸掉
                         pool = [d for d in MAIN_DISHES if d.get('category') == 'main']
                     
-                    # 安全取樣：pool 不夠 2 道時允許重複取
                     if len(pool) >= 2:
                         daily_pick = random.sample(pool, 2)
                     elif len(pool) == 1:
                         daily_pick = [pool[0], pool[0]]
                     else:
-                        continue  # 真的沒菜，跳過這天
+                        continue 
                     
                     plan_requests.append((w_num, d_num, f"第{w_num}週", d, daily_pick[0], daily_pick[1]))
 
@@ -555,18 +567,22 @@ def get_ai_response_with_memory(user_id, user_msg):
         # ✅ 保留您原本的貼心報錯提示
         return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}\n\n👉 老闆，這通常是因為 Railway 後台的 Variables 沒有設定好 OPENAI_API_KEY，或是設定完沒有重新 Deploy (部署) 喔！"
         
-    # 🔥 處理紀錄 (升級為：熱量 + 蛋白質雙擷取)
-    match = re.search(r'\[LOG_NUTRITION:\s*(\d+)[^\d,]*,\s*(\d+)', ans)  # 修復重點2：容錯，就算AI加單位也能抓
+    # 🔥 處理紀錄 (升級為：無敵防彈版，強迫抓取數字)
+    # 不管 AI 中間塞了空白、文字還是符號，只要抓到兩個連續的數字群就成立！
+    match = re.search(r'\[LOG_NUTRITION:\s*(\d+).*?,\s*(\d+).*?\]', ans)
+    
     if match:
         logged_cal = int(match.group(1))
         logged_pro = int(match.group(2))
         new_extra_cal = extra_cal + logged_cal
         new_extra_pro = extra_pro + logged_pro
-        c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_date=? WHERE user_id=?", (new_extra_cal, new_extra_pro, today_str, user_id))
+        c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=? WHERE user_id=?", (new_extra_cal, new_extra_pro, user_id))
         conn.commit()
-        ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans).strip()  # 修復重點3：清除整段標籤
-        
-        # ✅ 保留寫入 Google Sheet，並加上蛋白質數據！
+        # 清除整段標籤，確保客人看不到系統指令
+        ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans).strip()  
+       
+        # 修復重點3：清除整段標籤# 
+        ✅ 保留寫入 Google Sheet，並加上蛋白質數據！
         if daily_rec and daily_rec[2] and gc:
             try:
                 sheet = gc.open_by_url(SHEET_URL)
