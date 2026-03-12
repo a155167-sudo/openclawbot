@@ -205,6 +205,9 @@ async def receive_form_data(request: Request):
 
         name, goal, restrictions = get_val("稱呼"), get_val("目標"), get_val("禁忌")
         weight, height, age, gender = float(get_val("體重") or 70), float(get_val("身高") or 170), float(get_val("年齡") or 30), get_val("性別")
+        # 🔥 身高防呆：如果客人填 1.76 公尺，自動轉成 176 公分
+        if height < 3.0:
+            height *= 100
         activity = get_val("活動量")
         
         bmr = (10 * weight + 6.25 * height - 5 * age - 161) if "女" in gender else (10 * weight + 6.25 * height - 5 * age + 5)
@@ -300,12 +303,11 @@ async def receive_form_data(request: Request):
             if is_safe:
                 safe_menu.append(dish)
 
-        # 4. 解析取餐日期並進行「超級紅娘配對」 (🔥 融合終極穩定版)
+        # 4. 解析取餐日期並進行「超級紅娘配對」 (🔥 融合終極穩定版 + 主食黑名單)
         plan_requests = []
         total_price = 0  
         
         if date_str:
-            # 修復問題 1：使用完整字串比對，解決「週四」與「第四週」撞名的問題
             week_dict = {
                 "星期一": 1, "週一": 1, "星期二": 2, "週二": 2, 
                 "星期三": 3, "週三": 3, "星期四": 4, "週四": 4, 
@@ -316,20 +318,42 @@ async def receive_form_data(request: Request):
             week_tracker = {1:0, 2:0, 3:0, 4:0, 5:0, 6:0, 7:0}
             
             for d in days:
-                # 找出這行對應的是星期幾
                 d_num = next((num for zh, num in week_dict.items() if zh in d), 99)
                 if d_num != 99:
                     active_days_list.append(d)
                     week_tracker[d_num] += 1
                     w_num = week_tracker[d_num]
                     
-                    # 🔥 修復問題 2：配餐池邏輯優化
-                    # 同時比對「菜名」與「內容物」，確保地瓜、南瓜等原型食物能被抓到
-                    matches = [dish for dish in safe_menu if any(s in (dish['name'] + dish.get('ingredients','')).lower() for s in liked_staples)]
+                    # 🔥 終極主食地雷過濾系統 (漏掉的就是這裡！)
+                    unliked_staples = []
+                    if "都不挑食" not in pref_staple:
+                        if "沙拉" not in pref_staple: unliked_staples.append("沙拉")
+                        if "麵" not in pref_staple: unliked_staples.extend(["麵", "義大利麵", "烏龍", "筆管"])
+                        if "飯" not in pref_staple: unliked_staples.extend(["飯", "燉飯", "紫米", "糙米"])
                     
-                    # 優先從喜好池 (matches) 挑選；若喜好池不夠 2 種，則從安全池 (safe_menu) 挑選
-                    pool = matches if len(matches) >= 2 else safe_menu
+                    matches = []
+                    for dish in safe_menu:
+                        d_text = (dish['name'] + dish.get('ingredients', '')).lower()
+                        
+                        # 1. 踩到主食地雷？直接淘汰！沙拉跟麵絕對進不來
+                        if any(us in d_text for us in unliked_staples):
+                            continue
+                            
+                        # 2. 檢查是否命中喜歡的主食 (包含原型地瓜)
+                        if "都不挑食" in pref_staple or not liked_staples:
+                            matches.append(dish)
+                        elif any(ls in d_text for ls in liked_staples):
+                            matches.append(dish)
+                            
+                    # 優先用完美命中的池子，如果不夠，用排除地雷後的安全池
+                    if len(matches) >= 2:
+                        pool = matches
+                    else:
+                        pool = [dish for dish in safe_menu if not any(us in (dish['name'] + dish.get('ingredients', '')).lower() for us in unliked_staples)]
+                        if len(pool) < 2:
+                            pool = safe_menu 
                     
+                    # 隨機抽 2 道菜
                     if len(pool) >= 2:
                         daily_pick = random.sample(pool, 2)
                     elif len(pool) == 1:
@@ -338,7 +362,7 @@ async def receive_form_data(request: Request):
                         continue 
                     
                     plan_requests.append((w_num, d_num, f"第{w_num}週", d, daily_pick[0], daily_pick[1]))
-                    # 💡 重點：累加餐點總價
+                    # 💡 累加餐點總價
                     total_price += (daily_pick[0]['price'] + daily_pick[1]['price'])
 
         # 排序確保顯示順序正確
