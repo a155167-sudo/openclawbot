@@ -300,63 +300,35 @@ async def receive_form_data(request: Request):
             if is_safe:
                 safe_menu.append(dish)
 
-        # 4. 解析取餐日期並進行「超級紅娘配對 (雙重嚴格過濾)」
+        # 4. 解析取餐日期並進行「超級紅娘配對」 (🔥 融合終極穩定版)
+        plan_requests = []
+        total_price = 0  
+        
         if date_str:
-            # 移除 if "週" in d 的限制，避免吃掉純寫「星期四」的選項
-            days = [d.strip() for d in date_str.split(',')]
-            active_days = set()
-            week_tracker = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
-            
-            # 🔥 修復問題 1：完整字串比對，絕不會把「第四週」誤認為「星期四」
+            # 修復問題 1：使用完整字串比對，解決「週四」與「第四週」撞名的問題
             week_dict = {
-                "星期一": 1, "週一": 1, 
-                "星期二": 2, "週二": 2, 
-                "星期三": 3, "週三": 3, 
-                "星期四": 4, "週四": 4, 
-                "星期五": 5, "週五": 5, 
-                "星期六": 6, "週六": 6, 
-                "星期日": 7, "週日": 7
+                "星期一": 1, "週一": 1, "星期二": 2, "週二": 2, 
+                "星期三": 3, "週三": 3, "星期四": 4, "週四": 4, 
+                "星期五": 5, "週五": 5, "星期六": 6, "週六": 6, "星期日": 7, "週日": 7
             }
+            days = [d.strip() for d in date_str.split(',')]
+            active_days_list = [] 
+            week_tracker = {1:0, 2:0, 3:0, 4:0, 5:0, 6:0, 7:0}
             
             for d in days:
+                # 找出這行對應的是星期幾
                 d_num = next((num for zh, num in week_dict.items() if zh in d), 99)
                 if d_num != 99:
-                    active_days.add(d) # 確定是日期才加進去
+                    active_days_list.append(d)
                     week_tracker[d_num] += 1
                     w_num = week_tracker[d_num]
                     
-                    perfect_matches = []
-                    good_matches = []
+                    # 🔥 修復問題 2：配餐池邏輯優化
+                    # 同時比對「菜名」與「內容物」，確保地瓜、南瓜等原型食物能被抓到
+                    matches = [dish for dish in safe_menu if any(s in (dish['name'] + dish.get('ingredients','')).lower() for s in liked_staples)]
                     
-                    for dish in safe_menu:
-                        dish_name_lower = dish['name'].lower()
-                        # 🔥 修復問題 2：把內容物也抓出來一起比對！
-                        dish_ing_lower = dish.get('ingredients', '').lower()
-                        
-                        # 檢查蛋白質與主食是否命中 (同時檢查菜名 與 內容物)
-                        has_pro = any(p in dish_name_lower or p in dish_ing_lower for p in liked_proteins) if liked_proteins and "都不挑食" not in pref_protein else True
-                        has_sta = any(s in dish_name_lower or s in dish_ing_lower for s in liked_staples) if liked_staples and "都不挑食" not in pref_staple else True
-                        
-                        # 💣 地雷蛋白質濾網：如果這道菜有客人「沒勾選」的肉類，直接判出局！
-                        unliked_proteins = [p for p in ["素", "雞", "豬", "牛", "魚", "海鮮", "鱸魚", "鮭魚", "豆腐", "鷹嘴豆"] if p not in liked_proteins and "都不挑食" not in pref_protein]
-                        if any(up in dish_name_lower or up in dish_ing_lower for up in unliked_proteins):
-                            has_pro = False # 強制不合格
-                            
-                        # 依據符合程度放入池子
-                        if has_pro and has_sta:
-                            perfect_matches.append(dish) # 蛋白質跟主食都對
-                        elif has_pro: 
-                            good_matches.append(dish) # 至少蛋白質是對的
-                            
-                    # 優先級：完美命中 > 蛋白質命中 > 安全菜 > 全部主餐 (保底)
-                    if len(perfect_matches) >= 2:
-                        pool = perfect_matches
-                    elif len(good_matches) >= 2:
-                        pool = good_matches
-                    elif len(safe_menu) >= 2:
-                        pool = safe_menu
-                    else:
-                        pool = [d for d in MAIN_DISHES if d.get('category') == 'main']
+                    # 優先從喜好池 (matches) 挑選；若喜好池不夠 2 種，則從安全池 (safe_menu) 挑選
+                    pool = matches if len(matches) >= 2 else safe_menu
                     
                     if len(pool) >= 2:
                         daily_pick = random.sample(pool, 2)
@@ -366,66 +338,66 @@ async def receive_form_data(request: Request):
                         continue 
                     
                     plan_requests.append((w_num, d_num, f"第{w_num}週", d, daily_pick[0], daily_pick[1]))
+                    # 💡 重點：累加餐點總價
+                    total_price += (daily_pick[0]['price'] + daily_pick[1]['price'])
 
+        # 排序確保顯示順序正確
         plan_requests.sort(key=lambda x: (x[0], x[1]))
 
         # 5. 生成預覽文字與試算表資料
         schedule_text = ""
         schedule_sheet_rows = [["週期與星期", "午餐安排", "晚餐安排", "熱量剩餘 / 蛋白質需補"]]
-        total_price = 0
         
         for w_num, d_num, w_label, day_name, lunch, dinner in plan_requests:
             day_tdee_left = int(tdee) - lunch['cal'] - dinner['cal']
             day_p_need = int(protein) - lunch['pro'] - dinner['pro']
-            
             schedule_text += f"\n【{w_label}-{day_name}】\n☀️午：{lunch['name']} ({lunch['cal']}kcal)\n🌙晚：{dinner['name']} ({dinner['cal']}kcal)\n👉 當日熱量剩餘: {day_tdee_left}kcal\n"
             schedule_sheet_rows.append([f"{w_label}-{day_name}", lunch['name'], dinner['name'], f"剩 {day_tdee_left}kcal / 補 {day_p_need}g"])
-            total_price += (lunch['price'] + dinner['price'])
-        
-        # 🔥 升級版：加入日期戳記，完美保留每一次的續約歷史！
+
+        # 更新資料庫紀錄 (保留續約歷史)
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
-
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO health_profile (user_id, name, tdee, protein, goal, restrictions, summary_text, active_days, today_extra_cal, today_date, sheet_name) VALUES (?,?,?,?,?,?,?,?,0,'',?)", (user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(list(active_days)), safe_name))
+        c.execute("INSERT OR REPLACE INTO health_profile (user_id, name, tdee, protein, goal, restrictions, summary_text, active_days, today_extra_cal, today_date, sheet_name) VALUES (?,?,?,?,?,?,?,?,0,'',?)", (user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(active_days_list), safe_name))
         conn.commit(); conn.close()
 
+        # 6. 寫入 Google 試算表 (包含個人分頁功能)
         if gc:
             try:
                 sheet = gc.open_by_url(SHEET_URL)
+                # 寫入總表
                 main_sheet = sheet.sheet1
                 now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
-                row_data = [now_str, name, goal, int(tdee), int(protein), restrictions, total_price, ",".join(list(active_days)), schedule_text]
+                row_data = [now_str, name, goal, int(tdee), int(protein), restrictions, total_price, ",".join(active_days_list), schedule_text]
                 main_sheet.append_row(row_data)
                 
+                # 🔥 為客戶建立或更新專屬分頁 (保留原本功能)
                 try:
-                    # 🔥 建立全新的續約分頁 (因為檔名有加日期，舊資料不會被洗掉！)
                     try:
                         user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="8")
                     except:
-                        # 萬一客人同一天填了兩次表單，才覆蓋今天的
                         user_sheet = sheet.worksheet(safe_name)
                         user_sheet.clear()
                         
-                    # 🔥 第一行直接補上「體重」欄位，方便老闆追蹤！
-                    # 🔥 第一行直接補上所有客戶資訊，包含最新的「飲食喜好」！
                     profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}"], [""]]
                     menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
                     tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
                     
                     user_sheet.append_rows(profile_data + menu_title + schedule_sheet_rows + tracking_headers)
-                    print(f"✅ 成功將菜單完美寫入 {safe_name} 專屬分頁！")
-                except Exception as e: 
-                    print(f"⚠️ 寫入專屬分頁失敗: {e}")
-                print(f"📝 成功寫入總表，並為【{name}】建立含菜單的專屬分頁！")
+                    print(f"✅ 成功為 {name} 建立含菜單的專屬分頁：{safe_name}")
+                except Exception as e:
+                    print(f"⚠️ 建立專屬分頁失敗: {e}")
+                    
             except Exception as e:
-                print(f"⚠️ 寫入 Google 表單失敗: {e}")
+                print(f"⚠️ 寫入 Google 試算表失敗: {e}")
 
+        # 最後推播訊息給客人
         push_msg = f"🎉 {name} 填表成功！\nAI 營養師已為您精算：\n🔥 TDEE: {int(tdee)} kcal\n🥩 蛋白質: {int(protein)} g\n\n現在請點擊選單的『查看菜單』，我將為您列出每一天的詳細餐點與價格！"
         line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
         return {"status": "success"}
+
     except Exception as e: 
-        print(f"💥 [表單崩潰致命錯誤] 老闆救命啊：{str(e)}")
+        print(f"💥 [表單崩潰致命錯誤]: {str(e)}")
         return {"status": "error", "msg": str(e)}
 # ==========================================
 # 🔥 滿意度問卷接收器 (自動發放不重複點數)
@@ -519,12 +491,12 @@ def get_ai_response_with_memory(user_id, user_msg):
     today_str_zh = weekdays[tw_today().weekday()]
     
     if today_str_zh in active_days:
-        today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】！系統已經為他預留了本店便當的熱量與蛋白質。"
+        today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】。"
         calc_formula = f"""
-        2. 先查看上方報告中，他當天的「👉 當日熱量剩餘」與「蛋白質需補」。
-           【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} - 【你剛估算的熱量】。
-           【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} - 【你剛估算的蛋白質】。
-        3. 告訴他：「系統已為您預留了一日樂食便當。扣除外食後，您今天還剩下 OOO 大卡的額度，並且還需要補充 OOO 克蛋白質喔！」
+        2. 依照以下格式列出計算過程：
+           【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} (稍早累積) - 【(你估算的品項名) {logged_cal}卡】 = OOO 大卡
+           【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} (稍早累積) - 【(你估算的品項名) {logged_pro}g】 = OOO 克
+        3. 告訴他：「今天扣除一日樂食餐點與稍早外食，再加上這次的(品項名)後，您還剩下 OOO 卡...」
         """
     else:
         today_status = f"❌ 今天 ({today_str_zh}) 是顧客的【無排餐日】！他擁有完整的 TDEE 額度 ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g)。"
@@ -537,6 +509,18 @@ def get_ai_response_with_memory(user_id, user_msg):
 
     system_prompt = f"""你是「一日樂食」的專屬 AI 營養師。你是一位充滿熱情、幽默、且專業的健康顧問！
     {report}
+    
+    【🔥 飲食紀錄與計算規則 🔥】
+    1. 顧客「今日已累積外食」為：熱量 {extra_cal} kcal、蛋白 {extra_pro} g。
+    2. 你「絕對不可以」忽略掉這筆累積數字。
+    3. 當顧客回報食物時，你必須精確估算該食物的熱量與蛋白，並以下列格式呈現計算過程：
+       ---
+       估算品項：(品項名稱)
+       【真正熱量餘額】 = (原本剩餘) - {extra_cal} (稍早累積) - (本次食物熱量) = 最終大卡
+       【真正蛋白需求】 = (原本蛋白需補) - {extra_pro} (稍早累積) - (本次食物蛋白) = 最終克數
+       ---
+    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 本次熱量數字, 本次蛋白質數字]。
+       💡 只能填純數字，絕對不要加單位！(例如：[LOG_NUTRITION: 300, 15])
     
     【本店餐點內容物 - 機密小抄】(僅供內部參考)：
     {ingredients_memo}
