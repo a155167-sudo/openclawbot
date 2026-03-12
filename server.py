@@ -316,16 +316,16 @@ async def receive_form_data(request: Request):
                     good_matches = []
                     
                     for dish in safe_menu:
-                        name = dish['name'].lower()
+                        dish_name_lower = dish['name'].lower()  # 修正：不再用 name，避免蓋掉顧客姓名變數
                         
                         # 檢查蛋白質與主食是否命中 (如果選都不挑食，就視為 True)
-                        has_pro = any(p in name for p in liked_proteins) if liked_proteins and "都不挑食" not in pref_protein else True
-                        has_sta = any(s in name for s in liked_staples) if liked_staples and "都不挑食" not in pref_staple else True
+                        has_pro = any(p in dish_name_lower for p in liked_proteins) if liked_proteins and "都不挑食" not in pref_protein else True
+                        has_sta = any(s in dish_name_lower for s in liked_staples) if liked_staples and "都不挑食" not in pref_staple else True
                         
                         # 💣 地雷蛋白質濾網：如果這道菜有客人「沒勾選」的肉類，直接判出局！
                         # 例如：客人沒勾「海鮮」，那名字有「鱸魚」或「鮭魚」的餐點就會被踢掉。
                         unliked_proteins = [p for p in ["素", "雞", "豬", "牛", "魚", "海鮮", "鱸魚", "鮭魚", "豆腐", "鷹嘴豆"] if p not in liked_proteins and "都不挑食" not in pref_protein]
-                        if any(up in name for up in unliked_proteins):
+                        if any(up in dish_name_lower for up in unliked_proteins):
                             has_pro = False # 強制不合格
                             
                         # 依據符合程度放入池子
