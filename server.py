@@ -517,18 +517,20 @@ def get_ai_response_with_memory(user_id, user_msg):
     if today_str_zh in active_days:
         today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】。"
         calc_formula = f"""
-        2. 依照以下格式列出計算過程：
-           【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} (稍早累積) - 【(你估算的品項名) {logged_cal}卡】 = OOO 大卡
-           【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} (稍早累積) - 【(你估算的品項名) {logged_pro}g】 = OOO 克
-        3. 告訴他：「今天扣除一日樂食餐點與稍早外食，再加上這次的(品項名)後，您還剩下 OOO 卡...」
+        2. 依照以下格式列出計算過程（務必在算式中寫出這次紀錄的「食物品項名稱」）：
+           【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} (稍早累積) - 本次紀錄: [品項名稱] (熱量數字) = OOO 大卡
+           【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} (稍早累積) - 本次紀錄: [品項名稱] (蛋白數字) = OOO 克
+           (💡 範例：【真正熱量餘額】 = 1333 - 0 (稍早) - 西瓜 (30大卡) = 1303 大卡)
+        3. 告訴他：「今天扣除一日樂食餐點與稍早外食，再加上這次的[品項名稱]後，您還剩下 OOO 卡...」
         """
     else:
         today_status = f"❌ 今天 ({today_str_zh}) 是顧客的【無排餐日】！他擁有完整的 TDEE 額度 ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g)。"
         calc_formula = f"""
-        2. 因為今天沒有排餐，請直接用他完整的 TDEE ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g) 來計算！
-           【真正熱量餘額】 = {tdee_val} - {extra_cal} - 【你剛估算的熱量】。
-           【真正蛋白需求】 = {int(protein_val)} - {extra_pro} - 【你剛估算的蛋白質】。
-        3. 告訴他：「今天雖然沒有本店餐點，但扣除外食後，您的總 TDEE 還剩下 OOO 大卡，距離蛋白質目標還差 OOO 克！請繼續保持喔！」
+        2. 因為今天沒有排餐，請直接用他完整的 TDEE ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g) 來計算！依照以下格式列出計算過程：
+           【真正熱量餘額】 = {tdee_val} - {extra_cal} (稍早累積) - 本次紀錄: [品項名稱] (熱量數字) = OOO 大卡
+           【真正蛋白需求】 = {int(protein_val)} - {extra_pro} (稍早累積) - 本次紀錄: [品項名稱] (蛋白數字) = OOO 克
+           (💡 範例：【真正熱量餘額】 = 2000 - 150 (稍早) - 西瓜 (30大卡) = 1820 大卡)
+        3. 告訴他：「今天雖然沒有本店餐點，但扣除稍早外食與這次的[品項名稱]後，您的總 TDEE 還剩下 OOO 大卡...」
         """
 
     system_prompt = f"""你是「一日樂食」的專屬 AI 營養師。你是一位充滿熱情、幽默、且專業的健康顧問！
