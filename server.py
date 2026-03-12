@@ -580,25 +580,36 @@ def get_ai_response_with_memory(user_id, user_msg):
         
     match = re.search(r'\[LOG_NUTRITION:\s*(\d+).*?,\s*(\d+).*?,\s*(.+?)\]', ans)
     
+    tag_pattern = r'\[LOG_NUTRITION:\s*(\d+)[^\d,]*,\s*(\d+)[^\d,]*,\s*(.+?)\]'
+    match = re.search(tag_pattern, ans, re.IGNORECASE)
+    
     if match:
-        logged_cal = int(match.group(1))
-        logged_pro = int(match.group(2))
-        logged_name = match.group(3).strip()
-        
-        new_extra_cal = extra_cal + logged_cal
-        new_extra_pro = extra_pro + logged_pro
-        new_food_items = f"{food_items}、{logged_name}".strip("、") if food_items else logged_name
-        
-        c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=? WHERE user_id=?", (new_extra_cal, new_extra_pro, new_food_items, user_id))
-        conn.commit()
-        ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans).strip()
-        
-        if daily_rec and daily_rec[2] and gc:
-            try:
-                sheet = gc.open_by_url(SHEET_URL)
-                now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
-                sheet.worksheet(daily_rec[2]).append_row([now_str, "外食熱量與蛋白打卡", user_msg, f"+{logged_cal} kcal / +{logged_pro} g ({logged_name})"])
-            except Exception: pass
+        try:
+            logged_cal = int(match.group(1))
+            logged_pro = int(match.group(2))
+            # 清理 AI 可能亂加的單位，只留品項名稱
+            logged_name = match.group(3).strip().replace("大卡", "").replace("克", "").strip()
+            
+            new_extra_cal = extra_cal + logged_cal
+            new_extra_pro = extra_pro + logged_pro
+            new_food_items = f"{food_items}、{logged_name}".strip("、") if food_items else logged_name
+            
+            c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=? WHERE user_id=?", 
+                      (new_extra_cal, new_extra_pro, new_food_items, user_id))
+            conn.commit()
+            
+            # 清除整段標籤，確保客人看不到系統指令
+            ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans, flags=re.IGNORECASE).strip()
+            
+            # 寫入 Google Sheet
+            if daily_rec and daily_rec[2] and gc:
+                try:
+                    sheet = gc.open_by_url(SHEET_URL)
+                    now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+                    sheet.worksheet(daily_rec[2]).append_row([now_str, "外食熱量與蛋白打卡", user_msg, f"+{logged_cal} kcal / +{logged_pro} g ({logged_name})"])
+                except Exception: pass
+        except Exception as e:
+            print(f"❌ 標籤解析存入失敗: {e}")
 
     match_change = re.search(r'\[CHANGE_MEAL:\s*(.+?)\]', ans)
     if match_change:
@@ -707,7 +718,18 @@ def handle_message(event):
     if len(processed_messages) > 1000: processed_messages.clear()
 
     msg, uid = event.message.text.strip(), event.source.user_id
-    
+    # 👇 第一步加在這裡！老闆專屬的記憶檢查按鈕 👇
+    if msg == "#查狀態":
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("SELECT today_extra_cal, today_extra_pro, today_food_items, today_date FROM health_profile WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            status_msg = f"🔍 目前系統記憶狀況：\n📅 日期：{row[3]}\n🔥 累計熱量：{row[0]} kcal\n🥩 累計蛋白：{row[1]} g\n🍱 品項清單：{row[2] if row[2] else '空'}"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=status_msg))
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 系統裡還沒有您的檔案喔！請先填寫表單或重置。"))
+        return
     # 🔥 LINE 圖文選單攔截區
     if msg == "填寫體質表單":
         form_link = f"https://docs.google.com/forms/d/e/1FAIpQLSdVY7Zf-E2zSpsOFmItYHI0YtTujX6Ucux4QTQ3gjg5wcomgA/viewform?usp=pp_url&entry.1461831832={uid}"
