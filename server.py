@@ -488,7 +488,7 @@ async def receive_survey_data(request: Request):
         print(f"⚠️ 問卷處理錯誤: {e}")
         return {"status": "error"}
 # ==========================================
-# 5. AI 對話引擎 (🔥 升級版：熱量與蛋白質雙軌追蹤 + 食物記憶)
+# 5. AI 對話引擎 (🔥 終極防偷懶 + 食物記憶版)
 # ==========================================
 def get_ai_response_with_memory(user_id, user_msg):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -498,7 +498,7 @@ def get_ai_response_with_memory(user_id, user_msg):
     hp = c.fetchone()
     
     today_str = tw_today().isoformat()
-    # 🔥 抓取今日外食紀錄 (多抓 today_food_items)
+    # 抓取今日外食紀錄 (多抓 today_food_items)
     c.execute("SELECT today_extra_cal, today_date, sheet_name, name, today_extra_pro, today_food_items FROM health_profile WHERE user_id=?", (user_id,))
     daily_rec = c.fetchone()
     
@@ -519,17 +519,15 @@ def get_ai_response_with_memory(user_id, user_msg):
     history = user_memory.get(user_id, [])[-6:]
     ingredients_memo = "\n".join([f"- {d['name']}: {d.get('ingredients', '新鮮食材')}" for d in MAIN_DISHES])
     
-    # 🔥 把食物清單轉換成顯示文字
     food_items_text = food_items if food_items else "無"
     
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     today_str_zh = weekdays[tw_today().weekday()]
     
-    # 🔥 在算式中動態帶入稍早吃過的食物 (food_items_text)
     if today_str_zh in active_days:
         today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】。"
         calc_formula = f"""
-        2. 依照以下格式列出計算過程：
+        2. 依照以下格式列出計算過程（務必在算式中寫出這次紀錄的「食物品項名稱」）：
            【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (熱量數字) = OOO 大卡
            【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (蛋白數字) = OOO 克
         3. 告訴他：「今天扣除一日樂食餐點與稍早外食，再加上這次的[品項名稱]後，您還剩下 OOO 卡...」
@@ -549,7 +547,7 @@ def get_ai_response_with_memory(user_id, user_msg):
     【🔥 飲食紀錄與計算絕對規則（最高優先級） 🔥】
     1. 顧客「今日已累積外食」為：熱量 {extra_cal} kcal、蛋白 {extra_pro} g。(包含: {food_items_text})
     2. 你「絕對不可以」忽略掉這筆累積數字。
-    3. ⚠️ 當顧客回報任何食物時（不管在不在本店菜單上），你都「必須」給出一個【具體的單一估算數字】（絕對不可給範圍，例如 600-800，必須直接取 700），並且「強制」以下列格式完整呈現計算過程，絕不准跳過或找藉口：
+    3. ⚠️ 當顧客回報任何食物時（不管在不在本店菜單上），你都「必須」給出一個【具體的單一估算數字】（絕對不可給範圍，例如 600-800，必須直接取 700），並且「強制」依照下列格式完整呈現計算過程，絕不准跳過或找藉口：
        ---
        估算品項：(品項名稱)
        【真正熱量餘額】 = (原本剩餘) - {extra_cal} (稍早累積: {food_items_text}) - (本次食物熱量) = 最終大卡
@@ -567,28 +565,6 @@ def get_ai_response_with_memory(user_id, user_msg):
     只要顧客「確定答應」要更換未來的餐點，請在你整段回覆的最底部，直接加上 [CHANGE_MEAL: 將OOO替換為XXX]。
     ⚠️ 絕對不要輸出「隱藏標籤」這四個字，直接輸出中括號即可！
     """
-    {report}
-    
-    【🔥 飲食紀錄與計算規則 🔥】
-    1. 顧客「今日已累積外食」為：熱量 {extra_cal} kcal、蛋白 {extra_pro} g。(包含: {food_items_text})
-    2. 你「絕對不可以」忽略掉這筆累積數字。
-    3. 當顧客回報食物時，你必須精確估算該食物的熱量與蛋白，並以下列格式呈現計算過程：
-       ---
-       估算品項：(品項名稱)
-       【真正熱量餘額】 = (原本剩餘) - {extra_cal} (稍早累積: {food_items_text}) - (本次食物熱量) = 最終大卡
-       【真正蛋白需求】 = (原本蛋白需補) - {extra_pro} (稍早累積: {food_items_text}) - (本次食物蛋白) = 最終克數
-       ---
-    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 本次熱量, 本次蛋白質, 本次品項名稱]。
-       💡 只能填純數字與品項名稱，不要填總和！(例如：[LOG_NUTRITION: 300, 15, 滷肉飯])
-    
-    【本店餐點內容物 - 機密小抄】(僅供內部參考)：
-    {ingredients_memo}
-    {today_status}
-    
-    【🚨 換餐最高指令 🚨】
-    只要顧客「確定答應」要更換未來的餐點，請在你整段回覆的最底部，直接加上 [CHANGE_MEAL: 將OOO替換為XXX]。
-    ⚠️ 絕對不要輸出「隱藏標籤」這四個字，直接輸出中括號即可！
-    """
     
     try:
         messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
@@ -597,17 +573,15 @@ def get_ai_response_with_memory(user_id, user_msg):
     except Exception as e:
         return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}"
         
-    # 🔥 處理紀錄 (升級版：擷取熱量、蛋白質，外加「食物名稱」)
     match = re.search(r'\[LOG_NUTRITION:\s*(\d+).*?,\s*(\d+).*?,\s*(.+?)\]', ans)
     
     if match:
         logged_cal = int(match.group(1))
         logged_pro = int(match.group(2))
-        logged_name = match.group(3).strip() # 抓出食物名稱 (例如: 滷肉飯)
+        logged_name = match.group(3).strip()
         
         new_extra_cal = extra_cal + logged_cal
         new_extra_pro = extra_pro + logged_pro
-        # 把新食物接在舊食物後面 (例如: "珍奶、滷肉飯")
         new_food_items = f"{food_items}、{logged_name}".strip("、") if food_items else logged_name
         
         c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=? WHERE user_id=?", (new_extra_cal, new_extra_pro, new_food_items, user_id))
