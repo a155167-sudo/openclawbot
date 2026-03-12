@@ -521,49 +521,54 @@ def get_ai_response_with_memory(user_id, user_msg):
     
     food_items_text = food_items if food_items else "無"
     
+    # 🔥 智能雷達：判斷今天是星期幾，以及客人今天有沒有排餐？
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     today_str_zh = weekdays[tw_today().weekday()]
     
     if today_str_zh in active_days:
-        today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】。"
-        calc_formula = f"""
-        2. 依照以下格式列出計算過程（務必在算式中寫出這次紀錄的「食物品項名稱」）：
-           【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (熱量數字) = OOO 大卡
-           【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (蛋白數字) = OOO 克
-        3. 告訴他：「今天扣除一日樂食餐點與稍早外食，再加上這次的[品項名稱]後，您還剩下 OOO 卡...」
-        """
+        today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】(已有本店排餐)。"
+        base_cal_text = "【報告上的『當日熱量剩餘』】"
+        base_pro_text = "【報告上的『蛋白質需補』】"
     else:
-        today_status = f"❌ 今天 ({today_str_zh}) 是顧客的【無排餐日】！他擁有完整的 TDEE 額度 ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g)。"
-        calc_formula = f"""
-        2. 因為今天沒有排餐，請直接用他完整的 TDEE ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g) 來計算！依照以下格式列出計算過程：
-           【真正熱量餘額】 = {tdee_val} - {extra_cal} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (熱量數字) = OOO 大卡
-           【真正蛋白需求】 = {int(protein_val)} - {extra_pro} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (蛋白數字) = OOO 克
-        3. 告訴他：「今天雖然沒有本店餐點，但扣除稍早外食與這次的[品項名稱]後，您的總 TDEE 還剩下 OOO 大卡...」
-        """
+        today_status = f"❌ 今天 ({today_str_zh}) 是顧客的【無排餐日】(擁有今日完整額度)。"
+        base_cal_text = str(int(tdee_val))
+        base_pro_text = str(int(protein_val))
 
-    system_prompt = f"""你是「一日樂食」的專屬 AI 營養師。你是一位充滿熱情、幽默、且專業的健康顧問！
+    system_prompt = f"""你是「一日樂食」的專屬 AI 營養師。你充滿熱情、幽默，且語氣像真人一樣溫暖！千萬不要像個冷冰冰的機器人！
     {report}
     
-    【🔥 飲食紀錄與計算絕對規則（最高優先級） 🔥】
-    1. 顧客「今日已累積外食」為：熱量 {extra_cal} kcal、蛋白 {extra_pro} g。(包含: {food_items_text})
-    2. 你「絕對不可以」忽略掉這筆累積數字。
-    3. ⚠️ 當顧客回報任何食物時（不管在不在本店菜單上），你都「必須」給出一個【具體的單一估算數字】（絕對不可給範圍，例如 600-800，必須直接取 700），並且「強制」依照下列格式完整呈現計算過程，絕不准跳過或找藉口：
+    【🔥 目前系統記憶狀態 🔥】
+    - 今天狀態：{today_status}
+    - 初始可用熱量：{base_cal_text}
+    - 初始可用蛋白：{base_pro_text}
+    - 稍早已經吃掉的外食總熱量：{extra_cal} 大卡 (今日已吃清單: {food_items_text})
+    - 稍早已經吃掉的外食總蛋白：{extra_pro} 克
+    
+    【💬 對話與計算步驟（請嚴格遵守四步驟）】
+    👉 第一步（熱情回應）：先用溫暖、像朋友般的語氣回覆客人的分享，聊聊他吃的食物！(約2-3句話)
+    👉 第二步（精確估算）：不管食物在不在本店菜單上，一定要給出一個具體的熱量和蛋白質數字（絕不可給範圍，如600-800必須取700）。
+    👉 第三步（列出算式）：使用以下格式列出算式：
        ---
-       估算品項：(品項名稱)
-       【真正熱量餘額】 = (原本剩餘) - {extra_cal} (稍早累積: {food_items_text}) - (本次食物熱量) = 最終大卡
-       【真正蛋白需求】 = (原本蛋白需補) - {extra_pro} (稍早累積: {food_items_text}) - (本次食物蛋白) = 最終克數
+       📝 估算品項：[本次食物名稱] (本次熱量 OOO 大卡 / 本次蛋白 OO 克)
+       🔥 【今日熱量結算】 = {base_cal_text} (初始額度) - {extra_cal} (稍早累積) - OOO (本次吃掉) = 最終剩餘大卡
+       🥩 【今日蛋白結算】 = {base_pro_text} (初始額度) - {extra_pro} (稍早累積) - OO (本次吃掉) = 最終剩餘克
        ---
-    4. ⚠️【最高隱藏指令】：回覆的最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 本次熱量, 本次蛋白質, 本次品項名稱]。
-       💡 只能填「純數字」與「品項名稱」，絕對不要加單位或範圍！(正確範例：[LOG_NUTRITION: 700, 20, 咖哩飯])
+    👉 第四步（暖心鼓勵）：根據算出來的最終剩餘數字，給予客人後續的飲食建議或鼓勵。
+    
+    【🚨 最高隱藏指令（系統記錄用）🚨】
+    在你整段回覆的最尾端，必須加上隱藏標籤供系統抓取：
+    [LOG_NUTRITION: 本次食物熱量, 本次食物蛋白, 本次食物名稱]
+    
+    ⚠️ 致命警告：
+    1. 標籤裡面填的是「這一次食物本身的數字」，絕對不可以填「算完後剩餘的數字」！
+    2. 絕對不要加單位！
+    (正確範例：[LOG_NUTRITION: 700, 20, 咖哩飯])
     
     【本店餐點內容物 - 機密小抄】(僅供內部參考)：
     {ingredients_memo}
     
-    {today_status}
-    
-    【🚨 換餐最高指令 🚨】
-    只要顧客「確定答應」要更換未來的餐點，請在你整段回覆的最底部，直接加上 [CHANGE_MEAL: 將OOO替換為XXX]。
-    ⚠️ 絕對不要輸出「隱藏標籤」這四個字，直接輸出中括號即可！
+    【🚨 換餐指令】
+    只要顧客確定要換餐，請在最底部加上 [CHANGE_MEAL: 將OOO替換為XXX]。
     """
     
     try:
