@@ -119,7 +119,7 @@ def load_menu():
                     pro = float(row_clean.get("蛋白質(g)", "0").strip() or 0.0)
                     price = int(row_clean.get("價錢", row_clean.get("價格", "150")).strip() or 150)
                     ingredients = row_clean.get("內容物", "新鮮食材製作").strip()
-                    main_keywords = ["便當", "麵", "食蔬", "低碳", "沙拉"]
+                    main_keywords = ["便當", "麵", "食蔬", "低碳", "沙拉", "原型"]
                     if any(kw in name for kw in main_keywords):
                         category = "main"  
                     else:
@@ -562,7 +562,7 @@ def get_ai_response_with_memory(user_id, user_msg):
         logged_pro = int(match.group(2))
         new_extra_cal = extra_cal + logged_cal
         new_extra_pro = extra_pro + logged_pro
-        c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=? WHERE user_id=?", (new_extra_cal, new_extra_pro, user_id))
+        c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_date=? WHERE user_id=?", (new_extra_cal, new_extra_pro, today_str, user_id))
         conn.commit()
         ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans).strip()  # 修復重點3：清除整段標籤
         
