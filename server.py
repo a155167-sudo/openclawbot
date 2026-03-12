@@ -162,7 +162,7 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS reward_links (link TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
         c.execute('''CREATE TABLE IF NOT EXISTS survey_records (user_id TEXT PRIMARY KEY, claim_date TEXT)''')
 
-        for col, dtype in [("today_extra_cal", "INTEGER DEFAULT 0"), ("today_date", "TEXT DEFAULT ''"), ("sheet_name", "TEXT DEFAULT ''"), ("today_extra_pro", "INTEGER DEFAULT 0")]:
+        for col, dtype in [("today_extra_cal", "INTEGER DEFAULT 0"), ("today_date", "TEXT DEFAULT ''"), ("sheet_name", "TEXT DEFAULT ''"), ("today_extra_pro", "INTEGER DEFAULT 0"), ("today_food_items", "TEXT DEFAULT ''")]:
             try: 
                 c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
             except sqlite3.OperationalError: 
@@ -488,28 +488,29 @@ async def receive_survey_data(request: Request):
         print(f"⚠️ 問卷處理錯誤: {e}")
         return {"status": "error"}
 # ==========================================
-# 5. AI 對話引擎 (🔥 升級版：熱量與蛋白質雙軌追蹤)
+# 5. AI 對話引擎 (🔥 升級版：熱量與蛋白質雙軌追蹤 + 食物記憶)
 # ==========================================
 def get_ai_response_with_memory(user_id, user_msg):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     
-    # 🔥 抓取客人資料 (保留 active_days，並多抓 protein)
+    # 抓取客人資料
     c.execute("SELECT summary_text, tdee, active_days, protein FROM health_profile WHERE user_id=?", (user_id,))
     hp = c.fetchone()
     
     today_str = tw_today().isoformat()
-    # 🔥 抓取今日外食紀錄 (多抓 today_extra_pro)
-    c.execute("SELECT today_extra_cal, today_date, sheet_name, name, today_extra_pro FROM health_profile WHERE user_id=?", (user_id,))
+    # 🔥 抓取今日外食紀錄 (多抓 today_food_items)
+    c.execute("SELECT today_extra_cal, today_date, sheet_name, name, today_extra_pro, today_food_items FROM health_profile WHERE user_id=?", (user_id,))
     daily_rec = c.fetchone()
     
-    # 判斷是不是新的一天，如果是就歸零
+    # 判斷是不是新的一天，如果是就歸零 (包含食物清單)
     if daily_rec and daily_rec[1] != today_str:
-        c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0, today_date=? WHERE user_id=?", (today_str, user_id))
-        conn.commit()  # 修復重點1：確保換日歸零有被成功存檔！
-        extra_cal, extra_pro = 0, 0
+        c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0, today_food_items='', today_date=? WHERE user_id=?", (today_str, user_id))
+        conn.commit() 
+        extra_cal, extra_pro, food_items = 0, 0, ""
     else:
         extra_cal = daily_rec[0] if daily_rec else 0
         extra_pro = daily_rec[4] if (daily_rec and len(daily_rec) > 4 and daily_rec[4] is not None) else 0
+        food_items = daily_rec[5] if (daily_rec and len(daily_rec) > 5 and daily_rec[5] is not None) else ""
 
     report = f"\n【絕對參考報告內容】:\n{hp[0]}" if hp else "\n檔案未填，請引導客人填表。"
     tdee_val = hp[1] if hp else 2000
@@ -518,26 +519,27 @@ def get_ai_response_with_memory(user_id, user_msg):
     history = user_memory.get(user_id, [])[-6:]
     ingredients_memo = "\n".join([f"- {d['name']}: {d.get('ingredients', '新鮮食材')}" for d in MAIN_DISHES])
     
-    # 🔥 智能雷達：判斷今天是星期幾，以及客人今天有沒有排餐？
+    # 🔥 把食物清單轉換成顯示文字
+    food_items_text = food_items if food_items else "無"
+    
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     today_str_zh = weekdays[tw_today().weekday()]
     
+    # 🔥 在算式中動態帶入稍早吃過的食物 (food_items_text)
     if today_str_zh in active_days:
         today_status = f"✅ 今天 ({today_str_zh}) 是顧客的【取餐日】。"
         calc_formula = f"""
-        2. 依照以下格式列出計算過程（務必在算式中寫出這次紀錄的「食物品項名稱」）：
-           【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} (稍早累積) - 本次紀錄: [品項名稱] (熱量數字) = OOO 大卡
-           【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} (稍早累積) - 本次紀錄: [品項名稱] (蛋白數字) = OOO 克
-           (💡 範例：【真正熱量餘額】 = 1333 - 0 (稍早) - 西瓜 (30大卡) = 1303 大卡)
+        2. 依照以下格式列出計算過程：
+           【真正熱量餘額】 = 【當日熱量剩餘】 - {extra_cal} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (熱量數字) = OOO 大卡
+           【真正蛋白需求】 = 【蛋白質需補】 - {extra_pro} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (蛋白數字) = OOO 克
         3. 告訴他：「今天扣除一日樂食餐點與稍早外食，再加上這次的[品項名稱]後，您還剩下 OOO 卡...」
         """
     else:
         today_status = f"❌ 今天 ({today_str_zh}) 是顧客的【無排餐日】！他擁有完整的 TDEE 額度 ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g)。"
         calc_formula = f"""
         2. 因為今天沒有排餐，請直接用他完整的 TDEE ({tdee_val} kcal) 與蛋白質目標 ({int(protein_val)} g) 來計算！依照以下格式列出計算過程：
-           【真正熱量餘額】 = {tdee_val} - {extra_cal} (稍早累積) - 本次紀錄: [品項名稱] (熱量數字) = OOO 大卡
-           【真正蛋白需求】 = {int(protein_val)} - {extra_pro} (稍早累積) - 本次紀錄: [品項名稱] (蛋白數字) = OOO 克
-           (💡 範例：【真正熱量餘額】 = 2000 - 150 (稍早) - 西瓜 (30大卡) = 1820 大卡)
+           【真正熱量餘額】 = {tdee_val} - {extra_cal} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (熱量數字) = OOO 大卡
+           【真正蛋白需求】 = {int(protein_val)} - {extra_pro} (稍早累積: {food_items_text}) - 本次紀錄: [品項名稱] (蛋白數字) = OOO 克
         3. 告訴他：「今天雖然沒有本店餐點，但扣除稍早外食與這次的[品項名稱]後，您的總 TDEE 還剩下 OOO 大卡...」
         """
 
@@ -545,70 +547,57 @@ def get_ai_response_with_memory(user_id, user_msg):
     {report}
     
     【🔥 飲食紀錄與計算規則 🔥】
-    1. 顧客「今日已累積外食」為：熱量 {extra_cal} kcal、蛋白 {extra_pro} g。
+    1. 顧客「今日已累積外食」為：熱量 {extra_cal} kcal、蛋白 {extra_pro} g。(包含: {food_items_text})
     2. 你「絕對不可以」忽略掉這筆累積數字。
     3. 當顧客回報食物時，你必須精確估算該食物的熱量與蛋白，並以下列格式呈現計算過程：
        ---
        估算品項：(品項名稱)
-       【真正熱量餘額】 = (原本剩餘) - {extra_cal} (稍早累積) - (本次食物熱量) = 最終大卡
-       【真正蛋白需求】 = (原本蛋白需補) - {extra_pro} (稍早累積) - (本次食物蛋白) = 最終克數
+       【真正熱量餘額】 = (原本剩餘) - {extra_cal} (稍早累積: {food_items_text}) - (本次食物熱量) = 最終大卡
+       【真正蛋白需求】 = (原本蛋白需補) - {extra_pro} (稍早累積: {food_items_text}) - (本次食物蛋白) = 最終克數
        ---
-    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 本次熱量數字, 本次蛋白質數字]。
-       💡 只能填純數字，絕對不要加單位！(例如：[LOG_NUTRITION: 300, 15])
+    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 本次熱量, 本次蛋白質, 本次品項名稱]。
+       💡 只能填純數字與品項名稱，不要填總和！(例如：[LOG_NUTRITION: 300, 15, 滷肉飯])
     
     【本店餐點內容物 - 機密小抄】(僅供內部參考)：
     {ingredients_memo}
-    
-    【🔥 外食計算嚴格規則 🔥】
-    👉 系統目前的「今日已累積外食」紀錄為：熱量 {extra_cal} 大卡、蛋白質 {extra_pro} 克。
-    (系統已自動記憶稍早的對話，請「不要」重複計算顧客過去吃過的食物！只需針對「這次最新回報」的食物估算！)
     {today_status}
-    
-    當顧客回報他剛吃了什麼時，請嚴格按照以下步驟回覆：
-    1. 估算他「這次新吃」的外食「熱量」與「蛋白質」。
-    {calc_formula}
-    4. ⚠️【最高指令】：回覆最尾端，一定要加上隱藏標籤 [LOG_NUTRITION: 本次熱量, 本次蛋白質]。
-    💡 注意：只能填「這次新吃」的數值！只能填純數字，絕對不要加單位，也不要填入總和！
-    (正確範例：[LOG_NUTRITION: 450, 20])
     
     【🚨 換餐最高指令 🚨】
     只要顧客「確定答應」要更換未來的餐點，請在你整段回覆的最底部，直接加上 [CHANGE_MEAL: 將OOO替換為XXX]。
     ⚠️ 絕對不要輸出「隱藏標籤」這四個字，直接輸出中括號即可！
     """
     
-    # 呼叫大腦
     try:
         messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
         res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2000, temperature=0.3)
         ans = res.choices[0].message.content
     except Exception as e:
-        # ✅ 保留您原本的貼心報錯提示
-        return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}\n\n👉 老闆，這通常是因為 Railway 後台的 Variables 沒有設定好 OPENAI_API_KEY，或是設定完沒有重新 Deploy (部署) 喔！"
+        return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}"
         
-    # 🔥 處理紀錄 (升級為：無敵防彈版，強迫抓取數字)
-    # 不管 AI 中間塞了空白、文字還是符號，只要抓到兩個連續的數字群就成立！
-    match = re.search(r'\[LOG_NUTRITION:\s*(\d+).*?,\s*(\d+).*?\]', ans)
+    # 🔥 處理紀錄 (升級版：擷取熱量、蛋白質，外加「食物名稱」)
+    match = re.search(r'\[LOG_NUTRITION:\s*(\d+).*?,\s*(\d+).*?,\s*(.+?)\]', ans)
     
     if match:
         logged_cal = int(match.group(1))
         logged_pro = int(match.group(2))
+        logged_name = match.group(3).strip() # 抓出食物名稱 (例如: 滷肉飯)
+        
         new_extra_cal = extra_cal + logged_cal
         new_extra_pro = extra_pro + logged_pro
-        c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=? WHERE user_id=?", (new_extra_cal, new_extra_pro, user_id))
+        # 把新食物接在舊食物後面 (例如: "珍奶、滷肉飯")
+        new_food_items = f"{food_items}、{logged_name}".strip("、") if food_items else logged_name
+        
+        c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=? WHERE user_id=?", (new_extra_cal, new_extra_pro, new_food_items, user_id))
         conn.commit()
-        # 清除整段標籤，確保客人看不到系統指令
-        ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans).strip()  
-       
-        # 修復重點3：清除整段標籤# 
-        #✅ 保留寫入 Google Sheet，並加上蛋白質數據！
+        ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans).strip()
+        
         if daily_rec and daily_rec[2] and gc:
             try:
                 sheet = gc.open_by_url(SHEET_URL)
                 now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
-                sheet.worksheet(daily_rec[2]).append_row([now_str, "外食熱量與蛋白打卡", user_msg, f"+{logged_cal} kcal / +{logged_pro} g"])
+                sheet.worksheet(daily_rec[2]).append_row([now_str, "外食熱量與蛋白打卡", user_msg, f"+{logged_cal} kcal / +{logged_pro} g ({logged_name})"])
             except Exception: pass
 
-    # ✅ 處理換餐通知 (發送給老闆) (完整保留)
     match_change = re.search(r'\[CHANGE_MEAL:\s*(.+?)\]', ans)
     if match_change:
         change_req = match_change.group(1)
@@ -624,7 +613,6 @@ def get_ai_response_with_memory(user_id, user_msg):
             except Exception: pass
 
     conn.close()
-    # 更新記憶
     user_memory[user_id] = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": ans}]
     return ans
 
