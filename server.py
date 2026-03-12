@@ -582,7 +582,7 @@ def get_ai_response_with_memory(user_id, user_msg):
         ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans).strip()  
        
         # 修復重點3：清除整段標籤# 
-        ✅ 保留寫入 Google Sheet，並加上蛋白質數據！
+        #✅ 保留寫入 Google Sheet，並加上蛋白質數據！
         if daily_rec and daily_rec[2] and gc:
             try:
                 sheet = gc.open_by_url(SHEET_URL)
