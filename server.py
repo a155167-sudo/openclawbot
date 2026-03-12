@@ -370,13 +370,19 @@ async def receive_form_data(request: Request):
 
         # 5. 生成預覽文字與試算表資料
         schedule_text = ""
-        schedule_sheet_rows = [["週期與星期", "午餐安排", "晚餐安排", "熱量剩餘 / 蛋白質需補"]]
+        # 👉【修改】表頭多加一個「單日金額」
+        schedule_sheet_rows = [["週期與星期", "午餐安排", "晚餐安排", "熱量剩餘 / 蛋白質需補", "單日金額"]]
         
         for w_num, d_num, w_label, day_name, lunch, dinner in plan_requests:
             day_tdee_left = int(tdee) - lunch['cal'] - dinner['cal']
             day_p_need = int(protein) - lunch['pro'] - dinner['pro']
-            schedule_text += f"\n【{w_label}-{day_name}】\n☀️午：{lunch['name']} ({lunch['cal']}kcal)\n🌙晚：{dinner['name']} ({dinner['cal']}kcal)\n👉 當日熱量剩餘: {day_tdee_left}kcal\n"
-            schedule_sheet_rows.append([f"{w_label}-{day_name}", lunch['name'], dinner['name'], f"剩 {day_tdee_left}kcal / 補 {day_p_need}g"])
+            daily_price = lunch['price'] + dinner['price'] # 👉【新增】計算單日金額
+            
+            # 👉【修改】文字中補上價格 ($) 與 蛋白質需補 (g)，這樣 AI 才看得到蛋白質！
+            schedule_text += f"\n【{w_label}-{day_name}】\n☀️午：{lunch['name']} ({lunch['cal']}kcal / ${lunch['price']})\n🌙晚：{dinner['name']} ({dinner['cal']}kcal / ${dinner['price']})\n👉 當日熱量剩餘: {day_tdee_left}kcal\n👉 蛋白質需補: {day_p_need}g\n"
+            
+            # 👉【修改】試算表行數也補上金額
+            schedule_sheet_rows.append([f"{w_label}-{day_name}", f"{lunch['name']} (${lunch['price']})", f"{dinner['name']} (${dinner['price']})", f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}"])
 
         # 更新資料庫紀錄 (保留續約歷史)
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
@@ -403,7 +409,8 @@ async def receive_form_data(request: Request):
                         user_sheet = sheet.worksheet(safe_name)
                         user_sheet.clear()
                         
-                    profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}"], [""]]
+                    # 👉【修改】在個人分頁的第一行，最後面加入「💰 排餐總額」
+                    profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}", f"💰 排餐總額: ${total_price}"], [""]]
                     menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
                     tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
                     
@@ -416,7 +423,8 @@ async def receive_form_data(request: Request):
                 print(f"⚠️ 寫入 Google 試算表失敗: {e}")
 
         # 最後推播訊息給客人
-        push_msg = f"🎉 {name} 填表成功！\nAI 營養師已為您精算：\n🔥 TDEE: {int(tdee)} kcal\n🥩 蛋白質: {int(protein)} g\n\n現在請點擊選單的『查看菜單』，我將為您列出每一天的詳細餐點與價格！"
+        # 👉【修改】回覆客人的訊息中，補上本次排餐總額！
+        push_msg = f"🎉 {name} 填表成功！\nAI 營養師已為您精算：\n🔥 TDEE: {int(tdee)} kcal\n🥩 蛋白質: {int(protein)} g\n💰 本次排餐總額: ${total_price}\n\n現在請點擊選單的『查看菜單』，我將為您列出每一天的詳細餐點與價格！"
         line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
         return {"status": "success"}
 
