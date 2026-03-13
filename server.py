@@ -774,28 +774,26 @@ def handle_message(event):
     if len(processed_messages) > 1000: processed_messages.clear()
 
     msg, uid = event.message.text.strip(), event.source.user_id
-    @handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    msg_id = event.message.id
-    if msg_id in processed_messages: return 
-    processed_messages.add(msg_id)
-    if len(processed_messages) > 1000: processed_messages.clear()
-
-    msg, uid = event.message.text.strip(), event.source.user_id
 
     # 🔥 檢查是否處於「客服靜音期」
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT ai_silenced_until FROM health_profile WHERE user_id=?", (uid,))
-    row = c.fetchone()
-    if row and row[0]:
-        silenced_until = row[0]
-        if tw_now().isoformat() < silenced_until:
-            conn.close()
-            return # 還在靜音期，直接略過不理他，讓老闆回覆
-        else:
-            c.execute("UPDATE health_profile SET ai_silenced_until='' WHERE user_id=?", (uid,))
-            conn.commit()
-    conn.close()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT ai_silenced_until FROM health_profile WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        if row and row[0]:
+            silenced_until = row[0]
+            if tw_now().isoformat() < silenced_until:
+                conn.close()
+                return # 還在靜音期，直接略過不理他，讓老闆回覆
+            else:
+                c.execute("UPDATE health_profile SET ai_silenced_until='' WHERE user_id=?", (uid,))
+                conn.commit()
+    except sqlite3.OperationalError:
+        pass # 容錯處理：如果資料庫剛建好還沒更新欄位，直接跳過
+    finally:
+        conn.close()
+
     # 👇 第一步加在這裡！老闆專屬的記憶檢查按鈕 👇
     if msg == "#查狀態":
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
