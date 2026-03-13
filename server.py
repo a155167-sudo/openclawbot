@@ -162,7 +162,13 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS reward_links (link TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
         c.execute('''CREATE TABLE IF NOT EXISTS survey_records (user_id TEXT PRIMARY KEY, claim_date TEXT)''')
 
-        for col, dtype in [("today_extra_cal", "INTEGER DEFAULT 0"), ("today_date", "TEXT DEFAULT ''"), ("sheet_name", "TEXT DEFAULT ''"), ("today_extra_pro", "INTEGER DEFAULT 0"), ("today_food_items", "TEXT DEFAULT ''")]:
+        for col, dtype in [("today_extra_cal", "INTEGER DEFAULT 0"), 
+                           ("today_date", "TEXT DEFAULT ''"), 
+                           ("sheet_name", "TEXT DEFAULT ''"), 
+                           ("today_extra_pro", "INTEGER DEFAULT 0"), 
+                           ("today_food_items", "TEXT DEFAULT ''"),
+                           ("is_coaching_enabled", "INTEGER DEFAULT 1"), # 🔥 教練權限
+                           ("ai_silenced_until", "TEXT DEFAULT ''")]:    # 🔥 客服靜音倒數
             try: 
                 c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
             except sqlite3.OperationalError: 
@@ -368,59 +374,83 @@ async def receive_form_data(request: Request):
         # 排序確保顯示順序正確
         plan_requests.sort(key=lambda x: (x[0], x[1]))
 
-        # 5. 生成預覽文字與試算表資料
+        # ==========================================
+        # 5. 生成預覽文字與試算表資料 (🔥 升級版：自動推算日期與雙重表單)
+        # ==========================================
         schedule_text = ""
-        # 👉【修改】表頭多加一個「單日金額」
-        schedule_sheet_rows = [["週期與星期", "午餐安排", "晚餐安排", "熱量剩餘 / 蛋白質需補", "單日金額"]]
+        schedule_sheet_rows = [["實際日期", "週期與星期", "午餐安排", "晚餐安排", "熱量剩餘 / 蛋白質需補", "單日金額", "明日預定課表"]]
+        master_api_rows = []
         
+        # 💡 自動推算起始日 (設定為填表後的「下個週一」開始供餐)
+        today = tw_today()
+        days_ahead = 0 - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        start_date = today + datetime.timedelta(days=days_ahead)
+
         for w_num, d_num, w_label, day_name, lunch, dinner in plan_requests:
             day_tdee_left = int(tdee) - lunch['cal'] - dinner['cal']
             day_p_need = int(protein) - lunch['pro'] - dinner['pro']
-            daily_price = lunch['price'] + dinner['price'] # 👉【新增】計算單日金額
+            daily_price = lunch['price'] + dinner['price']
             
-            # 👉【修改】文字中補上價格 ($) 與 蛋白質需補 (g)，這樣 AI 才看得到蛋白質！
+            # 🎯 算出這餐的實際日期
+            target_date = start_date + datetime.timedelta(days=(w_num-1)*7 + (d_num-1))
+            actual_date_str = target_date.strftime("%Y/%m/%d")
+
             schedule_text += f"\n【{w_label}-{day_name}】\n☀️午：{lunch['name']} ({lunch['cal']}kcal / ${lunch['price']})\n🌙晚：{dinner['name']} ({dinner['cal']}kcal / ${dinner['price']})\n👉 當日熱量剩餘: {day_tdee_left}kcal\n👉 蛋白質需補: {day_p_need}g\n"
             
-            # 👉【修改】試算表行數也補上金額
-            schedule_sheet_rows.append([f"{w_label}-{day_name}", f"{lunch['name']} (${lunch['price']})", f"{dinner['name']} (${dinner['price']})", f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}"])
+            lunch_str = f"{lunch['name']} (${lunch['price']})"
+            dinner_str = f"{dinner['name']} (${dinner['price']})"
+            schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
 
-        # 更新資料庫紀錄 (保留續約歷史)
+            # 🤖 寫給機器人看的總表 (1 代表有教練權限)
+            master_api_rows.append([actual_date_str, user_id, int(tdee), lunch['name'], dinner['name'], "", 1])
+
+        # 更新 SQLite
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO health_profile (user_id, name, tdee, protein, goal, restrictions, summary_text, active_days, today_extra_cal, today_date, sheet_name) VALUES (?,?,?,?,?,?,?,?,0,'',?)", (user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(active_days_list), safe_name))
+        c.execute("INSERT OR REPLACE INTO health_profile (user_id, name, tdee, protein, goal, restrictions, summary_text, active_days, today_extra_cal, today_date, sheet_name, is_coaching_enabled, ai_silenced_until) VALUES (?,?,?,?,?,?,?,?,0,'',?, 1, '')", (user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(active_days_list), safe_name))
         conn.commit(); conn.close()
 
-        # 6. 寫入 Google 試算表 (包含個人分頁功能)
+        # ==========================================
+        # 6. 寫入 Google 試算表 (包含個人分頁與機器人總表)
+        # ==========================================
         if gc:
             try:
                 sheet = gc.open_by_url(SHEET_URL)
-                # 寫入總表
+                
+                # (1) 寫入歷史總表
                 main_sheet = sheet.sheet1
                 now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
-                row_data = [now_str, name, goal, int(tdee), int(protein), restrictions, total_price, ",".join(active_days_list), schedule_text]
-                main_sheet.append_row(row_data)
+                main_sheet.append_row([now_str, name, goal, int(tdee), int(protein), restrictions, total_price, ",".join(active_days_list), schedule_text])
                 
-                # 🔥 為客戶建立或更新專屬分頁 (保留原本功能)
+                # (2) 為客戶建立專屬分頁
                 try:
-                    try:
-                        user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="8")
+                    try: user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="8")
                     except:
                         user_sheet = sheet.worksheet(safe_name)
                         user_sheet.clear()
                         
-                    # 👉【修改】在個人分頁的第一行，最後面加入「💰 排餐總額」
                     profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}", f"💰 排餐總額: ${total_price}"], [""]]
                     menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
                     tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
                     
                     user_sheet.append_rows(profile_data + menu_title + schedule_sheet_rows + tracking_headers)
-                    print(f"✅ 成功為 {name} 建立含菜單的專屬分頁：{safe_name}")
-                except Exception as e:
-                    print(f"⚠️ 建立專屬分頁失敗: {e}")
+                except Exception: pass
+
+                # 🔥 (3) 同步將資料塞進 Master_API_View
+                try:
+                    try: api_sheet = sheet.worksheet("Master_API_View")
+                    except gspread.exceptions.WorksheetNotFound:
+                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="7")
+                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled"])
                     
-            except Exception as e:
-                print(f"⚠️ 寫入 Google 試算表失敗: {e}")
+                    api_sheet.append_rows(master_api_rows)
+                    print(f"✅ 成功將資料寫入 Master_API_View！")
+                except Exception as e: print(f"⚠️ 寫入 Master_API_View 失敗: {e}")
+                    
+            except Exception: pass
 
         # 最後推播訊息給客人
         # 👉【修改】回覆客人的訊息中，補上本次排餐總額！
@@ -627,9 +657,33 @@ def get_ai_response_with_memory(user_id, user_msg):
             try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=boss_msg))
             except Exception: pass
 
+
+# 🔥 偵測呼叫老闆訊號 [CALL_BOSS]
+    match_call_boss = re.search(r'\[CALL_BOSS\]', ans)
+    if match_call_boss:
+        ans = ans.replace('[CALL_BOSS]', '').strip()
+        ans += "\n\n(系統提示：已為您暫停 AI 助理，並通知真人客服，請稍候我們會盡快回覆您！)"
+        
+        # 設定靜音 24 小時
+        silence_time = (tw_now() + datetime.timedelta(hours=24)).isoformat()
+        c.execute("UPDATE health_profile SET ai_silenced_until=? WHERE user_id=?", (silence_time, user_id))
+        conn.commit()
+
+        # 發送求救訊號給老闆
+        c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+        admin_row = c.fetchone()
+        if admin_row:
+            customer_name = daily_rec[3] if daily_rec else "顧客"
+            boss_msg = f"🚨【客服呼叫】顧客 {customer_name} ({user_id[-4:]}) 需要真人協助！\nAI 已自動暫停 24 小時，請至 LINE 官方帳號處理。"
+            try: 
+                line_bot_api.push_message(admin_row[0], TextSendMessage(text=boss_msg))
+            except Exception: 
+                pass
+
     conn.close()
     user_memory[user_id] = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": ans}]
     return ans
+
 
 # ==========================================
 # 6. 其他輔助函數與 Webhook (🔥 融合版：完整保留測距、VIP功能)
@@ -720,6 +774,28 @@ def handle_message(event):
     if len(processed_messages) > 1000: processed_messages.clear()
 
     msg, uid = event.message.text.strip(), event.source.user_id
+    @handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    msg_id = event.message.id
+    if msg_id in processed_messages: return 
+    processed_messages.add(msg_id)
+    if len(processed_messages) > 1000: processed_messages.clear()
+
+    msg, uid = event.message.text.strip(), event.source.user_id
+
+    # 🔥 檢查是否處於「客服靜音期」
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute("SELECT ai_silenced_until FROM health_profile WHERE user_id=?", (uid,))
+    row = c.fetchone()
+    if row and row[0]:
+        silenced_until = row[0]
+        if tw_now().isoformat() < silenced_until:
+            conn.close()
+            return # 還在靜音期，直接略過不理他，讓老闆回覆
+        else:
+            c.execute("UPDATE health_profile SET ai_silenced_until='' WHERE user_id=?", (uid,))
+            conn.commit()
+    conn.close()
     # 👇 第一步加在這裡！老闆專屬的記憶檢查按鈕 👇
     if msg == "#查狀態":
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -885,6 +961,14 @@ def handle_message(event):
         else: reply_text = "哎呀！地圖系統暫時找不到這個地址，請確認地址是否完整喔！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
+        
+        elif msg.startswith("#喚醒AI "):
+        target_uid = msg.replace("#喚醒AI ", "").strip()
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("UPDATE health_profile SET ai_silenced_until='' WHERE user_id LIKE ?", (f"%{target_uid}%",))
+        conn.commit(); conn.close()
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已為該顧客提早解除 AI 靜音！"))
+        return
 
     # 🟢 顧客一般對話 (串接 AI) 🟢
     allow, q_msg = check_permission_and_quota(uid)
@@ -937,3 +1021,72 @@ def auto_send_tomorrow_reminders_to_boss():
     if admin_row:
         try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】明日提醒推播完畢：\n{result_msg}"))
         except: pass
+# ==========================================
+# 🦞 龍蝦專屬安全通道 (給 OpenClaw 讀取與發送訊息用)
+# ==========================================
+from pydantic import BaseModel
+
+class LobsterPayload(BaseModel):
+    admin_secret: str
+    user_id: str
+    coach_message: str
+
+@app.get("/api/lobster/daily_targets")
+async def get_lobster_targets(admin_secret: str):
+    if admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+        
+    today_str = tw_today().strftime("%Y/%m/%d")
+    targets = []
+    
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    try:
+        c.execute("SELECT user_id, name, today_extra_cal, today_food_items FROM health_profile WHERE is_coaching_enabled = 1")
+        users = c.fetchall()
+    except sqlite3.OperationalError:
+        users = []
+    conn.close()
+
+    if not users: return {"status": "success", "targets": []}
+    user_dict = {u[0]: {"name": u[1], "extra_cal": u[2], "food_items": u[3]} for u in users}
+
+    if gc:
+        try:
+            sheet = gc.open_by_url(SHEET_URL)
+            api_sheet = sheet.worksheet("Master_API_View")
+            all_records = api_sheet.get_all_records()
+            
+            for row in all_records:
+                uid = str(row.get("User_ID", ""))
+                if row.get("Date") == today_str and uid in user_dict:
+                    u_info = user_dict[uid]
+                    tdee = int(row.get("TDEE", 0))
+                    # 假設排餐 800 大卡，加上偷吃外食
+                    total_cal = 800 + u_info["extra_cal"]
+                    deficit = tdee - total_cal
+                    
+                    targets.append({
+                        "user_id": uid,
+                        "name": u_info["name"],
+                        "tdee": tdee,
+                        "lunch": row.get("Lunch_Item", ""),
+                        "dinner": row.get("Dinner_Item", ""),
+                        "extra_food": u_info["food_items"] or "無",
+                        "total_consumed_cal": total_cal,
+                        "caloric_deficit": deficit,
+                        "is_severe_deficit": deficit > 500,
+                        "tomorrow_training": str(row.get("Tomorrow_Training", "休息日"))
+                    })
+        except Exception as e: print(f"⚠️ 龍蝦通道讀取失敗: {e}")
+
+    return {"status": "success", "targets": targets}
+
+@app.post("/api/lobster/send_message")
+async def lobster_send_message(payload: LobsterPayload):
+    if payload.admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        line_bot_api.push_message(payload.user_id, TextSendMessage(text=payload.coach_message))
+        return {"status": "success", "msg": f"已發送教練報告給 {payload.user_id}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
