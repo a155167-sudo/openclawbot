@@ -1,21 +1,16 @@
-import requests
 import os
 import json
 import sqlite3
 import datetime
-from zoneinfo import ZoneInfo
-
-# 台灣時區工具函數
-TW_TZ = ZoneInfo("Asia/Taipei")
-def tw_today():
-    return datetime.datetime.now(TW_TZ).date()
-def tw_now():
-    return datetime.datetime.now(TW_TZ)
 import secrets
 import string
 import csv
 import random
 import re
+import requests
+from zoneinfo import ZoneInfo
+
+# Google & Web 相關套件
 import gspread
 from google.oauth2.service_account import Credentials
 from fastapi import FastAPI, Request, HTTPException
@@ -25,6 +20,53 @@ from linebot.models import MessageEvent, TextSendMessage, TextMessage
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from contextlib import asynccontextmanager
+
+# --- 1. 時區與基本工具設定 ---
+TW_TZ = ZoneInfo("Asia/Taipei")
+
+def tw_today():
+    return datetime.datetime.now(TW_TZ).date()
+
+def tw_now():
+    return datetime.datetime.now(TW_TZ)
+
+# --- 2. Google Sheet 授權與連線 (核心修改區) ---
+SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+try:
+    # ⚠️ 這裡的 filename 必須和你上傳到 GitHub 的 JSON 檔名完全一致
+    creds = Credentials.from_service_account_file("google_key.json", scopes=SCOPE)
+    gc = gspread.authorize(creds)
+    
+    # ⚠️ 填入你試算表網址中那段長長的 ID
+    SPREADSHEET_ID = "你的試算表ID填在這裡" 
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    
+    # 定義分頁，請確認你的 Google Sheet 分頁名稱一模一樣
+    sheet_main = sh.worksheet("Master_API_View")
+    sheet_log = sh.worksheet("raw_logs")
+    
+    print("✅ Google Sheet 服務帳戶連線成功！")
+except Exception as e:
+    print(f"❌ Google Sheet 連線出錯：{e}")
+    gc = None
+    sh = None
+
+# --- 3. FastAPI 生命週期管理 ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 啟動時執行的動作 (例如啟動 Scheduler)
+    # scheduler.start()
+    yield
+    # 關閉時執行的動作
+
+# 建立 FastAPI 實例
+app = FastAPI(lifespan=lifespan)
+
+# --- 下方接著寫你的 LINE Bot API 和 路由邏輯 ---
 
 # --- 保險箱初始化設定 ---
 # 我們把建立資料夾的邏輯移到 init_db 裡面會更安全，
