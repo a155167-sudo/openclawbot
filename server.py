@@ -1080,6 +1080,7 @@ async def get_lobster_targets(admin_secret: str):
     today_str = tw_today().strftime("%Y/%m/%d")
     targets = []
     
+    # 1. 取得資料庫中的使用者紀錄
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     try:
         c.execute("SELECT user_id, name, today_extra_cal, today_food_items FROM health_profile WHERE is_coaching_enabled = 1")
@@ -1091,34 +1092,61 @@ async def get_lobster_targets(admin_secret: str):
     if not users: return {"status": "success", "targets": []}
     user_dict = {u[0]: {"name": u[1], "extra_cal": u[2], "food_items": u[3]} for u in users}
 
+    # 2. 只有在 Google Sheet 成功連線時執行
     if gc:
         try:
             sheet = gc.open_by_url(SHEET_URL)
             api_sheet = sheet.worksheet("Master_API_View")
             all_records = api_sheet.get_all_records()
             
+            # --- 💡 先抓取 Intervals.icu 數據 (假設你是主要使用者) ---
+            icu_stats = get_intervals_data() # 調用之前寫好的函數
+            
             for row in all_records:
                 uid = str(row.get("User_ID", ""))
                 if row.get("Date") == today_str and uid in user_dict:
                     u_info = user_dict[uid]
+                    
+                    # --- 🎭 身分判斷邏輯 ---
+                    # 假設 Google Sheet 裡有一欄叫 "Plan_Type"，如果包含 "運動" 就是運動員
+                    plan_type = str(row.get("Plan_Type", "一般飲食"))
+                    is_athlete = any(keyword in plan_type for keyword in ["運動", "鐵人", "三鐵"])
+                    
                     tdee = int(row.get("TDEE", 0))
-                    # 假設排餐 800 大卡，加上偷吃外食
                     total_cal = 800 + u_info["extra_cal"]
                     deficit = tdee - total_cal
                     
-                    targets.append({
+                    # 建立單一使用者的回報資料
+                    user_data = {
                         "user_id": uid,
                         "name": u_info["name"],
+                        "is_athlete": is_athlete, # 👈 讓龍蝦知道這是不是運動員
                         "tdee": tdee,
                         "lunch": row.get("Lunch_Item", ""),
                         "dinner": row.get("Dinner_Item", ""),
                         "extra_food": u_info["food_items"] or "無",
                         "total_consumed_cal": total_cal,
                         "caloric_deficit": deficit,
-                        "is_severe_deficit": deficit > 500,
                         "tomorrow_training": str(row.get("Tomorrow_Training", "休息日"))
-                    })
-        except Exception as e: print(f"⚠️ 龍蝦通道讀取失敗: {e}")
+                    }
+
+                    # --- 🏃 如果是運動員，塞入專屬數據 ---
+                    if is_athlete:
+                        user_data["intervals_icu"] = icu_stats
+                        # 這裡可以寫死你的配速區間，或是從 Sheet/Intervals 抓
+                        user_data["training_zones"] = {
+                            "run_z2_pace": "5:30-6:00/km",
+                            "bike_z2_power": "130-150w",
+                            "swim_z2_pace": "2:10-2:20/100m"
+                        }
+                    else:
+                        user_data["intervals_icu"] = None
+                        user_data["training_zones"] = None
+
+                    targets.append(user_data)
+                    
+        except Exception as e: 
+            print(f"⚠️ 龍蝦通道讀取失敗: {e}")
 
     return {"status": "success", "targets": targets}
 
