@@ -968,16 +968,8 @@ def handle_message(event):
         else: reply_text = "哎呀！地圖系統暫時找不到這個地址，請確認地址是否完整喔！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
-        
-        elif msg.startswith("#喚醒AI "):
-        target_uid = msg.replace("#喚醒AI ", "").strip()
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("UPDATE health_profile SET ai_silenced_until='' WHERE user_id LIKE ?", (f"%{target_uid}%",))
-        conn.commit(); conn.close()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已為該顧客提早解除 AI 靜音！"))
-        return
-
-    # 🟢 顧客一般對話 (串接 AI) 🟢
+      
+     # 🟢 顧客一般對話 (串接 AI) 🟢
     allow, q_msg = check_permission_and_quota(uid)
     if not allow: return
     else: line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"{get_ai_response_with_memory(uid, msg)}\n\n{q_msg}"))
