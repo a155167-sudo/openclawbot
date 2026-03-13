@@ -846,6 +846,15 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 老闆好！系統已成功綁定。\n客人的【換餐通知】都會私訊給您！"))
         return
+
+    elif msg.startswith("#喚醒AI "):
+        target_uid = msg.replace("#喚醒AI ", "").strip()
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("UPDATE health_profile SET ai_silenced_until='' WHERE user_id LIKE ?", (f"%{target_uid}%",))
+        conn.commit(); conn.close()
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已手動解除客人的 AI 靜音！"))
+        return
+
     elif msg == "#點數庫存":
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         # 算一下沒用過的 (is_used=0)
