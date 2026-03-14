@@ -446,7 +446,7 @@ async def receive_form_data(request: Request):
             schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
 
             # 🤖 寫給機器人看的總表 (1 代表有教練權限)
-            master_api_rows.append([actual_date_str, user_id, int(tdee), lunch['name'], dinner['name'], "", 1])
+            master_api_rows.append([actual_date_str, user_id, int(tdee), lunch['name'], dinner['name'], "", 1, "", "", "", "", ""])
 
         # 更新 SQLite
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
@@ -486,7 +486,7 @@ async def receive_form_data(request: Request):
                     try: api_sheet = sheet.worksheet("Master_API_View")
                     except gspread.exceptions.WorksheetNotFound:
                         api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="7")
-                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled"])
+                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key"])
                     
                     api_sheet.append_rows(master_api_rows)
                     print(f"✅ 成功將資料寫入 Master_API_View！")
@@ -836,6 +836,40 @@ def handle_message(event):
     finally:
         conn.close()
 
+    # 🔥 AI 未來課表預約功能 (「運動：」前綴)
+    if msg.startswith("運動：") or msg.startswith("運動:"):
+        sys_prompt = f"今天是 {tw_today().strftime('%Y/%m/%d')}。請將這句話解析為未來運動排程的JSON。包含: date (YYYY/MM/DD), workout_content (字串), intensity (HIGH/MEDIUM/LOW)。只回傳純JSON字串。"
+        try:
+            res = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": msg}],
+                temperature=0.1
+            )
+            p_data = json.loads(res.choices[0].message.content.strip().replace("```json","").replace("```",""))
+            if gc:
+                api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
+                records = api_sheet.get_all_records()
+                target_idx = next(
+                    (i + 2 for i, r in enumerate(records)
+                     if str(r.get("Date")) == p_data.get("date") and str(r.get("User_ID")) == uid),
+                    None
+                )
+                if target_idx:
+                    headers = api_sheet.row_values(1)
+                    if "Today_Workout" not in headers:
+                        api_sheet.update_cell(1, len(headers)+1, "Today_Workout")
+                        api_sheet.update_cell(1, len(headers)+2, "Workout_Intensity")
+                        headers = api_sheet.row_values(1)
+                    api_sheet.update_cell(target_idx, headers.index("Today_Workout") + 1, p_data.get("workout_content"))
+                    api_sheet.update_cell(target_idx, headers.index("Workout_Intensity") + 1, p_data.get("intensity"))
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已成功排入 {p_data.get('date')} 課表！\n📝 內容：{p_data.get('workout_content')}\n💪 強度：{p_data.get('intensity')}"))
+                    return
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 找不到對應日期，請確認您的排餐計畫已啟動。"))
+        except Exception as e:
+            print(f"⚠️ 運動課表預約失敗: {e}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 日期格式無法辨識，請試試：運動：下週三 40分鐘慢跑"))
+        return
+
     # 👇 第一步加在這裡！老闆專屬的記憶檢查按鈕 👇
     if msg == "#查狀態":
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -1072,80 +1106,95 @@ class LobsterPayload(BaseModel):
     user_id: str
     coach_message: str
 
+# ==========================================
+# 🏃 Intervals.icu 數據抓取 (每位運動員個別設定)
+# ==========================================
+def get_intervals_data(athlete_id, api_key):
+    if not athlete_id or not api_key: return None
+    try:
+        url = f"https://intervals.icu/api/v1/athlete/{athlete_id}"
+        resp = requests.get(url, auth=('athlete', api_key), timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                "fitness": round(data.get("icu_fitness", 0)),
+                "fatigue": round(data.get("icu_fatigue", 0)),
+                "form": round(data.get("icu_training_load_balance", 0))
+            }
+    except Exception:
+        return None
+
 @app.get("/api/lobster/daily_targets")
-async def get_lobster_targets(admin_secret: str):
+async def get_lobster_targets(admin_secret: str, mode: str = "daily"):
     if admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
-        
+
     today_str = tw_today().strftime("%Y/%m/%d")
+    tomorrow_str = (tw_today() + datetime.timedelta(days=1)).strftime("%Y/%m/%d")
     targets = []
-    
+
     # 1. 取得資料庫中的使用者紀錄
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     try:
-        c.execute("SELECT user_id, name, today_extra_cal, today_food_items FROM health_profile WHERE is_coaching_enabled = 1")
+        c.execute("SELECT user_id, name, today_extra_cal, today_food_items, tdee FROM health_profile WHERE is_coaching_enabled = 1")
         users = c.fetchall()
     except sqlite3.OperationalError:
-        users = []
+        return {"status": "success", "targets": []}
     conn.close()
 
     if not users: return {"status": "success", "targets": []}
-    user_dict = {u[0]: {"name": u[1], "extra_cal": u[2], "food_items": u[3]} for u in users}
+    user_dict = {u[0]: {"name": u[1], "extra_cal": u[2], "food_items": u[3], "tdee": u[4]} for u in users}
 
     # 2. 只有在 Google Sheet 成功連線時執行
     if gc:
         try:
             sheet = gc.open_by_url(SHEET_URL)
             api_sheet = sheet.worksheet("Master_API_View")
-            all_records = api_sheet.get_all_records()
-            
-            # --- 💡 先抓取 Intervals.icu 數據 (假設你是主要使用者) ---
-            icu_stats = get_intervals_data() # 調用之前寫好的函數
-            
-            for row in all_records:
-                uid = str(row.get("User_ID", ""))
-                if row.get("Date") == today_str and uid in user_dict:
-                    u_info = user_dict[uid]
-                    
-                    # --- 🎭 身分判斷邏輯 ---
-                    # 假設 Google Sheet 裡有一欄叫 "Plan_Type"，如果包含 "運動" 就是運動員
-                    plan_type = str(row.get("Plan_Type", "一般飲食"))
-                    is_athlete = any(keyword in plan_type for keyword in ["運動", "鐵人", "三鐵"])
-                    
-                    tdee = int(row.get("TDEE", 0))
+            records = api_sheet.get_all_records()
+            sheet_data = {(str(r.get("User_ID")), str(r.get("Date"))): r for r in records}
+
+            for uid, u_info in user_dict.items():
+                row_today = sheet_data.get((uid, today_str), {})
+                plan_type = str(row_today.get("Plan_Type", "一般飲食"))
+                is_athlete = any(k in plan_type for k in ["運動", "鐵人", "三鐵"])
+                tdee = int(row_today.get("TDEE", 0)) if row_today.get("TDEE") else u_info["tdee"]
+
+                # 從 Sheet 讀取個別 Intervals 設定
+                icu_id = str(row_today.get("Intervals_ID", ""))
+                icu_key = str(row_today.get("Intervals_API_Key", ""))
+
+                user_data = {
+                    "user_id": uid,
+                    "name": u_info["name"],
+                    "is_athlete": is_athlete,
+                    "sport_type": str(row_today.get("Sport_Type", "無")),
+                    "plan_week": str(row_today.get("Plan_Week", "計畫未開始")),
+                    "tdee": tdee
+                }
+
+                if mode == "daily":
                     total_cal = 800 + u_info["extra_cal"]
-                    deficit = tdee - total_cal
-                    
-                    # 建立單一使用者的回報資料
-                    user_data = {
-                        "user_id": uid,
-                        "name": u_info["name"],
-                        "is_athlete": is_athlete, # 👈 讓龍蝦知道這是不是運動員
-                        "tdee": tdee,
-                        "lunch": row.get("Lunch_Item", ""),
-                        "dinner": row.get("Dinner_Item", ""),
+                    row_tomorrow = sheet_data.get((uid, tomorrow_str), {})
+                    user_data["today_summary"] = {
+                        "lunch": row_today.get("Lunch_Item", ""),
+                        "dinner": row_today.get("Dinner_Item", ""),
                         "extra_food": u_info["food_items"] or "無",
                         "total_consumed_cal": total_cal,
-                        "caloric_deficit": deficit,
-                        "tomorrow_training": str(row.get("Tomorrow_Training", "休息日"))
+                        "caloric_deficit": tdee - total_cal
                     }
-
-                    # --- 🏃 如果是運動員，塞入專屬數據 ---
-                    if is_athlete:
-                        user_data["intervals_icu"] = icu_stats
-                        # 這裡可以寫死你的配速區間，或是從 Sheet/Intervals 抓
-                        user_data["training_zones"] = {
-                            "run_z2_pace": "5:30-6:00/km",
-                            "bike_z2_power": "130-150w",
-                            "swim_z2_pace": "2:10-2:20/100m"
-                        }
-                    else:
-                        user_data["intervals_icu"] = None
-                        user_data["training_zones"] = None
-
+                    user_data["tomorrow_preview"] = {
+                        "date": tomorrow_str,
+                        "workout": str(row_tomorrow.get("Today_Workout", "休息日")),
+                        "intensity": str(row_tomorrow.get("Workout_Intensity", "LOW")).upper()
+                    }
                     targets.append(user_data)
-                    
-        except Exception as e: 
+
+                elif mode == "weekly":
+                    # weekly 模式：額外抓 Intervals.icu CTL/ATL/Form
+                    user_data["intervals_icu"] = get_intervals_data(icu_id, icu_key) if (is_athlete and icu_id and icu_key) else None
+                    targets.append(user_data)
+
+        except Exception as e:
             print(f"⚠️ 龍蝦通道讀取失敗: {e}")
 
     return {"status": "success", "targets": targets}
