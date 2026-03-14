@@ -257,7 +257,21 @@ async def receive_form_data(request: Request):
         if height < 3.0:
             height *= 100
         activity = get_val("活動量")
-        
+    
+        # ==========================================
+        # ==========================================
+        # 🔥 新增：接住運動客製化與 Intervals 授權資料
+        # ==========================================
+        plan_type_raw = get_val("習慣") or ""  # 抓取「您每週有規律運動的習慣嗎？」
+        plan_type = "運動客製化" if "有" in plan_type_raw else "純飲食控制"
+
+        sport_type = get_val("哪一種運動") or ""
+        plan_week = get_val("哪幾天") or ""
+        workout_intensity = get_val("一般訓練日") or ""
+
+        intervals_id = get_val("Athlete ID") or ""
+        intervals_api_key = get_val("API Key") or ""
+        # ==========================================
         bmr = (10 * weight + 6.25 * height - 5 * age - 161) if "女" in gender else (10 * weight + 6.25 * height - 5 * age + 5)
         act_mult = 1.2
         if "輕" in activity: act_mult = 1.375
@@ -446,8 +460,20 @@ async def receive_form_data(request: Request):
             schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
 
             # 🤖 寫給機器人看的總表 (1 代表有教練權限)
-            master_api_rows.append([actual_date_str, user_id, int(tdee), lunch['name'], dinner['name'], "", 1, "", "", "", "", ""])
-
+            master_api_rows.append([
+                actual_date_str, 
+                user_id, 
+                int(tdee), 
+                lunch['name'], 
+                dinner['name'], 
+                "", # Tomorrow_Training (先留空)
+                1,  # Is_Coaching_Enabled
+                plan_type,
+                sport_type,
+                plan_week,
+                intervals_id,
+                intervals_api_key
+            ])
         # 更新 SQLite
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
@@ -485,7 +511,7 @@ async def receive_form_data(request: Request):
                 try:
                     try: api_sheet = sheet.worksheet("Master_API_View")
                     except gspread.exceptions.WorksheetNotFound:
-                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="7")
+                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="15")
                         api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key"])
                     
                     api_sheet.append_rows(master_api_rows)
