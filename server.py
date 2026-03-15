@@ -501,13 +501,27 @@ async def receive_form_data(request: Request):
 
                 # 🔥 (3) 同步將資料塞進 Master_API_View
                 try:
-                    try: api_sheet = sheet.worksheet("Master_API_View")
+                    EXPECTED_HEADERS = [
+                        "Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item",
+                        "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type",
+                        "Sport_Type", "Plan_Week", "Run_5K_PB", "Cycling_FTP", "Swim_CSS"
+                    ]
+                    try:
+                        api_sheet = sheet.worksheet("Master_API_View")
                     except gspread.exceptions.WorksheetNotFound:
-                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="7")
-                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Run_5K_PB", "Cycling_FTP", "Swim_CSS"])
-                    
+                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="20")
+
+                    # 不管新建還是舊有：確保第一列是正確標題
+                    current_header = api_sheet.row_values(1)
+                    if current_header != EXPECTED_HEADERS:
+                        if not current_header:
+                            api_sheet.append_row(EXPECTED_HEADERS)
+                        else:
+                            api_sheet.update(range_name="A1", values=[EXPECTED_HEADERS])
+                        print("✅ Master_API_View 標題列已寫入/更新")
+
                     api_sheet.append_rows(master_api_rows)
-                    print(f"✅ 成功將資料寫入 Master_API_View！")
+                    print(f"✅ 成功將 {len(master_api_rows)} 筆資料寫入 Master_API_View！")
                 except Exception as e: print(f"⚠️ 寫入 Master_API_View 失敗: {e}")
                     
             except Exception: pass
