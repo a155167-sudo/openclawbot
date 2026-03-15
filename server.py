@@ -458,7 +458,6 @@ async def receive_form_data(request: Request):
             active_days_str = ",".join(active_days_list) if isinstance(active_days_list, list) else str(active_days_list)
         
         master_api_rows.append([
-            actmaster_api_rows.append([
             actual_date_str,        # 1. Date
             user_id,                # 2. User_ID
             int(tdee),              # 3. TDEE
