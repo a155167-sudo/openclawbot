@@ -458,6 +458,7 @@ async def receive_form_data(request: Request):
             active_days_str = ",".join(active_days_list) if isinstance(active_days_list, list) else str(active_days_list)
         
         master_api_rows.append([
+            actmaster_api_rows.append([
             actual_date_str,        # 1. Date
             user_id,                # 2. User_ID
             int(tdee),              # 3. TDEE
@@ -474,8 +475,8 @@ async def receive_form_data(request: Request):
             "",                     # 14. Tomorrow_Workout
             "",                     # 15. Tomorrow_Intensity
             "",                     # 16. AI_Mute
-            active_days_str,        # 17. Training_Days (運動星期幾)
-            schedule_text           # 18. Training_Time (運動時間)
+            "",                     # 17. Training_Days (先放空，等龍蝦補程式碼)
+            ""                      # 18. Training_Time (先放空，等龍蝦補程式碼)
         ])
 
         # 更新 SQLite
