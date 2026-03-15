@@ -801,6 +801,182 @@ def redeem_code(uid, code):
     link = f"https://docs.google.com/forms/d/e/1FAIpQLSdVY7Zf-E2zSpsOFmItYHI0YtTujX6Ucux4QTQ3gjg5wcomgA/viewform?usp=pp_url&entry.1461831832={uid}"
     return exp, f"🎉 兌換成功！\n您的專屬排餐表單：\n{link}"
 
+# ==========================================
+# 📅 功能四：每週教練排課核心函數
+# ==========================================
+def run_weekly_coach(uid, reply_token=None):
+    """執行每週教練排課完整流程：抓資料 → AI生成 → 寫Sheet → 推播LINE"""
+
+    # 1. 從 SQLite 取得用戶個人設定
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute("SELECT name, goal, restrictions, active_days, tdee, protein FROM health_profile WHERE user_id=?", (uid,))
+    hp = c.fetchone()
+    conn.close()
+    if not hp:
+        msg = "找不到您的個人檔案，請先填寫體質評估表單喔！📝"
+        try:
+            if reply_token: line_bot_api.reply_message(reply_token, TextSendMessage(text=msg))
+            else: line_bot_api.push_message(uid, TextSendMessage(text=msg))
+        except: pass
+        return False, msg
+    name, goal, restrictions, active_days, tdee, protein = hp
+
+    # 2. 計算下週日期範圍（下週一到週日）
+    today = tw_today()
+    days_to_monday = (7 - today.weekday()) % 7 or 7
+    next_monday = today + datetime.timedelta(days=days_to_monday)
+    next_week_dates = [(next_monday + datetime.timedelta(days=i)).strftime("%Y/%m/%d") for i in range(7)]
+    weekday_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+    week_range = f"{next_week_dates[0]} – {next_week_dates[6]}"
+
+    # 3. 從 Google Sheet 抓下週排餐 & Intervals 設定
+    next_week_meals, row_indices = [], []
+    intervals_id, intervals_key = "", ""
+    if gc:
+        try:
+            api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
+            all_records = api_sheet.get_all_records()
+            for i, row in enumerate(all_records):
+                if str(row.get("User_ID")) == uid and str(row.get("Date")) in next_week_dates:
+                    day_idx = next_week_dates.index(str(row.get("Date")))
+                    next_week_meals.append({
+                        "date": row.get("Date"),
+                        "weekday": weekday_names[day_idx],
+                        "lunch": row.get("Lunch_Item", ""),
+                        "dinner": row.get("Dinner_Item", "")
+                    })
+                    row_indices.append(i + 2)  # Google Sheets 1-indexed + header
+                    if not intervals_id and row.get("Intervals_ID"):
+                        intervals_id = str(row.get("Intervals_ID"))
+                        intervals_key = str(row.get("Intervals_API_Key", ""))
+        except Exception as e:
+            print(f"⚠️ 取得下週排餐失敗: {e}")
+
+    # 4. 抓 Intervals.icu 本週體能數據（若有設定）
+    icu_data = get_intervals_data(intervals_id, intervals_key) if (intervals_id and intervals_key) else None
+
+    # 5. 抓本週活動紀錄（若有 Intervals 設定）
+    this_week_activities = []
+    if intervals_id and intervals_key:
+        try:
+            week_start = (today - datetime.timedelta(days=today.weekday())).strftime("%Y-%m-%d")
+            resp = requests.get(
+                f"https://intervals.icu/api/v1/athlete/{intervals_id}/activities?oldest={week_start}&newest={today.strftime('%Y-%m-%d')}&limit=10",
+                auth=('API_KEY', intervals_key), timeout=10
+            )
+            if resp.status_code == 200:
+                for a in resp.json():
+                    if isinstance(a, dict):
+                        this_week_activities.append({
+                            "date": str(a.get("start_date_local", ""))[:10],
+                            "type": a.get("type", ""),
+                            "distance_km": round(a.get("distance", 0) / 1000, 1),
+                            "duration_min": a.get("moving_time", 0) // 60,
+                            "tss": a.get("icu_training_load") or 0
+                        })
+        except Exception as e:
+            print(f"⚠️ 抓本週活動失敗: {e}")
+
+    # 6. 建立 Prompt 輸入資料
+    input_data = {
+        "athlete": name,
+        "goal": goal,
+        "active_days": active_days,
+        "restrictions": restrictions or "無",
+        "tdee": tdee,
+        "protein_target_g": int(protein) if protein else 0,
+        "week_range": week_range,
+        "this_week_activities": this_week_activities or "無紀錄",
+        "intervals_fitness": icu_data,
+        "next_week_meals": next_week_meals
+    }
+
+    weekly_system_prompt = """# Role & Objective
+你是一位頂尖的科學化鐵人三項教練與運動營養專家，任職於「一日樂食」。
+每週任務：進行每週訓練與營養總結，根據排餐計畫安排下週訓練課表，給予加購建議。
+
+# Core Rules（嚴格遵守）
+1. 主餐不可更動：一日樂食下週主餐菜單已固定，只能在此基礎上建議加購補充。
+2. 根據 active_days 決定哪幾天有餐點供應，非供餐日安排輕鬆訓練或休息。
+3. 根據 CTL/ATL/Form 判斷疲勞度，Form > 5 可推進強度；Form < -10 以恢復為主。
+4. 至少 1-2 天休息日或主動恢復日（輕鬆散步、瑜伽）。
+5. 課表包含：運動種類、強度（Z2/Z3/閾值/FTP%）、建議時間長度。
+6. 高強度訓練日 → 強烈建議加購單點食物（舒肥雞胸肉、地瓜等）。
+
+# Jason 訓練區間（六週實際數據）
+- Z2 跑步：6:00–6:05/km @ HR 130–138
+- Z3 節奏跑：5:30–5:45/km @ HR 148–155
+- 閾值：4:33/km @ HR 172
+- 自行車 FTP：240W ｜ Z2：134–180W ｜ Z3 甜蜜點：182–216W
+
+# Output Format
+🏆 教練每週狀態總評
+══════════════════════════════
+📊 本週訓練回顧
+• 體能狀態：CTL {值} ｜ ATL {值} ｜ Form {值}（若無數據填 N/A）
+• 本週亮點與待改進：...（2-3句）
+
+📅 下週專屬訓練課表（{week_range}）
+• 週一（{日期}）：...
+• 週二（{日期}）：...
+• 週三（{日期}）：...
+• 週四（{日期}）：...
+• 週五（{日期}）：...
+• 週六（{日期}）：...
+• 週日（{日期}）：休息/主動恢復
+
+💡 下週加餐戰略建議
+• 高強度日補給：...
+• 推薦加購：（從一日樂食單品推薦）
+══════════════════════════════"""
+
+    # 7. 呼叫 LLM 生成課表
+    try:
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": weekly_system_prompt},
+                {"role": "user", "content": json.dumps(input_data, ensure_ascii=False)}
+            ],
+            temperature=0.6, max_tokens=1200
+        )
+        weekly_plan = res.choices[0].message.content
+    except Exception as e:
+        error_msg = f"⚠️ 教練排課失敗，請稍後再試。（{str(e)[:50]}）"
+        try:
+            if reply_token: line_bot_api.reply_message(reply_token, TextSendMessage(text=error_msg))
+            else: line_bot_api.push_message(uid, TextSendMessage(text=error_msg))
+        except: pass
+        return False, error_msg
+
+    # 8. 寫入 Plan_Week 欄位（更新 Google Sheet 下週所有 Row）
+    if gc and row_indices:
+        try:
+            api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
+            headers = api_sheet.row_values(1)
+            if "Plan_Week" not in headers:
+                api_sheet.update_cell(1, len(headers) + 1, "Plan_Week")
+                headers = api_sheet.row_values(1)
+            pw_col = headers.index("Plan_Week") + 1
+            for row_idx in row_indices:
+                api_sheet.update_cell(row_idx, pw_col, weekly_plan)
+            print(f"✅ Plan_Week 已寫入 {len(row_indices)} 個 Row")
+        except Exception as e:
+            print(f"⚠️ 寫入 Plan_Week 失敗: {e}")
+
+    # 9. LINE 推播
+    try:
+        if reply_token:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=weekly_plan))
+        else:
+            line_bot_api.push_message(uid, TextSendMessage(text=weekly_plan))
+    except Exception as e:
+        print(f"⚠️ LINE 發送失敗: {e}")
+        return False, str(e)
+
+    return True, weekly_plan
+
+
 @app.post("/callback")
 async def callback(request: Request):
     sig = request.headers.get("X-Line-Signature", "")
@@ -1120,6 +1296,14 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
       
+    # ==========================================
+    # 📅 功能四：每週課表觸發（LINE 指令）
+    # ==========================================
+    if msg in ["請安排下週課表", "排下週課表", "下週課表", "週課表"]:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="📋 收到！正在為您生成下週專屬課表，請稍候..."))
+        run_weekly_coach(uid)
+        return
+
      # 🟢 顧客一般對話 (串接 AI) 🟢
     allow, q_msg = check_permission_and_quota(uid)
     if not allow: return
@@ -1316,3 +1500,21 @@ async def lobster_send_message(payload: LobsterPayload):
         return {"status": "success", "msg": f"已發送教練報告給 {payload.user_id}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# 📅 功能四：每週教練系統觸發端點
+# ==========================================
+class WeeklyCoachPayload(BaseModel):
+    admin_secret: str
+    user_id: str
+
+@app.post("/api/lobster/weekly_coach")
+async def lobster_weekly_coach(payload: WeeklyCoachPayload):
+    """系統排程觸發每週教練排課，結果寫入 Plan_Week 並推播 LINE"""
+    if payload.admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    success, result = run_weekly_coach(payload.user_id)
+    if success:
+        return {"status": "success", "msg": "每週課表已生成並推播", "plan_preview": result[:100] + "..."}
+    else:
+        raise HTTPException(status_code=500, detail=result)
