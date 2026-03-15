@@ -269,6 +269,8 @@ async def receive_form_data(request: Request):
         run_5k_pb    = (data.get("🏃‍♂️ 跑步 5K 最佳成績 (5K PB)", [""])[0] or "").strip()
         cycling_ftp  = (data.get("🚴‍♂️ 自行車 FTP 瓦數",            [""])[0] or "").strip()
         swim_css     = (data.get("🏊‍♂️ 游泳 CSS 配速",               [""])[0] or "").strip()
+        # 🏷️ 運動類型（直接從表單抓）
+        sport_type   = (data.get("你主要想安排什麼運動訓練菜單", ["一般健身"])[0] or "一般健身").strip()
         # 🔥 身高防呆：如果客人填 1.76 公尺，自動轉成 176 公分
         if height < 3.0:
             height *= 100
@@ -462,7 +464,7 @@ async def receive_form_data(request: Request):
             schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
 
             # 🤖 寫給機器人看的總表 (1 代表有教練權限)
-            master_api_rows.append([actual_date_str, user_id, int(tdee), lunch['name'], dinner['name'], "", 1, "", "", "", run_5k_pb, cycling_ftp, swim_css])
+            master_api_rows.append([actual_date_str, user_id, int(tdee), lunch['name'], dinner['name'], "", 1, goal, sport_type, "", run_5k_pb, cycling_ftp, swim_css])
 
         # 更新 SQLite
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
