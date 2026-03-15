@@ -265,10 +265,10 @@ async def receive_form_data(request: Request):
 
         name, goal, restrictions = get_val("稱呼"), get_val("目標"), get_val("禁忌")
         weight, height, age, gender = float(get_val("體重") or 70), float(get_val("身高") or 170), float(get_val("年齡") or 30), get_val("性別")
-        # 🏅 三大運動指標（手填，取代 Intervals API）
-        run_5k_pb = get_val("5K") or get_val("5k") or get_val("跑步") or ""
-        cycling_ftp = get_val("FTP") or get_val("ftp") or get_val("功率") or ""
-        swim_css = get_val("CSS") or get_val("css") or get_val("游泳") or ""
+        # 🏅 三大運動指標（namedValues 精確 Key 讀取）
+        run_5k_pb    = (data.get("🏃‍♂️ 跑步 5K 最佳成績 (5K PB)", [""])[0] or "").strip()
+        cycling_ftp  = (data.get("🚴‍♂️ 自行車 FTP 瓦數",            [""])[0] or "").strip()
+        swim_css     = (data.get("🏊‍♂️ 游泳 CSS 配速",               [""])[0] or "").strip()
         # 🔥 身高防呆：如果客人填 1.76 公尺，自動轉成 176 公分
         if height < 3.0:
             height *= 100
@@ -971,21 +971,30 @@ def run_weekly_coach(uid, reply_token=None):
         "next_week_meals": next_week_meals
     }
 
-    weekly_system_prompt = """# Role & Objective
+    # 動態注入三大運動指標
+    athlete_section = f"""
+【使用者進階體能數據】
+- 跑步 5K 最佳成績：{run_5k_pb if run_5k_pb else '未提供'}
+- 自行車 FTP：{cycling_ftp if cycling_ftp else '未提供'}
+- 游泳 CSS 配速：{swim_css if swim_css else '未提供'}
+
+【課表數值化嚴格要求】
+1. 若使用者有提供「跑步 5K 成績」，排定跑步課表時，絕對不能只給「Z2」或「輕鬆跑」這種模糊字眼，必須明確推算出對應的配速區間（Pace, 例如 6:00-6:15/km）。
+2. 若有提供「自行車 FTP」，排定單車課表時，必須給出明確的瓦數區間（例如 150W-170W）或 %FTP。
+3. 若有提供「游泳 CSS」，必須給出每 100m 的配速建議。
+4. 若使用者「未提供」某項數據（為空值），則該項目的課表請改用「體感自覺量表 (RPE 1-10)」來引導強度。"""
+
+    weekly_system_prompt = f"""# Role & Objective
 你是一位頂尖的科學化鐵人三項教練與運動營養專家，任職於「一日樂食」。
 每週任務：根據排餐計畫安排下週訓練課表，給予加購建議，並精準計算訓練配速與強度。
+{athlete_section}
 
 # Core Rules（嚴格遵守）
 1. 主餐不可更動：一日樂食下週主餐菜單已固定，只能在此基礎上建議加購補充。
 2. 根據 active_days 決定哪幾天有餐點供應，非供餐日安排輕鬆訓練或休息。
-3. 【精準配速計算】請根據 athlete_metrics 中的三大指標：
-   - run_5k_pb（跑步 5K PB）→ 推算 Z2/Z3/閾值配速（Z2 ≈ PB pace + 90–120秒/km）
-   - cycling_ftp_watts（FTP 瓦數）→ 計算 Z2（56–75% FTP）、Z3甜蜜點（76–90%）、閾值（91–105%）
-   - swim_css（游泳 CSS 配速）→ 推算輕鬆游（CSS + 10–15秒/100m）、閾值游（CSS – 5秒）
-   - 若指標為「未填寫」，改用模糊描述（輕鬆、中等、強度）。
-4. 至少 1-2 天休息日或主動恢復日（輕鬆散步、瑜伽）。
-5. 課表包含：運動種類、強度、建議時間長度、具體配速或瓦數。
-6. 高強度訓練日 → 強烈建議加購單點食物（舒肥雞胸肉、地瓜等）。
+3. 至少 1-2 天休息日或主動恢復日（輕鬆散步、瑜伽）。
+4. 課表包含：運動種類、強度、建議時間長度、具體配速或瓦數（依上方嚴格要求）。
+5. 高強度訓練日 → 強烈建議加購單點食物（舒肥雞胸肉、地瓜等）。
 
 # Output Format（強制 JSON，不可輸出任何其他文字）
 你必須只回傳一個合法的 JSON 物件，格式如下：
