@@ -111,6 +111,9 @@ async def lifespan(app: FastAPI):
     
     # ⏰ 排定班表：每天 20:00 自動發送明日取餐與加購提醒
     scheduler.add_job(auto_send_tomorrow_reminders_to_boss, 'cron', hour=20, minute=0)
+
+    # ⏰ 排定班表：每週日 20:00 自動批次排下週課表（加購提醒之後執行）
+    scheduler.add_job(auto_weekly_coach_batch, 'cron', day_of_week='sun', hour=20, minute=5)
     
     scheduler.start()
     print("✅ 全自動定時器已啟動！系統進入無人駕駛模式 ON！")
@@ -830,7 +833,7 @@ def run_weekly_coach(uid, reply_token=None):
     week_range = f"{next_week_dates[0]} – {next_week_dates[6]}"
 
     # 3. 從 Google Sheet 抓下週排餐 & Intervals 設定
-    next_week_meals, row_indices = [], []
+    next_week_meals, row_date_map = [], {}
     intervals_id, intervals_key = "", ""
     if gc:
         try:
@@ -845,7 +848,7 @@ def run_weekly_coach(uid, reply_token=None):
                         "lunch": row.get("Lunch_Item", ""),
                         "dinner": row.get("Dinner_Item", "")
                     })
-                    row_indices.append(i + 2)  # Google Sheets 1-indexed + header
+                    row_date_map[str(row.get("Date"))] = i + 2  # {date: sheet_row}
                     if not intervals_id and row.get("Intervals_ID"):
                         intervals_id = str(row.get("Intervals_ID"))
                         intervals_key = str(row.get("Intervals_API_Key", ""))
@@ -909,26 +912,27 @@ def run_weekly_coach(uid, reply_token=None):
 - 閾值：4:33/km @ HR 172
 - 自行車 FTP：240W ｜ Z2：134–180W ｜ Z3 甜蜜點：182–216W
 
-# Output Format
-🏆 教練每週狀態總評
-══════════════════════════════
-📊 本週訓練回顧
-• 體能狀態：CTL {值} ｜ ATL {值} ｜ Form {值}（若無數據填 N/A）
-• 本週亮點與待改進：...（2-3句）
+# Output Format（強制 JSON，不可輸出任何其他文字）
+你必須只回傳一個合法的 JSON 物件，格式如下：
 
-📅 下週專屬訓練課表（{week_range}）
-• 週一（{日期}）：...
-• 週二（{日期}）：...
-• 週三（{日期}）：...
-• 週四（{日期}）：...
-• 週五（{日期}）：...
-• 週六（{日期}）：...
-• 週日（{日期}）：休息/主動恢復
+{
+  "line_message": "（這裡放完整的 LINE 推播長文，含 Emoji 排版、狀態總評、加餐建議等，格式如下）\n\n🏆 教練每週狀態總評\n══════════════════════════════\n📊 本週訓練回顧\n• 體能狀態：CTL {值} ｜ ATL {值} ｜ Form {值}\n• 本週亮點與待改進：...（2-3句）\n\n📅 下週專屬訓練課表（{week_range}）\n• 週一（{日期}）：...\n...\n\n💡 下週加餐戰略建議\n• 高強度日補給：...\n• 推薦加購：...\n══════════════════════════════",
+  "daily_plan": {
+    "YYYY/MM/DD": "運動種類 + 強度 + 時間長度（例：Z2 跑步 60 分鐘 @ 6:00–6:05/km）",
+    "YYYY/MM/DD": "...",
+    "YYYY/MM/DD": "...",
+    "YYYY/MM/DD": "...",
+    "YYYY/MM/DD": "...",
+    "YYYY/MM/DD": "...",
+    "YYYY/MM/DD": "休息 / 主動恢復（輕鬆散步 30 分鐘）"
+  }
+}
 
-💡 下週加餐戰略建議
-• 高強度日補給：...
-• 推薦加購：（從一日樂食單品推薦）
-══════════════════════════════"""
+規則：
+- daily_plan 的 key 必須是 YYYY/MM/DD 格式，與下週7天日期完全對應
+- daily_plan 的 value 只寫當天課表（簡潔一行），不含日期或星期
+- line_message 包含完整精美推播內容（含所有章節）
+- 不得輸出 JSON 以外的任何文字（不加 ```json 包裝）"""
 
     # 7. 呼叫 LLM 生成課表
     try:
@@ -940,7 +944,7 @@ def run_weekly_coach(uid, reply_token=None):
             ],
             temperature=0.6, max_tokens=1200
         )
-        weekly_plan = res.choices[0].message.content
+        raw_content = res.choices[0].message.content
     except Exception as e:
         error_msg = f"⚠️ 教練排課失敗，請稍後再試。（{str(e)[:50]}）"
         try:
@@ -949,8 +953,28 @@ def run_weekly_coach(uid, reply_token=None):
         except: pass
         return False, error_msg
 
-    # 8. 寫入 Plan_Week 欄位（更新 Google Sheet 下週所有 Row）
-    if gc and row_indices:
+    # 7b. 解析 LLM 回傳的 JSON
+    line_message = raw_content  # fallback
+    daily_plan = {}
+    try:
+        # 去除 ```json ... ``` 包裝（防禦）
+        clean = raw_content.strip()
+        if clean.startswith("```"):
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+            clean = clean.rsplit("```", 1)[0].strip()
+        parsed = json.loads(clean)
+        line_message = parsed.get("line_message", raw_content)
+        daily_plan = parsed.get("daily_plan", {})
+        print(f"✅ JSON 解析成功，daily_plan 包含 {len(daily_plan)} 天")
+    except Exception as e:
+        print(f"⚠️ JSON 解析失敗，fallback 為純文字: {e}")
+        line_message = raw_content
+        daily_plan = {}
+
+    # 8. 逐日寫入 Plan_Week（每個日期欄位只寫當天課表）
+    if gc and row_date_map:
         try:
             api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
             headers = api_sheet.row_values(1)
@@ -958,23 +982,27 @@ def run_weekly_coach(uid, reply_token=None):
                 api_sheet.update_cell(1, len(headers) + 1, "Plan_Week")
                 headers = api_sheet.row_values(1)
             pw_col = headers.index("Plan_Week") + 1
-            for row_idx in row_indices:
-                api_sheet.update_cell(row_idx, pw_col, weekly_plan)
-            print(f"✅ Plan_Week 已寫入 {len(row_indices)} 個 Row")
+            written = 0
+            for date_str, row_idx in row_date_map.items():
+                day_plan = daily_plan.get(date_str, "")
+                if day_plan:
+                    api_sheet.update_cell(row_idx, pw_col, day_plan)
+                    written += 1
+            print(f"✅ Plan_Week 逐日寫入完成：{written}/{len(row_date_map)} 天")
         except Exception as e:
             print(f"⚠️ 寫入 Plan_Week 失敗: {e}")
 
-    # 9. LINE 推播
+    # 9. LINE 推播（只送精美 line_message，不塞課表 JSON）
     try:
         if reply_token:
-            line_bot_api.reply_message(reply_token, TextSendMessage(text=weekly_plan))
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=line_message))
         else:
-            line_bot_api.push_message(uid, TextSendMessage(text=weekly_plan))
+            line_bot_api.push_message(uid, TextSendMessage(text=line_message))
     except Exception as e:
         print(f"⚠️ LINE 發送失敗: {e}")
         return False, str(e)
 
-    return True, weekly_plan
+    return True, line_message
 
 
 @app.post("/callback")
@@ -1355,6 +1383,75 @@ def auto_send_tomorrow_reminders_to_boss():
     if admin_row:
         try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】明日提醒推播完畢：\n{result_msg}"))
         except: pass
+
+# ==========================================
+# 📅 功能四：每週日自動批次排課
+# ==========================================
+def auto_weekly_coach_batch():
+    """每週日 20:00 自動撈出所有用戶，逐一呼叫 run_weekly_coach 排下週課表"""
+    import time
+
+    print("🏁 [auto_weekly_coach_batch] 每週排課開始...")
+
+    # 撈出所有有個人檔案的用戶
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    try:
+        c.execute("SELECT user_id, name FROM health_profile ORDER BY name")
+        users = c.fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"⚠️ [auto_weekly_coach_batch] 讀取用戶失敗: {e}")
+        return
+    finally:
+        conn.close()
+
+    if not users:
+        print("ℹ️ [auto_weekly_coach_batch] 無用戶需要排課，結束。")
+        return
+
+    print(f"📋 共找到 {len(users)} 位用戶，開始逐一排課...")
+
+    success_list, fail_list = [], []
+    for uid, name in users:
+        try:
+            print(f"  ▶ 排課中：{name} ({uid})")
+            ok, result = run_weekly_coach(uid)
+            if ok:
+                success_list.append(name)
+                print(f"  ✅ {name} 排課成功")
+            else:
+                fail_list.append(f"{name}（{result[:30]}）")
+                print(f"  ❌ {name} 排課失敗：{result[:50]}")
+        except Exception as e:
+            fail_list.append(f"{name}（Exception: {str(e)[:30]}）")
+            print(f"  ❌ {name} 排課例外：{e}")
+
+        # 每位用戶之間暫停 3 秒，避免打爆 OpenAI / LINE API
+        time.sleep(3)
+
+    # 排課結束，向老闆報告
+    summary = f"🤖【週排課批次完成】\n✅ 成功：{len(success_list)} 人\n"
+    if success_list:
+        summary += "  " + "、".join(success_list) + "\n"
+    if fail_list:
+        summary += f"❌ 失敗：{len(fail_list)} 人\n  " + "\n  ".join(fail_list)
+
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    try:
+        c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+        admin_row = c.fetchone()
+    except Exception:
+        admin_row = None
+    finally:
+        conn.close()
+
+    if admin_row:
+        try:
+            line_bot_api.push_message(admin_row[0], TextSendMessage(text=summary))
+        except Exception as e:
+            print(f"⚠️ 老闆報告發送失敗: {e}")
+
+    print(f"🏁 [auto_weekly_coach_batch] 排課完畢：成功 {len(success_list)}，失敗 {len(fail_list)}")
+
 # ==========================================
 # 🦞 龍蝦專屬安全通道 (給 OpenClaw 讀取與發送訊息用)
 # ==========================================
