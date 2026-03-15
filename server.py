@@ -266,11 +266,11 @@ async def receive_form_data(request: Request):
         name, goal, restrictions = get_val("稱呼"), get_val("目標"), get_val("禁忌")
         weight, height, age, gender = float(get_val("體重") or 70), float(get_val("身高") or 170), float(get_val("年齡") or 30), get_val("性別")
         # 🏅 三大運動指標（namedValues 精確 Key 讀取）
-        run_5k_pb    = (data.get("🏃‍♂️ 跑步 5K 最佳成績 (5K PB)", [""])[0] or "").strip()
-        cycling_ftp  = (data.get("🚴‍♂️ 自行車 FTP 瓦數",            [""])[0] or "").strip()
-        swim_css     = (data.get("🏊‍♂️ 游泳 CSS 配速",               [""])[0] or "").strip()
+        run_5k_pb    = (get_val("5K") or "").strip()                     # 跑步 5K 最佳成績
+        cycling_ftp  = (get_val("FTP") or "").strip()                    # 自行車 FTP 瓦數
+        swim_css     = (get_val("CSS") or "").strip()                    # 游泳 CSS 配速
         # 🏷️ 運動類型（直接從表單抓）
-        sport_type   = (data.get("你主要想安排什麼運動訓練菜單", ["一般健身"])[0] or "一般健身").strip()
+        sport_type   = (get_val("運動訓練菜單") or "一般健身").strip()   # 運動類型
         # 🔥 身高防呆：如果客人填 1.76 公尺，自動轉成 176 公分
         if height < 3.0:
             height *= 100
