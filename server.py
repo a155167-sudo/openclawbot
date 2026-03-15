@@ -455,7 +455,28 @@ async def receive_form_data(request: Request):
             schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
 
             # 🤖 寫給機器人看的總表 (1 代表有教練權限)
-            master_api_rows.append([actual_date_str, user_id, int(tdee), lunch['name'], dinner['name'], "", 1, "", "", "", "", ""])
+            active_days_str = ",".join(active_days_list) if isinstance(active_days_list, list) else str(active_days_list)
+        
+        master_api_rows.append([
+            actual_date_str,        # 1. Date
+            user_id,                # 2. User_ID
+            int(tdee),              # 3. TDEE
+            lunch['name'],          # 4. Lunch_Item
+            dinner['name'],         # 5. Dinner_Item
+            "",                     # 6. Today_Workout
+            1,                      # 7. Is_Coaching_Enabled
+            "",                     # 8. Plan_Type
+            "",                     # 9. Sport_Type
+            "",                     # 10. Plan_Week
+            "",                     # 11. Workout_Intensity
+            "",                     # 12. Intervals_ID
+            "",                     # 13. Intervals_API_Key
+            "",                     # 14. Tomorrow_Workout
+            "",                     # 15. Tomorrow_Intensity
+            "",                     # 16. AI_Mute
+            active_days_str,        # 17. Training_Days (運動星期幾)
+            schedule_text           # 18. Training_Time (運動時間)
+        ])
 
         # 更新 SQLite
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
@@ -494,8 +515,14 @@ async def receive_form_data(request: Request):
                 try:
                     try: api_sheet = sheet.worksheet("Master_API_View")
                     except gspread.exceptions.WorksheetNotFound:
-                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="7")
-                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key"])
+                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="18")
+                        api_sheet.append_row([
+                            "Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", 
+                            "Today_Workout", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", 
+                            "Plan_Week", "Workout_Intensity", "Intervals_ID", "Intervals_API_Key", 
+                            "Tomorrow_Workout", "Tomorrow_Intensity", "AI_Mute", 
+                            "Training_Days", "Training_Time"
+                        ])
                     
                     api_sheet.append_rows(master_api_rows)
                     print(f"✅ 成功將資料寫入 Master_API_View！")
