@@ -95,6 +95,11 @@ if not os.path.exists(DB_DIR):
 # Google 試算表設定 (網址公開安全，靠 service_account 保護)
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1cf0QhWeYynk9nqsoqMIM-Lkxk_bP57zcd-ES7Sufkqg/edit?gid=0#gid=0"
 
+# ==========================================
+# 🔑 功能一：老闆 LINE UID（靜音指令專用）
+# ==========================================
+ADMIN_UID = "Uefd72ca53a9a6ac39781fe673c398530"
+
 # 🔥 設定 FastAPI 的生命週期與隱形店長排程
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -210,7 +215,8 @@ def init_db():
                            ("today_extra_pro", "INTEGER DEFAULT 0"), 
                            ("today_food_items", "TEXT DEFAULT ''"),
                            ("is_coaching_enabled", "INTEGER DEFAULT 1"), # 🔥 教練權限
-                           ("ai_silenced_until", "TEXT DEFAULT ''")]:    # 🔥 客服靜音倒數
+                           ("ai_silenced_until", "TEXT DEFAULT ''"),     # 🔥 客服靜音倒數
+                           ("ai_mute", "INTEGER DEFAULT 0")]:            # 🔑 功能一：老闆靜音旗標
             try: 
                 c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
             except sqlite3.OperationalError: 
@@ -257,21 +263,7 @@ async def receive_form_data(request: Request):
         if height < 3.0:
             height *= 100
         activity = get_val("活動量")
-    
-        # ==========================================
-        # ==========================================
-        # 🔥 新增：接住運動客製化與 Intervals 授權資料
-        # ==========================================
-        plan_type_raw = get_val("習慣") or ""  # 抓取「您每週有規律運動的習慣嗎？」
-        plan_type = "運動客製化" if "有" in plan_type_raw else "純飲食控制"
-
-        sport_type = get_val("哪一種運動") or ""
-        plan_week = get_val("哪幾天") or ""
-        workout_intensity = get_val("一般訓練日") or ""
-
-        intervals_id = get_val("Athlete ID") or ""
-        intervals_api_key = get_val("API Key") or ""
-        # ==========================================
+        
         bmr = (10 * weight + 6.25 * height - 5 * age - 161) if "女" in gender else (10 * weight + 6.25 * height - 5 * age + 5)
         act_mult = 1.2
         if "輕" in activity: act_mult = 1.375
@@ -460,20 +452,8 @@ async def receive_form_data(request: Request):
             schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
 
             # 🤖 寫給機器人看的總表 (1 代表有教練權限)
-            master_api_rows.append([
-                actual_date_str, 
-                user_id, 
-                int(tdee), 
-                lunch['name'], 
-                dinner['name'], 
-                "", # Tomorrow_Training (先留空)
-                1,  # Is_Coaching_Enabled
-                plan_type,
-                sport_type,
-                plan_week,
-                intervals_id,
-                intervals_api_key
-            ])
+            master_api_rows.append([actual_date_str, user_id, int(tdee), lunch['name'], dinner['name'], "", 1, "", "", "", "", ""])
+
         # 更新 SQLite
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
@@ -511,7 +491,7 @@ async def receive_form_data(request: Request):
                 try:
                     try: api_sheet = sheet.worksheet("Master_API_View")
                     except gspread.exceptions.WorksheetNotFound:
-                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="15")
+                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="7")
                         api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key"])
                     
                     api_sheet.append_rows(master_api_rows)
@@ -843,6 +823,40 @@ def handle_message(event):
 
     msg, uid = event.message.text.strip(), event.source.user_id
 
+    # ==========================================
+    # 🔑 功能一：老闆靜音指令攔截（最優先）
+    # ==========================================
+    if uid == ADMIN_UID:
+        if msg.startswith("@靜音 ") or msg.startswith("@解除靜音 "):
+            is_mute = msg.startswith("@靜音 ")
+            target_name = msg.replace("@靜音 ", "").replace("@解除靜音 ", "").strip()
+            conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+            c.execute("UPDATE health_profile SET ai_mute=? WHERE name=?", (1 if is_mute else 0, target_name))
+            affected = conn.rowcount
+            conn.commit(); conn.close()
+            if affected > 0:
+                action_str = "已靜音" if is_mute else "已解除靜音"
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ {action_str} {target_name}"))
+            else:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 找不到客人：{target_name}（請確認姓名完全相符）"))
+            return
+
+    # ==========================================
+    # 🛑 功能一：靜音擋箭牌（一般客人才檢查）
+    # ==========================================
+    if uid != ADMIN_UID:
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        try:
+            c.execute("SELECT ai_mute FROM health_profile WHERE user_id=?", (uid,))
+            mute_row = c.fetchone()
+            if mute_row and mute_row[0] == 1:
+                conn.close()
+                return  # 🛑 已靜音，直接結束，不呼叫 AI
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
     # 🔥 檢查是否處於「客服靜音期」
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -862,38 +876,73 @@ def handle_message(event):
     finally:
         conn.close()
 
-    # 🔥 AI 未來課表預約功能 (「運動：」前綴)
+    # ==========================================
+    # 🏃 功能二：客人輸入明日運動（結構化格式解析）
+    # 格式：運動：[名稱]\n時間：[時間]\n強度：[高/中/低]
+    # ==========================================
     if msg.startswith("運動：") or msg.startswith("運動:"):
-        sys_prompt = f"今天是 {tw_today().strftime('%Y/%m/%d')}。請將這句話解析為未來運動排程的JSON。包含: date (YYYY/MM/DD), workout_content (字串), intensity (HIGH/MEDIUM/LOW)。只回傳純JSON字串。"
         try:
-            res = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": msg}],
-                temperature=0.1
-            )
-            p_data = json.loads(res.choices[0].message.content.strip().replace("```json","").replace("```",""))
-            if gc:
+            # 解析各欄位（相容換行或空白分隔）
+            parts = re.split(r'[\n\r]+', msg.strip())
+            workout_name, workout_time, workout_intensity_raw = "", "", ""
+            for part in parts:
+                part = part.strip()
+                if part.startswith("運動：") or part.startswith("運動:"):
+                    workout_name = re.sub(r'^運動[：:]', '', part).strip()
+                elif part.startswith("時間：") or part.startswith("時間:"):
+                    workout_time = re.sub(r'^時間[：:]', '', part).strip()
+                elif part.startswith("強度：") or part.startswith("強度:"):
+                    workout_intensity_raw = re.sub(r'^強度[：:]', '', part).strip()
+
+            # 強度轉換：高→HIGH, 中→MED, 低→LOW
+            intensity_map = {"高": "HIGH", "中": "MED", "低": "LOW"}
+            workout_intensity = intensity_map.get(workout_intensity_raw, workout_intensity_raw.upper() or "MED")
+
+            # 寫入 Google Sheet（Tomorrow_Workout / Tomorrow_Intensity）
+            if gc and workout_name:
                 api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
+                headers = api_sheet.row_values(1)
+
+                # 確保欄位存在
+                for col_name in ["Tomorrow_Workout", "Tomorrow_Intensity"]:
+                    if col_name not in headers:
+                        api_sheet.update_cell(1, len(headers) + 1, col_name)
+                        headers = api_sheet.row_values(1)
+
+                tw_col = headers.index("Tomorrow_Workout") + 1
+                ti_col = headers.index("Tomorrow_Intensity") + 1
+                tomorrow_str_sheet = (tw_today() + datetime.timedelta(days=1)).strftime("%Y/%m/%d")
+
                 records = api_sheet.get_all_records()
                 target_idx = next(
                     (i + 2 for i, r in enumerate(records)
-                     if str(r.get("Date")) == p_data.get("date") and str(r.get("User_ID")) == uid),
+                     if str(r.get("User_ID")) == uid and str(r.get("Date")) == tomorrow_str_sheet),
                     None
                 )
+                workout_content = f"{workout_name} {workout_time}".strip()
                 if target_idx:
-                    headers = api_sheet.row_values(1)
-                    if "Today_Workout" not in headers:
-                        api_sheet.update_cell(1, len(headers)+1, "Today_Workout")
-                        api_sheet.update_cell(1, len(headers)+2, "Workout_Intensity")
-                        headers = api_sheet.row_values(1)
-                    api_sheet.update_cell(target_idx, headers.index("Today_Workout") + 1, p_data.get("workout_content"))
-                    api_sheet.update_cell(target_idx, headers.index("Workout_Intensity") + 1, p_data.get("intensity"))
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已成功排入 {p_data.get('date')} 課表！\n📝 內容：{p_data.get('workout_content')}\n💪 強度：{p_data.get('intensity')}"))
-                    return
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 找不到對應日期，請確認您的排餐計畫已啟動。"))
+                    api_sheet.update_cell(target_idx, tw_col, workout_content)
+                    api_sheet.update_cell(target_idx, ti_col, workout_intensity)
+                else:
+                    # 找今天的 row，把 Tomorrow_Workout 寫在今天 row（若明天 row 尚未建立）
+                    today_str_sheet = tw_today().strftime("%Y/%m/%d")
+                    target_today = next(
+                        (i + 2 for i, r in enumerate(records)
+                         if str(r.get("User_ID")) == uid and str(r.get("Date")) == today_str_sheet),
+                        None
+                    )
+                    if target_today:
+                        api_sheet.update_cell(target_today, tw_col, workout_content)
+                        api_sheet.update_cell(target_today, ti_col, workout_intensity)
+
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"✅ 已成功為您新增明日運動！\n🏃 {workout_name} {workout_time}\n💪 強度：{workout_intensity}\n\n今晚 9 點教練會針對此運動給予飲食建議喔💪"
+            ))
         except Exception as e:
-            print(f"⚠️ 運動課表預約失敗: {e}")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 日期格式無法辨識，請試試：運動：下週三 40分鐘慢跑"))
+            print(f"⚠️ 明日運動寫入失敗: {e}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="⚠️ 格式不符，請用：\n運動：慢跑\n時間：40分鐘\n強度：中"
+            ))
         return
 
     # 👇 第一步加在這裡！老闆專屬的記憶檢查按鈕 👇
@@ -1208,10 +1257,43 @@ async def get_lobster_targets(admin_secret: str, mode: str = "daily"):
                         "total_consumed_cal": total_cal,
                         "caloric_deficit": tdee - total_cal
                     }
+
+                    # ==========================================
+                    # 🔄 功能三：Tomorrow_Workout 動態覆蓋機制
+                    # 優先使用客人手動輸入，用完後清空欄位
+                    # ==========================================
+                    manual_workout = str(row_today.get("Tomorrow_Workout", "")).strip()
+                    manual_intensity = str(row_today.get("Tomorrow_Intensity", "")).strip()
+
+                    if manual_workout:
+                        # 有手動輸入 → 使用它，並清空（重置迎接下一天）
+                        tomorrow_workout = manual_workout
+                        tomorrow_intensity = manual_intensity or "MED"
+                        try:
+                            headers = api_sheet.row_values(1)
+                            today_records = api_sheet.get_all_records()
+                            today_target = next(
+                                (i + 2 for i, r in enumerate(today_records)
+                                 if str(r.get("User_ID")) == uid and str(r.get("Date")) == today_str),
+                                None
+                            )
+                            if today_target and "Tomorrow_Workout" in headers:
+                                tw_col = headers.index("Tomorrow_Workout") + 1
+                                ti_col = headers.index("Tomorrow_Intensity") + 1 if "Tomorrow_Intensity" in headers else None
+                                api_sheet.update_cell(today_target, tw_col, "")  # 清空
+                                if ti_col:
+                                    api_sheet.update_cell(today_target, ti_col, "")  # 清空
+                        except Exception as e:
+                            print(f"⚠️ 清空 Tomorrow_Workout 失敗: {e}")
+                    else:
+                        # 無手動輸入 → 退回原本邏輯，抓明天 row 的 Today_Workout
+                        tomorrow_workout = str(row_tomorrow.get("Today_Workout", "休息日"))
+                        tomorrow_intensity = str(row_tomorrow.get("Workout_Intensity", "LOW")).upper()
+
                     user_data["tomorrow_preview"] = {
                         "date": tomorrow_str,
-                        "workout": str(row_tomorrow.get("Today_Workout", "休息日")),
-                        "intensity": str(row_tomorrow.get("Workout_Intensity", "LOW")).upper()
+                        "workout": tomorrow_workout,
+                        "intensity": tomorrow_intensity
                     }
                     targets.append(user_data)
 
