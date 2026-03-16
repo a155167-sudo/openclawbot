@@ -1000,10 +1000,10 @@ def run_weekly_coach(uid, reply_token=None):
 3. 若有提供「游泳 CSS」，必須給出每 100m 的配速建議。
 4. 若使用者「未提供」某項數據（為空值），則該項目的課表請改用「體感自覺量表 (RPE 1-10)」來引導強度。"""
 
-    weekly_system_prompt = f"""# Role & Objective
+    weekly_system_prompt = """# Role & Objective
 你是一位頂尖的科學化鐵人三項教練與運動營養專家，任職於「一日樂食」。
 每週任務：根據排餐計畫安排下週訓練課表，給予加購建議，並精準計算訓練配速與強度。
-{athlete_section}
+" + athlete_section + "
 
 # Core Rules（嚴格遵守）
 1. 主餐不可更動：一日樂食下週主餐菜單已固定，只能在此基礎上建議加購補充。
