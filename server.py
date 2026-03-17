@@ -614,12 +614,7 @@ def get_ai_response_with_memory(user_id, user_msg):
 
     if gc and user_sheet_name:
         try:
-            user_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(user_sheet_name)
-            all_rows = user_sheet.get_all_records()
-            for row in all_rows:
-                row_date = str(row.get("日期", "")).strip()
-                if gc and user_sheet_name:
-        try:
+            # 確認你的變數名稱是 SPREADSHEET_ID 還是 SHEET_ID，請依你檔案最上方的設定為準
             user_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(user_sheet_name)
             all_rows = user_sheet.get_all_records()
             for row in all_rows:
