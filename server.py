@@ -778,24 +778,26 @@ def check_permission_and_quota(user_id):
 
 
 def send_tomorrow_reminders():
-    """每日提醒：讀取 Master_API_View，關心今日運動、提醒明日課表與智能加購"""
+    """每日晚安總結：讀取 SQLite 今日結算 + Master_API_View 明日預告與智能推銷"""
     today = tw_today()
     tomorrow = today + datetime.timedelta(days=1)
     today_fmt = today.strftime("%Y/%m/%d")
     tomorrow_fmt = tomorrow.strftime("%Y/%m/%d")
+    
+    weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+    today_str_zh = weekdays[today.weekday()]
 
-    # 1. 取得所有有教練資格的用戶
+    # 1. 取得所有有教練資格的用戶，同時抓取「今日外食紀錄」
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT user_id, name FROM health_profile WHERE is_coaching_enabled = 1")
-    users = c.fetchall(); conn.close()
+    c.execute("SELECT user_id, name, today_extra_cal, today_extra_pro, today_food_items, active_days FROM health_profile WHERE is_coaching_enabled = 1")
+    users_data = c.fetchall(); conn.close()
 
-    if not users:
+    if not users_data:
         return "ℹ️ 目前無教練資格用戶"
 
     if not gc:
         return "⚠️ Google Sheets 未連線，跳過提醒"
 
-    # 2. 讀取 Master_API_View 全表
     try:
         api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
         all_records = api_sheet.get_all_records()
@@ -803,7 +805,9 @@ def send_tomorrow_reminders():
         return f"⚠️ 無法讀取 Master_API_View: {e}"
 
     count, graduated = 0, 0
-    for uid, name in users:
+    for u_data in users_data:
+        uid, name, extra_cal, extra_pro, food_items, active_days = u_data
+        
         user_rows = [r for r in all_records if str(r.get("User_ID")) == uid]
         future_rows = [r for r in user_rows if str(r.get("Date", "")) >= tomorrow_fmt]
         remaining_days = len(future_rows)
@@ -821,53 +825,61 @@ def send_tomorrow_reminders():
                 line_bot_api.push_message(uid, TextSendMessage(text=graduation_msg))
                 graduated += 1
             except Exception as e:
-                print(f"⚠️ 畢業訊息發送失敗 ({name}): {e}")
-
+                pass
+            
             conn = sqlite3.connect(DB_PATH); c = conn.cursor()
             c.execute("UPDATE health_profile SET is_coaching_enabled=0 WHERE user_id=?", (uid,))
             conn.commit(); conn.close()
             continue
 
-        # ── 抓取今日與明日資料 ───────────────────────────────
+        # ── 抓取今日與明日 Sheet 資料 ───────────────────────────────
         today_row = next((r for r in user_rows if str(r.get("Date")) == today_fmt), None)
         tomorrow_row = next((r for r in user_rows if str(r.get("Date")) == tomorrow_fmt), None)
+
+        # 🎯 邏輯 1：今日結算報告 (從 SQLite 抓取)
+        if today_str_zh in (active_days or ""):
+            day_status = "(狀態：有排餐日)"
+        else:
+            day_status = "(狀態：無排餐日)"
+            
+        items_str = food_items if food_items else "無外食紀錄，今天很自律喔！"
         
-        if not tomorrow_row:
-            continue  
+        msg = f"🌙 {name} 晚安！教練為您送上今日總結：\n\n"
+        msg += f"📊 【今日飲食結算】 {day_status}\n"
+        msg += f"🔥 額外攝取熱量：+{extra_cal} kcal\n"
+        msg += f"🥩 額外攝取蛋白：+{extra_pro or 0} g\n"
+        msg += f"🍱 紀錄品項：{items_str}\n\n"
 
-        lunch = tomorrow_row.get("Lunch_Item", "主餐")
-        dinner = tomorrow_row.get("Dinner_Item", "晚餐")
-
-        # 🎯 邏輯 1：關心今日運動
-        today_workout_msg = ""
+        # 🎯 邏輯 2：關心今日運動
         if today_row:
-            # 優先抓客人手動輸入，沒有的話抓 AI 排的
             t_workout = str(today_row.get("Tomorrow_Workout", "")).strip() or str(today_row.get("Plan_Week", "")).strip()
             if t_workout and "休息" not in t_workout and "未開始" not in t_workout:
-                today_workout_msg = f"🎉 恭喜您完成了今天的訓練【{t_workout}】！記得好好放鬆伸展喔！\n\n"
+                msg += f"🎉 恭喜您完成了今天的訓練【{t_workout}】！記得好好放鬆伸展喔！\n\n"
 
-        # 🎯 邏輯 2 & 3：明日運動提醒與智能強度推銷
-        tomorrow_workout_msg = ""
-        upsell_msg = "為確保營養達標，需要幫您額外準備【舒肥雞胸肉】或【無糖豆漿】來補足蛋白質缺口嗎？" # 預設推銷
+        msg += "──────────────\n\n"
 
-        tmr_workout = str(tomorrow_row.get("Tomorrow_Workout", "")).strip()
-        tmr_intensity = str(tomorrow_row.get("Tomorrow_Intensity", "")).strip().upper()
+        # 🎯 邏輯 3：明日菜單預告
+        msg += f"🍱 【明日 {tomorrow.strftime('%m/%d')} 預告】\n"
+        if tomorrow_row and tomorrow_row.get("Lunch_Item"):
+            msg += f"☀️ 午餐：{tomorrow_row.get('Lunch_Item')}\n"
+            msg += f"🌙 晚餐：{tomorrow_row.get('Dinner_Item')}\n"
+        else:
+            msg += f"ℹ️ 明天是您的【無排餐日】，請記得維持健康飲食原則喔！\n"
 
-        # 若客人沒手動輸入，抓 AI 幫他排的課表
-        if not tmr_workout:
-            tmr_workout = str(tomorrow_row.get("Plan_Week", "")).strip()
-            # 簡單判斷 AI 課表強度
-            if "高強度" in tmr_workout or "間歇" in tmr_workout or "節奏" in tmr_workout:
-                tmr_intensity = "HIGH"
-            elif "輕鬆" in tmr_workout or "恢復" in tmr_workout or "散步" in tmr_workout:
-                tmr_intensity = "LOW"
-            else:
-                tmr_intensity = "MED"
-
-        if tmr_workout and "休息" not in tmr_workout and "未開始" not in tmr_workout:
-            tomorrow_workout_msg = f"🏃 明日訓練目標：{tmr_workout}\n\n"
+        # 🎯 邏輯 4：明日運動提醒與智能強度推銷
+        tmr_workout, tmr_intensity = "", "MED"
+        if tomorrow_row:
+            tmr_workout = str(tomorrow_row.get("Tomorrow_Workout", "")).strip()
+            tmr_intensity = str(tomorrow_row.get("Tomorrow_Intensity", "")).strip().upper()
             
-            # 根據強度決定要推銷什麼！
+            if not tmr_workout:
+                tmr_workout = str(tomorrow_row.get("Plan_Week", "")).strip()
+                if "高強度" in tmr_workout or "間歇" in tmr_workout or "節奏" in tmr_workout: tmr_intensity = "HIGH"
+                elif "輕鬆" in tmr_workout or "恢復" in tmr_workout or "散步" in tmr_workout: tmr_intensity = "LOW"
+
+        upsell_msg = "💪 為了保持好狀態，需要幫您準備【無糖豆漿】或【舒肥雞胸肉】補充優質蛋白嗎？"
+        if tmr_workout and "休息" not in tmr_workout and "未開始" not in tmr_workout:
+            msg += f"🏃 明日訓練目標：{tmr_workout}\n"
             if tmr_intensity == "HIGH":
                 upsell_msg = "🔥 明天有高強度訓練！強烈建議幫您加購一份【地瓜】補充優質碳水，加上【舒肥雞胸肉】修復肌肉喔！需要幫您準備嗎？"
             elif tmr_intensity == "LOW":
@@ -875,36 +887,19 @@ def send_tomorrow_reminders():
             else:
                 upsell_msg = "💪 明天有運動安排！建議幫您加購一份【無糖豆漿】或【舒肥雞胸肉】補足流失的蛋白質喔！需要幫您準備嗎？"
 
-        # 組合最終推播訊息
-        msg = (
-            f"🌙 {name} 晚安！\n"
-            f"{today_workout_msg}"
-            f"明天 ({tomorrow.strftime('%m/%d')}) 是您的專屬取餐日喔！\n\n"
-            f"🍱 明日菜單預覽：\n"
-            f"☀️ 午餐：{lunch}\n"
-            f"🌙 晚餐：{dinner}\n\n"
-            f"{tomorrow_workout_msg}"
-            f"💡 營養師溫馨提醒：\n"
-            f"{upsell_msg}\n"
-            f"（直接回覆需要的品項，店長明天就會幫您準備好！）"
-        )
+        msg += f"\n💡 教練溫馨提醒：\n{upsell_msg}\n(直接打字回覆店長即可！)"
 
-        # ── 倒數 3 天：補充續約提醒 ────────────────────────────────
-        if remaining_days <= 3:
-            msg += (
-                f"\n\n⏰【溫馨通知】您的排餐計畫還剩最後 {remaining_days} 天！\n"
-                f"想繼續享有專屬健康餐點嗎？現在就提前預約下一期：\n"
-                f"http://example.com" # 老闆記得換成您的表單網址
-            )
+        # ── 倒數 3 天續約提醒 ────────────────────────────────
+        if remaining_days <= 3 and remaining_days > 0:
+            msg += f"\n\n⏰ 您的排餐計畫還剩最後 {remaining_days} 天！提前預約下一期：\nhttp://example.com"
 
         try:
             line_bot_api.push_message(uid, TextSendMessage(text=msg))
             count += 1
         except Exception as e:
-            print(f"⚠️ 明日提醒發送失敗 ({name}): {e}")
+            pass
 
-    return f"✅ 成功發送 {count} 封明日取餐提醒（包含智能加購建議）；{graduated} 位用戶已畢業結業。"
-
+    return f"✅ 每日晚安總結發送完畢！共發送 {count} 封；{graduated} 位結業。"
 def get_distance(origin_address, target_address, mode="driving"):
     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
     params = {"origins": origin_address, "destinations": target_address, "mode": mode, "language": "zh-TW", "key": GOOGLE_MAPS_API_KEY}
