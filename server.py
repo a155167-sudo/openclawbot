@@ -268,6 +268,9 @@ async def receive_form_data(request: Request):
         activity = get_val("活動量")  
         # 👇 新增這一行，利用你的 get_val 函數去抓表單資料
         sport_type = get_val("運動訓練菜單") or "未設定"
+        training_freq = get_val("確認訓練頻率") or "未設定"
+        normal_train_time = get_val("一般訓練日") or "未設定"
+        long_train_day = get_val("長距離") or "未設定"
         bmr = (10 * weight + 6.25 * height - 5 * age - 161) if "女" in gender else (10 * weight + 6.25 * height - 5 * age + 5)
         act_mult = 1.2
         if "輕" in activity: act_mult = 1.375
@@ -456,7 +459,7 @@ async def receive_form_data(request: Request):
             schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
 
             # 🤖 寫給機器人看的總表 (1 代表有教練權限)
-            # 對應欄位：[Date, User_ID, TDEE, Lunch_Item, Dinner_Item, Tomorrow_Training, Is_Coaching_Enabled, Plan_Type, Sport_Type, Plan_Week, Intervals_ID, Intervals_API_Key]
+            # 欄位：[Date, User_ID, TDEE, Lunch_Item, Dinner_Item, Tomorrow_Training, Is_Coaching_Enabled, Plan_Type, Sport_Type, Plan_Week, Intervals_ID, Intervals_API_Key, Training_Freq, Normal_Train_Time, Long_Train_Day]
             master_api_rows.append([
                 actual_date_str, 
                 user_id, 
@@ -465,11 +468,14 @@ async def receive_form_data(request: Request):
                 dinner['name'], 
                 "", 
                 1, 
-                goal,          # 💡 放入 Plan_Type (這裡用顧客的 goal 減脂/增肌代替)
-                sport_type,    # 🌟 關鍵！精準放入 Sport_Type！
-                "",            # Plan_Week 預設空白，由每週教練排程填寫
-                "",            # Intervals_ID
-                ""             # Intervals_API_Key
+                goal,          
+                sport_type,    
+                "",            
+                "",            
+                "",            
+                training_freq,       # 🌟 新增：填入訓練頻率
+                normal_train_time,   # 🌟 新增：填入一般訓練時間
+                long_train_day       # 🌟 新增：填入長訓安排日
             ])
 
         # 更新 SQLite
@@ -509,8 +515,9 @@ async def receive_form_data(request: Request):
                 try:
                     try: api_sheet = sheet.worksheet("Master_API_View")
                     except gspread.exceptions.WorksheetNotFound:
-                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="7")
-                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key"])
+                        # 將 cols="7" 改成 "15"，並把新表頭補在最後面
+                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="15")
+                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key", "Training_Freq", "Normal_Train_Time", "Long_Train_Day"])
                     
                     api_sheet.append_rows(master_api_rows)
                     print(f"✅ 成功將資料寫入 Master_API_View！")
