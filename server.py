@@ -904,20 +904,29 @@ def run_weekly_coach(uid, reply_token=None):
     weekday_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     week_range = f"{next_week_dates[0]} – {next_week_dates[6]}"
 
-    # 3. 從 Google Sheet 抓下週排餐 & Intervals 設定
+    # 3. 從 Google Sheet 抓下週排餐 & 運動設定
     next_week_meals, row_date_map = [], {}
     intervals_id, intervals_key = "", ""
-    sport_type = "未設定" # 🌟 新增這行：預設為未設定
+    # 👇 新增：預設空字串，準備裝客人的運動設定
+    sport_type = "未設定"
+    training_freq = "未設定"
+    normal_train_time = "未設定"
+    long_train_day = "未設定"
+    
     if gc:
         try:
             api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
             all_records = api_sheet.get_all_records()
             for i, row in enumerate(all_records):
                 if str(row.get("User_ID")) == uid and str(row.get("Date")) in next_week_dates:
-                    # 🌟 新增這行：把試算表的 Sport_Type 抓出來
-                    if not sport_type or sport_type == "未設定":
-                        sport_type = str(row.get("Sport_Type", "未設定"))
                     
+                    # 👇 新增：把客人的四個運動設定抓出來 (只要抓到一次就不再覆蓋)
+                    if sport_type == "未設定":
+                        sport_type = str(row.get("Sport_Type", "未設定"))
+                        training_freq = str(row.get("Training_Freq", "未設定"))
+                        normal_train_time = str(row.get("Normal_Train_Time", "未設定"))
+                        long_train_day = str(row.get("Long_Train_Day", "未設定"))
+
                     day_idx = next_week_dates.index(str(row.get("Date")))
                     next_week_meals.append({
                         "date": row.get("Date"),
@@ -930,7 +939,7 @@ def run_weekly_coach(uid, reply_token=None):
                         intervals_id = str(row.get("Intervals_ID"))
                         intervals_key = str(row.get("Intervals_API_Key", ""))
         except Exception as e:
-            print(f"⚠️ 取得下週排餐失敗: {e}")
+            print(f"⚠️ 取得下週排餐與設定失敗: {e}")
 
     # 4. 抓 Intervals.icu 本週體能數據（若有設定）
     icu_data = get_intervals_data(intervals_id, intervals_key) if (intervals_id and intervals_key) else None
@@ -961,12 +970,18 @@ def run_weekly_coach(uid, reply_token=None):
     input_data = {
         "athlete": name,
         "goal": goal,
-        "sport_type": sport_type, # 🌟 新增這行：傳遞給 AI
         "active_days": active_days,
         "restrictions": restrictions or "無",
         "tdee": tdee,
         "protein_target_g": int(protein) if protein else 0,
         "week_range": week_range,
+        
+        # 👇 新增：把四個訓練設定餵給 AI
+        "sport_type": sport_type,
+        "training_freq": training_freq,
+        "normal_train_time": normal_train_time,
+        "long_train_day": long_train_day,
+        
         "this_week_activities": this_week_activities or "無紀錄",
         "intervals_fitness": icu_data,
         "next_week_meals": next_week_meals
@@ -974,30 +989,30 @@ def run_weekly_coach(uid, reply_token=None):
 
     weekly_system_prompt = """# Role & Objective
 你是一位頂尖的科學化運動教練與營養專家，任職於「一日樂食」。
-每週任務：進行每週訓練與營養總結，根據排餐計畫與顧客目標安排下週訓練課表，並給予加購建議。
+每週任務：進行每週訓練與營養總結，根據排餐計畫、顧客目標與指定的訓練頻率，安排下週訓練課表。
 
 # Core Rules（嚴格遵守）
 1. 主餐不可更動：一日樂食下週主餐菜單已固定，只能在此基礎上建議加購補充。
-2. 根據 active_days 決定哪幾天有餐點供應，非供餐日安排輕鬆訓練或休息。
+2. 根據 active_days 決定哪幾天有餐點供應。
 3. 根據 CTL/ATL/Form 判斷疲勞度，Form > 5 可推進強度；Form < -10 以恢復為主。
-4. 至少 1-2 天休息日或主動恢復日（輕鬆散步、瑜伽）。
-5. 根據輸入資料中的 "sport_type" (運動類型) 決定課表風格：
-   - 若為「鐵人三項、跑步、自行車」等耐力運動，請給予 Z2/Z3/閾值配速課表。
-   - 若為「肌力訓練、重訓、健美」等力量運動，請給予明確的部位分化與組數次數。
-6. 高強度訓練日/腿部訓練日 → 強烈建議加購單點食物（舒肥雞胸肉、地瓜等）。
+4. 高強度訓練日/腿部訓練日 → 強烈建議加購單點食物（舒肥雞胸肉、地瓜等）。
 
-# 🏃 耐力型訓練區間參考 (僅適用於耐力運動)
+# 🏃‍♂️ 專屬排課鐵律 (極度重要)
+你必須嚴格根據輸入資料中的顧客設定來排課：
+- "sport_type" (運動類型)：決定課表是「耐力型(Z2/Z3)」還是「力量型(推拉腿/部位分化)」。
+- "training_freq" (訓練頻率)：顧客指定的訓練日(例如：週一,週三,週五)。【絕對不可】在顧客沒指定的日子安排主訓練！沒指定的日子一律排「休息」或「主動恢復(散步/瑜珈)」。
+- "normal_train_time" (一般訓練時間)：平日訓練的時長(例如：1小時)，請將課表時間控制在這個範圍內。
+- "long_train_day" (長訓安排日)：若顧客有指定(例如：星期六)，你必須把當週最耗時、強度最深的訓練(例如：Z2長距離/重訓腿日)排在這一天！
+
+# 🏃 耐力型訓練區間參考 (若 sport_type 為三鐵/跑步/自行車)
 - Z2 跑步：6:00–6:05/km @ HR 130–138
 - Z3 節奏跑：5:30–5:45/km @ HR 148–155
 - 閾值：4:33/km @ HR 172
 - 自行車 FTP：240W ｜ Z2：134–180W ｜ Z3 甜蜜點：182–216W
 
-# 💪 力量型訓練原則 (僅適用於肌力/重訓)
-- 分化訓練：根據一週練幾天，安排「推/拉/腿」或「上肢/下肢」分化。
-- 課表格式：必須明確寫出「部位 + 主要動作 + 組數x次數」。
-  - 例：下肢日（深蹲 4x8, RDL 3x10）
-  - 例：推部位（臥推 4x8, 肩推 3x12）
-- 漸進超負荷：提醒顧客記錄重量，每週嘗試增加次數或重量。
+# 💪 力量型訓練原則 (若 sport_type 為肌力/重訓/健美)
+- 分化訓練：根據 "training_freq" 的天數，合理安排「推/拉/腿」或「上肢/下肢」。
+- 課表格式：必須寫出「部位 + 主要動作 + 組數x次數」。例：下肢日（深蹲 4x8, RDL 3x10）
 
 # Output Format（強制 JSON，不可輸出任何其他文字）
 你必須只回傳一個合法的 JSON 物件，格式如下：
