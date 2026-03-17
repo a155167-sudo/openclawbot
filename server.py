@@ -1627,19 +1627,3 @@ async def lobster_weekly_coach(payload: WeeklyCoachPayload):
         return {"status": "success", "msg": "每週課表已生成並推播", "plan_preview": result[:100] + "..."}
     else:
         raise HTTPException(status_code=500, detail=result)
-Footer
-© 2026 GitHub, Inc.
-Footer navigation
-Terms
-Privacy
-Security
-Status
-Community
-Docs
-Contact
-Manage cookies
-Do not share my personal information
-
-備忘錄
-突顯
-解釋
