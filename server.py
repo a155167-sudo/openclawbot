@@ -614,16 +614,20 @@ def get_ai_response_with_memory(user_id, user_msg):
 
     if gc and user_sheet_name:
         try:
-            # 確認你的變數名稱是 SPREADSHEET_ID 還是 SHEET_ID，請依你檔案最上方的設定為準
+            # 確保使用正確的試算表變數名稱 (SPREADSHEET_ID 或 SHEET_ID)
             user_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(user_sheet_name)
             all_rows = user_sheet.get_all_records()
+            
             for row in all_rows:
+                # 把試算表上的日期抓下來並清除前後空白
                 row_date = str(row.get("日期", "")).strip()
-                # 優先用完整日期比對，再比對星期
-                if row_date == today_date_str or row_date == today_str_zh:
+                
+                # 🎯 關鍵修正：【只】比對今天的完整日期，不要再比對星期幾了！
+                if row_date == today_date_str:
                     today_lunch = str(row.get("午餐", row.get("Lunch_Item", "無")) or "無").strip()
                     today_dinner = str(row.get("晚餐", row.get("Dinner_Item", "無")) or "無").strip()
-                    break
+                    break # 找到了就立刻停止往下找
+                    
         except Exception as e:
             print(f"⚠️ 讀取當天排餐失敗: {e}")
 
