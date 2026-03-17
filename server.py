@@ -462,7 +462,6 @@ async def receive_form_data(request: Request):
             schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
 
             # 🤖 寫給機器人看的總表 (1 代表有教練權限)
-            # 欄位：[Date, User_ID, TDEE, Lunch_Item, Dinner_Item, Tomorrow_Training, Is_Coaching_Enabled, Plan_Type, Sport_Type, Plan_Week, Intervals_ID, Intervals_API_Key, Training_Freq, Normal_Train_Time, Long_Train_Day]
             master_api_rows.append([
                 actual_date_str, 
                 user_id, 
@@ -476,9 +475,12 @@ async def receive_form_data(request: Request):
                 "",            
                 "",            
                 "",            
-                training_freq,       # 🌟 新增：填入訓練頻率
-                normal_train_time,   # 🌟 新增：填入一般訓練時間
-                long_train_day       # 🌟 新增：填入長訓安排日
+                training_freq,       
+                normal_train_time,   
+                long_train_day,      
+                run_pace,            # 🌟 必須確保這裡有放進去！(對應第16欄)
+                bike_ftp,            # 🌟 必須確保這裡有放進去！(對應第17欄)
+                swim_pace            # 🌟 必須確保這裡有放進去！(對應第18欄)
             ])
 
         # 更新 SQLite
