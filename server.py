@@ -265,8 +265,9 @@ async def receive_form_data(request: Request):
         # 🔥 身高防呆：如果客人填 1.76 公尺，自動轉成 176 公分
         if height < 3.0:
             height *= 100
-        activity = get_val("活動量")
-        
+        activity = get_val("活動量")  
+        # 👇 新增這一行，利用你的 get_val 函數去抓表單資料
+        sport_type = get_val("運動訓練菜單") or "未設定"
         bmr = (10 * weight + 6.25 * height - 5 * age - 161) if "女" in gender else (10 * weight + 6.25 * height - 5 * age + 5)
         act_mult = 1.2
         if "輕" in activity: act_mult = 1.375
@@ -455,7 +456,21 @@ async def receive_form_data(request: Request):
             schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
 
             # 🤖 寫給機器人看的總表 (1 代表有教練權限)
-            master_api_rows.append([actual_date_str, user_id, int(tdee), lunch['name'], dinner['name'], "", 1, "", "", "", "", ""])
+            # 對應欄位：[Date, User_ID, TDEE, Lunch_Item, Dinner_Item, Tomorrow_Training, Is_Coaching_Enabled, Plan_Type, Sport_Type, Plan_Week, Intervals_ID, Intervals_API_Key]
+            master_api_rows.append([
+                actual_date_str, 
+                user_id, 
+                int(tdee), 
+                lunch['name'], 
+                dinner['name'], 
+                "", 
+                1, 
+                goal,          # 💡 放入 Plan_Type (這裡用顧客的 goal 減脂/增肌代替)
+                sport_type,    # 🌟 關鍵！精準放入 Sport_Type！
+                "",            # Plan_Week 預設空白，由每週教練排程填寫
+                "",            # Intervals_ID
+                ""             # Intervals_API_Key
+            ])
 
         # 更新 SQLite
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
