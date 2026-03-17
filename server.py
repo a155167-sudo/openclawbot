@@ -999,7 +999,7 @@ def run_weekly_coach(uid, reply_token=None):
 
     weekly_system_prompt = """# Role & Objective
 你是一位頂尖的科學化運動教練與營養專家，任職於「一日樂食」。
-每週任務：進行每週訓練與營養總結，根據排餐計畫、顧客目標與指定的訓練頻率，安排下週訓練課表。
+每週任務：進行每週訓練與營養總結，根據排餐計畫、顧客目標與指定的訓練頻率，訓練頻率與長訓日，安排下週 7 天完整的訓練課表。
 
 # Core Rules（嚴格遵守）
 1. 主餐不可更動：一日樂食下週主餐菜單已固定，只能在此基礎上建議加購補充。
@@ -1007,19 +1007,25 @@ def run_weekly_coach(uid, reply_token=None):
 3. 根據 CTL/ATL/Form 判斷疲勞度，Form > 5 可推進強度；Form < -10 以恢復為主。
 4. 高強度訓練日/腿部訓練日 → 強烈建議加購單點食物（舒肥雞胸肉、地瓜等）。
 
-# 🏃‍♂️ 專屬排課鐵律 (極度重要)
-你必須嚴格根據輸入資料中的顧客設定來排課：
-- "sport_type" (運動類型)：決定課表是「耐力型(Z2/Z3)」還是「力量型(推拉腿/部位分化)」。
-- "training_freq" (訓練頻率)：顧客指定的訓練日(例如：週一,週三,週五)。【絕對不可】在顧客沒指定的日子安排主訓練！沒指定的日子一律排「休息」或「主動恢復(散步/瑜珈)」。
-- "normal_train_time" (一般訓練時間)：平日訓練的時長(例如：1小時)，請將課表時間控制在這個範圍內。
-- "long_train_day" (長訓安排日)：若顧客有指定(例如：星期六)，你必須把當週最耗時、強度最深的訓練(例如：Z2長距離/重訓腿日)排在這一天！
+# 🏃‍♂️ 專屬排課鐵律 (極度重要，違規將導致系統失敗)
+1. 運動類型連動：
+   - 若為「鐵人三項」：每週【必須】包含：至少 1 次游泳、1 次騎車、1 次跑步。
+   - 若為「耐力運動」：必須利用顧客提供的配速數據計算出具體目標。
+2. 訓練時間與頻率：
+   - 嚴格遵守 "training_freq"：只能在顧客指定的日子安排「主訓練」。
+   - 非指定訓練日：一律安排「休息」或「主動恢復（散步、瑜珈、伸展）」。
+   - 長訓安排：必須將該週「時長最長、最累」的課表排在 "long_train_day"。
+3. 數據精準化 (🔥 核心要求)：
+   - 禁寫模糊字眼：絕對不可只寫「Z2 跑步」或「騎車 60m」。
+   - 強制計算：你必須根據 {run_pace}、{bike_ftp}、{swim_pace} 算出當天的「目標配速/瓦數」。
+   - 範例：不要寫「Z2 跑步」，要寫「Z2 跑步 60m (配速 6:15/km)」。
+   - 範例：不要寫「騎車 60m」，要寫「Z2 騎乘 60m (目標 180W)」。
 
-# 🏃 耐力型訓練區間參考 (若 sport_type 為三鐵/跑步/自行車)
-你必須根據以下顧客的真實體能數據，推算出適合他的 Z2/Z3 或間歇配速：
-- 🏃 顧客 5K 最佳成績：{run_pace} (若為未提供，請給予體感 RPE 建議)
-- 🚴 顧客自行車 FTP：{bike_ftp} 瓦 (若為未提供，請給予體感 RPE 建議)
-- 🏊 顧客游泳 CSS 配速：{swim_pace} (若為未提供，請給予體感 RPE 建議)
-*請在課表中明確寫出客製化的配速或瓦數要求！*
+# 📊 體能數據 (請參考此進行計算)
+- 🏃 5K 最佳成績：{run_pace} (以此推估各區間配速)
+- 🚴 自行車 FTP：{bike_ftp} (以其 60%-75% 為 Z2 瓦數)
+- 🏊 游泳 CSS 配速：{swim_pace} (以其為基礎設計間歇或長泳)
+*若數據為「未提供」，請使用 RPE 體感分級並註明。*
 
 # 💪 力量型訓練原則 (若 sport_type 為肌力/重訓/健美)
 - 分化訓練：根據 "training_freq" 的天數，合理安排「推/拉/腿」或「上肢/下肢」。
@@ -1086,24 +1092,46 @@ def run_weekly_coach(uid, reply_token=None):
         line_message = raw_content
         daily_plan = {}
 
-    # 8. 逐日寫入 Plan_Week（每個日期欄位只寫當天課表）
-    if gc and row_date_map:
-        try:
-            api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
-            headers = api_sheet.row_values(1)
-            if "Plan_Week" not in headers:
-                api_sheet.update_cell(1, len(headers) + 1, "Plan_Week")
-                headers = api_sheet.row_values(1)
-            pw_col = headers.index("Plan_Week") + 1
-            written = 0
-            for date_str, row_idx in row_date_map.items():
-                day_plan = daily_plan.get(date_str, "")
-                if day_plan:
-                    api_sheet.update_cell(row_idx, pw_col, day_plan)
-                    written += 1
-            print(f"✅ Plan_Week 逐日寫入完成：{written}/{len(row_date_map)} 天")
-        except Exception as e:
-            print(f"⚠️ 寫入 Plan_Week 失敗: {e}")
+    # 8. 寫回 Google Sheet (Tomorrow_Training 欄位)
+        if gc:
+            try:
+                new_rows_to_add = [] # 準備用來裝週末或沒訂餐的排課日
+                for date_str, plan_text in ai_plan.items():
+                    if date_str in row_date_map:
+                        # 狀況 A：原本就有訂餐的格子，直接更新運動課表 (假設在第 6 欄)
+                        row_idx = row_date_map[date_str]
+                        api_sheet.update_cell(row_idx, 6, plan_text)
+                    else:
+                        # 狀況 B：沒訂餐的日子 (例如六日)，Google Sheet 裡沒這列！
+                        # 我們要「無中生有」補齊這一天，讓課表完整呈現 7 天
+                        new_rows_to_add.append([
+                            date_str,             # Date
+                            uid,                  # User_ID
+                            0,                    # TDEE (沒訂餐填0)
+                            "無",                 # Lunch (沒訂餐)
+                            "無",                 # Dinner (沒訂餐)
+                            plan_text,            # 🌟 Tomorrow_Training (把訓練課表填進去！)
+                            1,                    # Is_Coaching_Enabled
+                            goal,                 # Plan_Type
+                            sport_type,           # Sport_Type
+                            week_range,           # Plan_Week
+                            intervals_id,         # Intervals_ID
+                            intervals_key,        # Intervals_API_Key
+                            training_freq,        # Training_Freq
+                            normal_train_time,    # Normal_Train_Time
+                            long_train_day,       # Long_Train_Day
+                            run_pace,             # Run_Pace
+                            bike_ftp,             # Bike_FTP
+                            swim_pace             # Swim_Pace
+                        ])
+                
+                # 如果有沒訂餐的週末課表，一口氣加進 Sheet 裡
+                if new_rows_to_add:
+                    api_sheet.append_rows(new_rows_to_add)
+                    print(f"✅ 自動補齊了 {len(new_rows_to_add)} 天的無餐點訓練日！")
+                    
+            except Exception as e:
+                print(f"⚠️ 寫回課表至 Sheet 失敗: {e}")
 
     # 9. LINE 推播（只送精美 line_message，不塞課表 JSON）
     try:
