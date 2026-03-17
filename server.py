@@ -1173,6 +1173,7 @@ def handle_message(event):
     # 🔑 功能一：老闆靜音指令攔截（最優先）
     # ==========================================
     if uid == ADMIN_UID:
+        # 🟢 如果老闆打的是這兩個指令，才執行裡面的所有動作
         if msg.startswith("@靜音 ") or msg.startswith("@解除靜音 "):
             is_mute = msg.startswith("@靜音 ")
             target_name = msg.replace("@靜音 ", "").replace("@解除靜音 ", "").strip()
@@ -1180,27 +1181,25 @@ def handle_message(event):
             c.execute("UPDATE health_profile SET ai_mute=? WHERE name=?", (1 if is_mute else 0, target_name))
             affected = conn.rowcount
             conn.commit(); conn.close()
-            user_id = event.source.user_id  # 🌟 確保抓得到發話者的 ID
+            user_id = event.source.user_id 
 
-        if affected > 0:
-            action_str = "已靜音" if is_mute else "已解除靜音"
-            # 這裡因為只是簡單的資料庫操作，速度很快，可以用 reply_message 節省主動推送額度
-            # 但如果你擔心後續還有其他動作，改用 push 也可以
-            try:
+            # 🌟 注意！這裡開始必須往右縮排，被包在上面的 if 裡面！
+            if affected > 0:
+                action_str = "已靜音" if is_mute else "已解除靜音"
+                try:
+                    line_bot_api.push_message(
+                        user_id, 
+                        TextSendMessage(text=f"✅ {action_str} {target_name}")
+                    )
+                except Exception as e:
+                    print(f"❌ Push 失敗: {e}")
+            else:
                 line_bot_api.push_message(
                     user_id, 
-                    TextSendMessage(text=f"✅ {action_str} {target_name}")
+                    TextSendMessage(text=f"❌ 找不到客人：{target_name}（請確認姓名完全相符）")
                 )
-            except Exception as e:
-                print(f"❌ Push 失敗: {e}")
-        else:
-            # 找不到客人的情況
-            line_bot_api.push_message(
-                user_id, 
-                TextSendMessage(text=f"❌ 找不到客人：{target_name}（請確認姓名完全相符）")
-            )
-        
-        return  # 結束這段處理
+            
+            return  # 🌟 指令處理完畢再 return
     # ==========================================
     # 🛑 功能一：靜音擋箭牌（一般客人才檢查）
     # ==========================================
