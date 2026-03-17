@@ -618,7 +618,14 @@ def get_ai_response_with_memory(user_id, user_msg):
             all_rows = user_sheet.get_all_records()
             for row in all_rows:
                 row_date = str(row.get("日期", "")).strip()
-                if row_date == today_date_str:
+                if gc and user_sheet_name:
+        try:
+            user_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(user_sheet_name)
+            all_rows = user_sheet.get_all_records()
+            for row in all_rows:
+                row_date = str(row.get("日期", "")).strip()
+                # 優先用完整日期比對，再比對星期
+                if row_date == today_date_str or row_date == today_str_zh:
                     today_lunch = str(row.get("午餐", row.get("Lunch_Item", "無")) or "無").strip()
                     today_dinner = str(row.get("晚餐", row.get("Dinner_Item", "無")) or "無").strip()
                     break
