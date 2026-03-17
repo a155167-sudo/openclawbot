@@ -1181,28 +1181,62 @@ def handle_message(event):
         conn.close()
 
     # ==========================================
-    # 🏃 功能二：客人輸入明日運動（結構化格式解析）
-    # 格式：運動：[名稱]\n時間：[時間]\n強度：[高/中/低]
+    # 🏃 功能二：客人輸入運動（支援指定日期版）
+    # 格式：
+    # 日期：[3/22 或 明天] (若不填寫，系統預設為明天)
+    # 運動：[名稱]
+    # 時間：[時間]
+    # 強度：[高/中/低]
     # ==========================================
-    if msg.startswith("運動：") or msg.startswith("運動:"):
+    if msg.startswith("運動：") or msg.startswith("運動:") or msg.startswith("日期：") or msg.startswith("日期:"):
         try:
-            # 解析各欄位（相容換行或空白分隔）
             parts = re.split(r'[\n\r]+', msg.strip())
-            workout_name, workout_time, workout_intensity_raw = "", "", ""
+            workout_date_raw, workout_name, workout_time, workout_intensity_raw = "", "", "", ""
+
             for part in parts:
                 part = part.strip()
-                if part.startswith("運動：") or part.startswith("運動:"):
+                if part.startswith("日期：") or part.startswith("日期:"):
+                    workout_date_raw = re.sub(r'^日期[：:]', '', part).strip()
+                elif part.startswith("運動：") or part.startswith("運動:"):
                     workout_name = re.sub(r'^運動[：:]', '', part).strip()
                 elif part.startswith("時間：") or part.startswith("時間:"):
                     workout_time = re.sub(r'^時間[：:]', '', part).strip()
                 elif part.startswith("強度：") or part.startswith("強度:"):
                     workout_intensity_raw = re.sub(r'^強度[：:]', '', part).strip()
 
+            # 📅 日期智能解析引擎
+            today = tw_today()
+            target_date = today + datetime.timedelta(days=1) # 預設防呆：預設為明天
+
+            if workout_date_raw:
+                if workout_date_raw in ["今天", "今日"]:
+                    target_date = today
+                elif workout_date_raw in ["明天", "明日"]:
+                    target_date = today + datetime.timedelta(days=1)
+                elif workout_date_raw in ["後天"]:
+                    target_date = today + datetime.timedelta(days=2)
+                else:
+                    # 處理 3/22 或 03-22 格式
+                    clean_date = workout_date_raw.replace("-", "/")
+                    if "/" in clean_date:
+                        try:
+                            d_parts = clean_date.split("/")
+                            if len(d_parts) == 2:
+                                target_date = datetime.date(today.year, int(d_parts[0]), int(d_parts[1]))
+                            elif len(d_parts) == 3:
+                                y = int(d_parts[0])
+                                if y < 100: y += 2000 # 支援 26/3/22 這種寫法
+                                target_date = datetime.date(y, int(d_parts[1]), int(d_parts[2]))
+                        except ValueError:
+                            pass # 如果客人亂打，解析失敗就默默維持預設的明天
+
+            target_date_str_sheet = target_date.strftime("%Y/%m/%d")
+
             # 強度轉換：高→HIGH, 中→MED, 低→LOW
             intensity_map = {"高": "HIGH", "中": "MED", "低": "LOW"}
             workout_intensity = intensity_map.get(workout_intensity_raw, workout_intensity_raw.upper() or "MED")
 
-            # 寫入 Google Sheet（Tomorrow_Workout / Tomorrow_Intensity）
+            # 寫入 Google Sheet
             if gc and workout_name:
                 api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
                 headers = api_sheet.row_values(1)
@@ -1215,37 +1249,37 @@ def handle_message(event):
 
                 tw_col = headers.index("Tomorrow_Workout") + 1
                 ti_col = headers.index("Tomorrow_Intensity") + 1
-                tomorrow_str_sheet = (tw_today() + datetime.timedelta(days=1)).strftime("%Y/%m/%d")
 
                 records = api_sheet.get_all_records()
+                # 🔥 這裡改為精準尋找「目標日期」的那一列
                 target_idx = next(
                     (i + 2 for i, r in enumerate(records)
-                     if str(r.get("User_ID")) == uid and str(r.get("Date")) == tomorrow_str_sheet),
+                     if str(r.get("User_ID")) == uid and str(r.get("Date")) == target_date_str_sheet),
                     None
                 )
+
                 workout_content = f"{workout_name} {workout_time}".strip()
                 if target_idx:
                     api_sheet.update_cell(target_idx, tw_col, workout_content)
                     api_sheet.update_cell(target_idx, ti_col, workout_intensity)
                 else:
-                    # 找今天的 row，把 Tomorrow_Workout 寫在今天 row（若明天 row 尚未建立）
-                    today_str_sheet = tw_today().strftime("%Y/%m/%d")
-                    target_today = next(
-                        (i + 2 for i, r in enumerate(records)
-                         if str(r.get("User_ID")) == uid and str(r.get("Date")) == today_str_sheet),
-                        None
-                    )
-                    if target_today:
-                        api_sheet.update_cell(target_today, tw_col, workout_content)
-                        api_sheet.update_cell(target_today, ti_col, workout_intensity)
+                    # 如果找不到那天的資料（例如他排了 3 個月後的課），就退回提醒
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text=f"⚠️ 找不到 {target_date_str_sheet} 的專屬檔案！\n請確認您的排餐日期範圍喔。"
+                    ))
+                    return
+
+            display_date = f"{target_date.month}/{target_date.day}"
+            if target_date == today: display_date = f"今天 ({display_date})"
+            elif target_date == today + datetime.timedelta(days=1): display_date = f"明天 ({display_date})"
 
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text=f"✅ 已成功為您新增明日運動！\n🏃 {workout_name} {workout_time}\n💪 強度：{workout_intensity}\n\n今晚 9 點教練會針對此運動給予飲食建議喔💪"
+                text=f"✅ 已成功為您新增 {display_date} 的運動！\n🏃 {workout_name} {workout_time}\n💪 強度：{workout_intensity}\n\n系統已同步紀錄，將為您精算營養攝取💪"
             ))
         except Exception as e:
-            print(f"⚠️ 明日運動寫入失敗: {e}")
+            print(f"⚠️ 運動寫入失敗: {e}")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="⚠️ 格式不符，請用：\n運動：慢跑\n時間：40分鐘\n強度：中"
+                text="⚠️ 格式不符，請點擊圖文選單重新輸入喔！"
             ))
         return
 
@@ -1402,7 +1436,14 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="👑 老闆特權啟動！系統已強制為您開通 VIP 檔案並補滿 50 次額度！現在請問我熱量！"))
         return
+    elif msg == "#全體排課":
+        # 先秒回老闆，避免 LINE 等太久當機
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🚀 老闆指令確認！系統已啟動「全體批次排課」引擎。這可能需要幾分鐘時間，全數完成後會私訊報告給您！"))
         
+        # 呼叫隱形店長在背景幫所有人排課
+        import threading
+        threading.Thread(target=auto_weekly_coach_batch).start()
+        return    
     # 🗺️ 智能測距與順風車 🗺️
     elif msg.startswith("#測距 "):
         target_address = msg.replace("#測距 ", "").strip()
