@@ -842,15 +842,38 @@ def send_tomorrow_reminders():
         else:
             day_status = "(狀態：無排餐日)"
             
-        items_str = food_items if food_items else "無外食紀錄，今天很自律喔！"
+        items_str = food_items if food_items else "無外食紀錄"
         
+        # 2. 新增 TDEE 四大情境判斷
+        # 【注意】這裡的 tdee 和 base_cal(排餐熱量) 需要從你的資料庫抓取，這裡先寫死數值作為範例
+        tdee = 2000 
+        base_cal = 0
+        if day_status == "(狀態：有排餐日)":
+            base_cal = 500 # 假設有排餐日的預設熱量，請依實際情況替換
+            
+        total_cal = base_cal + int(float(extra_cal) if extra_cal else 0)
+        
+        feedback_msg = ""
+        if total_cal == 0:
+            feedback_msg = "今天目前都沒有收到您的飲食紀錄喔！為了更精準掌握體態進度，記得隨手幫我記錄下來呀✍️"
+        elif total_cal < (tdee - 200):
+            feedback_msg = "今天的熱量距離目標還有點遠喔！吃太少可能會讓身體代謝變慢、流失肌肉。教練建議可以再補充一點優質蛋白質或好油！💪"
+        elif (tdee - 200) <= total_cal <= (tdee + 200):
+            feedback_msg = "太棒了！今天的熱量控制得非常精準🎯，繼續保持這個節奏，離目標又更近一步囉！今天很自律喔！"
+        else:
+            feedback_msg = "今天稍微爆卡了一點點，不過別有壓力！偶爾吃點好吃的放鬆一下也很重要😌。我們明天再把飲食步調調整回來就好，教練陪你繼續努力！"
+
+        # 3. 組合原本的訊息，並插入教練溫馨提醒
         msg = f"🌙 {name} 晚安！教練為您送上今日總結：\n\n"
         msg += f"📊 【今日飲食結算】 {day_status}\n"
         msg += f"🔥 額外攝取熱量：+{extra_cal} kcal\n"
         msg += f"🥩 額外攝取蛋白：+{extra_pro or 0} g\n"
         msg += f"🍱 紀錄品項：{items_str}\n\n"
+        
+        # 🌟 將 TDEE 情境回覆放在飲食結算下方
+        msg += f"💡 飲食小叮嚀：\n{feedback_msg}\n\n"
 
-        # 🎯 邏輯 2：關心今日運動
+        # 🎯 邏輯 2：關心今日運動 (這段完全保留你原本的寫法)
         if today_row:
             t_workout = str(today_row.get("Tomorrow_Workout", "")).strip() or str(today_row.get("Plan_Week", "")).strip()
             if t_workout and "休息" not in t_workout and "未開始" not in t_workout:
