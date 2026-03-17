@@ -1484,32 +1484,36 @@ def handle_message(event):
     # 📅 功能四：每週課表觸發（LINE 指令）
     # ==========================================
     if msg in ["請安排下週課表", "排下週課表", "下週課表", "週課表"]:
+        # 🌟 重要：先確保 user_id 有被正確賦值
+        target_user_id = event.source.user_id 
+        
         try:
-            # 1. 先用 reply 回應客人，避免 Token 過期，也讓客人知道系統有在動
+            # 1. 立即回應，守住 reply_token
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text="⏳ 收到！正在分析您的體能數據並編排下週課表，請稍等約 30 秒...")
             )
 
-            # 2. 執行 AI 運算 (這就是你原本那個很長的排課函數)
-            # 假設這個函數會回傳 (生成的長文, 7天課表字典)
-            ai_message, ai_plan = run_weekly_coach(user_id) 
+            # 2. 執行 AI 運算 (請確認你的函數名稱與回傳值正確)
+            # 注意：這裡會跑到你寫入 Google Sheet 的邏輯
+            ai_message, ai_plan = run_weekly_coach(target_user_id) 
 
-            # 3. 運算完後，使用 push_message 把結果傳給客人
-            line_bot_api.push_message(
-                user_id, 
-                TextSendMessage(text=ai_message)
-            )
+            # 3. 運算完後，使用 push_message 推送
+            if ai_message:
+                line_bot_api.push_message(
+                    target_user_id, 
+                    TextSendMessage(text=ai_message)
+                )
+                print(f"✅ 課表已成功推送給用戶: {target_user_id}")
             
-            # 🌟 4. 這裡接著跑「寫入 Google Sheet」的邏輯 (這很重要，不然 Sheet 還是空的)
-            # if ai_plan:
-            #     save_to_google_sheet(user_id, ai_plan)
-
         except Exception as e:
+            # 🌟 這裡就是報錯的地方！確保這裡面沒有提到 'affected'
             print(f"❌ 安排課表發生錯誤: {e}")
-            # 如果出錯了，也主動推播告知客人
-            line_bot_api.push_message(user_id, TextSendMessage(text="⚠️ 抱歉，生成課表時發生錯誤，請稍後再試或聯繫管理員。"))
-
+            line_bot_api.push_message(
+                target_user_id, 
+                TextSendMessage(text=f"⚠️ 系統編排課表時發生錯誤，請稍後再試。\n錯誤訊息: {str(e)}")
+            )
+        return # 處理完畢，直接返回
      # 🟢 顧客一般對話 (串接 AI) 🟢
     allow, q_msg = check_permission_and_quota(uid)
     if not allow: return
