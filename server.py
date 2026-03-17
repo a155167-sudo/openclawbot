@@ -271,6 +271,9 @@ async def receive_form_data(request: Request):
         training_freq = get_val("確認訓練頻率") or "未設定"
         normal_train_time = get_val("一般訓練日") or "未設定"
         long_train_day = get_val("長距離") or "未設定"
+        run_pace = get_val("5K") or "未提供"
+        bike_ftp = get_val("FTP") or "未提供"
+        swim_pace = get_val("CSS") or "未提供"
         bmr = (10 * weight + 6.25 * height - 5 * age - 161) if "女" in gender else (10 * weight + 6.25 * height - 5 * age + 5)
         act_mult = 1.2
         if "輕" in activity: act_mult = 1.375
@@ -515,9 +518,9 @@ async def receive_form_data(request: Request):
                 try:
                     try: api_sheet = sheet.worksheet("Master_API_View")
                     except gspread.exceptions.WorksheetNotFound:
-                        # 將 cols="7" 改成 "15"，並把新表頭補在最後面
-                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="15")
-                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key", "Training_Freq", "Normal_Train_Time", "Long_Train_Day"])
+                        # 🌟 改成 cols="18"，並補上最後三個表頭
+                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="18")
+                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key", "Training_Freq", "Normal_Train_Time", "Long_Train_Day", "Run_Pace", "Bike_FTP", "Swim_Pace"])
                     
                     api_sheet.append_rows(master_api_rows)
                     print(f"✅ 成功將資料寫入 Master_API_View！")
@@ -926,6 +929,9 @@ def run_weekly_coach(uid, reply_token=None):
                         training_freq = str(row.get("Training_Freq", "未設定"))
                         normal_train_time = str(row.get("Normal_Train_Time", "未設定"))
                         long_train_day = str(row.get("Long_Train_Day", "未設定"))
+                        run_pace = str(row.get("Run_Pace", "未提供"))
+                        bike_ftp = str(row.get("Bike_FTP", "未提供"))
+                        swim_pace = str(row.get("Swim_Pace", "未提供"))
 
                     day_idx = next_week_dates.index(str(row.get("Date")))
                     next_week_meals.append({
@@ -976,12 +982,14 @@ def run_weekly_coach(uid, reply_token=None):
         "protein_target_g": int(protein) if protein else 0,
         "week_range": week_range,
         
-        # 👇 新增：把四個訓練設定餵給 AI
+        # 👇 新增：把訓練設定餵給 AI
         "sport_type": sport_type,
         "training_freq": training_freq,
         "normal_train_time": normal_train_time,
         "long_train_day": long_train_day,
-        
+        "run_pace": run_pace,      # 🌟 新增：5K配速
+        "bike_ftp": bike_ftp,      # 🌟 新增：自行車FTP
+        "swim_pace": swim_pace,    # 🌟 新增：游泳CSS
         "this_week_activities": this_week_activities or "無紀錄",
         "intervals_fitness": icu_data,
         "next_week_meals": next_week_meals
@@ -1005,10 +1013,11 @@ def run_weekly_coach(uid, reply_token=None):
 - "long_train_day" (長訓安排日)：若顧客有指定(例如：星期六)，你必須把當週最耗時、強度最深的訓練(例如：Z2長距離/重訓腿日)排在這一天！
 
 # 🏃 耐力型訓練區間參考 (若 sport_type 為三鐵/跑步/自行車)
-- Z2 跑步：6:00–6:05/km @ HR 130–138
-- Z3 節奏跑：5:30–5:45/km @ HR 148–155
-- 閾值：4:33/km @ HR 172
-- 自行車 FTP：240W ｜ Z2：134–180W ｜ Z3 甜蜜點：182–216W
+你必須根據以下顧客的真實體能數據，推算出適合他的 Z2/Z3 或間歇配速：
+- 🏃 顧客 5K 最佳成績：{run_pace} (若為未提供，請給予體感 RPE 建議)
+- 🚴 顧客自行車 FTP：{bike_ftp} 瓦 (若為未提供，請給予體感 RPE 建議)
+- 🏊 顧客游泳 CSS 配速：{swim_pace} (若為未提供，請給予體感 RPE 建議)
+*請在課表中明確寫出客製化的配速或瓦數要求！*
 
 # 💪 力量型訓練原則 (若 sport_type 為肌力/重訓/健美)
 - 分化訓練：根據 "training_freq" 的天數，合理安排「推/拉/腿」或「上肢/下肢」。
