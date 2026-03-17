@@ -42,7 +42,7 @@ try:
     gc = gspread.authorize(creds)
     
     # ⚠️ 填入你試算表網址中那段長長的 ID
-    SPREADSHEET_ID = "你的試算表ID填在這裡" 
+    SPREADSHEET_ID = "https://www.googleapis.com/robot/v1/metadata/x509/railway-bot%40openclaw-agent-490102.iam.gserviceaccount.com" 
     sh = gc.open_by_key(SPREADSHEET_ID)
     
     # 定義分頁，請確認你的 Google Sheet 分頁名稱一模一樣
