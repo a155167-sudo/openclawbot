@@ -40,15 +40,15 @@ try:
     # ⚠️ 這裡的 filename 必須和你上傳到 GitHub 的 JSON 檔名完全一致
     creds = Credentials.from_service_account_file("google_key.json", scopes=SCOPE)
     gc = gspread.authorize(creds)
-
+    
     # ⚠️ 填入你試算表網址中那段長長的 ID
     SPREADSHEET_ID = "你的試算表ID填在這裡" 
     sh = gc.open_by_key(SPREADSHEET_ID)
-
+    
     # 定義分頁，請確認你的 Google Sheet 分頁名稱一模一樣
     sheet_main = sh.worksheet("Master_API_View")
     sheet_log = sh.worksheet("raw_logs")
-
+    
     print("✅ Google Sheet 服務帳戶連線成功！")
 except Exception as e:
     print(f"❌ Google Sheet 連線出錯：{e}")
@@ -105,21 +105,21 @@ ADMIN_UID = "Uefd72ca53a9a6ac39781fe673c398530"
 async def lifespan(app: FastAPI):
     # 伺服器啟動時，喚醒隱形店長
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-
+    
     # ⏰ 排定班表：每天 14:00 自動扣餐與催繳續約
     scheduler.add_job(auto_daily_meal_deduction, 'cron', hour=14, minute=0)
-
+    
     # ⏰ 排定班表：每天 20:00 自動發送明日取餐與加購提醒
     scheduler.add_job(auto_send_tomorrow_reminders_to_boss, 'cron', hour=20, minute=0)
 
     # ⏰ 排定班表：每週日 20:00 自動批次排下週課表（加購提醒之後執行）
     scheduler.add_job(auto_weekly_coach_batch, 'cron', day_of_week='sun', hour=20, minute=5)
-
+    
     scheduler.start()
     print("✅ 全自動定時器已啟動！系統進入無人駕駛模式 ON！")
-
+    
     yield
-
+    
     # 伺服器關閉時，讓店長下班
     scheduler.shutdown()
 
@@ -134,18 +134,18 @@ processed_messages = set()
 # 喚醒 Google 虛擬助理 (🔥 卸下裝甲，回歸純淨版)
 try:
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-
+    
     # 1. 直接從保險箱拿出完美的字串
     creds_str = os.environ.get("GOOGLE_CREDENTIALS")
-
+    
     # 2. 原汁原味轉成字典 (什麼 replace 都不用加，因為您貼得太完美了！)
     creds_dict = json.loads(creds_str)
-
+    
     # 3. 直接拿鑰匙開門
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
     print("✅ Google 雲端大門正式開啟！寫入權限 100% 取得！")
-
+    
 except Exception as e:
     print(f"⚠️ Google 助理連線失敗: {e}")
     gc = None
@@ -178,7 +178,7 @@ def load_menu():
                 except Exception as e:
                     # 🔥 抓蟲程式碼必須放在這裡，對齊內部的 try！
                     print(f"⚠️ 跳過餐點【{name}】: 數字格式有誤，原因：{e}")
-
+                    
         print(f"✅ 成功載入 {len(MAIN_DISHES)} 項餐點！")
         return f"✅ 菜單更新成功！共載入 {len(MAIN_DISHES)} 項餐點。"
     except Exception as e: 
@@ -201,13 +201,13 @@ def init_db():
         # 🔗 3. 安全連線
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-
+        
         # --- 以下是您的原本表格定義 (保持不變) ---
         c.execute('''CREATE TABLE IF NOT EXISTS usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)''')
         c.execute('''CREATE TABLE IF NOT EXISTS vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER DEFAULT 0)''')
         c.execute('''CREATE TABLE IF NOT EXISTS health_profile (user_id TEXT PRIMARY KEY, name TEXT, tdee INTEGER, protein REAL, goal TEXT, restrictions TEXT, summary_text TEXT, active_days TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS admin_settings (key TEXT PRIMARY KEY, value TEXT)''')
-
+        
         # 🔥 行銷問卷專用的資料表
         c.execute('''CREATE TABLE IF NOT EXISTS reward_links (link TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
         c.execute('''CREATE TABLE IF NOT EXISTS survey_records (user_id TEXT PRIMARY KEY, claim_date TEXT)''')
@@ -243,18 +243,18 @@ async def receive_form_data(request: Request):
     try:
         data = await request.json()
         print(f"📦 [表單測試] 收到 Google 傳來的大禮包：{data}")
-
+        
         def get_val(keyword):
             for k, v in data.items():
                 if keyword in k and v: 
                     return ",".join([str(i) for i in v]) if isinstance(v, list) else str(v)
             return ""
-
+        
         user_id = get_val("UID")
         print(f"🔍 [表單測試] 抓到的 UID 是：'{user_id}'")
         print(f"🔑 [DEBUG] 表單所有欄位 keys：{list(data.keys())}")
         print(f"📝 [DEBUG] 稱呼欄位比對結果：{ {k: v for k, v in data.items() if '稱呼' in str(k)} }")
-
+        
         if not user_id or user_id == "UID_REPLACE_ME": 
             print("❌ [表單拒絕] 找不到有效的 UID，這張表單我直接丟掉！")
             return {"status": "ignored"}
@@ -266,7 +266,7 @@ async def receive_form_data(request: Request):
         if height < 3.0:
             height *= 100
         activity = get_val("活動量")
-
+        
         bmr = (10 * weight + 6.25 * height - 5 * age - 161) if "女" in gender else (10 * weight + 6.25 * height - 5 * age + 5)
         act_mult = 1.2
         if "輕" in activity: act_mult = 1.375
@@ -274,7 +274,7 @@ async def receive_form_data(request: Request):
         elif "高" in activity: act_mult = 1.725
         elif "極" in activity: act_mult = 1.9
         tdee_base = bmr * act_mult
-
+        
         protein = weight * 1.6
         if "減脂" in goal: 
             tdee = tdee_base - 300
@@ -283,47 +283,47 @@ async def receive_form_data(request: Request):
             tdee = tdee_base + 300
             protein = weight * 2.0
         else: tdee = tdee_base
-
+        
         base_lunch_pool = [d for d in MAIN_DISHES if d.get('category') == 'main']
         base_dinner_pool = [d for d in MAIN_DISHES if d.get('category') == 'main']
-
+        
         if restrictions:
             noise_words = ['跟', '和', '與', '、', '，', ' ', '不吃', '不要', '不能', '不能吃', '過敏', '類', '我對', '另外']
             clean_res = restrictions
             for noise in noise_words:
                 clean_res = clean_res.replace(noise, ',')
-
+                
             bad_words = [w.strip() for w in clean_res.split(',')]
             bad_words = [w for w in bad_words if w]
-
+            
             major_allergens = ['牛', '豬', '雞', '羊', '海鮮', '魚', '蝦', '蟹', '堅果', '花生', '起司', '豆']
             for ma in major_allergens:
                 if ma in restrictions and ma not in bad_words:
                     bad_words.append(ma)
-
+            
             safe_lunch_pool = [d for d in base_lunch_pool if not any(bw in d['name'] or bw in d.get('ingredients', '') for bw in bad_words)]
             safe_dinner_pool = [d for d in base_dinner_pool if not any(bw in d['name'] or bw in d.get('ingredients', '') for bw in bad_words)]
-
+            
             lunch_pool = safe_lunch_pool if safe_lunch_pool else base_lunch_pool
             dinner_pool = safe_dinner_pool if safe_dinner_pool else base_dinner_pool
         else:
             lunch_pool = base_lunch_pool
             dinner_pool = base_dinner_pool
-
+        
         schedule_lines, total_price, active_days = [], 0, set()
         schedule_sheet_rows = [["週期與星期", "午餐安排", "晚餐安排", "熱量剩餘 / 蛋白質需補"]]
-
+        
         plan_requests = []
         week_dict = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7}
-
+        
         # 1. 抓取表單中的關鍵資訊
         date_str = get_val("日期") or get_val("取餐") or get_val("勾選")
         user_restrictions = restrictions.lower() # 顧客禁忌 (小寫化方便比對)
-
+        
         # 2. 抓取顧客喜好標籤
         pref_staple = get_val("主食偏好") or ""
         pref_protein = get_val("蛋白質") or ""
-
+        
         # 🔥 定義真正喜歡的關鍵字 (解決「沒有飯」卻抓到「飯」的 Bug)
         liked_staples = []
         if "飯食" in pref_staple: liked_staples.append("飯")   # 修正：原本錯寫成「飯食派」
@@ -338,7 +338,7 @@ async def receive_form_data(request: Request):
         if "豬" in pref_protein: liked_proteins.append("豬")
         if "牛" in pref_protein: liked_proteins.append("牛")
         if "海鮮" in pref_protein: liked_proteins.extend(["海鮮", "魚", "鱸魚", "鮭魚"])
-
+        
         # 3. 建立「絕對安全菜單池」 (先過濾掉禁忌，且只挑主餐)
         safe_menu = []
         # 🔥 修正：說「不要海鮮」時，擴展過濾所有魚蝦蟹相關關鍵字
@@ -363,7 +363,7 @@ async def receive_form_data(request: Request):
         # 4. 解析取餐日期並進行「超級紅娘配對」 (🔥 融合終極穩定版 + 主食黑名單)
         plan_requests = []
         total_price = 0  
-
+        
         if date_str:
             week_dict = {
                 "星期一": 1, "週一": 1, "星期二": 2, "週二": 2, 
@@ -373,35 +373,35 @@ async def receive_form_data(request: Request):
             days = [d.strip() for d in date_str.split(',')]
             active_days_list = [] 
             week_tracker = {1:0, 2:0, 3:0, 4:0, 5:0, 6:0, 7:0}
-
+            
             for d in days:
                 d_num = next((num for zh, num in week_dict.items() if zh in d), 99)
                 if d_num != 99:
                     active_days_list.append(d)
                     week_tracker[d_num] += 1
                     w_num = week_tracker[d_num]
-
+                    
                     # 🔥 終極主食地雷過濾系統 (漏掉的就是這裡！)
                     unliked_staples = []
                     if "都不挑食" not in pref_staple:
                         if "沙拉" not in pref_staple: unliked_staples.append("沙拉")
                         if "麵" not in pref_staple: unliked_staples.extend(["麵", "義大利麵", "烏龍", "筆管"])
                         if "飯" not in pref_staple: unliked_staples.extend(["飯", "燉飯", "紫米", "糙米"])
-
+                    
                     matches = []
                     for dish in safe_menu:
                         d_text = (dish['name'] + dish.get('ingredients', '')).lower()
-
+                        
                         # 1. 踩到主食地雷？直接淘汰！沙拉跟麵絕對進不來
                         if any(us in d_text for us in unliked_staples):
                             continue
-
+                            
                         # 2. 檢查是否命中喜歡的主食 (包含原型地瓜)
                         if "都不挑食" in pref_staple or not liked_staples:
                             matches.append(dish)
                         elif any(ls in d_text for ls in liked_staples):
                             matches.append(dish)
-
+                            
                     # 優先用完美命中的池子，如果不夠，用排除地雷後的安全池
                     if len(matches) >= 2:
                         pool = matches
@@ -409,7 +409,7 @@ async def receive_form_data(request: Request):
                         pool = [dish for dish in safe_menu if not any(us in (dish['name'] + dish.get('ingredients', '')).lower() for us in unliked_staples)]
                         if len(pool) < 2:
                             pool = safe_menu 
-
+                    
                     # 隨機抽 2 道菜
                     if len(pool) >= 2:
                         daily_pick = random.sample(pool, 2)
@@ -417,7 +417,7 @@ async def receive_form_data(request: Request):
                         daily_pick = [pool[0], pool[0]]
                     else:
                         continue 
-
+                    
                     plan_requests.append((w_num, d_num, f"第{w_num}週", d, daily_pick[0], daily_pick[1]))
                     # 💡 累加餐點總價
                     total_price += (daily_pick[0]['price'] + daily_pick[1]['price'])
@@ -431,7 +431,7 @@ async def receive_form_data(request: Request):
         schedule_text = ""
         schedule_sheet_rows = [["實際日期", "週期與星期", "午餐安排", "晚餐安排", "熱量剩餘 / 蛋白質需補", "單日金額", "明日預定課表"]]
         master_api_rows = []
-
+        
         # 💡 自動推算起始日 (設定為填表後的「下個週一」開始供餐)
         today = tw_today()
         days_ahead = 0 - today.weekday()
@@ -443,13 +443,13 @@ async def receive_form_data(request: Request):
             day_tdee_left = int(tdee) - lunch['cal'] - dinner['cal']
             day_p_need = int(protein) - lunch['pro'] - dinner['pro']
             daily_price = lunch['price'] + dinner['price']
-
+            
             # 🎯 算出這餐的實際日期
             target_date = start_date + datetime.timedelta(days=(w_num-1)*7 + (d_num-1))
             actual_date_str = target_date.strftime("%Y/%m/%d")
 
             schedule_text += f"\n【{w_label}-{day_name}】\n☀️午：{lunch['name']} ({lunch['cal']}kcal / ${lunch['price']})\n🌙晚：{dinner['name']} ({dinner['cal']}kcal / ${dinner['price']})\n👉 當日熱量剩餘: {day_tdee_left}kcal\n👉 蛋白質需補: {day_p_need}g\n"
-
+            
             lunch_str = f"{lunch['name']} (${lunch['price']})"
             dinner_str = f"{dinner['name']} (${dinner['price']})"
             schedule_sheet_rows.append([actual_date_str, f"{w_label}-{day_name}", lunch_str, dinner_str, f"剩 {day_tdee_left}kcal / 補 {day_p_need}g", f"${daily_price}", ""])
@@ -470,23 +470,23 @@ async def receive_form_data(request: Request):
         if gc:
             try:
                 sheet = gc.open_by_url(SHEET_URL)
-
+                
                 # (1) 寫入歷史總表
                 main_sheet = sheet.sheet1
                 now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
                 main_sheet.append_row([now_str, name, goal, int(tdee), int(protein), restrictions, total_price, ",".join(active_days_list), schedule_text])
-
+                
                 # (2) 為客戶建立專屬分頁
                 try:
                     try: user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="8")
                     except:
                         user_sheet = sheet.worksheet(safe_name)
                         user_sheet.clear()
-
+                        
                     profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}", f"💰 排餐總額: ${total_price}"], [""]]
                     menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
                     tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
-
+                    
                     user_sheet.append_rows(profile_data + menu_title + schedule_sheet_rows + tracking_headers)
                 except Exception: pass
 
@@ -496,11 +496,11 @@ async def receive_form_data(request: Request):
                     except gspread.exceptions.WorksheetNotFound:
                         api_sheet = sheet.add_worksheet(title="Master_API_View", rows="1000", cols="7")
                         api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key"])
-
+                    
                     api_sheet.append_rows(master_api_rows)
                     print(f"✅ 成功將資料寫入 Master_API_View！")
                 except Exception as e: print(f"⚠️ 寫入 Master_API_View 失敗: {e}")
-
+                    
             except Exception: pass
 
         # 最後推播訊息給客人
@@ -520,19 +520,19 @@ async def receive_survey_data(request: Request):
     try:
         data = await request.json()
         print(f"📝 [問卷測試] 收到問卷資料：{data}")
-
+        
         # 抓取表單裡的 UID
         user_id = ""
         for k, v in data.items():
             if "UID" in k.upper():
                 user_id = str(v).strip()
                 break
-
+                
         if not user_id or user_id == "UID_REPLACE_ME":
             return {"status": "ignored", "msg": "無效的 UID"}
 
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-
+        
         # 1. 檢查這個人是不是已經領過點數了？(防貪小便宜)
         c.execute("SELECT claim_date FROM survey_records WHERE user_id=?", (user_id,))
         if c.fetchone():
@@ -545,14 +545,14 @@ async def receive_survey_data(request: Request):
         # 2. 從保險箱抽出一張「還沒被使用」的點數網址
         c.execute("SELECT link FROM reward_links WHERE is_used=0 LIMIT 1")
         row = c.fetchone()
-
+        
         if row:
             reward_link = row[0]
             # 標記為已使用，並記錄這個人已經領過
             c.execute("UPDATE reward_links SET is_used=1 WHERE link=?", (reward_link,))
             c.execute("INSERT INTO survey_records (user_id, claim_date) VALUES (?, ?)", (user_id, tw_today().isoformat()))
             conn.commit()
-
+            
             # 3. 把專屬點數網址私訊給客人
             push_msg = f"🎉 感謝您的寶貴回饋！\n\n這是答應您的專屬獎勵，請點擊下方連結領取【一日樂食集點卡 1 點】👇\n\n{reward_link}\n\n(⚠️ 注意：此連結為專屬一次性連結，點擊後即失效，請勿轉發給他人喔！)"
             line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
@@ -562,7 +562,7 @@ async def receive_survey_data(request: Request):
             admin_row = c.fetchone()
             if admin_row:
                 line_bot_api.push_message(admin_row[0], TextSendMessage(text="🚨 老闆緊急通知：填問卷送點數的「點數網址」已經被抽光啦！請盡快上後台產生新的網址並用 #上傳點數 補貨！"))
-
+        
         conn.close()
         return {"status": "success"}
     except Exception as e:
@@ -573,16 +573,16 @@ async def receive_survey_data(request: Request):
 # ==========================================
 def get_ai_response_with_memory(user_id, user_msg):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-
+    
     # 抓取客人資料
     c.execute("SELECT summary_text, tdee, active_days, protein FROM health_profile WHERE user_id=?", (user_id,))
     hp = c.fetchone()
-
+    
     today_str = tw_today().isoformat()
     # 抓取今日外食紀錄 (多抓 today_food_items)
     c.execute("SELECT today_extra_cal, today_date, sheet_name, name, today_extra_pro, today_food_items FROM health_profile WHERE user_id=?", (user_id,))
     daily_rec = c.fetchone()
-
+    
     # 判斷是不是新的一天，如果是就歸零 (包含食物清單)
     if daily_rec and daily_rec[1] != today_str:
         c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0, today_food_items='', today_date=? WHERE user_id=?", (today_str, user_id))
@@ -599,9 +599,9 @@ def get_ai_response_with_memory(user_id, user_msg):
     protein_val = hp[3] if hp else 100
     history = user_memory.get(user_id, [])[-6:]
     ingredients_memo = "\n".join([f"- {d['name']}: {d.get('ingredients', '新鮮食材')}" for d in MAIN_DISHES])
-
+    
     food_items_text = food_items if food_items else "無"
-
+    
     # === 新增：從 Google Sheets 讀取當天排餐 ===
     today_date_str = tw_today().strftime("%Y/%m/%d")
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
@@ -638,17 +638,20 @@ def get_ai_response_with_memory(user_id, user_msg):
         base_pro_text = str(int(protein_val))
 
     system_prompt = f"""你是「一日樂食」的專屬 AI 營養師。你充滿熱情、幽默，且語氣像真人一樣溫暖！
+
     【🚨 外食估算鐵律 (最高指導原則) 🚨】
     當顧客告訴你他吃了什麼（例如：咖哩飯、麥當勞、西瓜等），不管這個食物「在不在我們的菜單上」，你都【絕對不可以】拒絕計算！
     ❌ 嚴禁回答：「抱歉我們菜單沒有咖哩飯，無法提供數據...」、「建議您改吃我們的...」而不列出算式。
     ✅ 必須回答：「哇！咖哩飯很讚耶！一般來說一碗大約 700 大卡、蛋白 15 克... (接著立刻列出算式)」
     身為專業營養師，你一定要憑你的知識給出一個「具體的估算數字」，然後立刻執行【今日結算】！
+
     【🔥 目前系統記憶狀態 🔥】
     - 今天狀態：{today_status}
     - 初始可用熱量：{base_cal_text}
     - 初始可用蛋白：{base_pro_text}
     - 稍早已經吃掉的外食總熱量：{extra_cal} 大卡 (今日已吃清單: {food_items_text})
     - 稍早已經吃掉的外食總蛋白：{extra_pro} 克
+
     【💬 對話與計算步驟（請嚴格遵守）】
     👉 第一步（熱情回應）：先溫暖回應客人吃的食物。
     👉 第二步（強制估算）：直接給出該食物的熱量與蛋白質具體數字 (例如 700大卡，絕對不可給範圍)。
@@ -659,9 +662,11 @@ def get_ai_response_with_memory(user_id, user_msg):
        🥩 【今日蛋白結算】 = {base_pro_text} (初始) - {extra_pro} (稍早累積: {food_items_text}) - OO (本次吃掉) = 最終剩餘克
        ---
     👉 第四步（暖心鼓勵）：給予後續建議。
+
     【🚨 最高隱藏指令（系統記錄用）🚨】
     回覆最尾端，必須加上：[LOG_NUTRITION: 本次食物熱量, 本次食物蛋白, 本次食物名稱]
     (只能填純數字與品項名稱，例如：[LOG_NUTRITION: 700, 20, 咖哩飯])
+
     {report}
     
     【本店餐點內容物 - 機密小抄】(僅供內部參考)：
@@ -670,37 +675,37 @@ def get_ai_response_with_memory(user_id, user_msg):
     【🚨 換餐指令】
     只要顧客確定要換餐，請在最底部加上 [CHANGE_MEAL: 將OOO替換為XXX]。
     """
-
+    
     try:
         messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
         res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2000, temperature=0.3)
         ans = res.choices[0].message.content
     except Exception as e:
         return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}"
-
+        
     match = re.search(r'\[LOG_NUTRITION:\s*(\d+).*?,\s*(\d+).*?,\s*(.+?)\]', ans)
-
+    
     tag_pattern = r'\[LOG_NUTRITION:\s*(\d+)[^\d,]*,\s*(\d+)[^\d,]*,\s*(.+?)\]'
     match = re.search(tag_pattern, ans, re.IGNORECASE)
-
+    
     if match:
         try:
             logged_cal = int(match.group(1))
             logged_pro = int(match.group(2))
             # 清理 AI 可能亂加的單位，只留品項名稱
             logged_name = match.group(3).strip().replace("大卡", "").replace("克", "").strip()
-
+            
             new_extra_cal = extra_cal + logged_cal
             new_extra_pro = extra_pro + logged_pro
             new_food_items = f"{food_items}、{logged_name}".strip("、") if food_items else logged_name
-
+            
             c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=? WHERE user_id=?", 
                       (new_extra_cal, new_extra_pro, new_food_items, user_id))
             conn.commit()
-
+            
             # 清除整段標籤，確保客人看不到系統指令
             ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans, flags=re.IGNORECASE).strip()
-
+            
             # 寫入 Google Sheet
             if daily_rec and daily_rec[2] and gc:
                 try:
@@ -716,7 +721,7 @@ def get_ai_response_with_memory(user_id, user_msg):
         change_req = match_change.group(1)
         ans = re.sub(r'\[CHANGE_MEAL:\s*.+?\]', '', ans).strip()
         ans = ans.replace('隱藏標籤', '').replace('`', '').strip()
-
+        
         c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
         admin_row = c.fetchone()
         if admin_row:
@@ -731,7 +736,7 @@ def get_ai_response_with_memory(user_id, user_msg):
     if match_call_boss:
         ans = ans.replace('[CALL_BOSS]', '').strip()
         ans += "\n\n(系統提示：已為您暫停 AI 助理，並通知真人客服，請稍候我們會盡快回覆您！)"
-
+        
         # 設定靜音 24 小時
         silence_time = (tw_now() + datetime.timedelta(hours=24)).isoformat()
         c.execute("UPDATE health_profile SET ai_silenced_until=? WHERE user_id=?", (silence_time, user_id))
@@ -914,6 +919,7 @@ def run_weekly_coach(uid, reply_token=None):
     weekly_system_prompt = """# Role & Objective
 你是一位頂尖的科學化鐵人三項教練與運動營養專家，任職於「一日樂食」。
 每週任務：進行每週訓練與營養總結，根據排餐計畫安排下週訓練課表，給予加購建議。
+
 # Core Rules（嚴格遵守）
 1. 主餐不可更動：一日樂食下週主餐菜單已固定，只能在此基礎上建議加購補充。
 2. 根據 active_days 決定哪幾天有餐點供應，非供餐日安排輕鬆訓練或休息。
@@ -921,13 +927,16 @@ def run_weekly_coach(uid, reply_token=None):
 4. 至少 1-2 天休息日或主動恢復日（輕鬆散步、瑜伽）。
 5. 課表包含：運動種類、強度（Z2/Z3/閾值/FTP%）、建議時間長度。
 6. 高強度訓練日 → 強烈建議加購單點食物（舒肥雞胸肉、地瓜等）。
+
 # Jason 訓練區間（六週實際數據）
 - Z2 跑步：6:00–6:05/km @ HR 130–138
 - Z3 節奏跑：5:30–5:45/km @ HR 148–155
 - 閾值：4:33/km @ HR 172
 - 自行車 FTP：240W ｜ Z2：134–180W ｜ Z3 甜蜜點：182–216W
+
 # Output Format（強制 JSON，不可輸出任何其他文字）
 你必須只回傳一個合法的 JSON 物件，格式如下：
+
 {
   "line_message": "（這裡放完整的 LINE 推播長文，含 Emoji 排版、狀態總評、加餐建議等，格式如下）\n\n🏆 教練每週狀態總評\n══════════════════════════════\n📊 本週訓練回顧\n• 體能狀態：CTL {值} ｜ ATL {值} ｜ Form {值}\n• 本週亮點與待改進：...（2-3句）\n\n📅 下週專屬訓練課表（{week_range}）\n• 週一（{日期}）：...\n...\n\n💡 下週加餐戰略建議\n• 高強度日補給：...\n• 推薦加購：...\n══════════════════════════════",
   "daily_plan": {
@@ -940,6 +949,7 @@ def run_weekly_coach(uid, reply_token=None):
     "YYYY/MM/DD": "休息 / 主動恢復（輕鬆散步 30 分鐘）"
   }
 }
+
 規則：
 - daily_plan 的 key 必須是 YYYY/MM/DD 格式，與下週7天日期完全對應
 - daily_plan 的 value 只寫當天課表（簡潔一行），不含日期或星期
@@ -1181,7 +1191,7 @@ def handle_message(event):
     elif msg == "填寫滿意度問卷":
         # 👉 老闆注意：請把下面這串網址，換成您剛剛在 Google 表單產生的那串「最後面有 {uid} 的黃金連結」！
         survey_link = f"https://docs.google.com/forms/d/e/1FAIpQLScF6Va_sdq6KMaKFd8BUVB2x5SyLji3JqX28-Z7h-tuLnpB-Q/viewform?usp=pp_url&entry.1048958109={uid}"
-
+        
         reply_text = f"🎁 感謝您對一日樂食的支持！\n請點擊下方專屬連結填寫滿意度調查 (約1分鐘)。\n\n完成填寫後，系統將自動發送【1 點集點卡點數】給您喔！👇\n\n{survey_link}"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
@@ -1231,7 +1241,7 @@ def handle_message(event):
         c.execute("SELECT COUNT(*) FROM reward_links WHERE is_used=1")
         used_count = c.fetchone()[0]
         conn.close()
-
+        
         reply_msg = f"📊 【老闆專屬：點數庫存報告】\n\n🟢 尚未發送：{unused_count} 張\n🔴 已經發出：{used_count} 張\n\n(歷史總共上傳過 {unused_count + used_count} 張點數網址)"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
         return
@@ -1245,7 +1255,7 @@ def handle_message(event):
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{today_str}%",))
         users = c.fetchall()
-
+        
         count, notify_count = 0, 0
         for u in users:
             u_id, u_name = u
@@ -1263,7 +1273,7 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！今日 ({today_str}) 出餐扣除完畢！\n共扣除了 {count} 份餐點，發送 {notify_count} 則續約推播！"))
         return
-
+    
     # 這裡開始的 elif 必須跟上面其他的 elif 對齊 (退回一格)
     elif msg.startswith("#上傳點數\n"):
         links = msg.replace("#上傳點數\n", "").strip().split('\n')
@@ -1278,7 +1288,7 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！成功存入 {count} 筆全新的點數網址！"))
         return
-
+        
     elif msg == "#發送明日提醒":
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=send_tomorrow_reminders()))
         return
@@ -1314,7 +1324,7 @@ def handle_message(event):
         conn.commit(); conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="👑 老闆特權啟動！系統已強制為您開通 VIP 檔案並補滿 50 次額度！現在請問我熱量！"))
         return
-
+        
     # 🗺️ 智能測距與順風車 🗺️
     elif msg.startswith("#測距 "):
         target_address = msg.replace("#測距 ", "").strip()
@@ -1324,7 +1334,7 @@ def handle_message(event):
             for hub in HUBS:
                 h_succ, h_d_txt, h_d_m, h_t_txt = get_distance(hub["address"], target_address, mode="walking")
                 if h_succ and h_d_m <= 1000: hub_match = hub["name"]; break 
-
+            
             if hub_match: fee_msg = f"20 元 🎉 (恭喜！您符合【{hub_match}】周邊 1 公里專屬順風車特惠！)"
             else:
                 if dist_meters <= 2000: fee_msg = "0 元 (2公里內免運專案！)"
@@ -1335,7 +1345,7 @@ def handle_message(event):
         else: reply_text = "哎呀！地圖系統暫時找不到這個地址，請確認地址是否完整喔！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
-
+      
     # ==========================================
     # 📅 功能四：每週課表觸發（LINE 指令）
     # ==========================================
@@ -1358,7 +1368,7 @@ def auto_daily_meal_deduction():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{today_str}%",))
     users = c.fetchall()
-
+    
     count, notify_count = 0, 0
     for u in users:
         u_id, u_name = u
@@ -1373,7 +1383,7 @@ def auto_daily_meal_deduction():
                 try: line_bot_api.push_message(u_id, TextSendMessage(text=notify_msg)); notify_count += 1
                 except: pass
     conn.commit(); conn.close()
-
+    
     # 任務完成，發報告給老闆
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
@@ -1386,7 +1396,7 @@ def auto_daily_meal_deduction():
 def auto_send_tomorrow_reminders_to_boss():
     """每天自動發送明日提醒，並跟老闆回報"""
     result_msg = send_tomorrow_reminders() # 呼叫原本寫好的推播函數
-
+    
     # 任務完成，發報告給老闆
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
