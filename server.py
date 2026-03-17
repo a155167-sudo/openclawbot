@@ -677,12 +677,11 @@ def get_ai_response_with_memory(user_id, user_msg):
        🥩 【今日蛋白結算】 = {base_pro_text} (初始) - {extra_pro} (稍早累積: {food_items_text}) - OO (本次吃掉) = 最終剩餘克
        ──────────────
     👉 第四步（暖心鼓勵）：給予後續飲食建議，並用 💪 💡 等符號結尾。
-    """
 
     【🚨 最高隱藏指令（系統記錄用）🚨】
     回覆最尾端，必須加上：[LOG_NUTRITION: 本次食物熱量, 本次食物蛋白, 本次食物名稱]
     (只能填純數字與品項名稱，例如：[LOG_NUTRITION: 700, 20, 咖哩飯])
-
+    """
     {report}
     
     【本店餐點內容物 - 機密小抄】(僅供內部參考)：
