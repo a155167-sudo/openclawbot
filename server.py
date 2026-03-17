@@ -1127,6 +1127,7 @@ def run_weekly_coach(uid, reply_token=None):
                 
                 # 如果有沒訂餐的週末課表，一口氣加進 Sheet 裡
                 if new_rows_to_add:
+                    print(f"DEBUG: 準備寫入的內容是 {new_rows_to_add}")
                     api_sheet.append_rows(new_rows_to_add)
                     print(f"✅ 自動補齊了 {len(new_rows_to_add)} 天的無餐點訓練日！")
                     
