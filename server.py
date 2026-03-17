@@ -1180,13 +1180,27 @@ def handle_message(event):
             c.execute("UPDATE health_profile SET ai_mute=? WHERE name=?", (1 if is_mute else 0, target_name))
             affected = conn.rowcount
             conn.commit(); conn.close()
-            if affected > 0:
-                action_str = "已靜音" if is_mute else "已解除靜音"
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ {action_str} {target_name}"))
-            else:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 找不到客人：{target_name}（請確認姓名完全相符）"))
-            return
+            user_id = event.source.user_id  # 🌟 確保抓得到發話者的 ID
 
+        if affected > 0:
+            action_str = "已靜音" if is_mute else "已解除靜音"
+            # 這裡因為只是簡單的資料庫操作，速度很快，可以用 reply_message 節省主動推送額度
+            # 但如果你擔心後續還有其他動作，改用 push 也可以
+            try:
+                line_bot_api.push_message(
+                    user_id, 
+                    TextSendMessage(text=f"✅ {action_str} {target_name}")
+                )
+            except Exception as e:
+                print(f"❌ Push 失敗: {e}")
+        else:
+            # 找不到客人的情況
+            line_bot_api.push_message(
+                user_id, 
+                TextSendMessage(text=f"❌ 找不到客人：{target_name}（請確認姓名完全相符）")
+            )
+        
+        return  # 結束這段處理
     # ==========================================
     # 🛑 功能一：靜音擋箭牌（一般客人才檢查）
     # ==========================================
@@ -1470,9 +1484,31 @@ def handle_message(event):
     # 📅 功能四：每週課表觸發（LINE 指令）
     # ==========================================
     if msg in ["請安排下週課表", "排下週課表", "下週課表", "週課表"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="📋 收到！正在為您生成下週專屬課表，請稍候..."))
-        run_weekly_coach(uid)
-        return
+        try:
+            # 1. 先用 reply 回應客人，避免 Token 過期，也讓客人知道系統有在動
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="⏳ 收到！正在分析您的體能數據並編排下週課表，請稍等約 30 秒...")
+            )
+
+            # 2. 執行 AI 運算 (這就是你原本那個很長的排課函數)
+            # 假設這個函數會回傳 (生成的長文, 7天課表字典)
+            ai_message, ai_plan = run_weekly_coach(user_id) 
+
+            # 3. 運算完後，使用 push_message 把結果傳給客人
+            line_bot_api.push_message(
+                user_id, 
+                TextSendMessage(text=ai_message)
+            )
+            
+            # 🌟 4. 這裡接著跑「寫入 Google Sheet」的邏輯 (這很重要，不然 Sheet 還是空的)
+            # if ai_plan:
+            #     save_to_google_sheet(user_id, ai_plan)
+
+        except Exception as e:
+            print(f"❌ 安排課表發生錯誤: {e}")
+            # 如果出錯了，也主動推播告知客人
+            line_bot_api.push_message(user_id, TextSendMessage(text="⚠️ 抱歉，生成課表時發生錯誤，請稍後再試或聯繫管理員。"))
 
      # 🟢 顧客一般對話 (串接 AI) 🟢
     allow, q_msg = check_permission_and_quota(uid)
