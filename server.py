@@ -109,11 +109,11 @@ async def lifespan(app: FastAPI):
     # ⏰ 排定班表：每天 14:00 自動扣餐與催繳續約
     scheduler.add_job(auto_daily_meal_deduction, 'cron', hour=14, minute=0)
     
-    # ⏰ 排定班表：每天 20:00 自動發送明日取餐與加購提醒
-    scheduler.add_job(auto_send_tomorrow_reminders_to_boss, 'cron', hour=20, minute=0)
+    # ⏰ 排定班表：每天 22:00 自動發送明日取餐與加購提醒
+    scheduler.add_job(auto_daily_evening_report, 'cron', hour=22, minute=0)
 
-    # ⏰ 排定班表：每週日 20:00 自動批次排下週課表（加購提醒之後執行）
-    scheduler.add_job(auto_weekly_coach_batch, 'cron', day_of_week='sun', hour=20, minute=5)
+    # ⏰ 排定班表：每週日 22:00 自動批次排下週課表（加購提醒之後執行）
+    scheduler.add_job(auto_weekly_coach_batch, 'cron', day_of_week='sun', hour=22, minute=5)
     
     scheduler.start()
     print("✅ 全自動定時器已啟動！系統進入無人駕駛模式 ON！")
@@ -607,29 +607,40 @@ def get_ai_response_with_memory(user_id, user_msg):
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     today_str_zh = weekdays[tw_today().weekday()]
 
+    # 🌟 1. 預設空值 (加入運動變數)
     today_lunch, today_dinner = "無", "無"
+    today_workout, tomorrow_workout = "無", "無" # 新增用來存運動的變數
 
-    # 從 daily_rec 取得 sheet_name
+    # 🌟 2. 取得今日與明日的日期字串 (嚴格比對用)
+    today_date_str = tw_today().strftime("%Y/%m/%d")
+    tomorrow_date_str = (tw_today() + datetime.timedelta(days=1)).strftime("%Y/%m/%d")
+
     user_sheet_name = daily_rec[2] if daily_rec and len(daily_rec) > 2 else ""
 
     if gc and user_sheet_name:
         try:
-            # 確保使用正確的試算表變數名稱 (SPREADSHEET_ID 或 SHEET_ID)
+            # 去個人的專屬分頁找排餐與運動
             user_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(user_sheet_name)
             all_rows = user_sheet.get_all_records()
             
             for row in all_rows:
-                # 把試算表上的日期抓下來並清除前後空白
+                # 嚴格清理日期字串
                 row_date = str(row.get("日期", "")).strip()
+                if not row_date:
+                     row_date = str(row.get("實際日期", "")).strip()
                 
-                # 🎯 關鍵修正：【只】比對今天的完整日期，不要再比對星期幾了！
+                # 🎯 比對今天：抓午晚餐 + 今日的 Sport_Type
                 if row_date == today_date_str:
-                    today_lunch = str(row.get("午餐", row.get("Lunch_Item", "無")) or "無").strip()
-                    today_dinner = str(row.get("晚餐", row.get("Dinner_Item", "無")) or "無").strip()
-                    break # 找到了就立刻停止往下找
+                    today_lunch = str(row.get("午餐", row.get("Lunch_Item", "無"))) or "無"
+                    today_dinner = str(row.get("晚餐", row.get("Dinner_Item", "無"))) or "無"
+                    today_workout = str(row.get("Sport_Type", "無")) or "無" # ✅ 換成你的表頭
+                    
+                # 🎯 比對明天：抓明日的 Sport_Type
+                elif row_date == tomorrow_date_str:
+                    tomorrow_workout = str(row.get("Sport_Type", "無")) or "無" # ✅ 換成你的表頭
                     
         except Exception as e:
-            print(f"⚠️ 讀取當天排餐失敗: {e}")
+            print(f"⚠️ 讀取當天排餐/運動失敗: {e}")
 
     # 判斷是否有排餐
     has_meal_today = (today_lunch != "無" or today_dinner != "無")
@@ -664,6 +675,8 @@ def get_ai_response_with_memory(user_id, user_msg):
     - 📅 今天狀態：{today_status}
     - 🎯 初始可用熱量：{base_cal_text} 大卡
     - 🥩 初始可用蛋白：{base_pro_text} 克
+    - 🏃 今日運動紀錄：{today_workout}       # <--- 把這行補上去！
+    - 📅 明日運動預定：{tomorrow_workout}    # <--- 把這行補上去！
     - 🍔 稍早已經吃掉的外食總熱量：{extra_cal} 大卡 (今日已吃清單: {food_items_text})
     - 🍳 稍早已經吃掉的外食總蛋白：{extra_pro} 克
 
@@ -872,12 +885,17 @@ def run_weekly_coach(uid, reply_token=None):
     # 3. 從 Google Sheet 抓下週排餐 & Intervals 設定
     next_week_meals, row_date_map = [], {}
     intervals_id, intervals_key = "", ""
+    sport_type = "未設定" # 🌟 新增這行：預設為未設定
     if gc:
         try:
             api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
             all_records = api_sheet.get_all_records()
             for i, row in enumerate(all_records):
                 if str(row.get("User_ID")) == uid and str(row.get("Date")) in next_week_dates:
+                    # 🌟 新增這行：把試算表的 Sport_Type 抓出來
+                    if not sport_type or sport_type == "未設定":
+                        sport_type = str(row.get("Sport_Type", "未設定"))
+                    
                     day_idx = next_week_dates.index(str(row.get("Date")))
                     next_week_meals.append({
                         "date": row.get("Date"),
@@ -921,6 +939,7 @@ def run_weekly_coach(uid, reply_token=None):
     input_data = {
         "athlete": name,
         "goal": goal,
+        "sport_type": sport_type, # 🌟 新增這行：傳遞給 AI
         "active_days": active_days,
         "restrictions": restrictions or "無",
         "tdee": tdee,
@@ -932,36 +951,45 @@ def run_weekly_coach(uid, reply_token=None):
     }
 
     weekly_system_prompt = """# Role & Objective
-你是一位頂尖的科學化鐵人三項教練與運動營養專家，任職於「一日樂食」。
-每週任務：進行每週訓練與營養總結，根據排餐計畫安排下週訓練課表，給予加購建議。
+你是一位頂尖的科學化運動教練與營養專家，任職於「一日樂食」。
+每週任務：進行每週訓練與營養總結，根據排餐計畫與顧客目標安排下週訓練課表，並給予加購建議。
 
 # Core Rules（嚴格遵守）
 1. 主餐不可更動：一日樂食下週主餐菜單已固定，只能在此基礎上建議加購補充。
 2. 根據 active_days 決定哪幾天有餐點供應，非供餐日安排輕鬆訓練或休息。
 3. 根據 CTL/ATL/Form 判斷疲勞度，Form > 5 可推進強度；Form < -10 以恢復為主。
 4. 至少 1-2 天休息日或主動恢復日（輕鬆散步、瑜伽）。
-5. 課表包含：運動種類、強度（Z2/Z3/閾值/FTP%）、建議時間長度。
-6. 高強度訓練日 → 強烈建議加購單點食物（舒肥雞胸肉、地瓜等）。
+5. 根據輸入資料中的 "sport_type" (運動類型) 決定課表風格：
+   - 若為「鐵人三項、跑步、自行車」等耐力運動，請給予 Z2/Z3/閾值配速課表。
+   - 若為「肌力訓練、重訓、健美」等力量運動，請給予明確的部位分化與組數次數。
+6. 高強度訓練日/腿部訓練日 → 強烈建議加購單點食物（舒肥雞胸肉、地瓜等）。
 
-# Jason 訓練區間（六週實際數據）
+# 🏃 耐力型訓練區間參考 (僅適用於耐力運動)
 - Z2 跑步：6:00–6:05/km @ HR 130–138
 - Z3 節奏跑：5:30–5:45/km @ HR 148–155
 - 閾值：4:33/km @ HR 172
 - 自行車 FTP：240W ｜ Z2：134–180W ｜ Z3 甜蜜點：182–216W
 
+# 💪 力量型訓練原則 (僅適用於肌力/重訓)
+- 分化訓練：根據一週練幾天，安排「推/拉/腿」或「上肢/下肢」分化。
+- 課表格式：必須明確寫出「部位 + 主要動作 + 組數x次數」。
+  - 例：下肢日（深蹲 4x8, RDL 3x10）
+  - 例：推部位（臥推 4x8, 肩推 3x12）
+- 漸進超負荷：提醒顧客記錄重量，每週嘗試增加次數或重量。
+
 # Output Format（強制 JSON，不可輸出任何其他文字）
 你必須只回傳一個合法的 JSON 物件，格式如下：
 
 {
-  "line_message": "（這裡放完整的 LINE 推播長文，含 Emoji 排版、狀態總評、加餐建議等，格式如下）\n\n🏆 教練每週狀態總評\n══════════════════════════════\n📊 本週訓練回顧\n• 體能狀態：CTL {值} ｜ ATL {值} ｜ Form {值}\n• 本週亮點與待改進：...（2-3句）\n\n📅 下週專屬訓練課表（{week_range}）\n• 週一（{日期}）：...\n...\n\n💡 下週加餐戰略建議\n• 高強度日補給：...\n• 推薦加購：...\n══════════════════════════════",
+  "line_message": "（這裡放完整的 LINE 推播長文，含 Emoji 排版、狀態總評、加餐建議等，格式如下）\n\n🏆 教練每週狀態總評\n══════════════════════════════\n📊 本週訓練回顧\n• 體能狀態：CTL {值} ｜ ATL {值} ｜ Form {值} (無數據則寫：已根據您的回報調整)\n• 本週亮點與待改進：...（2-3句）\n\n📅 下週專屬訓練課表（{week_range}）\n• 週一（{日期}）：...\n...\n\n💡 下週加餐戰略建議\n• 訓練後補給：...\n• 推薦加購：...\n══════════════════════════════",
   "daily_plan": {
-    "YYYY/MM/DD": "運動種類 + 強度 + 時間長度（例：Z2 跑步 60 分鐘 @ 6:00–6:05/km）",
+    "YYYY/MM/DD": "運動種類 + 強度/動作 + 時間/組數（例：Z2 跑步 60m 或 下肢日 深蹲4x8）",
     "YYYY/MM/DD": "...",
     "YYYY/MM/DD": "...",
     "YYYY/MM/DD": "...",
     "YYYY/MM/DD": "...",
     "YYYY/MM/DD": "...",
-    "YYYY/MM/DD": "休息 / 主動恢復（輕鬆散步 30 分鐘）"
+    "YYYY/MM/DD": "休息 / 主動恢復"
   }
 }
 
@@ -1420,7 +1448,102 @@ def auto_send_tomorrow_reminders_to_boss():
     if admin_row:
         try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】明日提醒推播完畢：\n{result_msg}"))
         except: pass
+def auto_daily_evening_report():
+    """每天 22:00 自動執行：今日結算、自動扣餐、明日提醒、運動關心與推銷"""
+    print("⏰ [22:00 排程啟動] 開始發送晚安報告與執行扣餐...")
+    
+    # 🎯 徹底解決幻覺：嚴格使用精準日期字串
+    now = datetime.datetime.now(ZoneInfo("Asia/Taipei"))
+    today_date_str = now.strftime("%Y/%m/%d")
+    tomorrow_date_str = (now + datetime.timedelta(days=1)).strftime("%Y/%m/%d")
+    
+    if not gc:
+        return
 
+    try:
+        users_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Users")
+        api_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Master_API_View")
+        
+        users_data = users_sheet.get_all_records()
+        api_data = api_sheet.get_all_records()
+        
+        for i, user in enumerate(users_data):
+            uid = str(user.get("User_ID", ""))
+            name = str(user.get("Name", "貴賓"))
+            if not uid or str(user.get("Status", "")) != "Active":
+                continue
+
+            # 抓取今日與明日的資料
+            today_lunch, today_dinner, today_workout = "無", "無", "無"
+            tomorrow_lunch, tomorrow_dinner, tomorrow_workout = "無", "無", "無"
+            
+            for row in api_data:
+                if str(row.get("User_ID")) != uid: continue
+                
+                row_date = str(row.get("Date", "")).strip()
+                # 嚴格比對今日
+                if row_date == today_date_str:
+                    today_lunch = str(row.get("Lunch_Item", "無")) or "無"
+                    today_dinner = str(row.get("Dinner_Item", "無")) or "無"
+                    today_workout = str(row.get("Tomorrow_Workout", "無")) or "無" # 假設存這欄
+                # 嚴格比對明日
+                elif row_date == tomorrow_date_str:
+                    tomorrow_lunch = str(row.get("Lunch_Item", "無")) or "無"
+                    tomorrow_dinner = str(row.get("Dinner_Item", "無")) or "無"
+                    tomorrow_workout = str(row.get("Tomorrow_Workout", "無")) or "無"
+
+            # 🎯 執行自動扣餐邏輯
+            had_meal_today = (today_lunch != "無" or today_dinner != "無")
+            if had_meal_today:
+                try:
+                    current_remains = int(user.get("Remaining_Meals", 0))
+                    new_remains = max(0, current_remains - 1)
+                    # 更新回 Users 表格 (加 2 是因為 header 和 index offset)
+                    users_sheet.update_cell(i + 2, 7, new_remains) # 假設 Remaining_Meals 在第 7 欄，請依實際情況調整
+                    print(f"✅ {name} 今日已扣餐，剩餘 {new_remains} 餐")
+                except Exception as e:
+                    print(f"⚠️ {name} 扣餐失敗: {e}")
+
+            # 🤖 呼叫 AI 生成專屬晚安訊息
+            extra_cal = str(user.get("Extra_Calories_Today", 0))
+            
+            system_prompt = f"""你是「一日樂食」專屬 AI 營養師與教練。現在是晚上 22:00，請寫一封【綜合晚安報告】給 {name}。
+            
+            【精準數據狀態】
+            📅 今日 ({today_date_str})：
+            - 排餐：午餐({today_lunch}) / 晚餐({today_dinner})
+            - 外食攝取：{extra_cal} 大卡
+            - 今日運動：{today_workout}
+            
+            📅 明日 ({tomorrow_date_str})：
+            - 排餐：午餐({tomorrow_lunch}) / 晚餐({tomorrow_dinner})
+            - 明日預定運動：{tomorrow_workout}
+
+            【✨ 撰寫鐵律 (務必使用 Emoji 條列排版) ✨】
+            1. 🌙 開場總結：溫暖打招呼，總結今日。
+            2. 📊 今日結算與關心：若今日有運動，給予肯定與放鬆建議；若無運動，給予安心飲食、好好恢復的口吻。
+            3. 🍱 明日出餐提醒：若明日有餐，清楚列出午晚餐內容；若無餐點，提醒「明日為無排餐日」。
+            4. 🏃 明日運動與加點推銷：
+               - 若明日有運動，列出課表，並「強烈建議根據該強度加購一日樂食的補充品」(例如高強度推雞胸肉/地瓜)。
+               - 若無，則提醒好好休息。
+            (字數控制在 250 字內，口吻必須像真人教練般熱情)"""
+            
+            # 呼叫 OpenAI API
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "system", "content": system_prompt}],
+                    temperature=0.7
+                )
+                final_msg = response.choices[0].message.content
+                
+                # 發送 LINE 推播
+                line_bot_api.push_message(uid, TextSendMessage(text=final_msg))
+            except Exception as e:
+                print(f"⚠️ 發送給 {name} 的晚安報告失敗: {e}")
+                
+    except Exception as e:
+        print(f"⚠️ 晚安排程執行發生錯誤: {e}")
 # ==========================================
 # 📅 功能四：每週日自動批次排課
 # ==========================================
