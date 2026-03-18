@@ -1255,38 +1255,49 @@ def handle_message(event):
             workout_time = user_input.get("時間", "")
             workout_intensity = user_input.get("強度", "")
 
-            # 如果客人亂填，至少要有這三個
+            # 🌟 情境 A：客人只點了選單，內容是空的
             if not target_date or not workout_name:
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                    text="⚠️ 格式不對喔！請務必填寫「日期」和「運動」。\n範例：\n新增課表\n日期：2026/03/24\n運動：跑步"
+                    text="哇！看來你準備要開始新的運動計畫了呢！🎉💪\n\n請複製並填寫以下資訊回傳給我：\n\n新增課表\n日期：2026/03/20\n運動：自行車\n時間：1小時\n強度：中\n\n我會幫你記錄下來，讓我們一起朝著健康的目標邁進吧！💡✨"
                 ))
                 return
+
+            # 🌟 情境 B：客人有填寫資料，開始處理日期格式 (將 3/20 轉成 2026/03/20)
+            if "/" in target_date:
+                d_parts = target_date.split("/")
+                if len(d_parts) == 2: # 如果客人只打 3/20
+                    target_date = f"{tw_today().year}/{int(d_parts[0]):02d}/{int(d_parts[1]):02d}"
+                elif len(d_parts) == 3: # 如果客人打 2026/3/20
+                    target_date = f"{d_parts[0]}/{int(d_parts[1]):02d}/{int(d_parts[2]):02d}"
 
             # 組合成單一字串準備寫入 Tomorrow_Training
             workout_content = f"{workout_intensity} {workout_name} {workout_time}".strip()
 
             # 2. 寫入 Google Sheet (Master_API_View 的 Tomorrow_Training 欄位)
             if gc:
-                api_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Master_API_View")
+                # ⚠️ 這裡換回你原本不會報錯的連線方式
+                api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
                 records = api_sheet.get_all_records()
                 
-                # 尋找客人的日期格子
-                target_idx = next(
-                    (i + 2 for i, r in enumerate(records)
-                     if str(r.get("User_ID")) == uid and str(r.get("Date")) == target_date),
-                    None
-                )
+                # 尋找客人的日期格子 (相容 / 與 - 格式)
+                target_idx = None
+                for i, r in enumerate(records):
+                    sheet_date = str(r.get("Date", "")).replace("-", "/") # 把試算表的橫線也轉成斜線比對
+                    if str(r.get("User_ID")) == uid and sheet_date == target_date.replace("-", "/"):
+                        target_idx = i + 2
+                        break
 
                 if target_idx:
                     # 找到格子，寫入第 6 欄 (Tomorrow_Training)
                     api_sheet.update_cell(target_idx, 6, workout_content)
                     
+                    # 🌟 寫入成功後，發送熱情的確認對話！
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                        text=f"✅ 已成功為您新增 {target_date} 的課表！\n🏃 內容：{workout_content}\n\n教練會針對此運動給予飲食建議喔💪"
+                        text=f"太棒了！🚴‍♂️✨你已經成功新增了一個運動計畫！以下是你的課表資訊：\n\n- 📅 日期：{target_date}\n- 🏃 運動：{workout_name}\n- ⏰ 時間：{workout_time}\n- ⚡ 強度：{workout_intensity}\n\n這樣的運動安排一定會讓你感覺神清氣爽！記得保持水分補充喔！💧💪"
                     ))
                 else:
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                        text=f"❌ 找不到 {target_date} 的資料格，請確認日期格式 (如: 2026/03/24) 或確認當天是否有排餐。"
+                        text=f"❌ 找不到 {target_date} 的專屬紀錄，請確認當天是否有為您排餐喔！"
                     ))
 
         except Exception as e:
