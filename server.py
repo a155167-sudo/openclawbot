@@ -1101,59 +1101,48 @@ def run_weekly_coach(uid, reply_token=None):
         line_message = raw_content
         daily_plan = {}
 
-    # 8. 寫回 Google Sheet (Tomorrow_Training 欄位)
-        if gc:
-            try:
-                new_rows_to_add = [] # 準備用來裝週末或沒訂餐的排課日
-                for date_str, plan_text in ai_plan.items():
-                    if date_str in row_date_map:
-                        # 狀況 A：原本就有訂餐的格子，直接更新運動課表 (假設在第 6 欄)
-                        row_idx = row_date_map[date_str]
-                        api_sheet.update_cell(row_idx, 10, plan_text)
-                    else:
-                        # 狀況 B：沒訂餐的日子 (例如六日)，Google Sheet 裡沒這列！
-                        # 我們要「無中生有」補齊這一天，讓課表完整呈現 7 天
-                        new_rows_to_add.append([
-                            date_str,             # Date
-                            uid,                  # User_ID
-                            0,                    # TDEE (沒訂餐填0)
-                            "無",                 # Lunch (沒訂餐)
-                            "無",                 # Dinner (沒訂餐)
-                            plan_text,            # 🌟 Tomorrow_Training (把訓練課表填進去！)
-                            1,                    # Is_Coaching_Enabled
-                            goal,                 # Plan_Type
-                            sport_type,           # Sport_Type
-                            week_range,           # Plan_Week
-                            intervals_id,         # Intervals_ID
-                            intervals_key,        # Intervals_API_Key
-                            training_freq,        # Training_Freq
-                            normal_train_time,    # Normal_Train_Time
-                            long_train_day,       # Long_Train_Day
-                            run_pace,             # Run_Pace
-                            bike_ftp,             # Bike_FTP
-                            swim_pace             # Swim_Pace
-                        ])
-                
-                # 如果有沒訂餐的週末課表，一口氣加進 Sheet 裡
-                if new_rows_to_add:
-                    print(f"DEBUG: 準備寫入的內容是 {new_rows_to_add}")
-                    api_sheet.append_rows(new_rows_to_add)
-                    print(f"✅ 自動補齊了 {len(new_rows_to_add)} 天的無餐點訓練日！")
-                    
-            except Exception as e:
-                print(f"⚠️ 寫回課表至 Sheet 失敗: {e}")
+    # ==========================================
+    # 🌟 8. 準備將課表寫回 Google Sheet (寫入 Plan_Week 第 10 欄)
+    # ==========================================
+    if gc and daily_plan:
+        try:
+            new_rows_to_add = [] 
+            for date_str, plan_text in daily_plan.items():
+                if date_str in row_date_map:
+                    # 狀況 A：原本就有的格子，直接更新 (寫入第 10 欄 Plan_Week)
+                    row_idx = row_date_map[date_str]
+                    api_sheet.update_cell(row_idx, 10, plan_text)
+                else:
+                    # 狀況 B：沒格子的週末，準備自動補齊 18 個欄位
+                    # ⚠️ 注意：這裡把 plan_text 放在第 10 個位子 (Plan_Week)
+                    new_rows_to_add.append([
+                        date_str, uid, 0, "無", "無", "", 1, 
+                        goal, sport_type, plan_text, intervals_id, intervals_key, 
+                        training_freq, normal_train_time, long_train_day, 
+                        run_pace, bike_ftp, swim_pace
+                    ])
+            
+            # 如果有沒訂餐的週末課表，一口氣加進 Sheet 裡
+            if new_rows_to_add:
+                print(f"📡 DEBUG: 準備寫入，長度為 {len(new_rows_to_add[0])} 欄")
+                api_sheet.append_rows(new_rows_to_add)
+                print(f"✅ [關鍵成功] Google Sheet 自動補齊了 {len(new_rows_to_add)} 天課表！")
 
-    # 9. LINE 推播（只送精美 line_message，不塞課表 JSON）
+        except Exception as e:
+            print(f"❌ [寫入失敗] Google Sheet 發生錯誤: {e}")
+
+    # ==========================================
+    # 🌟 9. 最後才把整理好的 LINE 訊息推播給客人
+    # ==========================================
     try:
-        if reply_token:
-            line_bot_api.reply_message(reply_token, TextSendMessage(text=line_message))
-        else:
-            line_bot_api.push_message(uid, TextSendMessage(text=line_message))
+        # 注意這裡用的是 uid，並推播解析出來的 line_message
+        line_bot_api.push_message(uid, TextSendMessage(text=line_message))
+        print(f"✅ LINE 訊息已順利推播給 UID: {uid}")
     except Exception as e:
-        print(f"⚠️ LINE 發送失敗: {e}")
-        return False, str(e)
+        print(f"❌ LINE 推播失敗: {e}")
 
-    return True, line_message
+    # 必須要有這行 return，把結果丟回給前面的 callback
+    return line_message, daily_plan
 
 
 @app.post("/callback")
