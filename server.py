@@ -1109,7 +1109,7 @@ def run_weekly_coach(uid, reply_token=None):
                     if date_str in row_date_map:
                         # 狀況 A：原本就有訂餐的格子，直接更新運動課表 (假設在第 6 欄)
                         row_idx = row_date_map[date_str]
-                        api_sheet.update_cell(row_idx, 6, plan_text)
+                        api_sheet.update_cell(row_idx, 10, plan_text)
                     else:
                         # 狀況 B：沒訂餐的日子 (例如六日)，Google Sheet 裡沒這列！
                         # 我們要「無中生有」補齊這一天，讓課表完整呈現 7 天
