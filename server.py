@@ -1233,73 +1233,68 @@ def handle_message(event):
     finally:
         conn.close()
 
+   # ==========================================
+    # 🏃 功能二：客人手動新增單日課表（對應 LINE 選單）
     # ==========================================
-    # 🏃 功能二：客人輸入明日運動（結構化格式解析）
-    # 格式：運動：[名稱]\n時間：[時間]\n強度：[高/中/低]
-    # ==========================================
-    if msg.startswith("運動：") or msg.startswith("運動:"):
+    if msg.startswith("新增課表"):
         try:
-            # 解析各欄位（相容換行或空白分隔）
+            # 1. 解析各欄位（相容換行或空白分隔）
             parts = re.split(r'[\n\r]+', msg.strip())
-            workout_name, workout_time, workout_intensity_raw = "", "", ""
+            user_input = {}
             for part in parts:
                 part = part.strip()
-                if part.startswith("運動：") or part.startswith("運動:"):
-                    workout_name = re.sub(r'^運動[：:]', '', part).strip()
-                elif part.startswith("時間：") or part.startswith("時間:"):
-                    workout_time = re.sub(r'^時間[：:]', '', part).strip()
-                elif part.startswith("強度：") or part.startswith("強度:"):
-                    workout_intensity_raw = re.sub(r'^強度[：:]', '', part).strip()
+                if "：" in part:  # 處理全形冒號
+                    key, val = part.split("：", 1)
+                    user_input[key.strip()] = val.strip()
+                elif ":" in part: # 處理半形冒號
+                    key, val = part.split(":", 1)
+                    user_input[key.strip()] = val.strip()
 
-            # 強度轉換：高→HIGH, 中→MED, 低→LOW
-            intensity_map = {"高": "HIGH", "中": "MED", "低": "LOW"}
-            workout_intensity = intensity_map.get(workout_intensity_raw, workout_intensity_raw.upper() or "MED")
+            target_date = user_input.get("日期", "")
+            workout_name = user_input.get("運動", "")
+            workout_time = user_input.get("時間", "")
+            workout_intensity = user_input.get("強度", "")
 
-            # 寫入 Google Sheet（Tomorrow_Workout / Tomorrow_Intensity）
-            if gc and workout_name:
-                api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
-                headers = api_sheet.row_values(1)
+            # 如果客人亂填，至少要有這三個
+            if not target_date or not workout_name:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text="⚠️ 格式不對喔！請務必填寫「日期」和「運動」。\n範例：\n新增課表\n日期：2026/03/24\n運動：跑步"
+                ))
+                return
 
-                # 確保欄位存在
-                for col_name in ["Tomorrow_Workout", "Tomorrow_Intensity"]:
-                    if col_name not in headers:
-                        api_sheet.update_cell(1, len(headers) + 1, col_name)
-                        headers = api_sheet.row_values(1)
+            # 組合成單一字串準備寫入 Tomorrow_Training
+            workout_content = f"{workout_intensity} {workout_name} {workout_time}".strip()
 
-                tw_col = headers.index("Tomorrow_Workout") + 1
-                ti_col = headers.index("Tomorrow_Intensity") + 1
-                tomorrow_str_sheet = (tw_today() + datetime.timedelta(days=1)).strftime("%Y/%m/%d")
-
+            # 2. 寫入 Google Sheet (Master_API_View 的 Tomorrow_Training 欄位)
+            if gc:
+                api_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Master_API_View")
                 records = api_sheet.get_all_records()
+                
+                # 尋找客人的日期格子
                 target_idx = next(
                     (i + 2 for i, r in enumerate(records)
-                     if str(r.get("User_ID")) == uid and str(r.get("Date")) == tomorrow_str_sheet),
+                     if str(r.get("User_ID")) == uid and str(r.get("Date")) == target_date),
                     None
                 )
-                workout_content = f"{workout_name} {workout_time}".strip()
-                if target_idx:
-                    api_sheet.update_cell(target_idx, tw_col, workout_content)
-                    api_sheet.update_cell(target_idx, ti_col, workout_intensity)
-                else:
-                    # 找今天的 row，把 Tomorrow_Workout 寫在今天 row（若明天 row 尚未建立）
-                    today_str_sheet = tw_today().strftime("%Y/%m/%d")
-                    target_today = next(
-                        (i + 2 for i, r in enumerate(records)
-                         if str(r.get("User_ID")) == uid and str(r.get("Date")) == today_str_sheet),
-                        None
-                    )
-                    if target_today:
-                        api_sheet.update_cell(target_today, tw_col, workout_content)
-                        api_sheet.update_cell(target_today, ti_col, workout_intensity)
 
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text=f"✅ 已成功為您新增明日運動！\n🏃 {workout_name} {workout_time}\n💪 強度：{workout_intensity}\n\n今晚 9 點教練會針對此運動給予飲食建議喔💪"
-            ))
+                if target_idx:
+                    # 找到格子，寫入第 6 欄 (Tomorrow_Training)
+                    api_sheet.update_cell(target_idx, 6, workout_content)
+                    
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text=f"✅ 已成功為您新增 {target_date} 的課表！\n🏃 內容：{workout_content}\n\n教練會針對此運動給予飲食建議喔💪"
+                    ))
+                else:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text=f"❌ 找不到 {target_date} 的資料格，請確認日期格式 (如: 2026/03/24) 或確認當天是否有排餐。"
+                    ))
+
         except Exception as e:
-            print(f"⚠️ 明日運動寫入失敗: {e}")
+            print(f"⚠️ 手動新增課表失敗: {e}")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="⚠️ 格式不符，請用：\n運動：慢跑\n時間：40分鐘\n強度：中"
+                text="⚠️ 系統發生錯誤，請稍後再試或檢查格式是否正確。"
             ))
+        
         return
 
     # 👇 第一步加在這裡！老闆專屬的記憶檢查按鈕 👇
