@@ -30,28 +30,35 @@ def tw_today():
 def tw_now():
     return datetime.datetime.now(TW_TZ)
 
-# --- 2. Google Sheet 授權與連線 (核心修改區) ---
-SCOPE = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+# --- 2. Google Sheet 授權與連線 ---
+SCOPE = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
 try:
-    # ⚠️ 這裡的 filename 必須和你上傳到 GitHub 的 JSON 檔名完全一致
-    creds = Credentials.from_service_account_file("google_key.json", scopes=SCOPE)
-    gc = gspread.authorize(creds)
+    # 1. 優先從環境變數讀取
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     
-    # ⚠️ 填入你試算表網址中那段長長的 ID
-    SPREADSHEET_ID = "1cf0QhWeYynk9nqsoqMIM-Lkxk_bP57zcd-ES7Sufkqg"
-    # 定義分頁，請確認你的 Google Sheet 分頁名稱一模一樣
+    if creds_json:
+        # 從環境變數
+        info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPE)
+        print("💡 使用環境變數 GOOGLE_CREDENTIALS")
+    else:
+        # 2. 從檔案
+        creds = Credentials.from_service_account_file("google_key.json", scopes=SCOPE)
+        print("💡 使用檔案 google_key.json")
+    
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key("1cf0QhWeYynk9nqsoqMIM-Lkxk_bP57zcd-ES7Sufkqg")
     sheet_main = sh.worksheet("Master_API_View")
     sheet_log = sh.worksheet("raw_logs")
+    print("✅ Google Sheet 連線成功！")
     
-    print("✅ Google Sheet 服務帳戶連線成功！")
 except Exception as e:
     print(f"❌ Google Sheet 連線出錯：{e}")
     gc = None
     sh = None
+    sheet_main = None
+    sheet_log = None
 
 # --- 3. FastAPI 生命週期管理 ---
 @asynccontextmanager
