@@ -2694,20 +2694,34 @@ def get_dashboard_data(user_id: str) -> dict:
     if gc and sheet_name:
         try:
             book = gc.open_by_key(SPREADSHEET_ID)
-            user_sheet = book.worksheet(sheet_name)
-            for row in get_user_sheet_rows(user_sheet):
-                row_date = _pick_first(row, ["日期", "取餐日期", "實際日期", "Date"], "")
-                if normalize_date_str(row_date) == normalize_date_str(today_date_str):
-                    today_lunch  = _pick_first(row, ["午餐", "午餐安排", "Lunch_Item"], "尚未安排")
-                    today_dinner = _pick_first(row, ["晚餐", "晚餐安排", "Dinner_Item"], "尚未安排")
-                    today_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
-                    lunch_cal = _to_int(_pick_first(row, ["午餐熱量"], 0), 0)
-                    lunch_pro = _to_int(_pick_first(row, ["午餐蛋白"], 0), 0)
-                    dinner_cal = _to_int(_pick_first(row, ["晚餐熱量"], 0), 0)
-                    dinner_pro = _to_int(_pick_first(row, ["晚餐蛋白"], 0), 0)
-                    planned_cal = _to_int(_pick_first(row, ["今日排餐總熱量"], 0), lunch_cal + dinner_cal)
-                    planned_pro = _to_int(_pick_first(row, ["今日排餐總蛋白"], 0), lunch_pro + dinner_pro)
-                    break
+            user_sheet = None
+
+            try:
+                user_sheet = book.worksheet(sheet_name)
+            except Exception:
+                print(f"⚠️ 個人分頁不存在，嘗試從 Master_API_View 重建：{sheet_name}")
+                try:
+                    sync_user_sheet_from_master(user_id)
+                    user_sheet = book.worksheet(sheet_name)
+                    print(f"✅ 已成功重建個人分頁：{sheet_name}")
+                except Exception as rebuild_error:
+                    print(f"⚠️ 重建個人分頁失敗：{sheet_name} / {rebuild_error}")
+                    user_sheet = None
+
+            if user_sheet:
+                for row in get_user_sheet_rows(user_sheet):
+                    row_date = _pick_first(row, ["日期", "取餐日期", "實際日期", "Date"], "")
+                    if normalize_date_str(row_date) == normalize_date_str(today_date_str):
+                        today_lunch = _pick_first(row, ["午餐", "午餐安排", "Lunch_Item"], "尚未安排")
+                        today_dinner = _pick_first(row, ["晚餐", "晚餐安排", "Dinner_Item"], "尚未安排")
+                        today_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
+                        lunch_cal = _to_int(_pick_first(row, ["午餐熱量"], 0), 0)
+                        lunch_pro = _to_int(_pick_first(row, ["午餐蛋白"], 0), 0)
+                        dinner_cal = _to_int(_pick_first(row, ["晚餐熱量"], 0), 0)
+                        dinner_pro = _to_int(_pick_first(row, ["晚餐蛋白"], 0), 0)
+                        planned_cal = _to_int(_pick_first(row, ["今日排餐總熱量"], 0), lunch_cal + dinner_cal)
+                        planned_pro = _to_int(_pick_first(row, ["今日排餐總蛋白"], 0), lunch_pro + dinner_pro)
+                        break
 
             if today_workout in ["", "無", "尚未安排"]:
                 try:
@@ -2716,7 +2730,12 @@ def get_dashboard_data(user_id: str) -> dict:
                     for r in records:
                         sheet_date = str(r.get("Date", "")).replace("-", "/").strip()
                         if str(r.get("User_ID", "")).strip() == user_id and sheet_date == today_date_str:
-                            today_workout = str(r.get("Tomorrow_Training", "")).strip() or str(r.get("Plan_Week", "")).strip() or str(r.get("Sport_Type", "")).strip() or "無"
+                            today_workout = (
+                                str(r.get("Tomorrow_Training", "")).strip()
+                                or str(r.get("Plan_Week", "")).strip()
+                                or str(r.get("Sport_Type", "")).strip()
+                                or "無"
+                            )
                             break
                 except Exception:
                     pass
@@ -3376,23 +3395,37 @@ def get_ai_response_with_memory(user_id, user_msg):
 
     if gc and user_sheet_name:
         try:
-            # 去個人的專屬分頁找排餐與運動
-            user_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(user_sheet_name)
-            all_rows = get_user_sheet_rows(user_sheet)
-            
-            for row in all_rows:
-                row_date = _pick_first(row, ["日期", "實際日期", "取餐日期", "Date"], "")
-                
-                # 🎯 比對今天：抓午晚餐 + 今日的 Sport_Type
-                if row_date == today_date_str:
-                    today_lunch = _pick_first(row, ["午餐", "午餐安排", "Lunch_Item"], "無")
-                    today_dinner = _pick_first(row, ["晚餐", "晚餐安排", "Dinner_Item"], "無")
-                    today_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
-                    
-                # 🎯 比對明天：抓明日的 Sport_Type
-                elif row_date == tomorrow_date_str:
-                    tomorrow_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
-                    
+            book = gc.open_by_key(SPREADSHEET_ID)
+            user_sheet = None
+
+            try:
+                user_sheet = book.worksheet(user_sheet_name)
+            except Exception:
+                print(f"⚠️ 個人分頁不存在，嘗試重建：{user_sheet_name}")
+                try:
+                    sync_user_sheet_from_master(user_id)
+                    user_sheet = book.worksheet(user_sheet_name)
+                    print(f"✅ 已成功重建個人分頁：{user_sheet_name}")
+                except Exception as rebuild_error:
+                    print(f"⚠️ 重建後仍無法讀取個人分頁：{user_sheet_name} / {rebuild_error}")
+                    user_sheet = None
+
+            if user_sheet:
+                all_rows = get_user_sheet_rows(user_sheet)
+
+                for row in all_rows:
+                    row_date = _pick_first(row, ["日期", "實際日期", "取餐日期", "Date"], "")
+
+                    # 🎯 比對今天：抓午晚餐 + 今日的 Sport_Type
+                    if row_date == today_date_str:
+                        today_lunch = _pick_first(row, ["午餐", "午餐安排", "Lunch_Item"], "無")
+                        today_dinner = _pick_first(row, ["晚餐", "晚餐安排", "Dinner_Item"], "無")
+                        today_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
+
+                    # 🎯 比對明天：抓明日的 Sport_Type
+                    elif row_date == tomorrow_date_str:
+                        tomorrow_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
+
         except Exception as e:
             print(f"⚠️ 讀取當天排餐/運動失敗: {e}")
 
