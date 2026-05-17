@@ -261,6 +261,7 @@ async def lifespan(app: FastAPI):
 
     # ⏰ 每週日 22:05 自動發送週報（含本週回顧 + 下週預覽）
     scheduler.add_job(auto_expiry_reminder, 'cron', hour=10, minute=0)
+    scheduler.add_job(send_subscription_expiry_reminders, 'cron', hour=11, minute=0)
     scheduler.add_job(auto_weekly_coach_batch, 'cron', day_of_week='sun', hour=22, minute=5)
     
     scheduler.start()
@@ -762,6 +763,22 @@ def init_db():
             source_text TEXT,
             updated_at TEXT
         )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS deferred_meals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            customer_name TEXT DEFAULT '',
+            original_date TEXT NOT NULL,
+            original_meal_type TEXT NOT NULL,
+            target_date TEXT NOT NULL,
+            target_meal_type TEXT NOT NULL,
+            is_cross_period INTEGER DEFAULT 0,
+            has_conflict INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'pending',
+            note TEXT DEFAULT '',
+            created_at TEXT DEFAULT '',
+            approved_at TEXT DEFAULT '',
+            approved_by TEXT DEFAULT ''
+        )''')
         c.execute('''CREATE TABLE IF NOT EXISTS planned_meal_checks (
             user_id TEXT,
             meal_date TEXT,
@@ -847,7 +864,14 @@ def init_db():
                            ("ai_silenced_until", "TEXT DEFAULT ''"),     # 🔥 客服靜音倒數
                            ("ai_mute", "INTEGER DEFAULT 0"),             # 🔑 功能一：老闆靜音旗標
                            ("user_level", "INTEGER DEFAULT 2"),          # 🔥 碳循環等級
-                           ("race_date", "TEXT DEFAULT ''")]:            # 🔥 目標賽事日期
+                           ("race_date", "TEXT DEFAULT ''"),            # 🔥 目標賽事日期
+                           ("address", "TEXT DEFAULT ''"),
+                           ("distance_text", "TEXT DEFAULT ''"),
+                           ("distance_meters", "INTEGER DEFAULT 0"),
+                           ("delivery_fee", "INTEGER DEFAULT 0"),
+                           ("delivery_zone", "TEXT DEFAULT ''"),
+                           ("route_group", "TEXT DEFAULT ''"),
+                           ("delivery_note", "TEXT DEFAULT ''")]:
             try: 
                 c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
             except sqlite3.OperationalError: 
@@ -889,6 +913,22 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         if user_id in user_memory: del user_memory[user_id]
 
         name, goal, restrictions = get_val("稱呼"), get_val("目標"), get_val("禁忌")
+        pickup_method = get_val("本期取餐方式") or get_val("取餐方式") or get_val("配送方式") or ""
+        address = get_val("本期外送地址") or get_val("地址") or get_val("外送地址") or get_val("收件地址") or ""
+        is_delivery = ("外送" in pickup_method) or (not pickup_method and bool(address))
+        delivery_info = calculate_delivery_quote(address) if (is_delivery and address) else {
+            "success": False,
+            "address": address,
+            "distance_text": "",
+            "distance_meters": 0,
+            "duration_text": "",
+            "delivery_fee": 0,
+            "delivery_fee_text": "自取或未提供地址",
+            "hub_name": "",
+            "route_group": "OTHER",
+            "delivery_zone": "SELF_PICKUP" if not is_delivery else "未分類",
+            "carpool_hint": "",
+        }
         weight, height, age, gender = float(get_val("體重") or 70), float(get_val("身高") or 170), float(get_val("年齡") or 30), get_val("性別")
         # 🔥 身高防呆：如果客人填 1.76 公尺，自動轉成 176 公分
         if height < 3.0:
@@ -1013,8 +1053,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         user_restrictions = restrictions.lower() # 顧客禁忌 (小寫化方便比對)
         
         # 2. 抓取顧客喜好標籤
-        pref_staple = get_val("主食偏好") or ""
-        pref_protein = get_val("蛋白質") or ""
+        pref_staple = get_val("您的主食偏好是？(可複選)") or get_val("主食偏好") or ""
+        pref_protein = get_val("您最喜歡的蛋白質是") or get_val("蛋白質") or ""
         
         # 🔥 定義真正喜歡的關鍵字 (解決「沒有飯」卻抓到「飯」的 Bug)
         liked_staples = []
@@ -1129,22 +1169,32 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                             carb_pool = safe_menu
 
                     matches = []
+                    staple_only_matches = []
+                    protein_only_matches = []
                     for dish in carb_pool:
                         d_text = (dish['name'] + dish.get('ingredients', '')).lower()
                         
                         # 1. 踩到主食地雷？直接淘汰！
                         if any(us in d_text for us in unliked_staples):
                             continue
-                            
-                        # 2. 檢查是否命中喜歡的主食
-                        if "都不挑食" in pref_staple or not liked_staples:
+
+                        staple_ok = ("都不挑食" in pref_staple or not liked_staples or any(ls in d_text for ls in liked_staples))
+                        protein_ok = (not liked_proteins or any(lp in d_text for lp in liked_proteins))
+
+                        if staple_ok:
+                            staple_only_matches.append(dish)
+                        if protein_ok:
+                            protein_only_matches.append(dish)
+                        if staple_ok and protein_ok:
                             matches.append(dish)
-                        elif any(ls in d_text for ls in liked_staples):
-                            matches.append(dish)
                             
-                    # 優先用完美命中的池子，不夠就用碳水 pool，最後 fallback 全池
+                    # 優先：主食＋蛋白質都命中 → 只命中主食 → 只命中蛋白 → 合法碳水池 → safe_menu
                     if len(matches) >= 2:
                         pool = matches
+                    elif len(staple_only_matches) >= 2:
+                        pool = staple_only_matches
+                    elif len(protein_only_matches) >= 2:
+                        pool = protein_only_matches
                     else:
                         pool = [dish for dish in carb_pool if not any(us in (dish['name'] + dish.get('ingredients', '')).lower() for us in unliked_staples)]
                         if len(pool) < 2:
@@ -1236,7 +1286,20 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO health_profile (user_id, name, tdee, protein, goal, restrictions, summary_text, active_days, today_extra_cal, today_date, sheet_name, is_coaching_enabled, is_carb_cycling_enabled, ai_silenced_until, user_level, race_date) VALUES (?,?,?,?,?,?,?,?,0,'',?,?,?,?, ?, ?)", (user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(active_days_list), safe_name, is_coaching_enabled, is_carb_cycling_enabled, '', user_level, race_date))
+        c.execute("""
+            INSERT OR REPLACE INTO health_profile (
+                user_id, name, tdee, protein, goal, restrictions, summary_text, active_days,
+                today_extra_cal, today_date, sheet_name, is_coaching_enabled, is_carb_cycling_enabled,
+                ai_silenced_until, user_level, race_date, address, distance_text, distance_meters,
+                delivery_fee, delivery_zone, route_group, delivery_note
+            ) VALUES (?,?,?,?,?,?,?,?,0,'',?,?,?,?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(active_days_list),
+            safe_name, is_coaching_enabled, is_carb_cycling_enabled, '', user_level, race_date,
+            address, delivery_info.get("distance_text", ""), delivery_info.get("distance_meters", 0),
+            delivery_info.get("delivery_fee", 0), delivery_info.get("delivery_zone", ""),
+            delivery_info.get("route_group", ""), delivery_info.get("carpool_hint", "")
+        ))
         conn.commit()
         # 同步顧客清單：從 usage 讀剩餘餐數與狀態
         _u = conn.execute("SELECT status, remaining_meals, expiry_date FROM usage WHERE user_id=?", (user_id,)).fetchone()
@@ -1334,7 +1397,17 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
 
         # 最後推播訊息給客人
         # 👉【修改】回覆客人的訊息中，補上本次排餐總額！
-        push_msg = f"🎉 {name} 填表成功！\nAI 營養師已為您精算：\n🔥 TDEE: {int(tdee)} kcal\n🥩 蛋白質: {int(protein)} g\n💰 本次排餐總額: ${total_price}\n\n現在請點擊選單的『查看菜單』，我將為您列出每一天的詳細餐點與價格！"
+        delivery_fee_per_trip = int(delivery_info.get("delivery_fee", 0) or 0)
+        delivery_days_count = len(active_days_list)
+        delivery_total_fee = delivery_fee_per_trip * delivery_days_count if is_delivery else 0
+        total_with_delivery = int(total_price) + delivery_total_fee
+        pickup_line = f"\n📦 取餐方式：{pickup_method}" if pickup_method else ""
+        address_line = f"\n📍 外送地址：{address}" if (is_delivery and address) else ""
+        delivery_line = f"\n🛵 單次外送運費：${delivery_fee_per_trip}（{delivery_info.get('distance_text', '未計算')}）" if (is_delivery and address) else ""
+        delivery_days_line = f"\n📦 本期配送天數：{delivery_days_count} 天" if is_delivery else ""
+        delivery_total_line = f"\n🚚 四週外送費：${delivery_total_fee}" if is_delivery else ""
+        self_pickup_line = "\n🛍️ 本期為自取，不產生外送費。" if (pickup_method and not is_delivery) else ""
+        push_msg = f"🎉 {name} 填表成功！\nAI 營養師已為您精算：\n🔥 TDEE: {int(tdee)} kcal\n🥩 蛋白質: {int(protein)} g\n💰 本次排餐總額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n🧾 本期總金額：${total_with_delivery}\n\n現在請點擊選單的『查看菜單』，我將為您列出每一天的詳細餐點與價格！"
         line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
         return {"status": "success"}
 
@@ -1397,6 +1470,183 @@ async def receive_survey_data(request: Request):
     except Exception as e:
         print(f"⚠️ 問卷處理錯誤: {e}")
         return {"status": "error"}
+def find_meal_slot_in_user_sheet(sheet, target_date: str, meal_type: str):
+    records = sheet.get_all_values()
+    meal_col = 2 if meal_type == "午餐" else 5
+    for i, row in enumerate(records):
+        if len(row) > 1 and target_date in row[1] and "週" in row[1]:
+            current_value = row[meal_col] if len(row) > meal_col else ""
+            printed = (len(row) > 13 and row[13] == "已列印")
+            return {
+                "row_idx": i,
+                "meal_col": meal_col,
+                "value": current_value,
+                "printed": printed,
+                "records": records,
+            }
+    return None
+
+
+def parse_defer_command(msg: str):
+    m = re.match(r'^#延餐\s*(\d{1,2}/\d{1,2})\s*(午餐|晚餐)\s*->\s*(\d{1,2}/\d{1,2})\s*(午餐|晚餐)\s*$', str(msg).strip())
+    if not m:
+        return None
+    return {
+        "original_date": m.group(1),
+        "original_meal_type": m.group(2),
+        "target_date": m.group(3),
+        "target_meal_type": m.group(4),
+    }
+
+
+def create_deferred_meal_request(user_id, customer_name, original_date, original_meal_type, target_date, target_meal_type, is_cross_period, has_conflict, note=""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    created_at = tw_now().isoformat()
+    c.execute("""
+        INSERT INTO deferred_meals (
+            user_id, customer_name, original_date, original_meal_type,
+            target_date, target_meal_type, is_cross_period, has_conflict,
+            status, note, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    """, (
+        user_id, customer_name, original_date, original_meal_type,
+        target_date, target_meal_type, int(is_cross_period), int(has_conflict),
+        note, created_at
+    ))
+    request_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return request_id
+
+
+def list_pending_deferred_meals(limit=10):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, customer_name, original_date, original_meal_type, target_date, target_meal_type, is_cross_period, has_conflict, note
+        FROM deferred_meals
+        WHERE status='pending'
+        ORDER BY id ASC
+        LIMIT ?
+    """, (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def execute_deferred_meal_move(user_id, original_date, original_meal_type, target_date, target_meal_type):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT sheet_name, summary_text FROM health_profile WHERE user_id=?", (user_id,))
+    res = c.fetchone()
+    if not res or not res[0]:
+        conn.close()
+        return False, "❌ 找不到您的專屬菜單檔案。"
+
+    sheet_name, old_summary = res[0], res[1] or ""
+    try:
+        sheet = gc.open_by_url(SHEET_URL).worksheet(sheet_name)
+        src = find_meal_slot_in_user_sheet(sheet, original_date, original_meal_type)
+        dst = find_meal_slot_in_user_sheet(sheet, target_date, target_meal_type)
+
+        if not src:
+            conn.close()
+            return False, f"❌ 找不到原餐：{original_date} {original_meal_type}"
+        if not dst:
+            conn.close()
+            return False, f"❌ 找不到目標日期：{target_date} {target_meal_type}"
+        if src["printed"] or dst["printed"]:
+            conn.close()
+            return False, "⚠️ 餐點已出單列印，無法延餐。"
+        if not src["value"] or src["value"] in ["無", "尚未安排"]:
+            conn.close()
+            return False, f"❌ 原餐 {original_date} {original_meal_type} 沒有可延的餐點。"
+        if dst["value"] not in ["", "無", "尚未安排"]:
+            conn.close()
+            return False, f"⚠️ 目標日 {target_date} {target_meal_type} 已有餐點，請人工處理。"
+
+        meal_name = src["value"]
+        sheet.update_cell(dst["row_idx"] + 1, dst["meal_col"] + 1, meal_name)
+        sheet.update_cell(src["row_idx"] + 1, src["meal_col"] + 1, "無")
+
+        timestamp = tw_now().strftime("%m/%d %H:%M")
+        new_summary = old_summary + f"\n⏸ 系統紀錄：{timestamp} 將 {original_date}{original_meal_type} 延至 {target_date}{target_meal_type}。"
+        c.execute("UPDATE health_profile SET summary_text=? WHERE user_id=?", (new_summary, user_id))
+        conn.commit()
+        conn.close()
+        return True, f"✅ 已將 {original_date}{original_meal_type} 延至 {target_date}{target_meal_type}"
+    except Exception as e:
+        conn.close()
+        print(f"⚠️ 延餐錯誤: {e}")
+        return False, "⚠️ 延餐失敗，請聯絡客服。"
+
+
+def approve_deferred_meal_request(request_id, admin_uid=""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT user_id, customer_name, original_date, original_meal_type, target_date, target_meal_type, status
+        FROM deferred_meals WHERE id=?
+    """, (request_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return "❌ 找不到這筆延餐申請。"
+
+    user_id, customer_name, original_date, original_meal_type, target_date, target_meal_type, status = row
+    if status != "pending":
+        conn.close()
+        return "⚠️ 這筆延餐申請已不是待審核狀態。"
+
+    ok, result_msg = execute_deferred_meal_move(user_id, original_date, original_meal_type, target_date, target_meal_type)
+    if ok:
+        c.execute("""
+            UPDATE deferred_meals
+            SET status='completed', approved_at=?, approved_by=?
+            WHERE id=?
+        """, (tw_now().isoformat(), admin_uid, request_id))
+        conn.commit()
+        conn.close()
+        try:
+            line_bot_api.push_message(user_id, TextSendMessage(text=f"✅ 您的延餐申請已核准\n{original_date} {original_meal_type} 已改至 {target_date} {target_meal_type}"))
+        except Exception:
+            pass
+        return f"✅ 已核准延餐申請 #{request_id}\n{result_msg}"
+
+    c.execute("UPDATE deferred_meals SET note=? WHERE id=?", (result_msg, request_id))
+    conn.commit()
+    conn.close()
+    return f"⚠️ 延餐申請 #{request_id} 核准失敗\n{result_msg}"
+
+
+def reject_deferred_meal_request(request_id, reason="", admin_uid=""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, status FROM deferred_meals WHERE id=?", (request_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return "❌ 找不到這筆延餐申請。"
+    user_id, status = row
+    if status != "pending":
+        conn.close()
+        return "⚠️ 這筆延餐申請已不是待審核狀態。"
+
+    c.execute("""
+        UPDATE deferred_meals
+        SET status='rejected', note=?, approved_at=?, approved_by=?
+        WHERE id=?
+    """, (reason, tw_now().isoformat(), admin_uid, request_id))
+    conn.commit()
+    conn.close()
+    try:
+        line_bot_api.push_message(user_id, TextSendMessage(text=f"⚠️ 您的延餐申請未通過\n原因：{reason or '請聯絡客服確認'}"))
+    except Exception:
+        pass
+    return f"✅ 已拒絕延餐申請 #{request_id}"
+
+
 def execute_meal_swap(user_id, d1, m1, d2, m2):
     """處理顧客餐點互換邏輯 - 精準定位版 [cite: 2]"""
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -1423,37 +1673,20 @@ def execute_meal_swap(user_id, d1, m1, d2, m2):
     # 2. Google Sheet 資料互換
     try:
         sheet = gc.open_by_url(SHEET_URL).worksheet(sheet_name)
-        records = sheet.get_all_values()
-        
-        r1_idx, r2_idx = -1, -1
-        # 👉 修改點：找到第一個符合的日期就 break，避免改到第 4 週去
-        for i, row in enumerate(records):
-            if len(row) > 1 and d1 in row[1] and "週" in row[1]:
-                if r1_idx == -1: r1_idx = i # 只記錄第一個找到的
-            if len(row) > 1 and d2 in row[1] and "週" in row[1]:
-                if r2_idx == -1: r2_idx = i
-            if r1_idx != -1 and r2_idx != -1: break # 兩天都找到了，直接收工
+        src = find_meal_slot_in_user_sheet(sheet, d1, m1)
+        dst = find_meal_slot_in_user_sheet(sheet, d2, m2)
 
-        if r1_idx == -1 or r2_idx == -1: 
+        if not src or not dst:
             conn.close(); return "❌ 找不到指定的日期。"
-
-        # 你的欄位索引：午餐在第 3 欄(Index 2)，晚餐在第 6 欄(Index 5)
-        col_m1 = 2 if m1 == "午餐" else 5
-        col_m2 = 2 if m2 == "午餐" else 5
-
-        # 檢查第 14 欄(Index 13)的列印狀態
-        if (len(records[r1_idx]) > 13 and records[r1_idx][13] == "已列印") or \
-           (len(records[r2_idx]) > 13 and records[r2_idx][13] == "已列印"):
+        if src["printed"] or dst["printed"]:
             conn.close(); return "⚠️ 您的餐點已經出單列印，無法更換！"
 
-        meal1_name = records[r1_idx][col_m1]
-        meal2_name = records[r2_idx][col_m2]
+        meal1_name = src["value"]
+        meal2_name = dst["value"]
 
-        # 執行交換動作
-        sheet.update_cell(r1_idx + 1, col_m1 + 1, meal2_name)
-        sheet.update_cell(r2_idx + 1, col_m2 + 1, meal1_name)
+        sheet.update_cell(src["row_idx"] + 1, src["meal_col"] + 1, meal2_name)
+        sheet.update_cell(dst["row_idx"] + 1, dst["meal_col"] + 1, meal1_name)
 
-        # 3. 更新資料庫記憶
         timestamp = tw_now().strftime("%m/%d %H:%M")
         new_summary = old_summary + f"\n🔄 系統紀錄：{timestamp} 將 {d1}{m1} 與 {d2}{m2} 互換。"
         c.execute("UPDATE health_profile SET summary_text=? WHERE user_id=?", (new_summary, user_id))
@@ -1757,10 +1990,102 @@ def repack_meal_plan_for_user(user_id: str):
             conn.close()
 
 
+def extract_user_sheet_suffix(user_id: str) -> str:
+    user_id = str(user_id or "").strip()
+    return user_id[-4:] if len(user_id) >= 4 else user_id
+
+
+def parse_sheet_title_date(sheet_title: str):
+    if not sheet_title:
+        return None
+    m = re.search(r'(20\d{6})$', str(sheet_title).strip())
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d")
+    except Exception:
+        return None
+
+
+def pick_latest_sheet_title(sheet_titles):
+    def _sort_key(title):
+        parsed = parse_sheet_title_date(title)
+        return (parsed or datetime.min, str(title))
+    return sorted(sheet_titles, key=_sort_key, reverse=True)[0] if sheet_titles else None
+
+
+def find_candidate_user_sheets(book, user_id: str, user_name: str = ""):
+    suffix = extract_user_sheet_suffix(user_id)
+    normalized_name = str(user_name or "").strip().lower()
+    candidates = []
+
+    for ws in book.worksheets():
+        title = ws.title.strip()
+        title_lower = title.lower()
+
+        suffix_match = bool(suffix and f"_{suffix}_" in title)
+        name_match = bool(normalized_name and title_lower.startswith(f"{normalized_name}_"))
+
+        if suffix_match or name_match:
+            candidates.append(title)
+
+    exact_candidates = [t for t in candidates if suffix and f"_{suffix}_" in t]
+    return exact_candidates if exact_candidates else candidates
+
+
+def resolve_user_sheet_name(book, user_id: str, user_name: str = "", current_sheet_name: str = ""):
+    worksheet_titles = {ws.title for ws in book.worksheets()}
+    current_sheet_name = str(current_sheet_name or "").strip()
+
+    if current_sheet_name and current_sheet_name in worksheet_titles:
+        return current_sheet_name, "current"
+
+    candidates = find_candidate_user_sheets(book, user_id, user_name)
+    if candidates:
+        return pick_latest_sheet_title(candidates), "candidate"
+
+    return None, "missing"
+
+
+def update_health_profile_sheet_name(user_id: str, sheet_name: str):
+    if not sheet_name:
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE health_profile SET sheet_name=? WHERE user_id=?", (sheet_name, user_id))
+        conn.commit()
+    except Exception as e:
+        print(f"⚠️ 更新 sheet_name 失敗: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_or_create_user_sheet(book, user_id: str, user_name: str, current_sheet_name: str = ""):
+    resolved_sheet_name, source = resolve_user_sheet_name(book, user_id, user_name, current_sheet_name)
+
+    if resolved_sheet_name:
+        if resolved_sheet_name != (current_sheet_name or ""):
+            update_health_profile_sheet_name(user_id, resolved_sheet_name)
+        return book.worksheet(resolved_sheet_name), resolved_sheet_name, source
+
+    sync_user_sheet_from_master(user_id)
+    resolved_sheet_name, source = resolve_user_sheet_name(book, user_id, user_name, current_sheet_name)
+    if resolved_sheet_name:
+        if resolved_sheet_name != (current_sheet_name or ""):
+            update_health_profile_sheet_name(user_id, resolved_sheet_name)
+        return book.worksheet(resolved_sheet_name), resolved_sheet_name, f"rebuilt_{source}"
+
+    return None, None, "missing"
+
+
 def sync_user_sheet_from_master(user_id: str):
     """
     以 Master_API_View 作為單一真實來源，重建個人分頁中的排餐區塊，
     避免第一階段初始排餐與第二階段碳循環重排後資料不一致。
+    同時把 health_profile.sheet_name 視為可校正欄位，而不是唯一真相。
     """
     if not gc:
         return
@@ -1772,9 +2097,7 @@ def sync_user_sheet_from_master(user_id: str):
         row = c.fetchone()
         if not row:
             return
-        sheet_name, name, tdee, protein, goal, restrictions = row
-        if not sheet_name:
-            return
+        current_sheet_name, name, tdee, protein, goal, restrictions = row
 
         sheet = gc.open_by_url(SHEET_URL)
         api_sheet = sheet.worksheet("Master_API_View")
@@ -1845,17 +2168,25 @@ def sync_user_sheet_from_master(user_id: str):
                 "待列印"
             ])
 
+        resolved_sheet_name, source = resolve_user_sheet_name(sheet, user_id, name, current_sheet_name)
+        final_sheet_name = resolved_sheet_name or current_sheet_name
+        if not final_sheet_name:
+            final_sheet_name = f"{name}_{extract_user_sheet_suffix(user_id)}_{tw_now().strftime('%Y%m%d')}"
+
+        if final_sheet_name != (current_sheet_name or ""):
+            update_health_profile_sheet_name(user_id, final_sheet_name)
+
         try:
-            user_sheet = sheet.worksheet(sheet_name)
+            user_sheet = sheet.worksheet(final_sheet_name)
         except Exception:
-            user_sheet = sheet.add_worksheet(title=sheet_name, rows="1000", cols="9")
+            user_sheet = sheet.add_worksheet(title=final_sheet_name, rows="1000", cols="14")
 
         user_sheet.clear()
-        profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", "", "", f"💰 排餐總額: ${total_price}"], [""]]
+        profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"User_ID: {user_id}", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", "", f"來源: {source}", f"💰 排餐總額: ${total_price}"], [""]]
         menu_title = [["【專屬排餐計畫 (第1週~第4週)｜已套用碳循環】"]]
         tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
         user_sheet.append_rows(profile_data + menu_title + schedule_sheet_rows + tracking_headers)
-        print(f"✅ 已同步更新個人分頁：{sheet_name}")
+        print(f"✅ 已同步更新個人分頁：{final_sheet_name}")
     except Exception as e:
         print(f"⚠️ sync_user_sheet_from_master 失敗: {e}")
     finally:
@@ -2694,25 +3025,16 @@ def get_dashboard_data(user_id: str) -> dict:
     if gc and sheet_name:
         try:
             book = gc.open_by_key(SPREADSHEET_ID)
-            user_sheet = None
-
-            try:
-                user_sheet = book.worksheet(sheet_name)
-            except Exception:
-                print(f"⚠️ 個人分頁不存在，嘗試從 Master_API_View 重建：{sheet_name}")
-                try:
-                    sync_user_sheet_from_master(user_id)
-                    user_sheet = book.worksheet(sheet_name)
-                    print(f"✅ 已成功重建個人分頁：{sheet_name}")
-                except Exception as rebuild_error:
-                    print(f"⚠️ 重建個人分頁失敗：{sheet_name} / {rebuild_error}")
-                    user_sheet = None
-
+            user_sheet, resolved_sheet_name, resolved_source = get_or_create_user_sheet(book, user_id, name, sheet_name)
             if user_sheet:
+                if resolved_sheet_name != sheet_name:
+                    sheet_name = resolved_sheet_name
+                    print(f"ℹ️ Dashboard 已校正 sheet_name：{user_id} -> {resolved_sheet_name} ({resolved_source})")
+
                 for row in get_user_sheet_rows(user_sheet):
                     row_date = _pick_first(row, ["日期", "取餐日期", "實際日期", "Date"], "")
                     if normalize_date_str(row_date) == normalize_date_str(today_date_str):
-                        today_lunch = _pick_first(row, ["午餐", "午餐安排", "Lunch_Item"], "尚未安排")
+                        today_lunch  = _pick_first(row, ["午餐", "午餐安排", "Lunch_Item"], "尚未安排")
                         today_dinner = _pick_first(row, ["晚餐", "晚餐安排", "Dinner_Item"], "尚未安排")
                         today_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
                         lunch_cal = _to_int(_pick_first(row, ["午餐熱量"], 0), 0)
@@ -2730,12 +3052,7 @@ def get_dashboard_data(user_id: str) -> dict:
                     for r in records:
                         sheet_date = str(r.get("Date", "")).replace("-", "/").strip()
                         if str(r.get("User_ID", "")).strip() == user_id and sheet_date == today_date_str:
-                            today_workout = (
-                                str(r.get("Tomorrow_Training", "")).strip()
-                                or str(r.get("Plan_Week", "")).strip()
-                                or str(r.get("Sport_Type", "")).strip()
-                                or "無"
-                            )
+                            today_workout = str(r.get("Tomorrow_Training", "")).strip() or str(r.get("Plan_Week", "")).strip() or str(r.get("Sport_Type", "")).strip() or "無"
                             break
                 except Exception:
                     pass
@@ -3395,37 +3712,29 @@ def get_ai_response_with_memory(user_id, user_msg):
 
     if gc and user_sheet_name:
         try:
+            # 去個人的專屬分頁找排餐與運動
             book = gc.open_by_key(SPREADSHEET_ID)
-            user_sheet = None
-
-            try:
-                user_sheet = book.worksheet(user_sheet_name)
-            except Exception:
-                print(f"⚠️ 個人分頁不存在，嘗試重建：{user_sheet_name}")
-                try:
-                    sync_user_sheet_from_master(user_id)
-                    user_sheet = book.worksheet(user_sheet_name)
-                    print(f"✅ 已成功重建個人分頁：{user_sheet_name}")
-                except Exception as rebuild_error:
-                    print(f"⚠️ 重建後仍無法讀取個人分頁：{user_sheet_name} / {rebuild_error}")
-                    user_sheet = None
-
+            user_sheet, resolved_sheet_name, resolved_source = get_or_create_user_sheet(book, user_id, daily_rec[3] if daily_rec else "", user_sheet_name)
             if user_sheet:
-                all_rows = get_user_sheet_rows(user_sheet)
+                if resolved_sheet_name != user_sheet_name:
+                    user_sheet_name = resolved_sheet_name
+                    print(f"ℹ️ 對話引擎已校正 sheet_name：{user_id} -> {resolved_sheet_name} ({resolved_source})")
 
+                all_rows = get_user_sheet_rows(user_sheet)
+                
                 for row in all_rows:
                     row_date = _pick_first(row, ["日期", "實際日期", "取餐日期", "Date"], "")
-
+                    
                     # 🎯 比對今天：抓午晚餐 + 今日的 Sport_Type
-                    if row_date == today_date_str:
+                    if normalize_date_str(row_date) == normalize_date_str(today_date_str):
                         today_lunch = _pick_first(row, ["午餐", "午餐安排", "Lunch_Item"], "無")
                         today_dinner = _pick_first(row, ["晚餐", "晚餐安排", "Dinner_Item"], "無")
                         today_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
-
+                        
                     # 🎯 比對明天：抓明日的 Sport_Type
-                    elif row_date == tomorrow_date_str:
+                    elif normalize_date_str(row_date) == normalize_date_str(tomorrow_date_str):
                         tomorrow_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
-
+                        
         except Exception as e:
             print(f"⚠️ 讀取當天排餐/運動失敗: {e}")
 
@@ -3647,14 +3956,20 @@ def check_permission_and_quota(user_id):
         today = tw_today().isoformat()
         c.execute("SELECT remaining_chat_quota, remaining_meals, last_date, status, expiry_date, daily_chat_limit FROM usage WHERE user_id=?", (user_id,))
         record = c.fetchone()
-        if record is None: return False, ""
+        if record is None:
+            return False, ""
         q, m, ld, s, ed, dcl = record
-        if ed and today > ed: return False, ""
-        if ld != today: q = dcl
+        if ed and today > ed:
+            return False, ""
+        if m is not None and int(m) <= 0:
+            return False, ""
+        if ld != today:
+            q = dcl
         if q > 0:
             c.execute("UPDATE usage SET remaining_chat_quota=?, last_date=? WHERE user_id=?", (q-1, today, user_id))
             conn.commit()
             return True, f"(剩{m}餐 | 諮詢:{q-1})"
+        return False, f"(剩{m}餐 | 諮詢:0)"
 
 def send_tomorrow_reminders():
     tomorrow = tw_today() + timedelta(days=1)
@@ -3693,7 +4008,132 @@ def get_distance(origin_address, target_address, mode="driving"):
             if element.get("status") == "OK":
                 return True, element["distance"]["text"], element["distance"]["value"], element["duration"]["text"]
         return False, "", 0, ""
-    except: return False, "", 0, ""
+    except:
+        return False, "", 0, ""
+
+
+def infer_route_group(address: str) -> str:
+    address = str(address or "").strip()
+    district_map = {
+        "WEST": ["萬華", "中正", "大同"],
+        "EAST": ["信義", "南港", "內湖"],
+        "SOUTH": ["大安", "文山", "新店", "永和", "中和"],
+        "NORTH": ["士林", "北投", "中山", "松山"],
+    }
+    for group, keywords in district_map.items():
+        if any(keyword in address for keyword in keywords):
+            return group
+    return "OTHER"
+
+
+def calculate_delivery_quote(target_address: str):
+    target_address = str(target_address or "").strip()
+    if not target_address:
+        return {
+            "success": False,
+            "address": "",
+            "distance_text": "",
+            "distance_meters": 0,
+            "duration_text": "",
+            "delivery_fee": 0,
+            "delivery_fee_text": "未提供地址",
+            "hub_name": "",
+            "route_group": "OTHER",
+            "delivery_zone": "未分類",
+            "carpool_hint": "",
+        }
+
+    success, dist_text, dist_meters, duration_text = get_distance(STORE_ADDRESS, target_address)
+    if not success:
+        return {
+            "success": False,
+            "address": target_address,
+            "distance_text": "",
+            "distance_meters": 0,
+            "duration_text": "",
+            "delivery_fee": 0,
+            "delivery_fee_text": "地址查詢失敗",
+            "hub_name": "",
+            "route_group": infer_route_group(target_address),
+            "delivery_zone": "未分類",
+            "carpool_hint": "",
+        }
+
+    hub_match = None
+    for hub in HUBS:
+        h_succ, h_d_txt, h_d_m, h_t_txt = get_distance(hub["address"], target_address, mode="walking")
+        if h_succ and h_d_m <= 1000:
+            hub_match = hub["name"]
+            break
+
+    if hub_match:
+        delivery_fee = 20
+        delivery_fee_text = f"20 元（{hub_match} 周邊順風車特惠）"
+        delivery_zone = "HUB"
+    else:
+        if dist_meters <= 2000:
+            delivery_fee = 0
+            delivery_fee_text = "0 元（2 公里內免運）"
+            delivery_zone = "NEAR"
+        elif dist_meters <= 4000:
+            delivery_fee = 40
+            delivery_fee_text = "40 元"
+            delivery_zone = "MID"
+        elif dist_meters <= 6000:
+            delivery_fee = 80
+            delivery_fee_text = "80 元"
+            delivery_zone = "FAR"
+        else:
+            delivery_fee = 150
+            delivery_fee_text = "150 元起（超出自家車隊範圍，建議再人工確認）"
+            delivery_zone = "OUTSIDE"
+
+    route_group = infer_route_group(target_address)
+    carpool_hint = f"若同配送日有 {route_group} 同路客戶，可再套用順風車折扣。" if route_group != "OTHER" else "若有同區域併單，可再人工調整順風車折扣。"
+
+    return {
+        "success": True,
+        "address": target_address,
+        "distance_text": dist_text,
+        "distance_meters": dist_meters,
+        "duration_text": duration_text,
+        "delivery_fee": delivery_fee,
+        "delivery_fee_text": delivery_fee_text,
+        "hub_name": hub_match or "",
+        "route_group": route_group,
+        "delivery_zone": delivery_zone,
+        "carpool_hint": carpool_hint,
+    }
+
+
+def send_subscription_expiry_reminders(days_before: int = 3):
+    target_date = (tw_today() + timedelta(days=days_before)).isoformat()
+    notified = 0
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT u.user_id, h.name, u.remaining_meals, u.expiry_date
+                FROM usage u
+                LEFT JOIN health_profile h ON h.user_id = u.user_id
+                WHERE u.status='vip' AND u.expiry_date=?
+            """, (target_date,))
+            rows = c.fetchall()
+
+        for user_id, name, remaining_meals, expiry_date in rows:
+            msg = (
+                f"⏰ {name or '會員'} 您好！\n"
+                f"您的方案將於 {expiry_date} 到期，目前剩餘 {remaining_meals or 0} 餐。\n\n"
+                "若想不中斷配餐與 AI 營養師服務，建議這幾天就先續訂下一期包月喔！"
+            )
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(text=msg))
+                notified += 1
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"⚠️ send_subscription_expiry_reminders 失敗: {e}")
+    return notified
 
 def generate_package_codes(t, n):
     codes = []
@@ -5040,7 +5480,8 @@ def handle_message(event):
                 c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (u_id,))
                 res = c.fetchone()
                 if res and res[0] > 0:
-                    new_meals = res[0] - 1
+                    old_meals = res[0]
+                    new_meals = old_meals - 1
                     c.execute("UPDATE usage SET remaining_meals=? WHERE user_id=?", (new_meals, u_id))
                     count += 1
                     if new_meals <= 3 and new_meals > 0:
@@ -5049,6 +5490,13 @@ def handle_message(event):
                             line_bot_api.push_message(u_id, TextSendMessage(text=notify_msg))
                             notify_count += 1
                         except Exception: pass
+                    elif old_meals == 2 and new_meals == 1:
+                        last_meal_msg = f"⏰ {u_name} 提醒您：明天將是您目前方案的最後一餐。\n若想不中斷外送與 AI 營養師服務，建議今天就先續訂下一期包月喔！"
+                        try:
+                            line_bot_api.push_message(u_id, TextSendMessage(text=last_meal_msg))
+                            notify_count += 1
+                        except Exception:
+                            pass
             conn.commit()
             
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 報告老闆！今日 ({today_str}) 出餐扣除完畢！\n共扣除了 {count} 份餐點，發送 {notify_count} 則續約推播！"))
@@ -5108,6 +5556,122 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=res))
         return
 
+    elif msg.startswith("#延餐 "):
+        parsed = parse_defer_command(msg)
+        if not parsed:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 格式錯誤，請輸入：\n#延餐 5/31 午餐 -> 6/2 午餐"))
+            return
+
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT sheet_name, name FROM health_profile WHERE user_id=?", (uid,))
+            hp = c.fetchone()
+        if not hp or not hp[0]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 找不到您的專屬菜單檔案。"))
+            return
+
+        sheet_name, customer_name = hp[0], hp[1] or "顧客"
+        try:
+            sheet = gc.open_by_url(SHEET_URL).worksheet(sheet_name)
+            src = find_meal_slot_in_user_sheet(sheet, parsed["original_date"], parsed["original_meal_type"])
+            dst = find_meal_slot_in_user_sheet(sheet, parsed["target_date"], parsed["target_meal_type"])
+        except Exception:
+            src, dst = None, None
+
+        if not src or not src.get("value") or src.get("value") in ["", "無", "尚未安排"]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 找不到原餐：{parsed['original_date']} {parsed['original_meal_type']}"))
+            return
+
+        has_conflict = 0
+        note = ""
+        if not dst:
+            has_conflict = 1
+            note = "目標日期不存在於目前個人分頁，需人工確認"
+        elif dst.get("value") not in ["", "無", "尚未安排"]:
+            has_conflict = 1
+            note = "目標日期已有餐點，需人工確認"
+
+        is_cross_period = 0
+        try:
+            od = datetime.strptime(parsed["original_date"], "%m/%d")
+            td = datetime.strptime(parsed["target_date"], "%m/%d")
+            is_cross_period = 1 if od.month != td.month else 0
+        except Exception:
+            pass
+
+        request_id = create_deferred_meal_request(
+            uid,
+            customer_name,
+            parsed["original_date"],
+            parsed["original_meal_type"],
+            parsed["target_date"],
+            parsed["target_meal_type"],
+            is_cross_period,
+            has_conflict,
+            note
+        )
+
+        admin_msg = (
+            f"📦【延餐申請 #{request_id}】\n"
+            f"顧客：{customer_name}\n"
+            f"原餐：{parsed['original_date']} {parsed['original_meal_type']}\n"
+            f"目標：{parsed['target_date']} {parsed['target_meal_type']}\n"
+            f"跨期：{'是' if is_cross_period else '否'}\n"
+            f"衝突：{'是' if has_conflict else '否'}\n"
+            f"備註：{note or '無'}"
+        )
+        try:
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                c = conn.cursor()
+                c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+                admin_row = c.fetchone()
+            if admin_row:
+                line_bot_api.push_message(admin_row[0], TextSendMessage(text=admin_msg))
+        except Exception:
+            pass
+
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
+            f"✅ 已收到您的延餐申請\n"
+            f"原餐：{parsed['original_date']} {parsed['original_meal_type']}\n"
+            f"目標：{parsed['target_date']} {parsed['target_meal_type']}\n\n"
+            f"此申請需由客服確認後安排，確認完成後會再通知您。"
+        )))
+        return
+
+    elif msg == "#延餐清單":
+        rows = list_pending_deferred_meals(limit=20)
+        if not rows:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 目前沒有待審核的延餐申請。"))
+            return
+        lines = ["📦【延餐待審核清單】"]
+        for rid, cname, od, omt, td, tmt, cross_p, conflict, note in rows:
+            lines.append(f"#{rid} {cname}｜{od} {omt} -> {td} {tmt}｜跨期：{'是' if cross_p else '否'}｜衝突：{'是' if conflict else '否'}")
+            if note:
+                lines.append(f"備註：{note}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines[:40])))
+        return
+
+    elif msg.startswith("#核准延餐 "):
+        request_id = msg.replace("#核准延餐 ", "").strip()
+        if not request_id.isdigit():
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 請輸入正確申請 ID，例如：#核准延餐 12"))
+            return
+        result = approve_deferred_meal_request(int(request_id), uid)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+        return
+
+    elif msg.startswith("#拒絕延餐 "):
+        raw = msg.replace("#拒絕延餐 ", "", 1).strip()
+        parts = raw.split(" ", 1)
+        request_id = parts[0].strip() if parts else ""
+        reason = parts[1].strip() if len(parts) > 1 else "請聯絡客服確認"
+        if not request_id.isdigit():
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 請輸入正確申請 ID，例如：#拒絕延餐 12 6/2已有餐點"))
+            return
+        result = reject_deferred_meal_request(int(request_id), reason, uid)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+        return
+
     elif msg == "#清空熱量":
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
@@ -5138,21 +5702,19 @@ def handle_message(event):
     # 🗺️ 智能測距與順風車 🗺️
     elif msg.startswith("#測距 "):
         target_address = msg.replace("#測距 ", "").strip()
-        success, dist_text, dist_meters, duration_text = get_distance(STORE_ADDRESS, target_address)
-        if success:
-            hub_match = None
-            for hub in HUBS:
-                h_succ, h_d_txt, h_d_m, h_t_txt = get_distance(hub["address"], target_address, mode="walking")
-                if h_succ and h_d_m <= 1000: hub_match = hub["name"]; break 
-            
-            if hub_match: fee_msg = f"20 元 🎉 (恭喜！您符合【{hub_match}】周邊 1 公里專屬順風車特惠！)"
-            else:
-                if dist_meters <= 2000: fee_msg = "0 元 (2公里內免運專案！)"
-                elif dist_meters <= 4000: fee_msg = "40 元"
-                elif dist_meters <= 6000: fee_msg = "80 元"
-                else: fee_msg = "超出自家車隊範圍，建議自取或由 Lalamove 專車報價配送喔！"
-            reply_text = f"🛵 **一日樂食 外送試算結果**\n📍 目的地：{target_address}\n📏 距本店距離：{dist_text}\n⏱️ 騎車時間：{duration_text}\n💰 運費評估：{fee_msg}"
-        else: reply_text = "哎呀！地圖系統暫時找不到這個地址，請確認地址是否完整喔！"
+        quote = calculate_delivery_quote(target_address)
+        if quote.get("success"):
+            reply_text = (
+                f"🛵 一日樂食 外送試算結果\n"
+                f"📍 目的地：{target_address}\n"
+                f"📏 距本店距離：{quote.get('distance_text')}\n"
+                f"⏱️ 騎車時間：{quote.get('duration_text')}\n"
+                f"💰 運費評估：{quote.get('delivery_fee_text')}\n"
+                f"🧭 建議分線：{quote.get('route_group')} / {quote.get('delivery_zone')}\n"
+                f"💡 {quote.get('carpool_hint')}"
+            )
+        else:
+            reply_text = "哎呀！地圖系統暫時找不到這個地址，請確認地址是否完整喔！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
       
