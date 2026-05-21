@@ -4919,7 +4919,87 @@ def handle_message(event):
     if len(processed_messages) > 1000: processed_messages.clear()
 
     msg, uid = event.message.text.strip(), event.source.user_id
-    
+
+    # ======================================================
+    # 🌱 公開行銷入口：未開通顧客也可以使用
+    # 放在靜音 / VIP 權限檢查之前，確保一定會觸發
+    # ======================================================
+    if msg == "了解包月方案":
+        reply_text = (
+            "一日樂食包月 2.0 說明來囉！\n\n"
+            "這次不只是幫你準備健康餐，而是幫你算好每天該怎麼吃。\n\n"
+            "包月 2.0 會依照你的身高、體重、目標與飲食禁忌，"
+            "幫你計算 TDEE、蛋白質目標，並安排四週專屬餐點。\n\n"
+            "你可以每天在 LINE 查看：\n"
+            "✅ 今日午餐 / 晚餐\n"
+            "✅ 剩餘熱量\n"
+            "✅ 蛋白質進度\n"
+            "✅ 飲食紀錄\n"
+            "✅ 延餐 / 換餐\n\n"
+            "🎁 上線優惠：\n"
+            "現在訂購包月，AI 營養管理功能免費開通，續訂也不另外收服務費。\n\n"
+            "想先確認外送範圍，請直接回覆：\n"
+            "測距＋地址\n\n"
+            "範例：\n"
+            "測距 台北市松山區南京東路四段133巷4弄5號\n\n"
+            "想開始加入，請回覆：\n"
+            "我要填寫包月資料"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    if msg.startswith("測距 ") or msg.startswith("#測距 "):
+        target_address = msg.replace("#測距 ", "").replace("測距 ", "").strip()
+
+        if not target_address:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請輸入完整地址喔！\n範例：測距 台北市松山區南京東路四段133巷4弄5號")
+            )
+            return
+
+        quote = calculate_delivery_quote(target_address)
+
+        if quote.get("success"):
+            reply_text = (
+                f"🛵 一日樂食 外送試算結果\n"
+                f"📍 目的地：{target_address}\n"
+                f"📏 距本店距離：{quote.get('distance_text')}\n"
+                f"⏱️ 騎車時間：{quote.get('duration_text')}\n"
+                f"💰 運費評估：{quote.get('delivery_fee_text')}\n"
+                f"🧭 建議分線：{quote.get('route_group')} / {quote.get('delivery_zone')}\n"
+                f"💡 {quote.get('carpool_hint')}\n\n"
+                f"想了解包月方案，請回覆：了解包月方案"
+            )
+        else:
+            reply_text = "哎呀！地圖系統暫時找不到這個地址，請確認地址是否完整喔！"
+
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    if msg == "我要填寫包月資料":
+        reply_text = (
+            "太好了！請先填寫包月資料表，系統會幫你計算 TDEE、蛋白質目標，並安排四週專屬餐點。\n\n"
+            "填完後我們會確認餐數、取餐方式、外送費與本期總金額，再提供付款資訊。\n\n"
+            "表單連結：\n"
+            "請把你的 Google 表單連結放這裡"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    if msg == "付款方式":
+        reply_text = (
+            "包月付款流程：\n\n"
+            "1️⃣ 先填寫包月資料\n"
+            "2️⃣ 系統產生 TDEE 與四週菜單\n"
+            "3️⃣ 我們確認餐數、外送費與總金額\n"
+            "4️⃣ 提供付款資訊\n"
+            "5️⃣ 完成付款後正式開通包月\n\n"
+            "目前可使用：轉帳、現場付款。"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+        
     # 🕵️‍♂️ 工程師專用除錯指令
     if msg == "檢查數據":
         try:
