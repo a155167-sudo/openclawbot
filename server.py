@@ -298,15 +298,16 @@ async def get_coach_data(admin_uid: str):
         """)
         records = c.fetchall()
         
-        # 🌟 修改：多撈一個 status 欄位當作分類群組
-        c.execute("SELECT user_id, name, status FROM health_profile")
+        # 🌟 修改：status 作為大班別，training_group 作為 1~6 區
+        c.execute("SELECT user_id, name, status, COALESCE(training_group, '') FROM health_profile")
         profiles = {}
         for row in c.fetchall():
             uid_str = row[0]
             name_str = row[1]
             # 如果資料庫裡的 status 是空的，就歸類到 '未分類'
-            group_str = row[2] if row[2] else '未分類' 
-            profiles[uid_str] = {"name": name_str, "group": group_str}
+            group_str = row[2] if row[2] else '未分類'
+            training_group_str = str(row[3] or '').strip()
+            profiles[uid_str] = {"name": name_str, "group": group_str, "training_group": training_group_str}
 
     result = {}
     for r in records:
@@ -320,6 +321,7 @@ async def get_coach_data(admin_uid: str):
                 "uid": uid_r, 
                 "name": user_info["name"], 
                 "group": user_info["group"], # 🌟 新增群組資料給網頁用
+                "training_group": user_info.get("training_group", ""), # 🌟 1~6 區
                 "total_dur": 0, "total_load": 0, 
                 "logs": [], 
                 "chart_data": {"dates": [], "loads": [], "hrs": []} 
@@ -336,6 +338,19 @@ async def get_coach_data(admin_uid: str):
         result[uid_r]["chart_data"]["loads"].append(load)
         result[uid_r]["chart_data"]["hrs"].append(hr)
         
+    # 🌟 補上沒有近期運動紀錄的學員，讓教練也能分配 1~6 區與指派課表
+    for uid_p, user_info in profiles.items():
+        if uid_p not in result:
+            result[uid_p] = {
+                "uid": uid_p,
+                "name": user_info["name"],
+                "group": user_info["group"],
+                "training_group": user_info.get("training_group", ""),
+                "total_dur": 0, "total_load": 0,
+                "logs": ["尚無近期運動紀錄"],
+                "chart_data": {"dates": [], "loads": [], "hrs": []}
+            }
+
     # 🌟 為了讓圖表從左到右顯示 (舊到新)，我們把陣列反轉
     final_list = list(result.values())
     for item in final_list:
@@ -420,8 +435,229 @@ async def update_student_group(payload: UpdateGroupPayload):
 
         return {"success": True}
     except Exception as e:
+
         print(f"❌ 發生錯誤: {str(e)}")
         return {"success": False, "error": str(e)}
+
+# ─────────────────────────────────────────────────────────────────────────
+# 🌟 教練分區課表：班級(status) + 1~6 區(training_group) + 課表指派
+# ─────────────────────────────────────────────────────────────────────────
+TRAINING_ASSIGNMENTS_SHEET = "training_assignments"
+TRAINING_ASSIGNMENTS_HEADERS = [
+    "assignment_id", "created_at", "plan_title", "class_name", "training_group",
+    "group_coach", "member_uid", "member_name", "session_label", "session_order",
+    "target_date", "workout_type", "content", "note", "assignment_type",
+    "assigned_by", "status"
+]
+
+class UpdateTrainingGroupPayload(BaseModel):
+    admin_uid: str
+    target_uid: str
+    training_group: str
+
+class AddGroupTrainingPlanPayload(BaseModel):
+    admin_uid: str
+    class_name: str
+    target_date: str = ""
+    plan_title: str = ""
+    session_label: str = "訓練一"
+    session_order: int = 1
+    workout_type: str = "跑步"
+    raw_plan_text: str
+
+
+def is_coach_user(user_id: str) -> bool:
+    return user_id in COACH_UIDS
+
+
+def normalize_training_group(raw) -> str:
+    s = str(raw or "").strip()
+    circled = {"❶":"1", "❷":"2", "❸":"3", "❹":"4", "❺":"5", "❻":"6", "①":"1", "②":"2", "③":"3", "④":"4", "⑤":"5", "⑥":"6"}
+    for k, v in circled.items():
+        s = s.replace(k, v)
+    m = re.search(r"[1-6]", s)
+    return m.group(0) if m else ""
+
+
+def get_or_create_training_assignments_sheet():
+    if not gc:
+        raise RuntimeError("Google Sheet 尚未連線")
+    ss = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        ws = ss.worksheet(TRAINING_ASSIGNMENTS_SHEET)
+    except Exception:
+        ws = ss.add_worksheet(title=TRAINING_ASSIGNMENTS_SHEET, rows=2000, cols=len(TRAINING_ASSIGNMENTS_HEADERS) + 2)
+        ws.append_row(TRAINING_ASSIGNMENTS_HEADERS)
+    return ws
+
+
+def parse_group_training_plan(raw_text: str):
+    """解析 ❶~❻ 分區課表。Coach 行只用來切段，不寫入正式課表內容。"""
+    marker_map = {"❶":"1", "❷":"2", "❸":"3", "❹":"4", "❺":"5", "❻":"6", "①":"1", "②":"2", "③":"3", "④":"4", "⑤":"5", "⑥":"6"}
+    lines = [ln.rstrip() for ln in str(raw_text or "").splitlines()]
+    groups = []
+    current = None
+
+    def flush():
+        nonlocal current
+        if not current:
+            return
+        content = "\n".join([ln for ln in current["lines"] if ln.strip()]).strip()
+        if content:
+            groups.append({"training_group": current["group"], "content": content})
+        current = None
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current and current["lines"]:
+                current["lines"].append("")
+            continue
+        group = ""
+        rest = stripped
+        for mark, num in marker_map.items():
+            if stripped.startswith(mark):
+                group = num
+                rest = stripped[len(mark):].strip()
+                break
+        if not group:
+            m = re.match(r"^([1-6])[\.、\)]?\s*(.*)$", stripped)
+            if m and "coach" in m.group(2).lower():
+                group = m.group(1)
+                rest = m.group(2).strip()
+        if group:
+            flush()
+            current = {"group": group, "lines": []}
+            # Coach 可能會變動：不寫入正式課表內容。
+            if rest and not rest.lower().startswith("coach"):
+                current["lines"].append(rest)
+            continue
+        if current:
+            current["lines"].append(stripped)
+    flush()
+    return groups
+
+
+def append_group_training_plan(payload: AddGroupTrainingPlanPayload):
+    groups = parse_group_training_plan(payload.raw_plan_text)
+    if not groups:
+        return False, "解析不到 ❶~❻ 分區課表，請確認格式。", 0
+    ws = get_or_create_training_assignments_sheet()
+    created_at = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+    plan_title = (payload.plan_title or payload.target_date or "分區課表").strip()
+    class_name = payload.class_name.strip()
+    target_date = normalize_date_str(payload.target_date).replace("/", "-") if payload.target_date else ""
+    rows = []
+    for g in groups:
+        assignment_id = f"assign_{tw_now().strftime('%Y%m%d%H%M%S')}_{class_name}_{payload.session_order}_{g['training_group']}"
+        rows.append([
+            assignment_id, created_at, plan_title, class_name, g["training_group"],
+            "", "", "", payload.session_label.strip() or "訓練一", payload.session_order,
+            target_date, payload.workout_type.strip() or "跑步", g["content"], "", "group",
+            payload.admin_uid, "assigned"
+        ])
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    return True, f"✅ 已新增 {class_name} {payload.session_label} 的 {len(rows)} 個分區課表", len(rows)
+
+
+@app.post("/api/update-training-group")
+async def update_training_group(payload: UpdateTrainingGroupPayload):
+    if not is_coach_user(payload.admin_uid):
+        return {"success": False, "error": "Unauthorized"}
+    training_group = normalize_training_group(payload.training_group)
+    if not training_group:
+        return {"success": False, "error": "請輸入 1~6 的區別"}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("UPDATE health_profile SET training_group=? WHERE user_id=?", (training_group, payload.target_uid))
+            conn.commit()
+        return {"success": True, "training_group": training_group}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/add-group-training-plan")
+async def add_group_training_plan(payload: AddGroupTrainingPlanPayload):
+    if not is_coach_user(payload.admin_uid):
+        return {"success": False, "error": "Unauthorized"}
+    try:
+        ok, msg, count = append_group_training_plan(payload)
+        return {"success": ok, "message": msg, "count": count}
+    except Exception as e:
+        print(f"❌ 新增分區課表失敗: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def get_user_assignment_context(user_id: str):
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT name, COALESCE(status, ''), COALESCE(training_group, '') FROM health_profile WHERE user_id=?", (user_id,))
+            row = c.fetchone()
+            if row:
+                return {"member_name": row[0] or "", "class_name": row[1] or "", "training_group": normalize_training_group(row[2])}
+    except Exception as e:
+        print(f"⚠️ 讀取學員分區失敗: {e}")
+    return {"member_name": "", "class_name": "", "training_group": ""}
+
+
+def _assignment_date_key(raw):
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    return normalize_date_str(s).replace("/", "-")
+
+
+def format_assignment_workout(row):
+    label = str(row.get("session_label", "") or "").strip()
+    content = str(row.get("content", "") or "").strip()
+    title = str(row.get("plan_title", "") or "").strip()
+    parts = []
+    if title:
+        parts.append(title)
+    if label:
+        parts.append(label)
+    if content:
+        parts.append(content)
+    return "\n".join(parts).strip() or "無"
+
+
+def find_training_assignment_for_date(user_id: str, target_date) -> dict:
+    if not gc:
+        return {}
+    ctx = get_user_assignment_context(user_id)
+    date_key = target_date.isoformat() if hasattr(target_date, "isoformat") else _assignment_date_key(target_date)
+    try:
+        ws = get_or_create_training_assignments_sheet()
+        records = ws.get_all_records()
+    except Exception as e:
+        print(f"⚠️ 讀取 training_assignments 失敗: {e}")
+        return {}
+
+    best = None
+    best_priority = -1
+    for row in records:
+        if str(row.get("status", "assigned") or "assigned").strip() not in ["assigned", ""]:
+            continue
+        if _assignment_date_key(row.get("target_date")) != date_key:
+            continue
+        assignment_type = str(row.get("assignment_type", "group") or "group").strip()
+        class_name = str(row.get("class_name", "") or "").strip()
+        training_group = normalize_training_group(row.get("training_group"))
+        member_uid = str(row.get("member_uid", "") or "").strip()
+        priority = -1
+        if assignment_type == "individual" and member_uid == user_id:
+            priority = 3
+        elif assignment_type == "group" and class_name == ctx["class_name"] and training_group and training_group == ctx["training_group"]:
+            priority = 2
+        elif assignment_type == "class" and class_name == ctx["class_name"]:
+            priority = 1
+        if priority >= best_priority and priority > 0:
+            best = row
+            best_priority = priority
+    return best or {}
+
 # 2. 戰情室網頁畫面 (HTML)
 @app.get("/coach-dashboard", response_class=HTMLResponse)
 async def coach_dashboard():
@@ -444,6 +680,8 @@ async def coach_dashboard():
     <style>.hide-scrollbar::-webkit-scrollbar { display: none; }</style>        
             <div id="group-tabs" class="flex gap-2 overflow-x-auto mb-4 pb-2 hide-scrollbar">
                 </div>
+
+            <button onclick="addGroupTrainingPlan()" class="w-full mb-4 bg-emerald-600 text-white rounded-xl py-3 font-bold shadow-sm hover:bg-emerald-700">➕ 新增分區課表</button>
 
             <div id="loader" class="text-center py-10 text-gray-500 animate-pulse">資料讀取中...</div>
             <div id="student-list" class="space-y-5 hidden"></div>
@@ -555,6 +793,58 @@ async def coach_dashboard():
                 } catch(e) { alert('系統錯誤。'); }
             };
 
+            // --- 4B. 更新 1~6 區 ---
+            window.changeTrainingGroup = async function(studentUid, studentName, currentTrainingGroup) {
+                const newGroup = prompt(`請輸入 ${studentName} 的區別（1~6）：`, currentTrainingGroup || '');
+                if (!newGroup || newGroup === currentTrainingGroup) return;
+                try {
+                    const profile = await liff.getProfile();
+                    const res = await fetch('/api/update-training-group', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ admin_uid: profile.userId, target_uid: studentUid, training_group: newGroup })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        alert(`✅ 已將 ${studentName} 設為 ${data.training_group} 區！`);
+                        window.location.reload();
+                    } else {
+                        alert(`❌ 更新失敗：${data.error}`);
+                    }
+                } catch(e) { alert('系統錯誤。'); }
+            };
+
+            // --- 4C. 貼上 ❶~❻ 分區課表 ---
+            window.addGroupTrainingPlan = async function() {
+                const className = prompt('班級 / 大分組（例如：週三班）：', currentGroup !== '全部' ? currentGroup : '週三班');
+                if (!className) return;
+                const targetDate = prompt('課表日期（例如：2026-05-27；可留空）：', '');
+                const planTitle = prompt('課表名稱（例如：05/27訓練課表）：', targetDate ? `${targetDate}訓練課表` : '分區訓練課表');
+                const sessionLabel = prompt('訓練標籤（例如：訓練一 / 訓練二）：', '訓練一');
+                const rawPlanText = prompt('請貼上完整 ❶~❻ 分區課表（Coach 行會自動忽略，不寫入會員課表）：', '');
+                if (!rawPlanText) return;
+                try {
+                    const profile = await liff.getProfile();
+                    const res = await fetch('/api/add-group-training-plan', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            admin_uid: profile.userId,
+                            class_name: className,
+                            target_date: targetDate || '',
+                            plan_title: planTitle || '',
+                            session_label: sessionLabel || '訓練一',
+                            session_order: 1,
+                            workout_type: '跑步',
+                            raw_plan_text: rawPlanText
+                        })
+                    });
+                    const data = await res.json();
+                    if (data.success) alert(data.message || '✅ 已新增分區課表');
+                    else alert(`❌ 新增失敗：${data.error || data.message}`);
+                } catch(e) { alert('系統錯誤。'); }
+            };
+
             // --- 5. 畫出上方標籤按鈕 ---
             function renderTabs() {
                 const tabsContainer = document.getElementById('group-tabs');
@@ -612,6 +902,10 @@ async def coach_dashboard():
                                 <h2 class="font-bold text-xl text-slate-800">${std.name}</h2>
                                 <button onclick="changeGroup('${std.uid}', '${std.name}', '${std.group}')" class="inline-flex items-center gap-1 mt-1 bg-slate-100 text-slate-500 hover:bg-slate-200 text-[10px] px-2 py-1 rounded transition-colors cursor-pointer">
                                     <span>🏷️ ${std.group}</span>
+                                    <span class="text-[8px]">▼</span>
+                                </button>
+                                <button onclick="changeTrainingGroup('${std.uid}', '${std.name}', '${std.training_group || ''}')" class="inline-flex items-center gap-1 mt-1 ml-1 bg-emerald-50 text-emerald-600 hover:bg-emerald-100 text-[10px] px-2 py-1 rounded transition-colors cursor-pointer">
+                                    <span>📍 ${std.training_group ? std.training_group + '區' : '未分區'}</span>
                                     <span class="text-[8px]">▼</span>
                                 </button>
                             </div>
@@ -871,7 +1165,8 @@ def init_db():
                            ("delivery_fee", "INTEGER DEFAULT 0"),
                            ("delivery_zone", "TEXT DEFAULT ''"),
                            ("route_group", "TEXT DEFAULT ''"),
-                           ("delivery_note", "TEXT DEFAULT ''")]:
+                           ("delivery_note", "TEXT DEFAULT ''"),
+                           ("training_group", "TEXT DEFAULT ''")]:
             try: 
                 c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
             except sqlite3.OperationalError: 
@@ -3117,6 +3412,26 @@ def get_dashboard_data(user_id: str) -> dict:
                 })
         except Exception:
             pass
+
+    # 🌟 教練後台分區課表優先覆蓋：個人 > 區別 > 班級
+    try:
+        today_assignment = find_training_assignment_for_date(user_id, tw_today())
+        if today_assignment:
+            today_workout = format_assignment_workout(today_assignment)
+        for item in future_days:
+            try:
+                label = item.get("label", "")
+                m = re.search(r"(\d{2})/(\d{2})", label)
+                if not m:
+                    continue
+                row_date = tw_today().replace(month=int(m.group(1)), day=int(m.group(2)))
+                assignment = find_training_assignment_for_date(user_id, row_date)
+                if assignment:
+                    item["workout"] = format_assignment_workout(assignment)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"⚠️ 分區課表整合失敗: {e}")
 
     result = {
         "name": name or "你", "today_label": today_label, "tdee": tdee, "protein_goal": protein_goal,
