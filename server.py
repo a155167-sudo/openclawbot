@@ -465,6 +465,28 @@ class AddGroupTrainingPlanPayload(BaseModel):
     workout_type: str = "跑步"
     raw_plan_text: str
 
+class AddIndividualTrainingPlanPayload(BaseModel):
+    admin_uid: str
+    target_uid: str
+    member_name: str = ""
+    class_name: str = ""
+    training_group: str = ""
+    target_date: str = ""
+    plan_title: str = ""
+    session_label: str = "個人微調"
+    session_order: int = 1
+    workout_type: str = "跑步"
+    content: str
+    note: str = ""
+
+class AddWeeklyGroupTrainingPlanPayload(BaseModel):
+    admin_uid: str
+    class_name: str
+    plan_title: str = "週課表"
+    workout_type: str = "跑步"
+    target_dates: str = ""
+    raw_weekly_text: str
+
 
 def is_coach_user(user_id: str) -> bool:
     return user_id in COACH_UIDS
@@ -538,6 +560,48 @@ def parse_group_training_plan(raw_text: str):
     return groups
 
 
+def parse_weekly_group_training_plan(raw_text: str):
+    """解析一整週多段課表。段落標題支援：訓練一/訓練二/訓練3/Day 1。"""
+    lines = str(raw_text or "").splitlines()
+    sessions = []
+    current_label = "訓練一"
+    current_lines = []
+    order = 1
+    label_pattern = re.compile(r"^(訓練[一二三四五六七八九十0-9]+|第[一二三四五六七八九十0-9]+練|Day\s*\d+|D\d+)\s*[:：-]?\s*$", re.I)
+
+    def flush():
+        nonlocal order, current_label, current_lines
+        raw = "\n".join(current_lines).strip()
+        if raw:
+            groups = parse_group_training_plan(raw)
+            if groups:
+                sessions.append({"session_label": current_label, "session_order": order, "groups": groups})
+                order += 1
+        current_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if label_pattern.match(stripped):
+            flush()
+            current_label = stripped.rstrip(':：-').strip()
+            continue
+        current_lines.append(line)
+    flush()
+    return sessions
+
+
+def parse_target_dates(raw_dates: str):
+    tokens = [x.strip() for x in re.split(r"[,，、\n\s]+", str(raw_dates or "")) if x.strip()]
+    dates = []
+    for token in tokens:
+        normalized = normalize_date_str(token)
+        # 支援教練只輸入 MM/DD；自動補今年，避免寫成 05-31 造成會員端查不到。
+        if re.match(r"^\d{1,2}/\d{1,2}$", normalized):
+            normalized = f"{tw_today().year}/{normalized}"
+        dates.append(normalized.replace("/", "-"))
+    return dates
+
+
 def append_group_training_plan(payload: AddGroupTrainingPlanPayload):
     groups = parse_group_training_plan(payload.raw_plan_text)
     if not groups:
@@ -558,6 +622,50 @@ def append_group_training_plan(payload: AddGroupTrainingPlanPayload):
         ])
     ws.append_rows(rows, value_input_option="USER_ENTERED")
     return True, f"✅ 已新增 {class_name} {payload.session_label} 的 {len(rows)} 個分區課表", len(rows)
+
+
+def append_individual_training_plan(payload: AddIndividualTrainingPlanPayload):
+    content = str(payload.content or "").strip()
+    if not content:
+        return False, "個人課表內容不可空白", 0
+    ws = get_or_create_training_assignments_sheet()
+    created_at = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+    target_date = normalize_date_str(payload.target_date).replace("/", "-") if payload.target_date else ""
+    assignment_id = f"assign_{tw_now().strftime('%Y%m%d%H%M%S')}_individual_{payload.target_uid}_{payload.session_order}"
+    row = [
+        assignment_id, created_at, (payload.plan_title or payload.target_date or "個人微調課表").strip(),
+        payload.class_name.strip(), normalize_training_group(payload.training_group),
+        "", payload.target_uid, payload.member_name.strip(), payload.session_label.strip() or "個人微調", payload.session_order,
+        target_date, payload.workout_type.strip() or "跑步", content, payload.note.strip(), "individual",
+        payload.admin_uid, "assigned"
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+    return True, f"✅ 已新增 {payload.member_name or '學員'} 的個人微調課表", 1
+
+
+def append_weekly_group_training_plan(payload: AddWeeklyGroupTrainingPlanPayload):
+    sessions = parse_weekly_group_training_plan(payload.raw_weekly_text)
+    if not sessions:
+        return False, "解析不到週課表段落，請確認包含 訓練一/訓練二 與 ❶~❻ 內容。", 0
+    dates = parse_target_dates(payload.target_dates)
+    ws = get_or_create_training_assignments_sheet()
+    created_at = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+    class_name = payload.class_name.strip()
+    rows = []
+    for idx, session in enumerate(sessions):
+        target_date = dates[idx] if idx < len(dates) else ""
+        for g in session["groups"]:
+            assignment_id = f"assign_{tw_now().strftime('%Y%m%d%H%M%S')}_{class_name}_{session['session_order']}_{g['training_group']}"
+            rows.append([
+                assignment_id, created_at, payload.plan_title.strip() or "週課表", class_name, g["training_group"],
+                "", "", "", session["session_label"], session["session_order"],
+                target_date, payload.workout_type.strip() or "跑步", g["content"], "", "group",
+                payload.admin_uid, "assigned"
+            ])
+    if not rows:
+        return False, "沒有可寫入的分區課表", 0
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    return True, f"✅ 已新增 {class_name} 週課表：{len(sessions)} 個訓練日、{len(rows)} 筆分區課表", len(rows)
 
 
 @app.post("/api/update-training-group")
@@ -586,6 +694,28 @@ async def add_group_training_plan(payload: AddGroupTrainingPlanPayload):
         return {"success": ok, "message": msg, "count": count}
     except Exception as e:
         print(f"❌ 新增分區課表失敗: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/add-individual-training-plan")
+async def add_individual_training_plan(payload: AddIndividualTrainingPlanPayload):
+    if not is_coach_user(payload.admin_uid):
+        return {"success": False, "error": "Unauthorized"}
+    try:
+        ok, msg, count = append_individual_training_plan(payload)
+        return {"success": ok, "message": msg, "count": count}
+    except Exception as e:
+        print(f"❌ 新增個人微調課表失敗: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/add-weekly-group-training-plan")
+async def add_weekly_group_training_plan(payload: AddWeeklyGroupTrainingPlanPayload):
+    if not is_coach_user(payload.admin_uid):
+        return {"success": False, "error": "Unauthorized"}
+    try:
+        ok, msg, count = append_weekly_group_training_plan(payload)
+        return {"success": ok, "message": msg, "count": count}
+    except Exception as e:
+        print(f"❌ 新增週分區課表失敗: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -681,7 +811,10 @@ async def coach_dashboard():
             <div id="group-tabs" class="flex gap-2 overflow-x-auto mb-4 pb-2 hide-scrollbar">
                 </div>
 
-            <button onclick="addGroupTrainingPlan()" class="w-full mb-4 bg-emerald-600 text-white rounded-xl py-3 font-bold shadow-sm hover:bg-emerald-700">➕ 新增分區課表</button>
+            <div class="grid grid-cols-2 gap-2 mb-4">
+                <button onclick="addGroupTrainingPlan()" class="bg-emerald-600 text-white rounded-xl py-3 font-bold shadow-sm hover:bg-emerald-700 text-sm">➕ 單日分區</button>
+                <button onclick="addWeeklyGroupTrainingPlan()" class="bg-indigo-600 text-white rounded-xl py-3 font-bold shadow-sm hover:bg-indigo-700 text-sm">🗓️ 週課表</button>
+            </div>
 
             <div id="loader" class="text-center py-10 text-gray-500 animate-pulse">資料讀取中...</div>
             <div id="student-list" class="space-y-5 hidden"></div>
@@ -845,6 +978,76 @@ async def coach_dashboard():
                 } catch(e) { alert('系統錯誤。'); }
             };
 
+            // --- 4D. 一次新增整週多日分區課表 ---
+            window.addWeeklyGroupTrainingPlan = async function() {
+                const className = prompt('班級 / 大分組（例如：週三班）：', currentGroup !== '全部' ? currentGroup : '週三班');
+                if (!className) return;
+                const targetDates = prompt('各訓練日日期，依序用逗號分隔（例如：2026-05-27,2026-05-29,2026-05-31；可留空）：', '');
+                const planTitle = prompt('週課表名稱（例如：05/27這週課表）：', '週課表');
+                const rawWeeklyText = prompt('請貼上整週課表。格式：先寫「訓練一」再貼 ❶~❻，接著「訓練二」再貼 ❶~❻：', `訓練一
+❶Coach：
+
+❷Coach：
+
+訓練二
+❶Coach：
+
+❷Coach：`);
+                if (!rawWeeklyText) return;
+                try {
+                    const profile = await liff.getProfile();
+                    const res = await fetch('/api/add-weekly-group-training-plan', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            admin_uid: profile.userId,
+                            class_name: className,
+                            plan_title: planTitle || '週課表',
+                            workout_type: '跑步',
+                            target_dates: targetDates || '',
+                            raw_weekly_text: rawWeeklyText
+                        })
+                    });
+                    const data = await res.json();
+                    if (data.success) alert(data.message || '✅ 已新增週課表');
+                    else alert(`❌ 新增失敗：${data.error || data.message}`);
+                } catch(e) { alert('系統錯誤。'); }
+            };
+
+            // --- 4E. 個人微調課表：優先覆蓋分區課表 ---
+            window.addIndividualTrainingPlan = async function(studentUid, studentName, className, trainingGroup) {
+                const targetDate = prompt(`要替 ${studentName} 微調哪一天？（例如：2026-05-27）`, '');
+                if (!targetDate) return;
+                const sessionLabel = prompt('訓練標籤（例如：訓練一 / 個人微調）：', '個人微調');
+                const content = prompt('請輸入個人微調課表內容：', '');
+                if (!content) return;
+                const note = prompt('備註（可留空）：', '');
+                try {
+                    const profile = await liff.getProfile();
+                    const res = await fetch('/api/add-individual-training-plan', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            admin_uid: profile.userId,
+                            target_uid: studentUid,
+                            member_name: studentName,
+                            class_name: className || '',
+                            training_group: trainingGroup || '',
+                            target_date: targetDate,
+                            plan_title: `${targetDate} 個人微調`,
+                            session_label: sessionLabel || '個人微調',
+                            session_order: 1,
+                            workout_type: '跑步',
+                            content: content,
+                            note: note || ''
+                        })
+                    });
+                    const data = await res.json();
+                    if (data.success) alert(data.message || '✅ 已新增個人微調');
+                    else alert(`❌ 新增失敗：${data.error || data.message}`);
+                } catch(e) { alert('系統錯誤。'); }
+            };
+
             // --- 5. 畫出上方標籤按鈕 ---
             function renderTabs() {
                 const tabsContainer = document.getElementById('group-tabs');
@@ -917,9 +1120,10 @@ async def coach_dashboard():
                             </div>
                         </div>
                         <div class="bg-slate-50 rounded-xl p-3 pl-4 border border-slate-100 mb-4">${logsHtml}</div>
-                        <div class="flex gap-2 pl-2">
-                            <button onclick="sendCare('${std.uid}', '${std.name}', ${std.total_load})" class="flex-1 bg-blue-50 text-blue-600 text-sm py-2.5 rounded-xl font-bold hover:bg-blue-100 transition-all">💬 傳送關心</button>
-                            <button onclick="showChart('${std.uid}')" class="flex-1 bg-slate-50 text-slate-600 text-sm py-2.5 rounded-xl font-bold hover:bg-slate-100 transition-all">📊 歷史圖表</button>
+                        <div class="grid grid-cols-3 gap-2 pl-2">
+                            <button onclick="sendCare('${std.uid}', '${std.name}', ${std.total_load})" class="bg-blue-50 text-blue-600 text-xs py-2.5 rounded-xl font-bold hover:bg-blue-100 transition-all">💬 關心</button>
+                            <button onclick="addIndividualTrainingPlan('${std.uid}', '${std.name}', '${std.group}', '${std.training_group || ''}')" class="bg-amber-50 text-amber-600 text-xs py-2.5 rounded-xl font-bold hover:bg-amber-100 transition-all">✏️ 微調</button>
+                            <button onclick="showChart('${std.uid}')" class="bg-slate-50 text-slate-600 text-xs py-2.5 rounded-xl font-bold hover:bg-slate-100 transition-all">📊 圖表</button>
                         </div>
                     `;
                     list.appendChild(card);
