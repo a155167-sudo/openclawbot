@@ -947,6 +947,40 @@ async def coach_dashboard():
                 } catch(e) { alert('系統錯誤。'); }
             };
 
+            // --- 共用：多行貼上課表輸入框 ---
+            window.openLargeTextModal = function(title, placeholder = '', defaultText = '') {
+                return new Promise((resolve) => {
+                    const overlay = document.createElement('div');
+                    overlay.className = 'fixed inset-0 bg-slate-900 bg-opacity-50 z-[9999] flex items-end justify-center p-0 sm:p-4';
+                    overlay.innerHTML = `
+                        <div class="bg-white w-full max-w-lg rounded-t-3xl sm:rounded-3xl p-5 shadow-xl">
+                            <div class="flex items-center justify-between mb-3">
+                                <h2 class="text-lg font-bold text-slate-800">${title}</h2>
+                                <button type="button" data-action="cancel" class="text-slate-500 bg-slate-100 rounded-full w-8 h-8 font-bold">×</button>
+                            </div>
+                            <p class="text-xs text-slate-500 mb-2">可直接貼上完整多行課表；按「儲存」送出。</p>
+                            <textarea data-role="textarea" class="w-full h-80 border border-slate-300 rounded-xl p-3 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="${placeholder}"></textarea>
+                            <div class="grid grid-cols-2 gap-2 mt-4">
+                                <button type="button" data-action="cancel" class="bg-slate-100 text-slate-700 rounded-xl py-3 font-bold">取消</button>
+                                <button type="button" data-action="submit" class="bg-blue-600 text-white rounded-xl py-3 font-bold">儲存</button>
+                            </div>
+                        </div>`;
+                    document.body.appendChild(overlay);
+                    const textarea = overlay.querySelector('[data-role="textarea"]');
+                    textarea.value = defaultText || '';
+                    const close = (value) => {
+                        overlay.remove();
+                        resolve(value);
+                    };
+                    overlay.querySelectorAll('[data-action="cancel"]').forEach(btn => btn.onclick = () => close(null));
+                    overlay.querySelector('[data-action="submit"]').onclick = () => close(textarea.value);
+                    textarea.addEventListener('keydown', (e) => {
+                        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') close(textarea.value);
+                    });
+                    setTimeout(() => textarea.focus(), 50);
+                });
+            };
+
             // --- 4C. 貼上 ❶~❻ 分區課表 ---
             window.addGroupTrainingPlan = async function() {
                 const className = prompt('班級 / 大分組（例如：週三班）：', currentGroup !== '全部' ? currentGroup : '週三班');
@@ -954,7 +988,7 @@ async def coach_dashboard():
                 const targetDate = prompt('課表日期（例如：2026-05-27；可留空）：', '');
                 const planTitle = prompt('課表名稱（例如：05/27訓練課表）：', targetDate ? `${targetDate}訓練課表` : '分區訓練課表');
                 const sessionLabel = prompt('訓練標籤（例如：訓練一 / 訓練二）：', '訓練一');
-                const rawPlanText = prompt('請貼上完整 ❶~❻ 分區課表（Coach 行會自動忽略，不寫入會員課表）：', '');
+                const rawPlanText = await openLargeTextModal('貼上單日 ❶~❻ 分區課表', '❶Coach：\n課表內容...\n\n❷Coach：\n課表內容...');
                 if (!rawPlanText) return;
                 try {
                     const profile = await liff.getProfile();
@@ -984,7 +1018,7 @@ async def coach_dashboard():
                 if (!className) return;
                 const targetDates = prompt('各訓練日日期，依序用逗號分隔（例如：2026-05-27,2026-05-29,2026-05-31；可留空）：', '');
                 const planTitle = prompt('週課表名稱（例如：05/27這週課表）：', '週課表');
-                const rawWeeklyText = prompt('請貼上整週課表。格式：先寫「訓練一」再貼 ❶~❻，接著「訓練二」再貼 ❶~❻：', `訓練一
+                const rawWeeklyText = await openLargeTextModal('貼上整週多日分區課表', '格式：先寫「訓練一」再貼 ❶~❻，接著「訓練二」再貼 ❶~❻', `訓練一
 ❶Coach：
 
 ❷Coach：
