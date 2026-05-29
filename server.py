@@ -988,7 +988,7 @@ async def coach_dashboard():
                 const targetDate = prompt('課表日期（例如：2026-05-27；可留空）：', '');
                 const planTitle = prompt('課表名稱（例如：05/27訓練課表）：', targetDate ? `${targetDate}訓練課表` : '分區訓練課表');
                 const sessionLabel = prompt('訓練標籤（例如：訓練一 / 訓練二）：', '訓練一');
-                const rawPlanText = await openLargeTextModal('貼上單日 ❶~❻ 分區課表', '❶Coach：\n課表內容...\n\n❷Coach：\n課表內容...');
+                const rawPlanText = await openLargeTextModal('貼上單日 ❶~❻ 分區課表', '❶Coach：\\n課表內容...\\n\\n❷Coach：\\n課表內容...');
                 if (!rawPlanText) return;
                 try {
                     const profile = await liff.getProfile();
