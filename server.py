@@ -6378,7 +6378,12 @@ def auto_expiry_reminder():
     today = tw_today()
     remind_date = (today + timedelta(days=REMINDER_DAYS_BEFORE)).isoformat()
 
-    c.execute("SELECT user_id, name, expiry_date FROM usage WHERE expiry_date=?", (remind_date,))
+    c.execute("""
+        SELECT u.user_id, COALESCE(h.name, '親愛的會員') AS name, u.expiry_date
+        FROM usage u
+        LEFT JOIN health_profile h ON h.user_id = u.user_id
+        WHERE u.expiry_date=?
+    """, (remind_date,))
     expiring_users = c.fetchall()
     conn.close()
 
