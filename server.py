@@ -211,6 +211,21 @@ with sqlite3.connect(DB_PATH) as conn:
 # ==========================================    
 COACH_UIDS = ["Uefd72ca53a9a6ac39781fe673c398530","U9540c22cea2d6e0b1df8edbd9e3ebc41"]
 pending_image_date = {}
+pending_subscription_state = {}
+
+ADMIN_ONLY_EXACT_COMMANDS = {
+    "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成", "#發送明日提醒",
+    "#測試週報", "#測試晚報", "#生24", "#生48", "#延餐清單", "#待核訂單",
+    "#清空熱量", "#刪除檔案", "#重置", "重置本週", "檢查數據"
+}
+ADMIN_ONLY_PREFIXES = (
+    "@靜音 ", "@解除靜音 ", "#喚醒AI ", "#上傳點數\n", "#核准延餐 ", "#拒絕延餐 ",
+    "#核准訂單 ", "#拒絕訂單 ", "#開通訂單 "
+)
+
+def is_admin_only_command(msg: str) -> bool:
+    return msg in ADMIN_ONLY_EXACT_COMMANDS or any(msg.startswith(prefix) for prefix in ADMIN_ONLY_PREFIXES)
+
 # ── 顧客清單同步 helper ──────────────────────────────────────────────────────
 def sync_customer_sheet(uid, name, status, remaining_meals, expiry_date, tdee):
     """將用戶資料同步寫入 Google Sheet「顧客清單」（upsert）"""
@@ -1320,6 +1335,28 @@ def init_db():
             pro INTEGER,
             checked_at TEXT,
             PRIMARY KEY (user_id, meal_date, meal_slot)
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS subscription_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            customer_name TEXT DEFAULT '',
+            meal_count INTEGER DEFAULT 0,
+            address TEXT DEFAULT '',
+            distance_text TEXT DEFAULT '',
+            delivery_fee INTEGER DEFAULT 0,
+            delivery_count INTEGER DEFAULT 0,
+            meal_low_total INTEGER DEFAULT 0,
+            meal_high_total INTEGER DEFAULT 0,
+            delivery_total INTEGER DEFAULT 0,
+            quote_low_total INTEGER DEFAULT 0,
+            quote_high_total INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'pending',
+            admin_note TEXT DEFAULT '',
+            created_at TEXT DEFAULT '',
+            approved_at TEXT DEFAULT '',
+            approved_by TEXT DEFAULT '',
+            activated_at TEXT DEFAULT '',
+            vip_code TEXT DEFAULT ''
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS workout_checks (
             user_id TEXT,
@@ -4659,6 +4696,198 @@ def calculate_delivery_quote(target_address: str):
     }
 
 
+def get_subscription_form_link(uid: str) -> str:
+    return f"https://docs.google.com/forms/d/e/1FAIpQLSdVY7Zf-E2zSpsOFmItYHI0YtTujX6Ucux4QTQ3gjg5wcomgA/viewform?usp=pp_url&entry.1461831832={uid}"
+
+
+def get_customer_profile_for_order(uid: str):
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT name, address, distance_text, delivery_fee FROM health_profile WHERE user_id=?", (uid,))
+            return c.fetchone()
+    except Exception:
+        return None
+
+
+def parse_subscription_order_message(msg: str):
+    cleaned = msg.strip()
+    cleaned = cleaned.replace("我要估價", "估價", 1).replace("我要訂購", "訂購", 1)
+    m = re.match(r"^(估價|訂購)\s*(\d{1,3})\s*餐?\s*(.*)$", cleaned)
+    if not m:
+        return None
+    action, meal_count, address = m.group(1), int(m.group(2)), m.group(3).strip()
+    if meal_count <= 0 or meal_count > 120:
+        return {"error": "餐數請輸入 1～120 之間，例如：訂購 24餐 台北市松山區..."}
+    return {"action": action, "meal_count": meal_count, "address": address}
+
+
+def build_subscription_intro_text(uid: str) -> str:
+    return (
+        "🍱 一日樂食包月 2.0｜從 0 到下單流程\n\n"
+        "1️⃣ 先估外送：輸入「測距 地址」確認距離與運費\n"
+        "2️⃣ 填資料：回覆「我要填寫包月資料」建立 TDEE、蛋白質與禁忌\n"
+        "3️⃣ 估價：輸入「估價 24餐 地址」取得本期粗估金額\n"
+        "4️⃣ 下單：輸入「訂購 24餐 地址」送出訂單給客服確認\n"
+        "5️⃣ 客服確認餐數、外送、付款後，正式開通包月與 AI 營養管理\n\n"
+        "💰 單餐目前粗估 $170～$220，實際金額會依菜單、餐數與外送調整。\n"
+        "🛵 外送時間：11:30–12:30，會盡量 12:00 前送達並 LINE 通知。\n\n"
+        f"📝 資料表：\n{get_subscription_form_link(uid)}"
+    )
+
+
+def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""):
+    profile = get_customer_profile_for_order(uid)
+    name = profile[0] if profile else ""
+    saved_address = profile[1] if profile and len(profile) > 1 else ""
+    if not address:
+        address = saved_address or ""
+
+    quote = calculate_delivery_quote(address) if address else {"success": False, "delivery_fee": 0, "distance_text": "", "delivery_fee_text": "未提供地址", "route_group": "OTHER", "delivery_zone": "未分類", "carpool_hint": ""}
+    delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") else 0
+    delivery_count = meal_count
+    meal_low_total = meal_count * 170
+    meal_high_total = meal_count * 220
+    delivery_total = delivery_fee * delivery_count
+    quote_low_total = meal_low_total + delivery_total
+    quote_high_total = meal_high_total + delivery_total
+    return {
+        "name": name,
+        "address": address,
+        "quote": quote,
+        "meal_count": meal_count,
+        "delivery_count": delivery_count,
+        "delivery_fee": delivery_fee,
+        "meal_low_total": meal_low_total,
+        "meal_high_total": meal_high_total,
+        "delivery_total": delivery_total,
+        "quote_low_total": quote_low_total,
+        "quote_high_total": quote_high_total,
+    }
+
+
+def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> str:
+    q = est.get("quote", {})
+    address = est.get("address") or "尚未提供"
+    distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else "📏 距離：尚未完成測距"
+    delivery_text = q.get("delivery_fee_text") or "尚未提供地址，外送費需人工確認"
+    hint = ""
+    if include_order_hint:
+        hint = f"\n\n若要送出訂單，請回覆：\n訂購 {est['meal_count']}餐 {address if address != '尚未提供' else '你的完整地址'}"
+    return (
+        "🧾 一日樂食包月估價單\n"
+        f"🍱 餐數：{est['meal_count']} 餐\n"
+        f"📍 地址：{address}\n"
+        f"{distance_line}\n"
+        f"🛵 單次外送費：{delivery_text}\n"
+        f"🚚 估計配送次數：{est['delivery_count']} 次\n\n"
+        f"餐費粗估：${est['meal_low_total']:,}～${est['meal_high_total']:,}\n"
+        f"外送費粗估：${est['delivery_total']:,}\n"
+        f"本期粗估合計：${est['quote_low_total']:,}～${est['quote_high_total']:,}\n\n"
+        "備註：這是下單前粗估，實際金額會由客服依菜單、順風車併單與付款方式最後確認。"
+        f"{hint}"
+    )
+
+
+def create_subscription_order(uid: str, est: dict):
+    created_at = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO subscription_orders (
+                user_id, customer_name, meal_count, address, distance_text, delivery_fee, delivery_count,
+                meal_low_total, meal_high_total, delivery_total, quote_low_total, quote_high_total,
+                status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            uid, est.get("name") or "", est["meal_count"], est.get("address") or "",
+            est.get("quote", {}).get("distance_text") or "", est["delivery_fee"], est["delivery_count"],
+            est["meal_low_total"], est["meal_high_total"], est["delivery_total"],
+            est["quote_low_total"], est["quote_high_total"], created_at
+        ))
+        order_id = c.lastrowid
+        conn.commit()
+    return order_id
+
+
+def notify_admin_new_subscription_order(order_id: int, uid: str, est: dict):
+    admin_msg = (
+        f"🧾【包月待確認訂單 #{order_id}】\n"
+        f"顧客：{est.get('name') or uid[:8]}\n"
+        f"UID：{uid}\n"
+        f"餐數：{est['meal_count']} 餐\n"
+        f"地址：{est.get('address') or '未提供'}\n"
+        f"距離：{est.get('quote', {}).get('distance_text') or 'NA'}\n"
+        f"單次外送費：{est['delivery_fee']}\n"
+        f"粗估合計：${est['quote_low_total']:,}～${est['quote_high_total']:,}\n\n"
+        f"核准：#核准訂單 {order_id}\n"
+        f"拒絕：#拒絕訂單 {order_id} 原因\n"
+        f"付款後開通：#開通訂單 {order_id}"
+    )
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+            row = c.fetchone()
+        admin_id = row[0] if row else ADMIN_UID
+        line_bot_api.push_message(admin_id, TextSendMessage(text=admin_msg))
+    except Exception as e:
+        print(f"⚠️ 推播包月訂單給管理員失敗: {e}")
+
+
+def list_pending_subscription_orders(limit=20):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, customer_name, meal_count, address, quote_low_total, quote_high_total, created_at
+            FROM subscription_orders
+            WHERE status='pending'
+            ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        return c.fetchall()
+
+
+def update_subscription_order_status(order_id: int, status: str, admin_uid: str, note: str = ""):
+    now = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, user_id, customer_name, meal_count, quote_low_total, quote_high_total, status FROM subscription_orders WHERE id=?", (order_id,))
+        row = c.fetchone()
+        if not row:
+            return False, "❌ 找不到這筆包月訂單。"
+        oid, user_id, customer_name, meal_count, low_total, high_total, old_status = row
+        if status == "approved":
+            c.execute("UPDATE subscription_orders SET status='approved', approved_at=?, approved_by=?, admin_note=? WHERE id=?", (now, admin_uid, note, order_id))
+            customer_msg = (
+                f"✅ 您的一日樂食包月訂單 #{order_id} 已確認！\n"
+                f"餐數：{meal_count} 餐\n"
+                f"粗估金額：${low_total:,}～${high_total:,}\n\n"
+                "下一步請依客服提供的付款方式完成付款；付款確認後，我們會正式開通包月與 AI 營養管理。"
+            )
+        elif status == "rejected":
+            c.execute("UPDATE subscription_orders SET status='rejected', admin_note=? WHERE id=?", (note or "需人工重新確認", order_id))
+            customer_msg = f"⚠️ 您的一日樂食包月訂單 #{order_id} 需要重新確認：{note or '請聯絡客服確認'}"
+        elif status == "activated":
+            duration_days = 31
+            chat_limit = 30 if meal_count >= 48 else 20
+            vip_code = "#VIPORDER-" + ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+            c.execute("INSERT INTO vips (code, meals, duration_days, chat_limit, is_used) VALUES (?, ?, ?, ?, 0)", (vip_code, meal_count, duration_days, chat_limit))
+            c.execute("UPDATE subscription_orders SET status='activated', activated_at=?, vip_code=? WHERE id=?", (now, vip_code, order_id))
+            customer_msg = (
+                f"🎉 付款已確認，包月準備開通！\n"
+                f"請直接複製並傳送這組開通碼：\n{vip_code}\n\n"
+                "開通後就能使用專屬菜單、AI 營養紀錄與會員功能。"
+            )
+        else:
+            return False, "❌ 不支援的訂單狀態。"
+        conn.commit()
+    try:
+        line_bot_api.push_message(user_id, TextSendMessage(text=customer_msg))
+    except Exception as e:
+        print(f"⚠️ 推播訂單狀態給顧客失敗: {e}")
+    return True, f"✅ 訂單 #{order_id} 已更新為 {status}。"
+
+
 def send_subscription_expiry_reminders(days_before: int = 3):
     target_date = (tw_today() + timedelta(days=days_before)).isoformat()
     notified = 0
@@ -5473,32 +5702,16 @@ def handle_message(event):
 
     msg, uid = event.message.text.strip(), event.source.user_id
 
+    if uid != ADMIN_UID and is_admin_only_command(msg):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⛔ 這是管理員專用指令，若需要協助請直接留言給客服喔。"))
+        return
+
     # ======================================================
     # 🌱 公開行銷入口：未開通顧客也可以使用
     # 放在靜音 / VIP 權限檢查之前，確保一定會觸發
     # ======================================================
-    if msg == "了解包月方案":
-        reply_text = (
-            "一日樂食包月 2.0 說明來囉！\n\n"
-            "這次不只是幫你準備健康餐，而是幫你算好每天該怎麼吃。\n\n"
-            "包月 2.0 會依照你的身高、體重、目標與飲食禁忌，"
-            "幫你計算 TDEE、蛋白質目標，並安排四週專屬餐點。\n\n"
-            "你可以每天在 LINE 查看：\n"
-            "✅ 今日午餐 / 晚餐\n"
-            "✅ 剩餘熱量\n"
-            "✅ 蛋白質進度\n"
-            "✅ 飲食紀錄\n"
-            "✅ 延餐 / 換餐\n\n"
-            "🎁 上線優惠：\n"
-            "現在訂購包月，AI 營養管理功能免費開通，續訂也不另外收服務費。\n\n"
-            "想先確認外送範圍，請直接回覆：\n"
-            "測距＋地址\n\n"
-            "範例：\n"
-            "測距 台北市松山區南京東路四段133巷4弄5號\n\n"
-            "想開始加入，請回覆：\n"
-            "我要填寫包月資料"
-        )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+    if msg in ["了解包月方案", "包月方案", "我要包月", "如何訂購"]:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_subscription_intro_text(uid)))
         return
 
     if msg.startswith("測距 ") or msg.startswith("#測距 "):
@@ -5534,10 +5747,44 @@ def handle_message(event):
         reply_text = (
             "太好了！請先填寫包月資料表，系統會幫你計算 TDEE、蛋白質目標，並安排四週專屬餐點。\n\n"
             "填完後我們會確認餐數、取餐方式、外送費與本期總金額，再提供付款資訊。\n\n"
-            "表單連結：\n"
-            "請把你的 Google 表單連結放這裡"
+            f"表單連結：\n{get_subscription_form_link(uid)}\n\n"
+            "填完後可以回到 LINE 輸入：\n估價 24餐 你的完整地址"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    parsed_order = parse_subscription_order_message(msg)
+    if parsed_order:
+        if parsed_order.get("error"):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=parsed_order["error"]))
+            return
+        est = calculate_subscription_estimate(uid, parsed_order["meal_count"], parsed_order.get("address", ""))
+        if not est.get("address"):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
+                "請提供完整外送地址，才能估運費與送出訂單喔！\n\n"
+                "範例：\n估價 24餐 台北市松山區南京東路四段133巷4弄5號\n"
+                "或：\n訂購 24餐 台北市松山區南京東路四段133巷4弄5號"
+            )))
+            return
+        if parsed_order["action"] == "估價":
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=format_subscription_estimate(est, include_order_hint=True)))
+            return
+        order_id = create_subscription_order(uid, est)
+        notify_admin_new_subscription_order(order_id, uid, est)
+        reply_text = (
+            f"✅ 已收到您的包月訂單 #{order_id}，客服會確認餐數、外送與付款資訊。\n\n"
+            f"{format_subscription_estimate(est, include_order_hint=False)}\n\n"
+            "客服確認後會用 LINE 通知您下一步。"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    if msg in ["我要估價", "估價"]:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請用這個格式，我才能幫你算：\n估價 24餐 你的完整地址\n\n例如：\n估價 24餐 台北市松山區南京東路四段133巷4弄5號"))
+        return
+
+    if msg in ["我要訂購", "訂購"]:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請用這個格式送出訂單：\n訂購 24餐 你的完整地址\n\n例如：\n訂購 24餐 台北市松山區南京東路四段133巷4弄5號"))
         return
 
     if msg == "付款方式":
@@ -6029,8 +6276,8 @@ def handle_message(event):
         return
     # 🔥 LINE 圖文選單攔截區
     if msg == "填寫體質表單":
-        form_link = f"https://docs.google.com/forms/d/e/1FAIpQLSdVY7Zf-E2zSpsOFmItYHI0YtTujX6Ucux4QTQ3gjg5wcomgA/viewform?usp=pp_url&entry.1461831832={uid}"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📝 請點擊下方專屬連結，填寫您的體質評估表單：\n\n{form_link}\n\n(系統已為您自動帶入 LINE 帳號，請直接填寫即可喔！)"))
+        form_link = get_subscription_form_link(uid)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📝 請點擊下方專屬連結，填寫您的體質評估 / 包月資料表單：\n\n{form_link}\n\n(系統已為您自動帶入 LINE 帳號，請直接填寫即可喔！)"))
         return
     elif msg == "填寫滿意度問卷":
         # 👉 老闆注意：請把下面這串網址，換成您剛剛在 Google 表單產生的那串「最後面有 {uid} 的黃金連結」！
@@ -6096,6 +6343,52 @@ def handle_message(event):
     elif msg == "#更新菜單":
         reply_msg = load_menu()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
+        return
+
+    elif msg == "#待核訂單":
+        rows = list_pending_subscription_orders(limit=20)
+        if not rows:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 目前沒有待確認的包月訂單。"))
+            return
+        lines = ["🧾【包月待確認訂單】"]
+        for oid, cname, meal_count, address, low_total, high_total, created_at in rows:
+            lines.append(f"#{oid} {cname or '顧客'}｜{meal_count}餐｜${low_total:,}～${high_total:,}｜{created_at}")
+            lines.append(f"地址：{address or '未提供'}")
+            lines.append(f"核准：#核准訂單 {oid}｜付款後開通：#開通訂單 {oid}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines[:60])))
+        return
+
+    elif msg.startswith("#核准訂單 "):
+        raw = msg.replace("#核准訂單 ", "", 1).strip()
+        parts = raw.split(" ", 1)
+        order_id = parts[0].strip() if parts else ""
+        note = parts[1].strip() if len(parts) > 1 else ""
+        if not order_id.isdigit():
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 請輸入正確訂單 ID，例如：#核准訂單 12"))
+            return
+        ok, result = update_subscription_order_status(int(order_id), "approved", uid, note)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+        return
+
+    elif msg.startswith("#拒絕訂單 "):
+        raw = msg.replace("#拒絕訂單 ", "", 1).strip()
+        parts = raw.split(" ", 1)
+        order_id = parts[0].strip() if parts else ""
+        reason = parts[1].strip() if len(parts) > 1 else "請聯絡客服重新確認"
+        if not order_id.isdigit():
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 請輸入正確訂單 ID，例如：#拒絕訂單 12 地址超出範圍"))
+            return
+        ok, result = update_subscription_order_status(int(order_id), "rejected", uid, reason)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+        return
+
+    elif msg.startswith("#開通訂單 "):
+        order_id = msg.replace("#開通訂單 ", "", 1).strip()
+        if not order_id.isdigit():
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 請輸入正確訂單 ID，例如：#開通訂單 12"))
+            return
+        ok, result = update_subscription_order_status(int(order_id), "activated", uid)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
         return
 
     elif msg == "#今日出餐完成":
