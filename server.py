@@ -4820,6 +4820,12 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
         address = saved_address or ""
 
     quote = calculate_delivery_quote(address) if address and pickup_method == "外送" else {"success": False, "delivery_fee": 0, "distance_text": "", "duration_text": "", "delivery_fee_text": "自取無外送費" if pickup_method == "自取" else "未提供地址", "route_group": "OTHER", "delivery_zone": "未分類", "carpool_hint": ""}
+    if pickup_method == "外送" and address and not quote.get("success"):
+        # Google Maps 偶爾會因地址格式/API 狀態查不到；估價流程不要卡死，先讓用戶看到餐費，外送費交由客服確認。
+        quote["delivery_fee_text"] = "地圖暫時無法判讀，外送費需客服確認"
+        quote["distance_text"] = quote.get("distance_text") or "需客服確認"
+        quote["duration_text"] = quote.get("duration_text") or ""
+        quote["route_group"] = quote.get("route_group") or infer_route_group(address)
     delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") and pickup_method == "外送" else 0
     if delivery_count is None:
         delivery_count = meal_count if pickup_method == "外送" else 0
@@ -4853,7 +4859,7 @@ def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> 
     pickup_method = est.get("pickup_method") or "外送"
     days = est.get("days_per_week")
     meals_per_day = est.get("meals_per_day")
-    distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("📏 距離：自取不需測距" if pickup_method == "自取" else "📏 距離：尚未完成測距")
+    distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("📏 距離：自取不需測距" if pickup_method == "自取" else f"📏 距離：{q.get('distance_text') or '需客服確認'}")
     delivery_text = q.get("delivery_fee_text") or ("自取無外送費" if pickup_method == "自取" else "尚未提供地址，外送費需人工確認")
     plan_line = f"📅 每週：{days} 天\n" if days else ""
     meals_line = f"🍽️ 餐數：每週 {days} 天 × 每天 {meals_per_day} 餐，本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐\n" if days and meals_per_day else f"🍱 餐數：{est['meal_count']} 餐\n"
@@ -4885,7 +4891,7 @@ def build_subscription_estimate_flex(uid: str, est: dict):
     address = est.get("address") or "尚未提供"
     q = est.get("quote", {})
     summary = f"每週 {days} 天 × 每天 {meals_per_day} 餐｜本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐" if days and meals_per_day else f"共 {est['meal_count']} 餐"
-    distance_text = f"{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("自取不需測距" if pickup_method == "自取" else "尚未完成測距")
+    distance_text = f"{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("自取不需測距" if pickup_method == "自取" else (q.get("distance_text") or "需客服確認"))
     bubble = {
         "type": "bubble",
         "size": "mega",
@@ -5975,10 +5981,8 @@ def handle_message(event):
         meals_per_day = 2
         meal_count = days * meals_per_day * SUBSCRIPTION_PERIOD_WEEKS
         delivery_count = days * SUBSCRIPTION_PERIOD_WEEKS
-        est = calculate_subscription_estimate(uid, meal_count, msg, delivery_count=delivery_count, pickup_method="外送", days_per_week=days, meals_per_day=meals_per_day)
-        if not est.get("quote", {}).get("success"):
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="我暫時無法判讀這個地址，請再輸入一次完整地址，或點找客服協助。"))
-            return
+        address_text = msg.replace("#測距 ", "").replace("測距 ", "").strip()
+        est = calculate_subscription_estimate(uid, meal_count, address_text, delivery_count=delivery_count, pickup_method="外送", days_per_week=days, meals_per_day=meals_per_day)
         pending_subscription_state[uid] = {"step": "estimated", "estimate": est}
         line_bot_api.reply_message(event.reply_token, build_subscription_estimate_flex(uid, est))
         return
@@ -6007,7 +6011,11 @@ def handle_message(event):
                 f"想了解包月方案，請回覆：了解包月方案"
             )
         else:
-            reply_text = "哎呀！地圖系統暫時找不到這個地址，請確認地址是否完整喔！"
+            reply_text = (
+                "地圖系統暫時找不到這個地址，可能是地址格式或 Google Maps 暫時查詢失敗。\n\n"
+                "你仍可先走包月估價流程，系統會先算餐費，外送費由客服最後確認。\n"
+                "請回覆：開始包月估價"
+            )
 
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
@@ -6933,7 +6941,7 @@ def handle_message(event):
                 f"💡 {quote.get('carpool_hint')}"
             )
         else:
-            reply_text = "哎呀！地圖系統暫時找不到這個地址，請確認地址是否完整喔！"
+            reply_text = "地圖系統暫時找不到這個地址，請確認地址是否完整；若是包月估價，可先回覆「開始包月估價」，外送費由客服最後確認。"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
       
