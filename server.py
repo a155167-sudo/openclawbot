@@ -4722,32 +4722,109 @@ def parse_subscription_order_message(msg: str):
     return {"action": action, "meal_count": meal_count, "address": address}
 
 
+SUBSCRIPTION_PERIOD_WEEKS = 4
+SUBSCRIPTION_MEAL_LOW = 170
+SUBSCRIPTION_MEAL_HIGH = 220
+
+
 def build_subscription_intro_text(uid: str) -> str:
     return (
-        "🍱 一日樂食包月 2.0｜從 0 到下單流程\n\n"
-        "1️⃣ 先估外送：輸入「測距 地址」確認距離與運費\n"
-        "2️⃣ 填資料：回覆「我要填寫包月資料」建立 TDEE、蛋白質與禁忌\n"
-        "3️⃣ 估價：輸入「估價 24餐 地址」取得本期粗估金額\n"
-        "4️⃣ 下單：輸入「訂購 24餐 地址」送出訂單給客服確認\n"
-        "5️⃣ 客服確認餐數、外送、付款後，正式開通包月與 AI 營養管理\n\n"
-        "💰 單餐目前粗估 $170～$220，實際金額會依菜單、餐數與外送調整。\n"
-        "🛵 外送時間：11:30–12:30，會盡量 12:00 前送達並 LINE 通知。\n\n"
-        f"📝 資料表：\n{get_subscription_form_link(uid)}"
+        "🍱 一日樂食包月 2.0\n\n"
+        "先不用填完整資料，我們可以先幫你粗估本期費用。\n\n"
+        "估價會依照：\n"
+        "1️⃣ 一週想吃幾天\n"
+        "2️⃣ 自取或外送\n"
+        "3️⃣ 外送地址距離\n\n"
+        "小提醒：\n"
+        "・外送一天固定 2 餐\n"
+        "・自取餐數可彈性調整\n"
+        "・週六目前不配送，但可以自取\n\n"
+        "請點選下方按鈕開始估價。"
     )
 
 
-def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""):
+def build_subscription_intro_flex(uid: str):
+    from linebot.models import FlexSendMessage
+    bubble = {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "20px",
+            "backgroundColor": "#FFF8ED",
+            "contents": [
+                {"type": "text", "text": "🍱 一日樂食包月 2.0", "weight": "bold", "size": "xl", "color": "#7A3E16"},
+                {"type": "text", "text": "先估價，再填資料，客服確認後正式開通", "size": "sm", "color": "#8A6A4F", "wrap": True, "margin": "sm"},
+                {"type": "separator", "margin": "lg", "color": "#E8D3B8"},
+                {"type": "text", "text": "適合想穩定控制熱量、蛋白質，又不想每天煩惱吃什麼的人。", "size": "sm", "color": "#3F2F24", "wrap": True, "margin": "lg"},
+                {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
+                    {"type": "text", "text": "估價會先看這 3 件事", "weight": "bold", "size": "sm", "color": "#7A3E16"},
+                    {"type": "text", "text": "1️⃣ 一週想吃幾天（每週 2～5 天）", "size": "sm", "color": "#3F2F24", "wrap": True},
+                    {"type": "text", "text": "2️⃣ 自取或外送", "size": "sm", "color": "#3F2F24", "wrap": True},
+                    {"type": "text", "text": "3️⃣ 外送地址距離與運費", "size": "sm", "color": "#3F2F24", "wrap": True}
+                ]},
+                {"type": "box", "layout": "vertical", "spacing": "xs", "margin": "lg", "paddingAll": "12px", "backgroundColor": "#FFFFFF", "cornerRadius": "12px", "contents": [
+                    {"type": "text", "text": "小提醒", "weight": "bold", "size": "sm", "color": "#C45A18"},
+                    {"type": "text", "text": "外送：一天固定 2 餐", "size": "xs", "color": "#5A4638"},
+                    {"type": "text", "text": "自取：餐數可彈性調整", "size": "xs", "color": "#5A4638"},
+                    {"type": "text", "text": "週六：不配送，但可自取", "size": "xs", "color": "#5A4638"}
+                ]}
+            ]
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {"type": "button", "style": "primary", "color": "#D96B2B", "action": {"type": "message", "label": "開始估價", "text": "開始包月估價"}},
+                {"type": "button", "style": "secondary", "action": {"type": "message", "label": "看包月說明", "text": "包月說明"}},
+                {"type": "button", "style": "link", "action": {"type": "message", "label": "找客服", "text": "找客服"}}
+            ]
+        }
+    }
+    return FlexSendMessage(alt_text="一日樂食包月 2.0", contents=bubble)
+
+
+def subscription_days_quick_reply():
+    return QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="每週 2 天", text="包月天數 2")),
+        QuickReplyButton(action=MessageAction(label="每週 3 天", text="包月天數 3")),
+        QuickReplyButton(action=MessageAction(label="每週 4 天", text="包月天數 4")),
+        QuickReplyButton(action=MessageAction(label="每週 5 天", text="包月天數 5")),
+        QuickReplyButton(action=MessageAction(label="我不確定", text="包月天數 不確定")),
+    ])
+
+
+def subscription_pickup_quick_reply():
+    return QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="我要外送", text="包月取餐 外送")),
+        QuickReplyButton(action=MessageAction(label="我要自取", text="包月取餐 自取")),
+    ])
+
+
+def subscription_self_pickup_meals_quick_reply():
+    return QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="每天 1 餐", text="自取餐數 1")),
+        QuickReplyButton(action=MessageAction(label="每天 2 餐", text="自取餐數 2")),
+        QuickReplyButton(action=MessageAction(label="每天 3 餐", text="自取餐數 3")),
+        QuickReplyButton(action=MessageAction(label="跟客服討論", text="自取餐數 客服討論")),
+    ])
+
+
+def calculate_subscription_estimate(uid: str, meal_count: int, address: str = "", delivery_count: int = None, pickup_method: str = "外送", days_per_week: int = None, meals_per_day: int = None):
     profile = get_customer_profile_for_order(uid)
     name = profile[0] if profile else ""
     saved_address = profile[1] if profile and len(profile) > 1 else ""
     if not address:
         address = saved_address or ""
 
-    quote = calculate_delivery_quote(address) if address else {"success": False, "delivery_fee": 0, "distance_text": "", "delivery_fee_text": "未提供地址", "route_group": "OTHER", "delivery_zone": "未分類", "carpool_hint": ""}
-    delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") else 0
-    delivery_count = meal_count
-    meal_low_total = meal_count * 170
-    meal_high_total = meal_count * 220
+    quote = calculate_delivery_quote(address) if address and pickup_method == "外送" else {"success": False, "delivery_fee": 0, "distance_text": "", "duration_text": "", "delivery_fee_text": "自取無外送費" if pickup_method == "自取" else "未提供地址", "route_group": "OTHER", "delivery_zone": "未分類", "carpool_hint": ""}
+    delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") and pickup_method == "外送" else 0
+    if delivery_count is None:
+        delivery_count = meal_count if pickup_method == "外送" else 0
+    meal_low_total = meal_count * SUBSCRIPTION_MEAL_LOW
+    meal_high_total = meal_count * SUBSCRIPTION_MEAL_HIGH
     delivery_total = delivery_fee * delivery_count
     quote_low_total = meal_low_total + delivery_total
     quote_high_total = meal_high_total + delivery_total
@@ -4763,30 +4840,90 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
         "delivery_total": delivery_total,
         "quote_low_total": quote_low_total,
         "quote_high_total": quote_high_total,
+        "pickup_method": pickup_method,
+        "days_per_week": days_per_week,
+        "meals_per_day": meals_per_day,
+        "period_weeks": SUBSCRIPTION_PERIOD_WEEKS,
     }
 
 
 def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> str:
     q = est.get("quote", {})
     address = est.get("address") or "尚未提供"
-    distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else "📏 距離：尚未完成測距"
-    delivery_text = q.get("delivery_fee_text") or "尚未提供地址，外送費需人工確認"
+    pickup_method = est.get("pickup_method") or "外送"
+    days = est.get("days_per_week")
+    meals_per_day = est.get("meals_per_day")
+    distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("📏 距離：自取不需測距" if pickup_method == "自取" else "📏 距離：尚未完成測距")
+    delivery_text = q.get("delivery_fee_text") or ("自取無外送費" if pickup_method == "自取" else "尚未提供地址，外送費需人工確認")
+    plan_line = f"📅 每週：{days} 天\n" if days else ""
+    meals_line = f"🍽️ 餐數：每週 {days} 天 × 每天 {meals_per_day} 餐，本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐\n" if days and meals_per_day else f"🍱 餐數：{est['meal_count']} 餐\n"
     hint = ""
     if include_order_hint:
-        hint = f"\n\n若要送出訂單，請回覆：\n訂購 {est['meal_count']}餐 {address if address != '尚未提供' else '你的完整地址'}"
+        hint = "\n\n價格可接受的話，請點「可以，建立包月資料」或回覆「我要填寫包月資料」。"
     return (
-        "🧾 一日樂食包月估價單\n"
-        f"🍱 餐數：{est['meal_count']} 餐\n"
-        f"📍 地址：{address}\n"
+        "🧾 一日樂食包月粗估\n"
+        f"{plan_line}"
+        f"🚚 取餐方式：{pickup_method}\n"
+        f"{meals_line}"
+        f"📍 地址：{address if pickup_method == '外送' else '自取'}\n"
         f"{distance_line}\n"
         f"🛵 單次外送費：{delivery_text}\n"
         f"🚚 估計配送次數：{est['delivery_count']} 次\n\n"
         f"餐費粗估：${est['meal_low_total']:,}～${est['meal_high_total']:,}\n"
         f"外送費粗估：${est['delivery_total']:,}\n"
         f"本期粗估合計：${est['quote_low_total']:,}～${est['quote_high_total']:,}\n\n"
-        "備註：這是下單前粗估，實際金額會由客服依菜單、順風車併單與付款方式最後確認。"
+        "備註：這是下單前粗估，實際金額會由客服依菜單、餐數、外送距離與付款方式最後確認。"
         f"{hint}"
     )
+
+
+def build_subscription_estimate_flex(uid: str, est: dict):
+    from linebot.models import FlexSendMessage
+    pickup_method = est.get("pickup_method") or "外送"
+    days = est.get("days_per_week")
+    meals_per_day = est.get("meals_per_day")
+    address = est.get("address") or "尚未提供"
+    q = est.get("quote", {})
+    summary = f"每週 {days} 天 × 每天 {meals_per_day} 餐｜本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐" if days and meals_per_day else f"共 {est['meal_count']} 餐"
+    distance_text = f"{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("自取不需測距" if pickup_method == "自取" else "尚未完成測距")
+    bubble = {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "20px",
+            "backgroundColor": "#F7FBF4",
+            "contents": [
+                {"type": "text", "text": "💰 包月粗估結果", "weight": "bold", "size": "xl", "color": "#24513A"},
+                {"type": "text", "text": summary, "size": "sm", "color": "#466152", "wrap": True, "margin": "sm"},
+                {"type": "separator", "margin": "lg", "color": "#CFE4D5"},
+                {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
+                    {"type": "text", "text": f"取餐方式：{pickup_method}", "size": "sm", "color": "#23352A", "wrap": True},
+                    {"type": "text", "text": f"地址：{address if pickup_method == '外送' else '自取'}", "size": "sm", "color": "#23352A", "wrap": True},
+                    {"type": "text", "text": f"距離：{distance_text}", "size": "sm", "color": "#23352A", "wrap": True},
+                    {"type": "text", "text": f"配送次數：{est['delivery_count']} 次", "size": "sm", "color": "#23352A", "wrap": True}
+                ]},
+                {"type": "box", "layout": "vertical", "margin": "lg", "paddingAll": "14px", "backgroundColor": "#FFFFFF", "cornerRadius": "12px", "contents": [
+                    {"type": "text", "text": f"餐費：${est['meal_low_total']:,}～${est['meal_high_total']:,}", "size": "sm", "color": "#24513A", "weight": "bold"},
+                    {"type": "text", "text": f"外送費：${est['delivery_total']:,}", "size": "sm", "color": "#24513A", "weight": "bold", "margin": "xs"},
+                    {"type": "text", "text": f"本期合計：約 ${est['quote_low_total']:,}～${est['quote_high_total']:,}", "size": "lg", "color": "#D85A1B", "weight": "bold", "wrap": True, "margin": "md"}
+                ]},
+                {"type": "text", "text": "實際金額會依菜單、餐數、外送距離與客服確認為準。", "size": "xs", "color": "#6F7B72", "wrap": True, "margin": "md"}
+            ]
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {"type": "button", "style": "primary", "color": "#2E8B57", "action": {"type": "uri", "label": "可以，建立包月資料", "uri": get_subscription_form_link(uid)}},
+                {"type": "button", "style": "secondary", "action": {"type": "message", "label": "修改天數", "text": "開始包月估價"}},
+                {"type": "button", "style": "link", "action": {"type": "message", "label": "找客服確認", "text": "找客服"}}
+            ]
+        }
+    }
+    return FlexSendMessage(alt_text="包月粗估結果", contents=bubble)
 
 
 def create_subscription_order(uid: str, est: dict):
@@ -5711,7 +5848,139 @@ def handle_message(event):
     # 放在靜音 / VIP 權限檢查之前，確保一定會觸發
     # ======================================================
     if msg in ["了解包月方案", "包月方案", "我要包月", "如何訂購"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_subscription_intro_text(uid)))
+        pending_subscription_state.pop(uid, None)
+        line_bot_api.reply_message(event.reply_token, build_subscription_intro_flex(uid))
+        return
+
+    if msg == "包月說明":
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=build_subscription_intro_text(uid),
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="開始估價", text="開始包月估價")),
+                    QuickReplyButton(action=MessageAction(label="填寫資料", text="我要填寫包月資料")),
+                    QuickReplyButton(action=MessageAction(label="找客服", text="找客服")),
+                ])
+            )
+        )
+        return
+
+    if msg == "開始包月估價":
+        pending_subscription_state[uid] = {"step": "days"}
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=(
+                    "你一週想吃幾天？\n\n"
+                    "目前可選每週 2～5 天。\n"
+                    "外送一天固定 2 餐；自取餐數可以再調整。\n"
+                    "提醒：週六目前不提供外送，但可以自取。"
+                ),
+                quick_reply=subscription_days_quick_reply()
+            )
+        )
+        return
+
+    if msg.startswith("包月天數 "):
+        raw_days = msg.replace("包月天數 ", "", 1).strip()
+        if raw_days == "不確定":
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text=(
+                        "如果剛開始控制飲食，建議先從每週 2～3 天開始。\n"
+                        "如果想更穩定控熱量或增肌減脂，可以選每週 4～5 天。\n\n"
+                        "你想先用幾天估算？"
+                    ),
+                    quick_reply=subscription_days_quick_reply()
+                )
+            )
+            return
+        if raw_days not in ["2", "3", "4", "5"]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請選擇每週 2～5 天喔。", quick_reply=subscription_days_quick_reply()))
+            return
+        pending_subscription_state[uid] = {"step": "pickup", "days_per_week": int(raw_days)}
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=(
+                    f"好的，先用每週 {raw_days} 天估算。\n\n"
+                    "你想選擇自取還是外送？\n\n"
+                    "外送：一天固定 2 餐，會依地址估算外送費。\n"
+                    "自取：餐數較彈性，也可以週六自取。"
+                ),
+                quick_reply=subscription_pickup_quick_reply()
+            )
+        )
+        return
+
+    if msg.startswith("包月取餐 "):
+        pickup_method = msg.replace("包月取餐 ", "", 1).strip()
+        state = pending_subscription_state.get(uid) or {}
+        days = state.get("days_per_week")
+        if not days:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="我先幫你從天數開始估算。", quick_reply=subscription_days_quick_reply()))
+            pending_subscription_state[uid] = {"step": "days"}
+            return
+        if pickup_method == "外送":
+            pending_subscription_state[uid] = {"step": "delivery_address", "days_per_week": days, "pickup_method": "外送"}
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
+                "好的，外送會以一天 2 餐估算。\n\n"
+                "請直接輸入你的外送地址，我幫你確認距離與預估外送費。\n\n"
+                "提醒：週六目前不提供外送。"
+            )))
+            return
+        if pickup_method == "自取":
+            pending_subscription_state[uid] = {"step": "self_pickup_meals", "days_per_week": days, "pickup_method": "自取"}
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="自取可以彈性選擇餐數。\n你一個取餐日大約想拿幾餐？", quick_reply=subscription_self_pickup_meals_quick_reply())
+            )
+            return
+
+    if msg.startswith("自取餐數 "):
+        raw_meals = msg.replace("自取餐數 ", "", 1).strip()
+        state = pending_subscription_state.get(uid) or {}
+        days = state.get("days_per_week")
+        if not days:
+            pending_subscription_state[uid] = {"step": "days"}
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="我先幫你從天數開始估算。", quick_reply=subscription_days_quick_reply()))
+            return
+        if raw_meals == "客服討論":
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="沒問題，自取餐數可由客服協助安排。你也可以先選每天 1～3 餐看粗估價格。", quick_reply=subscription_self_pickup_meals_quick_reply()))
+            return
+        if raw_meals not in ["1", "2", "3"]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請選擇每天 1～3 餐喔。", quick_reply=subscription_self_pickup_meals_quick_reply()))
+            return
+        meals_per_day = int(raw_meals)
+        meal_count = int(days) * meals_per_day * SUBSCRIPTION_PERIOD_WEEKS
+        est = calculate_subscription_estimate(uid, meal_count, "", delivery_count=0, pickup_method="自取", days_per_week=int(days), meals_per_day=meals_per_day)
+        pending_subscription_state[uid] = {"step": "estimated", "estimate": est}
+        line_bot_api.reply_message(event.reply_token, build_subscription_estimate_flex(uid, est))
+        return
+
+    if msg in ["找客服", "客服", "聯絡客服"]:
+        pending_subscription_state.pop(uid, None)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="可以，請直接在這裡留言你的需求，客服會協助確認餐數、外送/自取、金額與付款方式。"))
+        return
+
+    state = pending_subscription_state.get(uid) or {}
+    if state.get("step") == "delivery_address" and msg and not msg.startswith("#"):
+        days = int(state.get("days_per_week") or 0)
+        if not days:
+            pending_subscription_state[uid] = {"step": "days"}
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="我先幫你從天數開始估算。", quick_reply=subscription_days_quick_reply()))
+            return
+        meals_per_day = 2
+        meal_count = days * meals_per_day * SUBSCRIPTION_PERIOD_WEEKS
+        delivery_count = days * SUBSCRIPTION_PERIOD_WEEKS
+        est = calculate_subscription_estimate(uid, meal_count, msg, delivery_count=delivery_count, pickup_method="外送", days_per_week=days, meals_per_day=meals_per_day)
+        if not est.get("quote", {}).get("success"):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="我暫時無法判讀這個地址，請再輸入一次完整地址，或點找客服協助。"))
+            return
+        pending_subscription_state[uid] = {"step": "estimated", "estimate": est}
+        line_bot_api.reply_message(event.reply_token, build_subscription_estimate_flex(uid, est))
         return
 
     if msg.startswith("測距 ") or msg.startswith("#測距 "):
@@ -5745,12 +6014,22 @@ def handle_message(event):
 
     if msg == "我要填寫包月資料":
         reply_text = (
-            "太好了！請先填寫包月資料表，系統會幫你計算 TDEE、蛋白質目標，並安排四週專屬餐點。\n\n"
-            "填完後我們會確認餐數、取餐方式、外送費與本期總金額，再提供付款資訊。\n\n"
+            "太好了！接下來請填寫包月資料表。\n\n"
+            "這份資料會用來計算 TDEE、蛋白質目標、飲食禁忌與配餐方向。\n"
+            "填完後客服會協助確認餐數、取餐方式、外送費、本期金額與付款資訊。\n\n"
             f"表單連結：\n{get_subscription_form_link(uid)}\n\n"
-            "填完後可以回到 LINE 輸入：\n估價 24餐 你的完整地址"
+            "如果還沒估價，也可以回覆「開始包月估價」先看粗估金額。"
         )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=reply_text,
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="開始估價", text="開始包月估價")),
+                    QuickReplyButton(action=MessageAction(label="找客服", text="找客服")),
+                ])
+            )
+        )
         return
 
     parsed_order = parse_subscription_order_message(msg)
@@ -5780,11 +6059,25 @@ def handle_message(event):
         return
 
     if msg in ["我要估價", "估價"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請用這個格式，我才能幫你算：\n估價 24餐 你的完整地址\n\n例如：\n估價 24餐 台北市松山區南京東路四段133巷4弄5號"))
+        pending_subscription_state[uid] = {"step": "days"}
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="可以，我先幫你用包月 2.0 流程估價。\n請先選擇一週想吃幾天：", quick_reply=subscription_days_quick_reply())
+        )
         return
 
     if msg in ["我要訂購", "訂購"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請用這個格式送出訂單：\n訂購 24餐 你的完整地址\n\n例如：\n訂購 24餐 台北市松山區南京東路四段133巷4弄5號"))
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text="包月 2.0 會先完成估價與資料填寫，再由客服確認正式金額與付款。\n你可以先開始估價，或直接填寫包月資料。",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="開始估價", text="開始包月估價")),
+                    QuickReplyButton(action=MessageAction(label="填寫資料", text="我要填寫包月資料")),
+                    QuickReplyButton(action=MessageAction(label="找客服", text="找客服")),
+                ])
+            )
+        )
         return
 
     if msg == "付款方式":
