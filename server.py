@@ -1371,6 +1371,14 @@ def init_db():
             activated_at TEXT DEFAULT '',
             vip_code TEXT DEFAULT ''
         )''')
+        for _col, _ddl in [
+            ("form_payload_json", "TEXT DEFAULT ''"),
+            ("formalized_at", "TEXT DEFAULT ''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE subscription_orders ADD COLUMN {_col} {_ddl}")
+            except sqlite3.OperationalError:
+                pass
         c.execute('''CREATE TABLE IF NOT EXISTS workout_checks (
             user_id TEXT,
             workout_date TEXT,
@@ -1867,9 +1875,60 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                 is_carb_cycling_enabled
             ])
 
-        # 更新 SQLite
+        # 付款 gate：表單送出後先只建立 pending 訂單，不寫正式 health_profile / Master_API_View / 個人分頁。
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
+        delivery_fee_per_trip = int(delivery_info.get("delivery_fee", 0) or 0)
+        delivery_days_count = len(active_days_list)
+        delivery_total_fee = delivery_fee_per_trip * delivery_days_count if is_delivery else 0
+        total_with_delivery = int(total_price) + delivery_total_fee
+        form_snapshot = {
+            "user_id": user_id, "name": name, "goal": goal, "restrictions": restrictions,
+            "pickup_method": pickup_method, "address": address, "is_delivery": is_delivery,
+            "delivery_info": delivery_info, "delivery_fee_per_trip": delivery_fee_per_trip,
+            "delivery_days_count": delivery_days_count, "delivery_total_fee": delivery_total_fee,
+            "total_with_delivery": total_with_delivery, "weight": weight, "height": height,
+            "age": age, "gender": gender, "activity": activity, "tdee": int(tdee),
+            "protein": float(protein), "pref_staple": pref_staple, "pref_protein": pref_protein,
+            "schedule_text": schedule_text, "schedule_sheet_rows": schedule_sheet_rows,
+            "master_api_rows": master_api_rows, "active_days_list": active_days_list,
+            "total_price": int(total_price), "safe_name": safe_name,
+            "is_coaching_enabled": is_coaching_enabled, "is_carb_cycling_enabled": is_carb_cycling_enabled,
+            "user_level": user_level, "race_date": race_date, "sport_type": sport_type,
+            "training_freq": training_freq, "normal_train_time": normal_train_time,
+            "long_train_day": long_train_day, "run_pace": run_pace, "bike_ftp": bike_ftp,
+            "swim_pace": swim_pace, "start_date": start_date.isoformat(),
+            "phase_name": phase_name, "weeks_to_race": weeks_to_race_val,
+            "created_at": tw_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "raw_form_data": data,
+        }
+        order_id = create_pending_subscription_form_order(form_snapshot)
+
+        pickup_line = f"\n📦 取餐方式：{pickup_method}" if pickup_method else ""
+        address_line = f"\n📍 外送地址：{address}" if (is_delivery and address) else ""
+        delivery_line = f"\n🛵 單次外送運費：${delivery_fee_per_trip}（{delivery_info.get('distance_text', '未計算')}）" if (is_delivery and address) else ""
+        delivery_days_line = f"\n📦 本期配送天數：{delivery_days_count} 天" if is_delivery else ""
+        delivery_total_line = f"\n🚚 四週外送費：${delivery_total_fee}" if is_delivery else ""
+        self_pickup_line = "\n🛍️ 本期為自取，不產生外送費。" if (pickup_method and not is_delivery) else ""
+        push_msg = (
+            f"🎉 {name}，包月資料已收到！\n\n"
+            f"訂單編號：#{order_id}\n"
+            "AI 營養師已先為您完成初步精算，但尚未正式開通：\n"
+            f"🔥 TDEE: {int(tdee)} kcal\n"
+            f"🥩 蛋白質目標: {int(protein)} g\n"
+            f"💰 排餐金額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n"
+            f"🧾 本期預估總金額：${total_with_delivery}\n\n"
+            "📌 下一步流程\n"
+            "1️⃣ 客服確認餐數、取餐日期、外送費與最終金額\n"
+            "2️⃣ 確認無誤後提供付款資訊\n"
+            "3️⃣ 付款完成後，客服會正式開通，不需要您再填一次表單\n"
+            "4️⃣ 開通後即可使用專屬菜單與 AI 營養管理"
+        )
+        line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
+        notify_admin_pending_subscription_form(order_id, form_snapshot)
+        return {"status": "pending", "order_id": order_id}
+
+        # 更新 SQLite
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("""
             INSERT OR REPLACE INTO health_profile (
@@ -5027,6 +5086,179 @@ def notify_admin_new_subscription_order(order_id: int, uid: str, est: dict):
         print(f"⚠️ 推播包月訂單給管理員失敗: {e}")
 
 
+def create_pending_subscription_form_order(snapshot: dict) -> int:
+    """把已填表單先存成 pending 訂單；付款前不寫正式排餐表。"""
+    created_at = snapshot.get("created_at") or tw_now().strftime("%Y-%m-%d %H:%M:%S")
+    meal_count = len(snapshot.get("active_days_list") or []) * 2
+    quote_total = int(snapshot.get("total_with_delivery") or snapshot.get("total_price") or 0)
+    delivery_info = snapshot.get("delivery_info") or {}
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO subscription_orders (
+                user_id, customer_name, meal_count, address, distance_text, delivery_fee, delivery_count,
+                meal_low_total, meal_high_total, delivery_total, quote_low_total, quote_high_total,
+                status, created_at, form_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        """, (
+            snapshot.get("user_id") or "",
+            snapshot.get("name") or "",
+            meal_count,
+            snapshot.get("address") or "",
+            delivery_info.get("distance_text") or "",
+            int(snapshot.get("delivery_fee_per_trip") or 0),
+            int(snapshot.get("delivery_days_count") or 0),
+            int(snapshot.get("total_price") or 0),
+            int(snapshot.get("total_price") or 0),
+            int(snapshot.get("delivery_total_fee") or 0),
+            quote_total,
+            quote_total,
+            created_at,
+            json.dumps(snapshot, ensure_ascii=False)
+        ))
+        order_id = c.lastrowid
+        conn.commit()
+    return order_id
+
+
+def notify_admin_pending_subscription_form(order_id: int, snapshot: dict):
+    admin_form_msg = (
+        f"📝【包月表單待付款 #{order_id}】\n"
+        f"顧客：{snapshot.get('name') or str(snapshot.get('user_id', ''))[:8]}\n"
+        f"UID：{snapshot.get('user_id')}\n"
+        f"取餐方式：{snapshot.get('pickup_method') or '未填'}\n"
+        f"外送地址：{snapshot.get('address') or '未提供'}\n"
+        f"單次外送費：${int(snapshot.get('delivery_fee_per_trip') or 0)}\n"
+        f"配送天數：{snapshot.get('delivery_days_count') if snapshot.get('is_delivery') else '自取'}\n"
+        f"排餐金額：${int(snapshot.get('total_price') or 0)}\n"
+        f"本期預估總金額：${int(snapshot.get('total_with_delivery') or 0)}\n\n"
+        f"確認金額/付款資訊：#核准訂單 {order_id}\n"
+        f"付款完成後正式開通：#開通訂單 {order_id}\n\n"
+        "此單目前只存在 pending，尚未寫入正式排餐試算表。"
+    )
+    try:
+        admin_notify_uid = get_admin_notify_uid()
+        line_bot_api.push_message(admin_notify_uid, TextSendMessage(text=admin_form_msg))
+        print(f"✅ 已推播包月 pending 表單通知給管理員：{admin_notify_uid}")
+    except Exception as e:
+        print(f"⚠️ 推播包月 pending 表單通知給管理員失敗: {e}")
+
+
+def formalize_subscription_snapshot(order_id: int, snapshot: dict):
+    """付款開通後，將 pending 表單資料正式寫入 health_profile、個人分頁與 Master_API_View。"""
+    user_id = snapshot.get("user_id") or ""
+    if not user_id:
+        return False, "pending 表單資料缺少 UID"
+
+    name = snapshot.get("name") or ""
+    goal = snapshot.get("goal") or ""
+    restrictions = snapshot.get("restrictions") or ""
+    schedule_text = snapshot.get("schedule_text") or ""
+    active_days_list = snapshot.get("active_days_list") or []
+    safe_name = snapshot.get("safe_name") or f"{name}_{user_id[-4:]}_{tw_now().strftime('%Y%m%d')}"
+    delivery_info = snapshot.get("delivery_info") or {}
+    tdee = int(snapshot.get("tdee") or 0)
+    protein = float(snapshot.get("protein") or 0)
+    is_coaching_enabled = int(snapshot.get("is_coaching_enabled") or 0)
+    is_carb_cycling_enabled = int(snapshot.get("is_carb_cycling_enabled") or 0)
+    user_level = int(snapshot.get("user_level") or 2)
+    race_date = snapshot.get("race_date") or ""
+    address = snapshot.get("address") or ""
+    total_price = int(snapshot.get("total_price") or 0)
+    schedule_sheet_rows = snapshot.get("schedule_sheet_rows") or []
+    master_api_rows = snapshot.get("master_api_rows") or []
+    pref_staple = snapshot.get("pref_staple") or ""
+    pref_protein = snapshot.get("pref_protein") or ""
+    weight = snapshot.get("weight") or ""
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT OR REPLACE INTO health_profile (
+                user_id, name, tdee, protein, goal, restrictions, summary_text, active_days,
+                today_extra_cal, today_date, sheet_name, is_coaching_enabled, is_carb_cycling_enabled,
+                ai_silenced_until, user_level, race_date, address, distance_text, distance_meters,
+                delivery_fee, delivery_zone, route_group, delivery_note
+            ) VALUES (?,?,?,?,?,?,?,?,0,'',?,?,?,?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id, name, tdee, protein, goal, restrictions, schedule_text, ",".join(active_days_list),
+            safe_name, is_coaching_enabled, is_carb_cycling_enabled, '', user_level, race_date,
+            address, delivery_info.get("distance_text", ""), delivery_info.get("distance_meters", 0),
+            delivery_info.get("delivery_fee", 0), delivery_info.get("delivery_zone", ""),
+            delivery_info.get("route_group", ""), delivery_info.get("carpool_hint", "")
+        ))
+        c.execute("UPDATE subscription_orders SET formalized_at=? WHERE id=?", (tw_now().strftime("%Y-%m-%d %H:%M:%S"), order_id))
+        _u = c.execute("SELECT status, remaining_meals, expiry_date FROM usage WHERE user_id=?", (user_id,)).fetchone()
+        conn.commit()
+
+    if _u:
+        sync_customer_sheet(user_id, name, _u[0], _u[1], _u[2], tdee)
+
+    if gc:
+        try:
+            print(f"📊 [PAYMENT_GATE] 正式寫入 Google Sheet，訂單 #{order_id}，共 {len(master_api_rows)} 筆資料")
+            sheet = gc.open_by_url(SHEET_URL)
+            main_sheet = sheet.sheet1
+            now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+            main_sheet.append_row([now_str, name, goal, tdee, int(protein), restrictions, total_price, ",".join(active_days_list), schedule_text])
+
+            try:
+                try:
+                    user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="20")
+                except Exception:
+                    user_sheet = sheet.worksheet(safe_name)
+                    user_sheet.clear()
+                profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {tdee} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}", f"💰 排餐總額: ${total_price}"], [""]]
+                menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
+                tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
+                user_sheet.append_rows(profile_data + menu_title + schedule_sheet_rows + tracking_headers)
+            except Exception as e:
+                print(f"⚠️ 建立/更新個人分頁失敗: {e}")
+
+            try:
+                try:
+                    api_sheet = sheet.worksheet("Master_API_View")
+                except gspread.exceptions.WorksheetNotFound:
+                    api_sheet = sheet.add_worksheet(title="Master_API_View", rows="2000", cols="20")
+                    api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key", "Training_Freq", "Normal_Train_Time", "Long_Train_Day", "Run_Pace", "Bike_FTP", "Swim_Pace", "User_Level", "Race_Date", "Is_Carb_Cycling_Enabled"])
+                try:
+                    all_vals = api_sheet.get_all_values()
+                    rows_to_del = [i + 1 for i, row in enumerate(all_vals) if i > 0 and len(row) > 1 and row[1] == user_id]
+                    for rn in sorted(rows_to_del, reverse=True):
+                        api_sheet.delete_rows(rn)
+                except Exception as e:
+                    print(f"⚠️ 刪除 Master_API_View 舊行失敗: {e}")
+                if master_api_rows:
+                    api_sheet.append_rows(master_api_rows)
+                print(f"✅ [PAYMENT_GATE] 訂單 #{order_id} 已正式寫入 Master_API_View：{len(master_api_rows)} 行")
+            except Exception as e:
+                print(f"⚠️ 寫入 Master_API_View 失敗: {e}")
+        except Exception as e:
+            print(f"⚠️ 正式寫入 Google Sheet 失敗: {e}")
+            return False, f"Google Sheet 寫入失敗：{e}"
+
+    if is_coaching_enabled:
+        try:
+            start_date_raw = snapshot.get("start_date") or ""
+            start_date = datetime.fromisoformat(start_date_raw).date() if start_date_raw else tw_today()
+            threading.Thread(target=update_4week_plan_background, args=(user_id, start_date, {
+                "sport_type": snapshot.get("sport_type") or "未設定",
+                "training_freq": snapshot.get("training_freq") or "未設定",
+                "long_train_day": snapshot.get("long_train_day") or "未設定",
+                "run_pace": snapshot.get("run_pace") or "未提供",
+                "bike_ftp": snapshot.get("bike_ftp") or "未提供",
+                "swim_pace": snapshot.get("swim_pace") or "未提供",
+                "phase_name": snapshot.get("phase_name") or "",
+                "weeks_to_race": snapshot.get("weeks_to_race"),
+                "restrictions": restrictions or "",
+                "is_carb_cycling_enabled": is_carb_cycling_enabled,
+            }), daemon=True).start()
+        except Exception as e:
+            print(f"⚠️ 啟動背景課表/碳循環更新失敗: {e}")
+
+    return True, "已將 pending 表單正式寫入排餐試算表"
+
+
 def list_pending_subscription_orders(limit=20):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
@@ -5043,11 +5275,11 @@ def update_subscription_order_status(order_id: int, status: str, admin_uid: str,
     now = tw_now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
-        c.execute("SELECT id, user_id, customer_name, meal_count, quote_low_total, quote_high_total, status FROM subscription_orders WHERE id=?", (order_id,))
+        c.execute("SELECT id, user_id, customer_name, meal_count, quote_low_total, quote_high_total, status, form_payload_json FROM subscription_orders WHERE id=?", (order_id,))
         row = c.fetchone()
         if not row:
             return False, "❌ 找不到這筆包月訂單。"
-        oid, user_id, customer_name, meal_count, low_total, high_total, old_status = row
+        oid, user_id, customer_name, meal_count, low_total, high_total, old_status, form_payload_json = row
         if status == "approved":
             c.execute("UPDATE subscription_orders SET status='approved', approved_at=?, approved_by=?, admin_note=? WHERE id=?", (now, admin_uid, note, order_id))
             customer_msg = (
@@ -5066,13 +5298,24 @@ def update_subscription_order_status(order_id: int, status: str, admin_uid: str,
             c.execute("INSERT INTO vips (code, meals, duration_days, chat_limit, is_used) VALUES (?, ?, ?, ?, 0)", (vip_code, meal_count, duration_days, chat_limit))
             c.execute("UPDATE subscription_orders SET status='activated', activated_at=?, vip_code=? WHERE id=?", (now, vip_code, order_id))
             customer_msg = (
-                f"🎉 付款已確認，包月準備開通！\n"
-                f"請直接複製並傳送這組開通碼：\n{vip_code}\n\n"
-                "開通後就能使用專屬菜單、AI 營養紀錄與會員功能。"
+                f"🎉 付款已確認，包月已正式開通！\n"
+                f"請直接複製並傳送這組開通碼完成會員權限啟用：\n{vip_code}\n\n"
+                "您先前填寫的包月資料已轉正式，不需要再填一次表單。"
             )
         else:
             return False, "❌ 不支援的訂單狀態。"
         conn.commit()
+    if status == "activated" and form_payload_json:
+        try:
+            snapshot = json.loads(form_payload_json)
+            ok, formalize_msg = formalize_subscription_snapshot(order_id, snapshot)
+            if not ok:
+                customer_msg += f"\n\n⚠️ 系統提醒：正式排餐表寫入需客服確認：{formalize_msg}"
+            else:
+                customer_msg += "\n\n✅ 專屬排餐與正式試算表已同步建立。"
+        except Exception as e:
+            print(f"⚠️ formalize pending 訂單失敗: {e}")
+            customer_msg += "\n\n⚠️ 系統提醒：正式排餐表寫入失敗，客服會協助確認。"
     try:
         line_bot_api.push_message(user_id, TextSendMessage(text=customer_msg))
     except Exception as e:
@@ -5126,6 +5369,8 @@ def redeem_code(uid, code):
     c.execute("SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0", (code,))
     r = c.fetchone()
     if not r: conn.close(); return None, "❌ 無效"
+    c.execute("SELECT id, formalized_at FROM subscription_orders WHERE vip_code=? AND user_id=?", (code, uid))
+    linked_order = c.fetchone()
     m, d, l = r; today = tw_today()
     c.execute("UPDATE vips SET is_used=1 WHERE code=?", (code,))
     c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (uid,))
@@ -5133,6 +5378,12 @@ def redeem_code(uid, code):
     exp = (today + timedelta(days=d)).isoformat()
     c.execute("INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)", (uid, l, curr_m+m, today.isoformat(), 'vip', exp, l))
     conn.commit(); conn.close()
+    if linked_order and linked_order[1]:
+        return exp, (
+            "🎉 兌換成功，包月會員權限已啟用！\n"
+            "您先前填寫的包月資料已由客服付款確認後轉正式，\n"
+            "不需要再填一次表單，接下來可直接使用專屬菜單與 AI 營養管理。"
+        )
     link = f"https://docs.google.com/forms/d/e/1FAIpQLSfblmRmSc669n_C7JU1wja0g4KrEGs1oRQwdq6cfNCC8b1DFA/viewform?usp=pp_url&entry.1461831832={uid}"
     return exp, f"🎉 兌換成功！\n您的專屬排餐表單：\n{link}"
 
