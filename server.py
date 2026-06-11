@@ -284,8 +284,8 @@ async def lifespan(app: FastAPI):
     # 伺服器啟動時，喚醒隱形店長
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
     
-    # ⏰ 每天 22:00（週一～週六）自動扣餐 + 個人化晚報
-    scheduler.add_job(auto_daily_evening_report, 'cron', day_of_week='mon-sat', hour=22, minute=0)
+    # ⏸️ 每天 22:00（週一～週六）自動扣餐 + 個人化晚報：Jason 2026-06-12 要求暫時關閉
+    # scheduler.add_job(auto_daily_evening_report, 'cron', day_of_week='mon-sat', hour=22, minute=0)
 
     # ⏰ 每週日 22:05 自動發送週報（含本週回顧 + 下週預覽）
     scheduler.add_job(auto_expiry_reminder, 'cron', hour=10, minute=0)
