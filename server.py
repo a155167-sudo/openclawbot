@@ -186,7 +186,7 @@ HUBS = [
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
-GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("MAPS_API_KEY")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "#GEN_CODES")
 DB_DIR = os.path.join(os.getcwd(), 'data')
 DB_PATH = os.path.join(DB_DIR, 'user_quota.db')
@@ -1979,8 +1979,37 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         delivery_days_line = f"\n📦 本期配送天數：{delivery_days_count} 天" if is_delivery else ""
         delivery_total_line = f"\n🚚 四週外送費：${delivery_total_fee}" if is_delivery else ""
         self_pickup_line = "\n🛍️ 本期為自取，不產生外送費。" if (pickup_method and not is_delivery) else ""
-        push_msg = f"🎉 {name} 填表成功！\nAI 營養師已為您精算：\n🔥 TDEE: {int(tdee)} kcal\n🥩 蛋白質: {int(protein)} g\n💰 本次排餐總額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n🧾 本期總金額：${total_with_delivery}\n\n現在請點擊選單的『查看菜單』，我將為您列出每一天的詳細餐點與價格！"
+        push_msg = (
+            f"🎉 {name}，包月資料已收到！\n\n"
+            "AI 營養師已先為您完成初步精算：\n"
+            f"🔥 TDEE: {int(tdee)} kcal\n"
+            f"🥩 蛋白質目標: {int(protein)} g\n"
+            f"💰 排餐金額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n"
+            f"🧾 本期預估總金額：${total_with_delivery}\n\n"
+            "📌 下一步流程\n"
+            "1️⃣ 客服確認餐數、取餐日期、外送費與最終金額\n"
+            "2️⃣ 確認無誤後提供付款資訊\n"
+            "3️⃣ 付款完成後，客服會傳送 VIP 開通碼給您\n"
+            "4️⃣ 開通後即可使用專屬菜單與 AI 營養管理\n\n"
+            "您也可以先點選選單的『查看菜單』查看初步排餐。"
+        )
         line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
+        admin_form_msg = (
+            f"📝【包月表單已完成】\n"
+            f"顧客：{name or user_id[:8]}\n"
+            f"UID：{user_id}\n"
+            f"取餐方式：{pickup_method or '未填'}\n"
+            f"外送地址：{address or '未提供'}\n"
+            f"單次外送費：${delivery_fee_per_trip}\n"
+            f"配送天數：{delivery_days_count if is_delivery else '自取'}\n"
+            f"排餐金額：${total_price}\n"
+            f"本期預估總金額：${total_with_delivery}\n\n"
+            "下一步：請客服確認金額與付款資訊；付款後再開通 VIP。"
+        )
+        try:
+            line_bot_api.push_message(ADMIN_UID, TextSendMessage(text=admin_form_msg))
+        except Exception as _admin_push_e:
+            print(f"⚠️ 推播包月表單完成通知給管理員失敗: {_admin_push_e}")
         return {"status": "success"}
 
     except Exception as e: 
@@ -4590,17 +4619,24 @@ def send_tomorrow_reminders():
     return f"✅ 成功發送了 {count} 封明日取餐提醒推播！"
 
 def get_distance(origin_address, target_address, mode="driving"):
+    if not GOOGLE_MAPS_API_KEY:
+        print("⚠️ Google Maps 測距失敗：環境變數 GOOGLE_MAPS_API_KEY 未設定。")
+        return False, "", 0, ""
     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
     params = {"origins": origin_address, "destinations": target_address, "mode": mode, "language": "zh-TW", "key": GOOGLE_MAPS_API_KEY}
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=10)
         data = response.json()
         if data.get("status") == "OK":
             element = data["rows"][0]["elements"][0]
             if element.get("status") == "OK":
                 return True, element["distance"]["text"], element["distance"]["value"], element["duration"]["text"]
+            print(f"⚠️ Google Maps element status: {element.get('status')}｜origin={origin_address}｜target={target_address}")
+        else:
+            print(f"⚠️ Google Maps API status: {data.get('status')}｜error={data.get('error_message', '')}")
         return False, "", 0, ""
-    except:
+    except Exception as e:
+        print(f"⚠️ Google Maps 測距例外：{e}")
         return False, "", 0, ""
 
 
@@ -5880,10 +5916,15 @@ def handle_message(event):
             event.reply_token,
             TextSendMessage(
                 text=(
-                    "你一週想吃幾天？\n\n"
-                    "目前可選每週 2～5 天。\n"
-                    "外送一天固定 2 餐，兩餐同一個時段配送、一天只送一次；自取餐數可以再調整。\n"
-                    "提醒：週六目前不提供外送，但可以自取。"
+                    "🍱 你一週想吃幾天？\n\n"
+                    "📅 目前可選：每週 2～5 天\n\n"
+                    "🚚 外送小提醒\n"
+                    "・一天固定 2 餐\n"
+                    "・兩餐同一個時段配送\n"
+                    "・一天只送一次，不會午晚各送一趟\n\n"
+                    "🛍️ 自取小提醒\n"
+                    "・餐數可以再彈性調整\n\n"
+                    "⚠️ 週六目前不提供外送，但可以自取。"
                 ),
                 quick_reply=subscription_days_quick_reply()
             )
