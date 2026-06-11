@@ -265,6 +265,19 @@ SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
 # ==========================================
 ADMIN_UID = "Uefd72ca53a9a6ac39781fe673c398530"
 
+def get_admin_notify_uid():
+    """回傳目前應接收管理通知的 LINE UID；優先使用 #綁定老闆 寫入的 admin_settings。"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+            row = c.fetchone()
+            if row and row[0]:
+                return row[0]
+    except Exception as e:
+        print(f"⚠️ 讀取管理員通知 UID 失敗，改用預設 ADMIN_UID: {e}")
+    return ADMIN_UID
+
 # 🔥 設定 FastAPI 的生命週期與隱形店長排程
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -2007,7 +2020,9 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "下一步：請客服確認金額與付款資訊；付款後再開通 VIP。"
         )
         try:
-            line_bot_api.push_message(ADMIN_UID, TextSendMessage(text=admin_form_msg))
+            admin_notify_uid = get_admin_notify_uid()
+            line_bot_api.push_message(admin_notify_uid, TextSendMessage(text=admin_form_msg))
+            print(f"✅ 已推播包月表單完成通知給管理員：{admin_notify_uid}")
         except Exception as _admin_push_e:
             print(f"⚠️ 推播包月表單完成通知給管理員失敗: {_admin_push_e}")
         return {"status": "success"}
@@ -5006,11 +5021,7 @@ def notify_admin_new_subscription_order(order_id: int, uid: str, est: dict):
         f"付款後開通：#開通訂單 {order_id}"
     )
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
-            row = c.fetchone()
-        admin_id = row[0] if row else ADMIN_UID
+        admin_id = get_admin_notify_uid()
         line_bot_api.push_message(admin_id, TextSendMessage(text=admin_msg))
     except Exception as e:
         print(f"⚠️ 推播包月訂單給管理員失敗: {e}")
