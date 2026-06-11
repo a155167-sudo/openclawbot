@@ -1635,11 +1635,13 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         if "沙拉" in pref_staple: liked_staples.append("沙拉")
 
         liked_proteins = []
-        if "素食" in pref_protein: liked_proteins.extend(["素", "豆腐", "鷹嘴豆", "鮮蔬"])
+        if any(kw in pref_protein for kw in ["素食", "豆腐", "鷹嘴豆"]):
+            liked_proteins.extend(["素", "豆腐", "鷹嘴豆", "鮮蔬"])
         if "雞" in pref_protein: liked_proteins.append("雞")
         if "豬" in pref_protein: liked_proteins.append("豬")
         if "牛" in pref_protein: liked_proteins.append("牛")
-        if "海鮮" in pref_protein: liked_proteins.extend(["海鮮", "魚", "鱸魚", "鮭魚"])
+        if any(kw in pref_protein for kw in ["海鮮", "魚", "鱸魚", "鮭魚"]):
+            liked_proteins.extend(["海鮮", "魚", "鱸魚", "鮭魚"])
         
         # 3. 建立「絕對安全菜單池」 (先過濾掉禁忌，且只挑主餐)
         safe_menu = []
@@ -4697,7 +4699,7 @@ def calculate_delivery_quote(target_address: str):
 
 
 def get_subscription_form_link(uid: str) -> str:
-    return f"https://docs.google.com/forms/d/e/1FAIpQLSdVY7Zf-E2zSpsOFmItYHI0YtTujX6Ucux4QTQ3gjg5wcomgA/viewform?usp=pp_url&entry.1461831832={uid}"
+    return f"https://docs.google.com/forms/d/e/1FAIpQLSfblmRmSc669n_C7JU1wja0g4KrEGs1oRQwdq6cfNCC8b1DFA/viewform?usp=pp_url&entry.1461831832={uid}"
 
 
 def get_customer_profile_for_order(uid: str):
@@ -4736,7 +4738,7 @@ def build_subscription_intro_text(uid: str) -> str:
         "2️⃣ 自取或外送\n"
         "3️⃣ 外送地址距離\n\n"
         "小提醒：\n"
-        "・外送一天固定 2 餐\n"
+        "・外送一天固定 2 餐，兩餐同一個時段配送，一天只送一次\n"
         "・自取餐數可彈性調整\n"
         "・週六目前不配送，但可以自取\n\n"
         "請點選下方按鈕開始估價。"
@@ -4822,8 +4824,8 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
     quote = calculate_delivery_quote(address) if address and pickup_method == "外送" else {"success": False, "delivery_fee": 0, "distance_text": "", "duration_text": "", "delivery_fee_text": "自取無外送費" if pickup_method == "自取" else "未提供地址", "route_group": "OTHER", "delivery_zone": "未分類", "carpool_hint": ""}
     if pickup_method == "外送" and address and not quote.get("success"):
         # Google Maps 偶爾會因地址格式/API 狀態查不到；估價流程不要卡死，先讓用戶看到餐費，外送費交由客服確認。
-        quote["delivery_fee_text"] = "地圖暫時無法判讀，外送費需客服確認"
-        quote["distance_text"] = quote.get("distance_text") or "需客服確認"
+        quote["delivery_fee_text"] = "已收到地址，但地圖暫時無法判讀，外送費需客服確認"
+        quote["distance_text"] = quote.get("distance_text") or "已填地址，距離需客服確認"
         quote["duration_text"] = quote.get("duration_text") or ""
         quote["route_group"] = quote.get("route_group") or infer_route_group(address)
     delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") and pickup_method == "外送" else 0
@@ -4859,7 +4861,7 @@ def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> 
     pickup_method = est.get("pickup_method") or "外送"
     days = est.get("days_per_week")
     meals_per_day = est.get("meals_per_day")
-    distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("📏 距離：自取不需測距" if pickup_method == "自取" else f"📏 距離：{q.get('distance_text') or '需客服確認'}")
+    distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("📏 距離：自取不需測距" if pickup_method == "自取" else f"📏 距離：{q.get('distance_text') or '已填地址，距離需客服確認'}")
     delivery_text = q.get("delivery_fee_text") or ("自取無外送費" if pickup_method == "自取" else "尚未提供地址，外送費需人工確認")
     plan_line = f"📅 每週：{days} 天\n" if days else ""
     meals_line = f"🍽️ 餐數：每週 {days} 天 × 每天 {meals_per_day} 餐，本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐\n" if days and meals_per_day else f"🍱 餐數：{est['meal_count']} 餐\n"
@@ -4891,7 +4893,7 @@ def build_subscription_estimate_flex(uid: str, est: dict):
     address = est.get("address") or "尚未提供"
     q = est.get("quote", {})
     summary = f"每週 {days} 天 × 每天 {meals_per_day} 餐｜本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐" if days and meals_per_day else f"共 {est['meal_count']} 餐"
-    distance_text = f"{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("自取不需測距" if pickup_method == "自取" else (q.get("distance_text") or "需客服確認"))
+    distance_text = f"{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("自取不需測距" if pickup_method == "自取" else (q.get("distance_text") or "已填地址，距離需客服確認"))
     bubble = {
         "type": "bubble",
         "size": "mega",
@@ -5880,7 +5882,7 @@ def handle_message(event):
                 text=(
                     "你一週想吃幾天？\n\n"
                     "目前可選每週 2～5 天。\n"
-                    "外送一天固定 2 餐；自取餐數可以再調整。\n"
+                    "外送一天固定 2 餐，兩餐同一個時段配送、一天只送一次；自取餐數可以再調整。\n"
                     "提醒：週六目前不提供外送，但可以自取。"
                 ),
                 quick_reply=subscription_days_quick_reply()
@@ -5913,7 +5915,7 @@ def handle_message(event):
                 text=(
                     f"好的，先用每週 {raw_days} 天估算。\n\n"
                     "你想選擇自取還是外送？\n\n"
-                    "外送：一天固定 2 餐，會依地址估算外送費。\n"
+                    "外送：一天固定 2 餐，兩餐同一個時段配送、一天只送一次，會依地址估算外送費。\n"
                     "自取：餐數較彈性，也可以週六自取。"
                 ),
                 quick_reply=subscription_pickup_quick_reply()
@@ -5932,7 +5934,7 @@ def handle_message(event):
         if pickup_method == "外送":
             pending_subscription_state[uid] = {"step": "delivery_address", "days_per_week": days, "pickup_method": "外送"}
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
-                "好的，外送會以一天 2 餐估算。\n\n"
+                "好的，外送會以一天 2 餐估算，兩餐同一個時段配送、一天只送一次。\n\n"
                 "請直接輸入你的外送地址，我幫你確認距離與預估外送費。\n\n"
                 "提醒：週六目前不提供外送。"
             )))
