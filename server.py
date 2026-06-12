@@ -1927,7 +1927,16 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "4️⃣ 開通後即可使用專屬菜單與 AI 營養管理\n\n"
             "🍽️ 想先檢查排餐內容的話，可以直接輸入「查看菜單」，確認有沒有想更換或需要調整的餐點。"
         )
-        line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
+        line_bot_api.push_message(
+            user_id,
+            TextSendMessage(
+                text=push_msg,
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="查看菜單", text="查看菜單")),
+                    QuickReplyButton(action=MessageAction(label="找客服調整", text="找客服")),
+                ])
+            )
+        )
         notify_admin_pending_subscription_form(order_id, form_snapshot)
         return {"status": "pending", "order_id": order_id}
 
