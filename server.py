@@ -1924,7 +1924,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "1️⃣ 客服確認餐數、取餐日期、外送費與最終金額\n"
             "2️⃣ 確認無誤後提供付款資訊\n"
             "3️⃣ 付款完成後，客服會正式開通，不需要您再填一次表單\n"
-            "4️⃣ 開通後即可使用專屬菜單與 AI 營養管理"
+            "4️⃣ 開通後即可使用專屬菜單與 AI 營養管理\n\n"
+            "🍽️ 想先檢查排餐內容的話，可以直接輸入「查看菜單」，確認有沒有想更換或需要調整的餐點。"
         )
         line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
         notify_admin_pending_subscription_form(order_id, form_snapshot)
@@ -4993,6 +4994,17 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
     }
 
 
+def format_delivery_manual_review_note(q: dict) -> str:
+    """外送距離較遠時，提示顧客與管理員需人工確認，避免長距離運費被誤解為一定可承接。"""
+    distance_meters = int((q or {}).get("distance_meters") or 0)
+    delivery_zone = (q or {}).get("delivery_zone") or ""
+    if delivery_zone == "OUTSIDE" or distance_meters > 6000:
+        return "⚠️ 此地址距離較遠，超出自家車隊主要配送範圍，需客服人工確認；也可能建議改自取或不承接外送。"
+    if delivery_zone == "FAR" or distance_meters > 4000:
+        return "⚠️ 此地址已超過 4 公里，外送費與是否可併單需客服人工確認。"
+    return ""
+
+
 def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> str:
     q = est.get("quote", {})
     address = est.get("address") or "尚未提供"
@@ -5001,6 +5013,8 @@ def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> 
     meals_per_day = est.get("meals_per_day")
     distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("📏 距離：自取不需測距" if pickup_method == "自取" else f"📏 距離：{q.get('distance_text') or '已填地址，距離需客服確認'}")
     delivery_text = q.get("delivery_fee_text") or ("自取無外送費" if pickup_method == "自取" else "尚未提供地址，外送費需人工確認")
+    manual_review_note = format_delivery_manual_review_note(q) if pickup_method == "外送" else ""
+    manual_review_line = f"\n{manual_review_note}" if manual_review_note else ""
     plan_line = f"📅 每週：{days} 天\n" if days else ""
     meals_line = f"🍽️ 餐數：每週 {days} 天 × 每天 {meals_per_day} 餐，本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐\n" if days and meals_per_day else f"🍱 餐數：{est['meal_count']} 餐\n"
     hint = ""
@@ -5019,6 +5033,7 @@ def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> 
         f"外送費粗估：${est['delivery_total']:,}\n"
         f"本期粗估合計：${est['quote_low_total']:,}～${est['quote_high_total']:,}\n\n"
         "備註：這是下單前粗估，實際金額會由客服依菜單、餐數、外送距離與付款方式最後確認。"
+        f"{manual_review_line}"
         f"{hint}"
     )
 
@@ -5032,6 +5047,7 @@ def build_subscription_estimate_flex(uid: str, est: dict):
     q = est.get("quote", {})
     summary = f"每週 {days} 天 × 每天 {meals_per_day} 餐｜本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐" if days and meals_per_day else f"共 {est['meal_count']} 餐"
     distance_text = f"{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("自取不需測距" if pickup_method == "自取" else (q.get("distance_text") or "已填地址，距離需客服確認"))
+    manual_review_note = format_delivery_manual_review_note(q) if pickup_method == "外送" else ""
     bubble = {
         "type": "bubble",
         "size": "mega",
@@ -5064,11 +5080,13 @@ def build_subscription_estimate_flex(uid: str, est: dict):
             "spacing": "sm",
             "contents": [
                 {"type": "button", "style": "primary", "color": "#2E8B57", "action": {"type": "uri", "label": "可以，建立包月資料", "uri": get_subscription_form_link(uid)}},
-                {"type": "button", "style": "secondary", "action": {"type": "message", "label": "修改天數", "text": "開始包月估價"}},
+                {"type": "button", "style": "secondary", "action": {"type": "message", "label": "重新選天數", "text": "開始包月估價"}},
                 {"type": "button", "style": "link", "action": {"type": "message", "label": "找客服確認", "text": "找客服"}}
             ]
         }
     }
+    if manual_review_note:
+        bubble["body"]["contents"].insert(-1, {"type": "text", "text": manual_review_note, "size": "xs", "color": "#D85A1B", "wrap": True, "margin": "md"})
     return FlexSendMessage(alt_text="包月粗估結果", contents=bubble)
 
 
@@ -5153,6 +5171,8 @@ def notify_admin_pending_subscription_form(order_id: int, snapshot: dict):
     uid = snapshot.get('user_id') or ''
     line_display_name = snapshot.get('line_display_name') or get_line_display_name_safe(uid)
     uid_tail = uid[-8:] if uid else 'NA'
+    delivery_review_note = format_delivery_manual_review_note(snapshot.get('delivery_info') or {})
+    delivery_review_line = f"\n{delivery_review_note}" if delivery_review_note else ""
     admin_form_msg = (
         f"📝【包月表單待付款 #{order_id}】\n"
         f"表單姓名：{snapshot.get('name') or '未填'}\n"
@@ -5164,7 +5184,8 @@ def notify_admin_pending_subscription_form(order_id: int, snapshot: dict):
         f"單次外送費：${int(snapshot.get('delivery_fee_per_trip') or 0)}\n"
         f"配送天數：{snapshot.get('delivery_days_count') if snapshot.get('is_delivery') else '自取'}\n"
         f"排餐金額：${int(snapshot.get('total_price') or 0)}\n"
-        f"本期預估總金額：${int(snapshot.get('total_with_delivery') or 0)}\n\n"
+        f"本期預估總金額：${int(snapshot.get('total_with_delivery') or 0)}\n"
+        f"{delivery_review_line}\n\n"
         f"核准並發送匯款資訊：#核准訂單 {order_id}\n"
         f"付款完成後正式開通：#開通訂單 {order_id}\n\n"
         "提醒：#核准訂單 會直接把中國信託匯款資訊推送給這個 LINE 用戶。\n"
@@ -6256,10 +6277,10 @@ def handle_message(event):
             event.reply_token,
             TextSendMessage(
                 text=(
-                    f"好的，先用每週 {raw_days} 天估算。\n\n"
-                    "你想選擇自取還是外送？\n\n"
-                    "外送：一天固定 2 餐，兩餐同一個時段配送、一天只送一次，會依地址估算外送費。\n"
-                    "自取：餐數較彈性，也可以週六自取。"
+                    f"✅ 好的，先用每週 {raw_days} 天估算。\n\n"
+                    "🚚 你想選擇自取還是外送？\n\n"
+                    "🛵 外送：一天固定 2 餐，兩餐同一個時段配送、一天只送一次，會依地址估算外送費。\n"
+                    "🛍️ 自取：餐數較彈性，也可以週六自取。"
                 ),
                 quick_reply=subscription_pickup_quick_reply()
             )
@@ -6277,9 +6298,10 @@ def handle_message(event):
         if pickup_method == "外送":
             pending_subscription_state[uid] = {"step": "delivery_address", "days_per_week": days, "pickup_method": "外送"}
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
-                "好的，外送會以一天 2 餐估算，兩餐同一個時段配送、一天只送一次。\n\n"
-                "請直接輸入你的外送地址，我幫你確認距離與預估外送費。\n\n"
-                "提醒：週六目前不提供外送。"
+                "✅ 好的，外送會以一天 2 餐估算。\n"
+                "🛵 兩餐同一個時段配送、一天只送一次。\n\n"
+                "📍 請直接輸入你的外送地址，我幫你確認距離與預估外送費。\n\n"
+                "⚠️ 提醒：週六目前不提供外送。"
             )))
             return
         if pickup_method == "自取":
