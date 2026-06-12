@@ -1882,8 +1882,10 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         delivery_days_count = len(active_days_list)
         delivery_total_fee = delivery_fee_per_trip * delivery_days_count if is_delivery else 0
         total_with_delivery = int(total_price) + delivery_total_fee
+        line_display_name = get_line_display_name_safe(user_id)
         form_snapshot = {
-            "user_id": user_id, "name": name, "goal": goal, "restrictions": restrictions,
+            "user_id": user_id, "line_display_name": line_display_name,
+            "name": name, "goal": goal, "restrictions": restrictions,
             "pickup_method": pickup_method, "address": address, "is_delivery": is_delivery,
             "delivery_info": delivery_info, "delivery_fee_per_trip": delivery_fee_per_trip,
             "delivery_days_count": delivery_days_count, "delivery_total_fee": delivery_total_fee,
@@ -4837,6 +4839,32 @@ def parse_subscription_order_message(msg: str):
 SUBSCRIPTION_PERIOD_WEEKS = 4
 SUBSCRIPTION_MEAL_LOW = 170
 SUBSCRIPTION_MEAL_HIGH = 220
+PAYMENT_BANK_NAME = "中國信託銀行"
+PAYMENT_BANK_BRANCH = "東門分行"
+PAYMENT_ACCOUNT_NAME = "一日樂食店"
+PAYMENT_ACCOUNT_NUMBER = "215540069587"
+
+
+def format_payment_info() -> str:
+    return (
+        "匯款資訊：\n"
+        f"銀行：{PAYMENT_BANK_NAME}\n"
+        f"分行：{PAYMENT_BANK_BRANCH}\n"
+        f"戶名：{PAYMENT_ACCOUNT_NAME}\n"
+        f"帳號：{PAYMENT_ACCOUNT_NUMBER}"
+    )
+
+
+def get_line_display_name_safe(uid: str) -> str:
+    """盡量用 LINE userId 抓顧客顯示名稱；失敗時回空字串，避免表單 webhook 中斷。"""
+    if not uid:
+        return ""
+    try:
+        profile = line_bot_api.get_profile(uid)
+        return getattr(profile, "display_name", "") or ""
+    except Exception as e:
+        print(f"⚠️ 取得 LINE 顯示名稱失敗 uid={str(uid)[:8]}...: {e}")
+        return ""
 
 
 def build_subscription_intro_text(uid: str) -> str:
@@ -5122,18 +5150,24 @@ def create_pending_subscription_form_order(snapshot: dict) -> int:
 
 
 def notify_admin_pending_subscription_form(order_id: int, snapshot: dict):
+    uid = snapshot.get('user_id') or ''
+    line_display_name = snapshot.get('line_display_name') or get_line_display_name_safe(uid)
+    uid_tail = uid[-8:] if uid else 'NA'
     admin_form_msg = (
         f"📝【包月表單待付款 #{order_id}】\n"
-        f"顧客：{snapshot.get('name') or str(snapshot.get('user_id', ''))[:8]}\n"
-        f"UID：{snapshot.get('user_id')}\n"
+        f"表單姓名：{snapshot.get('name') or '未填'}\n"
+        f"LINE名稱：{line_display_name or '抓取失敗/未提供'}\n"
+        f"UID末8碼：{uid_tail}\n"
+        f"UID：{uid or '未提供'}\n"
         f"取餐方式：{snapshot.get('pickup_method') or '未填'}\n"
         f"外送地址：{snapshot.get('address') or '未提供'}\n"
         f"單次外送費：${int(snapshot.get('delivery_fee_per_trip') or 0)}\n"
         f"配送天數：{snapshot.get('delivery_days_count') if snapshot.get('is_delivery') else '自取'}\n"
         f"排餐金額：${int(snapshot.get('total_price') or 0)}\n"
         f"本期預估總金額：${int(snapshot.get('total_with_delivery') or 0)}\n\n"
-        f"確認金額/付款資訊：#核准訂單 {order_id}\n"
+        f"核准並發送匯款資訊：#核准訂單 {order_id}\n"
         f"付款完成後正式開通：#開通訂單 {order_id}\n\n"
+        "提醒：#核准訂單 會直接把中國信託匯款資訊推送給這個 LINE 用戶。\n"
         "此單目前只存在 pending，尚未寫入正式排餐試算表。"
     )
     try:
@@ -5263,7 +5297,7 @@ def list_pending_subscription_orders(limit=20):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
-            SELECT id, customer_name, meal_count, address, quote_low_total, quote_high_total, created_at
+            SELECT id, customer_name, meal_count, address, quote_low_total, quote_high_total, created_at, user_id, form_payload_json
             FROM subscription_orders
             WHERE status='pending'
             ORDER BY id DESC LIMIT ?
@@ -5282,11 +5316,15 @@ def update_subscription_order_status(order_id: int, status: str, admin_uid: str,
         oid, user_id, customer_name, meal_count, low_total, high_total, old_status, form_payload_json = row
         if status == "approved":
             c.execute("UPDATE subscription_orders SET status='approved', approved_at=?, approved_by=?, admin_note=? WHERE id=?", (now, admin_uid, note, order_id))
+            amount_text = f"${low_total:,}" if int(low_total or 0) == int(high_total or 0) else f"${low_total:,}～${high_total:,}"
             customer_msg = (
                 f"✅ 您的一日樂食包月訂單 #{order_id} 已確認！\n"
+                f"姓名：{customer_name or '未填'}\n"
                 f"餐數：{meal_count} 餐\n"
-                f"粗估金額：${low_total:,}～${high_total:,}\n\n"
-                "下一步請依客服提供的付款方式完成付款；付款確認後，我們會正式開通包月與 AI 營養管理。"
+                f"本期應匯款金額：{amount_text}\n\n"
+                f"{format_payment_info()}\n\n"
+                "匯款完成後，請直接回傳匯款帳號末五碼，或傳送匯款截圖給客服確認。\n"
+                "付款確認後，我們會正式開通包月與 AI 營養管理。"
             )
         elif status == "rejected":
             c.execute("UPDATE subscription_orders SET status='rejected', admin_note=? WHERE id=?", (note or "需人工重新確認", order_id))
@@ -5320,7 +5358,9 @@ def update_subscription_order_status(order_id: int, status: str, admin_uid: str,
         line_bot_api.push_message(user_id, TextSendMessage(text=customer_msg))
     except Exception as e:
         print(f"⚠️ 推播訂單狀態給顧客失敗: {e}")
-    return True, f"✅ 訂單 #{order_id} 已更新為 {status}。"
+        return False, f"⚠️ 訂單 #{order_id} 已更新為 {status}，但推播給顧客失敗：{e}"
+    recipient_hint = f"{customer_name or '顧客'}（UID末8碼：{str(user_id)[-8:]}）" if user_id else (customer_name or '顧客')
+    return True, f"✅ 訂單 #{order_id} 已更新為 {status}，並已推播給 {recipient_hint}。"
 
 
 def send_subscription_expiry_reminders(days_before: int = 3):
@@ -6957,10 +6997,18 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 目前沒有待確認的包月訂單。"))
             return
         lines = ["🧾【包月待確認訂單】"]
-        for oid, cname, meal_count, address, low_total, high_total, created_at in rows:
-            lines.append(f"#{oid} {cname or '顧客'}｜{meal_count}餐｜${low_total:,}～${high_total:,}｜{created_at}")
+        for oid, cname, meal_count, address, low_total, high_total, created_at, order_user_id, form_payload_json in rows:
+            line_display_name = ""
+            try:
+                if form_payload_json:
+                    line_display_name = (json.loads(form_payload_json) or {}).get("line_display_name") or ""
+            except Exception:
+                line_display_name = ""
+            amount_text = f"${low_total:,}" if int(low_total or 0) == int(high_total or 0) else f"${low_total:,}～${high_total:,}"
+            lines.append(f"#{oid} 表單:{cname or '未填'}｜LINE:{line_display_name or 'NA'}｜UID末8:{str(order_user_id)[-8:]}")
+            lines.append(f"{meal_count}餐｜{amount_text}｜{created_at}")
             lines.append(f"地址：{address or '未提供'}")
-            lines.append(f"核准：#核准訂單 {oid}｜付款後開通：#開通訂單 {oid}")
+            lines.append(f"核准並發匯款資訊：#核准訂單 {oid}｜付款後開通：#開通訂單 {oid}")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines[:60])))
         return
 
