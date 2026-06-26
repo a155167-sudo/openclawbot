@@ -6302,6 +6302,27 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, build_subscription_intro_flex(uid))
         return
 
+    if msg in ["我的方案", "包月狀態", "查看狀態"]:
+        pending_subscription_state.pop(uid, None)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=(
+                "你目前尚未啟用包月方案。\n"
+                "包月會員可以查看剩餘餐數、配送日、付款狀態與包月菜單。\n\n"
+                "要先了解包月內容嗎？"
+            ),
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=MessageAction(label="查看包月方案", text="包月方案")),
+                QuickReplyButton(action=MessageAction(label="查看包月菜單", text="查看包月菜單")),
+                QuickReplyButton(action=MessageAction(label="先不用", text="先不用")),
+            ])
+        ))
+        return
+
+    if msg == "先不用":
+        pending_subscription_state.pop(uid, None)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="沒問題～有需要時可以再從圖文選單查看「包月方案」。"))
+        return
+
     if msg in ["碳循環", "碳循環排餐", "啟用碳循環", "我要碳循環", "碳循環菜單"]:
         pending_subscription_state.pop(uid, None)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
@@ -6854,12 +6875,23 @@ def handle_message(event):
         return
     # 📊 儀表板觸發
     # 📊 首頁儀表板觸發 (最乾淨的單一訊息雙卡輪播)
-    if msg in ["首頁", "儀表板", "我的狀態", "今日進度", "dashboard", "Dashboard"]:
+    if msg in ["首頁", "儀表板", "我的狀態", "今日進度", "飲食紀錄", "dashboard", "Dashboard"]:
         flex_msg = build_dashboard_flex(uid)
         if flex_msg:
             line_bot_api.reply_message(event.reply_token, flex_msg)
         else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 找不到你的資料，請先填寫表單建立檔案喔！"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=(
+                    "⚠️ 目前還沒有你的飲食紀錄資料\n"
+                    "請先填寫資料建立檔案，就可以開始查看每日飲食紀錄。\n\n"
+                    "也可以點選「包月方案」了解固定健康餐服務。"
+                ),
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="填寫資料", text="填寫體質表單")),
+                    QuickReplyButton(action=MessageAction(label="包月方案", text="包月方案")),
+                    QuickReplyButton(action=MessageAction(label="先不用", text="先不用")),
+                ])
+            ))
         return
 
     if msg.startswith("加入常吃："):
@@ -7050,7 +7082,7 @@ def handle_message(event):
         reply_text = f"🎁 感謝您對一日樂食的支持！\n請點擊下方專屬連結填寫滿意度調查 (約1分鐘)。\n\n完成填寫後，系統將自動發送【1 點集點卡點數】給您喔！👇\n\n{survey_link}"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
-    elif msg == "查看菜單":
+    elif msg in ["查看菜單", "包月菜單", "查看包月菜單"]:
         # ✅ 安全連線
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
