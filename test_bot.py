@@ -2,6 +2,7 @@ import sqlite3
 import datetime
 import asyncio
 import random
+from fastapi import BackgroundTasks
 import server  # 匯入主程式
 
 # ==========================================
@@ -76,7 +77,7 @@ def run_all_tests():
         "取餐": [f"{today_str},{tomorrow_str}"],
         "主食偏好": ["飯食派"], "蛋白質": ["雞"]
     }
-    asyncio.run(server.receive_form_data(MockRequest(form_data)))
+    asyncio.run(server.receive_form_data(MockRequest(form_data), BackgroundTasks()))
 
     conn = sqlite3.connect(server.DB_PATH); c = conn.cursor()
     c.execute("SELECT tdee, protein, active_days, sheet_name, summary_text FROM health_profile WHERE user_id=?", (uid,))

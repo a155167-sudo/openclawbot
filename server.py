@@ -24,6 +24,18 @@ from contextlib import asynccontextmanager, closing
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from nutrition_system import (
+    build_label_confirmation_bubble,
+    confirm_pending_label,
+    daily_consumed_totals,
+    ensure_nutrition_schema,
+    normalize_garmin_payload,
+    normalize_label_payload,
+    nutrition_sheet_specs,
+    rank_menu_candidates,
+    remaining_targets,
+    save_pending_label,
+)
 
 # --- 1. 時區與基本工具設定 ---
 TW_TZ = ZoneInfo("Asia/Taipei")
@@ -188,14 +200,13 @@ LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("MAPS_API_KEY")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "#GEN_CODES")
-DB_DIR = os.path.join(os.getcwd(), 'data')
-DB_PATH = os.path.join(DB_DIR, 'user_quota.db')
-if not os.path.exists(DB_DIR):
-    os.makedirs(DB_DIR, exist_ok=True)
-DB_DIR = os.path.join(os.getcwd(), 'data')
-DB_PATH = os.path.join(DB_DIR, 'user_quota.db')
-if not os.path.exists(DB_DIR):
-    os.makedirs(DB_DIR, exist_ok=True)
+DB_DIR = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
+DB_PATH = os.path.join(DB_DIR, "user_quota.db")
+os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
+try:
+    os.chmod(DB_DIR, 0o700)
+except OSError:
+    pass
 
 # ==========================================
 # 🌟 自動升級資料庫：確保 health_profile 有 status 欄位
@@ -291,7 +302,16 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(auto_expiry_reminder, 'cron', hour=10, minute=0)
     scheduler.add_job(send_subscription_expiry_reminders, 'cron', hour=11, minute=0)
     scheduler.add_job(auto_weekly_coach_batch, 'cron', day_of_week='sun', hour=22, minute=5)
-    
+    scheduler.add_job(retry_pending_nutrition_plan_links, 'interval', minutes=10, max_instances=1, coalesce=True)
+    scheduler.add_job(flush_nutrition_sheet_outbox, 'interval', minutes=10, max_instances=1, coalesce=True)
+    scheduler.add_job(cleanup_nutrition_images, 'cron', hour=3, minute=20, max_instances=1)
+    try:
+        retry_pending_nutrition_plan_links()
+        flush_nutrition_sheet_outbox()
+        cleanup_nutrition_images()
+    except Exception as exc:
+        print(f"⚠️ 啟動時營養資料維護失敗：{exc}")
+
     scheduler.start()
     print("✅ 全自動定時器已啟動！系統進入無人駕駛模式 ON！")
     
@@ -302,6 +322,27 @@ async def lifespan(app: FastAPI):
 
 # 正式建立啟用了定時器的 FastAPI 應用程式
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+def health_check():
+    try:
+        with sqlite3.connect(DB_PATH, timeout=5) as conn:
+            existing = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            required = {"usage", "health_profile", "food_catalog", "food_logs", "nutrition_sheet_outbox"}
+            missing = required - existing
+            if missing:
+                raise sqlite3.OperationalError("required schema missing")
+    except sqlite3.Error as exc:
+        print(f"⚠️ 健康檢查資料庫失敗：{exc}")
+        raise HTTPException(status_code=503, detail="database unavailable") from exc
+    return {"status": "ok", "service": "openclawbot"}
+
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -1257,6 +1298,8 @@ def load_menu():
                 try:
                     cal = float(row_clean.get("熱量(kcal)", "0").strip() or 0.0)
                     pro = float(row_clean.get("蛋白質(g)", "0").strip() or 0.0)
+                    fat = float(row_clean.get("脂肪(g)", "0").strip() or 0.0)
+                    carbs = float(row_clean.get("碳水化合物(g)", row_clean.get("碳水(g)", "0")).strip() or 0.0)
                     price = int(row_clean.get("價錢", row_clean.get("價格", "150")).strip() or 150)
                     ingredients = row_clean.get("內容物", "新鮮食材製作").strip()
                     main_keywords = ["便當", "麵", "食蔬", "低碳", "沙拉", "原型"]
@@ -1269,7 +1312,23 @@ def load_menu():
                         carb_type = "高碳"
                     else:
                         carb_type = "低碳"  # 沙拉、低碳、其他
-                    MAIN_DISHES.append({"name": name, "cal": cal, "pro": pro, "price": price, "category": category, "ingredients": ingredients, "carb_type": carb_type})
+                    dish = {
+                        "name": name, "cal": cal, "pro": pro, "fat": fat, "carbs": carbs,
+                        "calories_kcal": cal, "protein_g": pro, "fat_g": fat, "carbohydrate_g": carbs,
+                        "price": price, "category": category, "ingredients": ingredients,
+                        "carb_type": carb_type, "safe": True, "available": True,
+                    }
+                    exchange_columns = {
+                        "milk_exchange": "奶份", "protein_low_exchange": "低脂蛋白份",
+                        "protein_medium_exchange": "中脂蛋白份", "protein_high_exchange": "高脂蛋白份",
+                        "starch_exchange": "主食份", "vegetable_exchange": "蔬菜份",
+                        "fruit_exchange": "水果份", "fat_exchange": "油脂份",
+                    }
+                    for exchange_key, column_name in exchange_columns.items():
+                        raw_exchange = row_clean.get(column_name)
+                        if raw_exchange is not None and str(raw_exchange).strip() != "":
+                            dish[exchange_key] = float(str(raw_exchange).strip())
+                    MAIN_DISHES.append(dish)
                 except Exception as e:
                     # 🔥 抓蟲程式碼必須放在這裡，對齊內部的 try！
                     print(f"⚠️ 跳過餐點【{name}】: 數字格式有誤，原因：{e}")
@@ -1283,18 +1342,12 @@ def load_menu():
 # 3. 資料庫初始化 (🔥 升級版：支援點數網址與發放紀錄)
 # ==========================================
 def init_db():
-    # 🎯 1. 自動定位：確保路徑絕對正確
-    db_dir = os.path.join(os.getcwd(), 'data')
-    db_path = os.path.join(db_dir, 'user_quota.db')
-
-    # 📂 2. 防撞檢查：如果保險箱資料夾不存在，就立刻建一個
-    if not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-        print(f"📁 已自動建立資料夾: {db_dir}")
+    # 單一資料路徑來源：必須遵守 DATA_DIR／DB_PATH，才能安全掛載 Railway Volume。
+    os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
 
     try:
         # 🔗 3. 安全連線
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         
         # --- 以下是您的原本表格定義 (保持不變) ---
@@ -1467,11 +1520,14 @@ def init_db():
                 c.execute(f"ALTER TABLE health_profile ADD COLUMN {col} {dtype}")
             except sqlite3.OperationalError: 
                 pass
+        # 營養辨識、客製化計畫與完整飲食紀錄資料表（只新增，不覆寫既有資料）
+        ensure_nutrition_schema(conn)
+
         # --- 以上結束 ---
 
         conn.commit()
         conn.close()
-        print(f"✅ 保險箱資料庫連線成功！路徑: {db_path}")
+        print(f"✅ 保險箱資料庫連線成功！路徑: {DB_PATH}")
 
     except Exception as e:
         print(f"❌ 啟動保險箱失敗，錯誤原因: {e}")
@@ -4533,7 +4589,8 @@ def get_ai_response_with_memory(user_id, user_msg):
         res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2000, temperature=0.3)
         ans = res.choices[0].message.content
     except Exception as e:
-        return f"⚠️ 【系統除錯報告】呼叫 AI 大腦失敗！\n原因：{str(e)}"
+        print(f"⚠️ AI 大腦呼叫失敗：{e}")
+        return ("⚠️ AI 助理暫時忙碌中，請稍後再試；若持續發生請聯繫客服。", None)
         
     meal_log_flex = None
     parsed_tag = parse_log_nutrition_tag(ans) or parse_log_nutrition_fallback(ans, user_msg)
@@ -6088,16 +6145,591 @@ line_message 末尾必須標明：「本週總 eTSS：XXX（TSS/預算{budget}�
 async def callback(request: Request):
     sig = request.headers.get("X-Line-Signature", "")
     body = await request.body()
-    
+
     try:
         handler.handle(body.decode("utf-8"), sig)
     except InvalidSignatureError: 
         print("⚠️ LINE 簽章錯誤！請檢查 Railway 的 LINE_CHANNEL_SECRET 是否填錯或有空格！")
         raise HTTPException(status_code=400, detail="Invalid signature")
-    except Exception as e: 
+    except Exception as e:
         print(f"⚠️ LINE 訊息處理發生嚴重錯誤: {e}")
-        
+        raise HTTPException(status_code=500, detail="Webhook processing failed") from e
+
     return "OK"
+
+
+def _nutrition_ws(title):
+    if not sh:
+        raise RuntimeError("Google Sheet 尚未連線")
+    specs = nutrition_sheet_specs()
+    try:
+        ws = sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        spec = specs[title]
+        ws = sh.add_worksheet(title=title, rows=500, cols=len(spec["headers"]) + 2)
+        ws.append_row(spec["headers"])
+        for row in spec.get("seed_rows", []):
+            ws.append_row(row)
+        ws.freeze(rows=1)
+    return ws
+
+
+nutrition_sheet_sync_lock = threading.Lock()
+
+
+def _upsert_raw_sheet_row(ws, entity_id, row_values):
+    try:
+        cell = ws.find(entity_id, in_column=1)
+    except gspread.exceptions.CellNotFound:
+        cell = None
+    if cell:
+        end = gspread.utils.rowcol_to_a1(cell.row, len(row_values))
+        ws.update(values=[row_values], range_name=f"A{cell.row}:{end}", value_input_option="RAW")
+    else:
+        ws.append_row(row_values, value_input_option="RAW")
+
+
+def _sync_food_outbox(entity_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        food = conn.execute("""
+            SELECT food_id, product_name, brand, barcode, source_type, owner_user_id,
+                   visibility, package_amount, package_unit, servings_per_package,
+                   per_serving_json, exchange_json, exchange_review_status,
+                   original_image_ref, recognition_confidence, verification_status,
+                   fingerprint, created_at, updated_at
+            FROM food_catalog WHERE food_id=?
+        """, (entity_id,)).fetchone()
+    if not food:
+        raise RuntimeError("food outbox entity missing")
+    per = json.loads(food[10] or "{}")
+    exch = json.loads(food[11] or "{}")
+    ws = _nutrition_ws("食品資料庫")
+    row_values = [
+        food[0], food[1], food[2], food[3], food[4], food[5], food[6],
+        food[7], food[8], food[9], per.get("calories_kcal", 0), per.get("protein_g", 0),
+        per.get("fat_g", 0), per.get("carbohydrate_g", 0), per.get("sugar_g", 0),
+        per.get("fiber_g", 0), per.get("sodium_mg", 0), exch.get("milk_exchange", 0),
+        exch.get("protein_low_exchange", 0), exch.get("protein_medium_exchange", 0),
+        exch.get("protein_high_exchange", 0), exch.get("starch_exchange", 0),
+        exch.get("vegetable_exchange", 0), exch.get("fruit_exchange", 0),
+        exch.get("fat_exchange", 0), food[12], food[13], food[14], food[15],
+        food[16], food[17], food[18]
+    ]
+    _upsert_raw_sheet_row(ws, entity_id, row_values)
+
+
+def _sync_food_log_outbox(entity_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        log = conn.execute("""
+            SELECT l.log_id, l.user_id, l.food_id, f.product_name, l.consumed_at,
+                   l.meal_slot, l.consumed_servings, l.consumed_amount, l.consumed_unit,
+                   l.nutrition_snapshot_json, l.exchange_snapshot_json, l.source_image_ref,
+                   l.plan_id, l.confirmation_status, l.created_at, l.updated_at
+            FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id WHERE l.log_id=?
+        """, (entity_id,)).fetchone()
+    if not log:
+        raise RuntimeError("food log outbox entity missing")
+    nutrition = json.loads(log[9] or "{}")
+    exch = json.loads(log[10] or "{}")
+    ws = _nutrition_ws("飲食紀錄")
+    row_values = [
+        log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7], log[8],
+        nutrition.get("calories_kcal", 0), nutrition.get("protein_g", 0), nutrition.get("fat_g", 0),
+        nutrition.get("carbohydrate_g", 0), nutrition.get("sugar_g", 0), nutrition.get("fiber_g", 0),
+        nutrition.get("sodium_mg", 0), exch.get("milk_exchange", 0),
+        exch.get("protein_low_exchange", 0), exch.get("protein_medium_exchange", 0),
+        exch.get("protein_high_exchange", 0), exch.get("starch_exchange", 0),
+        exch.get("vegetable_exchange", 0), exch.get("fruit_exchange", 0),
+        exch.get("fat_exchange", 0), log[11], log[12], log[13], log[14], log[15]
+    ]
+    _upsert_raw_sheet_row(ws, entity_id, row_values)
+
+
+def flush_nutrition_sheet_outbox(limit=50):
+    """用SQLite lease跨執行緒／worker認領事件，失敗或逾時後可安全重試。"""
+    if not sh:
+        return 0
+    synced = 0
+    lease_owner = f"lease_{secrets.token_hex(12)}"
+    claimed_at = tw_now().isoformat(timespec="seconds")
+    lease_cutoff = (tw_now() - timedelta(minutes=5)).isoformat(timespec="seconds")
+    with nutrition_sheet_sync_lock:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            ensure_nutrition_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """UPDATE nutrition_sheet_outbox
+                   SET status='pending', claimed_at='', lease_owner='', resync_required=0
+                   WHERE status='processing' AND claimed_at<?""",
+                (lease_cutoff,),
+            )
+            candidates = conn.execute(
+                """SELECT outbox_id FROM nutrition_sheet_outbox
+                   WHERE status='pending' ORDER BY created_at LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+            ids = [row[0] for row in candidates]
+            for outbox_id in ids:
+                conn.execute(
+                    """UPDATE nutrition_sheet_outbox SET status='processing', claimed_at=?, lease_owner=?
+                       WHERE outbox_id=? AND status='pending'""",
+                    (claimed_at, lease_owner, outbox_id),
+                )
+            conn.commit()
+            rows = conn.execute(
+                """SELECT outbox_id, entity_type, entity_id FROM nutrition_sheet_outbox
+                   WHERE status='processing' AND lease_owner=? ORDER BY created_at""",
+                (lease_owner,),
+            ).fetchall()
+        for outbox_id, entity_type, entity_id in rows:
+            try:
+                if entity_type == "food":
+                    _sync_food_outbox(entity_id)
+                elif entity_type == "food_log":
+                    _sync_food_log_outbox(entity_id)
+                else:
+                    raise ValueError("unknown outbox entity type")
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute(
+                        """UPDATE nutrition_sheet_outbox
+                           SET status=CASE WHEN resync_required=1 THEN 'pending' ELSE 'synced' END,
+                               synced_at=CASE WHEN resync_required=1 THEN '' ELSE ? END,
+                               resync_required=0, last_error='', claimed_at='', lease_owner=''
+                           WHERE outbox_id=? AND status='processing' AND lease_owner=?""",
+                        (tw_now().isoformat(timespec="seconds"), outbox_id, lease_owner),
+                    )
+                    conn.commit()
+                synced += 1
+            except Exception as exc:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute(
+                        """UPDATE nutrition_sheet_outbox
+                           SET status='pending', attempts=attempts+1, last_error=?,
+                               claimed_at='', lease_owner='', resync_required=0
+                           WHERE outbox_id=? AND lease_owner=?""",
+                        (str(exc)[:500], outbox_id, lease_owner),
+                    )
+                    conn.commit()
+                print(f"⚠️ 營養 outbox 同步失敗 {entity_type}/{entity_id}: {exc}")
+    return synced
+
+
+def sync_confirmed_nutrition_to_sheet(result):
+    return flush_nutrition_sheet_outbox()
+
+
+def apply_confirmed_nutrition_to_legacy_dashboard(user_id, result):
+    """兼容既有儀表板，並用 food_logs.legacy_applied_at 保證只累加一次。"""
+    consumed_at = str(result["log"].get("consumed_at") or "")
+    log_id = result["log"]["log_id"]
+    if consumed_at[:10] != tw_today().isoformat():
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE food_logs SET legacy_applied_at='not_applicable' WHERE log_id=? AND legacy_applied_at=''", (log_id,))
+            conn.commit()
+        return None
+    nutrition = result["log"]["nutrition"]
+    cal = float(nutrition.get("calories_kcal", 0) or 0)
+    pro = float(nutrition.get("protein_g", 0) or 0)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        applied = conn.execute("SELECT legacy_applied_at FROM food_logs WHERE log_id=? AND user_id=?", (log_id, user_id)).fetchone()
+        if not applied or applied[0]:
+            conn.commit()
+            return None
+        row = conn.execute("SELECT today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein FROM health_profile WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            conn.execute("UPDATE food_logs SET legacy_applied_at='no_profile' WHERE log_id=?", (log_id,))
+            conn.commit()
+            return None
+        old_cal, old_pro, items, today_date, tdee, protein_goal = row
+        if today_date != tw_today().isoformat():
+            old_cal, old_pro, items = 0, 0, ""
+        new_cal = round(float(old_cal or 0) + cal, 1)
+        new_pro = round(float(old_pro or 0) + pro, 1)
+        name = result["food"]["product_name"]
+        new_items = f"{items}、{name}".strip("、") if items else name
+        applied_at = tw_now().isoformat(timespec="seconds")
+        conn.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=?, today_date=? WHERE user_id=?", (new_cal, new_pro, new_items, tw_today().isoformat(), user_id))
+        conn.execute("UPDATE food_logs SET legacy_applied_at=? WHERE log_id=?", (applied_at, log_id))
+        conn.commit()
+    upsert_frequent_food(user_id, result["food"]["product_name"], round(cal), round(pro))
+    return build_meal_log_flex(result["food"]["product_name"], round(cal, 1), round(pro, 1), new_cal, tdee or 2000, new_pro, protein_goal or 100)
+
+
+def get_pending_nutrition_label(user_id, token):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT label_payload_json, consumed_servings, status FROM pending_nutrition_logs WHERE token=? AND user_id=?", (token, user_id)).fetchone()
+    if not row or row[2] != "pending":
+        raise ValueError("找不到待確認的營養紀錄，或這筆已處理。")
+    return normalize_label_payload(json.loads(row[0])), float(row[1])
+
+
+def _sheet_number(row, key):
+    try:
+        return float(str(row.get(key, 0) or 0).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def current_meal_slot(now=None):
+    hour = (now or tw_now()).hour
+    if hour < 10:
+        return "早餐"
+    if hour < 15:
+        return "午餐"
+    if hour < 21:
+        return "晚餐"
+    return "點心"
+
+
+def get_active_nutrition_target(user_id, meal_slot="", target_date=None):
+    """依指定攝取日期取得有效版本；精確星期／餐別優先於萬用列。"""
+    meal_slot = meal_slot or current_meal_slot()
+    if target_date is None:
+        plan_date = tw_today()
+    elif hasattr(target_date, "year") and not isinstance(target_date, str):
+        plan_date = target_date
+    else:
+        try:
+            plan_date = datetime.fromisoformat(str(target_date)[:10]).date()
+        except ValueError:
+            return None
+    weekday_names = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
+    weekday = weekday_names[plan_date.weekday()]
+    try:
+        records = _nutrition_ws("客製化營養計畫").get_all_records()
+    except Exception as exc:
+        print(f"⚠️ 讀取客製化營養計畫失敗：{exc}")
+        raise RuntimeError("客製化營養計畫暫時無法讀取") from exc
+
+    matching = []
+    for row in records:
+        plan_id = str(row.get("plan_id", "")).strip()
+        if not plan_id or str(row.get("User_ID", "")).strip() != user_id:
+            continue
+        if str(row.get("狀態", "active")).strip().lower() not in ("active", "啟用", "有效", ""):
+            continue
+        row_weekday = str(row.get("星期", "")).strip()
+        exact_weekday = row_weekday in (weekday, str(plan_date.weekday() + 1))
+        if row_weekday and not exact_weekday and row_weekday not in ("每日", "全部"):
+            continue
+        row_meal = str(row.get("餐別", "")).strip()
+        exact_meal = row_meal == meal_slot
+        daily_scope = row_meal in ("全日", "每日")
+        if row_meal and not exact_meal and not daily_scope:
+            continue
+        start = normalize_date_str(row.get("生效日期", "")).replace("/", "-")
+        end = normalize_date_str(row.get("結束日期", "")).replace("/", "-")
+        if start and start > plan_date.isoformat():
+            continue
+        if end and end < plan_date.isoformat():
+            continue
+        specificity = (1 if exact_meal else 0, 1 if exact_weekday else 0)
+        matching.append((specificity, row))
+    if not matching:
+        return None
+    matching.sort(
+        key=lambda item: (
+            item[0][0], item[0][1], _sheet_number(item[1], "版本"),
+            str(item[1].get("生效日期", "")),
+        ),
+        reverse=True,
+    )
+    row = matching[0][1]
+    row_meal = str(row.get("餐別", "")).strip()
+    daily_scope = row_meal in ("全日", "每日")
+    targets = {
+        "calories_kcal": _sheet_number(row, "熱量目標"),
+        "protein_g": _sheet_number(row, "蛋白質目標g"),
+        "fat_g": _sheet_number(row, "脂肪目標g"),
+        "carbohydrate_g": _sheet_number(row, "碳水目標g"),
+        "milk_exchange": _sheet_number(row, "奶份"),
+        "protein_low_exchange": _sheet_number(row, "低脂蛋白份"),
+        "protein_medium_exchange": _sheet_number(row, "中脂蛋白份"),
+        "protein_high_exchange": _sheet_number(row, "高脂蛋白份"),
+        "starch_exchange": _sheet_number(row, "主食份"),
+        "vegetable_exchange": _sheet_number(row, "蔬菜份"),
+        "fruit_exchange": _sheet_number(row, "水果份"),
+        "fat_exchange": _sheet_number(row, "油脂份"),
+    }
+    return {
+        "plan_id": str(row.get("plan_id", "")).strip(),
+        "meal_slot": "全日" if daily_scope else meal_slot,
+        "consumption_meal_slot": "" if daily_scope else meal_slot,
+        "target_date": plan_date.isoformat(),
+        "targets": targets,
+        "row": row,
+    }
+
+
+def retry_pending_nutrition_plan_links(limit=50):
+    """重新連結因Google Sheet暫時失敗而未能判定的歷史計畫。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_nutrition_schema(conn)
+        rows = conn.execute(
+            """SELECT log_id, user_id, meal_slot, consumed_at FROM food_logs
+               WHERE plan_link_status='pending' ORDER BY created_at LIMIT ?""",
+            (int(limit),),
+        ).fetchall()
+    updated = 0
+    for log_id, user_id, meal_slot, consumed_at in rows:
+        try:
+            plan = get_active_nutrition_target(user_id, meal_slot or "", consumed_at or "")
+        except Exception as exc:
+            print(f"⚠️ 計畫連結重試仍失敗 {log_id}: {exc}")
+            continue
+        plan_id = plan["plan_id"] if plan else ""
+        status = "linked" if plan else "no_plan"
+        with sqlite3.connect(DB_PATH) as conn:
+            changed = conn.execute(
+                """UPDATE food_logs SET plan_id=?, plan_link_status=?, updated_at=?
+                   WHERE log_id=? AND plan_link_status='pending'""",
+                (plan_id, status, tw_now().isoformat(timespec="seconds"), log_id),
+            ).rowcount
+            if changed:
+                _queue_nutrition_outbox(conn, "food_log", log_id)
+                updated += 1
+            conn.commit()
+    return updated
+
+
+def nutrition_menu_recommendations(user_id, meal_slot=""):
+    plan = get_active_nutrition_target(user_id, meal_slot, tw_today())
+    if not plan:
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_nutrition_schema(conn)
+        consumed = daily_consumed_totals(
+            conn, user_id=user_id, date_iso=plan["target_date"],
+            meal_slot=plan["consumption_meal_slot"],
+        )
+    remaining = remaining_targets(plan["targets"], consumed)
+    with sqlite3.connect(DB_PATH) as conn:
+        restriction_row = conn.execute("SELECT restrictions FROM health_profile WHERE user_id=?", (user_id,)).fetchone()
+    restrictions = str(restriction_row[0] if restriction_row else "").strip()
+    restriction_terms = [x.strip() for x in re.split(r"[,，、/]|不吃|過敏", restrictions) if len(x.strip()) >= 2]
+    candidates = []
+    for dish in MAIN_DISHES:
+        if dish.get("category") != "main":
+            continue
+        haystack = f"{dish.get('name', '')} {dish.get('ingredients', '')}"
+        candidate = dict(dish)
+        candidate["safe"] = not any(term in haystack for term in restriction_terms)
+        candidates.append(candidate)
+    ranked = rank_menu_candidates(remaining, candidates, limit=3)
+    return {"plan": plan, "consumed": consumed, "remaining": remaining, "ranked": ranked}
+
+
+def build_nutrition_recommendation_flex(recommendation):
+    meal_slot = recommendation["plan"]["meal_slot"]
+    remaining = recommendation["remaining"]
+    ranked = recommendation["ranked"]
+    target_lines = []
+    exchange_labels = [
+        ("starch_exchange", "主"), ("protein_low_exchange", "低脂蛋"),
+        ("protein_medium_exchange", "中脂蛋"), ("protein_high_exchange", "高脂蛋"),
+        ("vegetable_exchange", "菜"), ("fruit_exchange", "果"),
+        ("milk_exchange", "奶"), ("fat_exchange", "油"),
+    ]
+    for key, label in exchange_labels:
+        if remaining.get(key, 0) > 0:
+            target_lines.append(f"{label}{remaining[key]:g}")
+    if not target_lines:
+        target_lines = [
+            f"{remaining.get('calories_kcal', 0):g} kcal",
+            f"蛋白質 {remaining.get('protein_g', 0):g}g",
+        ]
+    contents = [
+        {"type": "text", "text": f"{meal_slot}剩餘需求", "size": "sm", "color": "#666666"},
+        {"type": "text", "text": "・".join(target_lines), "size": "lg", "weight": "bold", "wrap": True, "margin": "sm"},
+        {"type": "separator", "margin": "md"},
+    ]
+    if not ranked:
+        contents.append({"type": "text", "text": "目前沒有符合禁忌與供應條件的餐點。", "wrap": True, "margin": "md"})
+    for index, dish in enumerate(ranked, 1):
+        contents.extend([
+            {"type": "text", "text": f"{index}. {dish['name']}", "weight": "bold", "size": "md", "margin": "md", "wrap": True},
+            {"type": "text", "text": f"符合度 {dish['match_score']:g}%｜{dish.get('calories_kcal', 0):g} kcal｜蛋白質 {dish.get('protein_g', 0):g}g｜${dish.get('price', 0)}", "size": "xs", "color": "#555555", "wrap": True, "margin": "xs"},
+        ])
+    contents.append({"type": "text", "text": "份量代號未完整建檔的菜單會以熱量與三大營養素後備比對；營養師補齊份量後排序會更準。", "size": "xs", "color": "#8A6D3B", "wrap": True, "margin": "lg"})
+    return {
+        "type": "bubble", "size": "mega",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#D97706", "paddingAll": "16px", "contents": [
+            {"type": "text", "text": "🍱 一日樂食個人推薦", "color": "#FFFFFF", "weight": "bold", "size": "lg"},
+            {"type": "text", "text": "已扣除今天確認過的飲食紀錄", "color": "#FEF3C7", "size": "sm", "margin": "xs"},
+        ]},
+        "body": {"type": "box", "layout": "vertical", "paddingAll": "18px", "contents": contents},
+        "footer": {"type": "box", "layout": "vertical", "paddingAll": "14px", "contents": [
+            {"type": "button", "style": "primary", "color": "#D97706", "action": {"type": "message", "label": "重新計算", "text": "推薦一日樂食"}},
+        ]},
+    }
+
+
+def _validate_image_bytes(image_bytes):
+    if not isinstance(image_bytes, (bytes, bytearray)):
+        raise ValueError("圖片格式無效")
+    if not 100 <= len(image_bytes) <= 10 * 1024 * 1024:
+        raise ValueError("圖片大小必須介於100 bytes與10MB")
+    data = bytes(image_bytes)
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    raise ValueError("只支援 JPEG、PNG 或 WebP 圖片")
+
+
+def _nutrition_image_path(image_ref):
+    prefix = "nutrition-image:"
+    if not str(image_ref).startswith(prefix):
+        return None
+    filename = str(image_ref)[len(prefix):]
+    if not re.fullmatch(r"[0-9a-f]{32}\.(jpg|png|webp)", filename):
+        return None
+    root = os.path.abspath(os.path.join(DB_DIR, "nutrition_images"))
+    path = os.path.abspath(os.path.join(root, filename))
+    return path if os.path.dirname(path) == root else None
+
+
+def _store_nutrition_image(image_bytes, extension, image_ref=""):
+    root = os.path.join(DB_DIR, "nutrition_images")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    os.chmod(root, 0o700)
+    ref = image_ref or f"nutrition-image:{secrets.token_hex(16)}{extension}"
+    if not ref.endswith(extension):
+        raise ValueError("圖片參照與格式不一致")
+    path = _nutrition_image_path(ref)
+    if not path:
+        raise RuntimeError("無法建立安全的圖片路徑")
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as existing_file:
+                existing_bytes = existing_file.read(10 * 1024 * 1024 + 1)
+            existing_extension, _ = _validate_image_bytes(existing_bytes)
+            if existing_extension == extension:
+                return ref
+        except (OSError, ValueError):
+            pass
+    temp_path = f"{path}.{secrets.token_hex(8)}.tmp"
+    fd = None
+    try:
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as image_file:
+            fd = None
+            image_file.write(image_bytes)
+            image_file.flush()
+            os.fsync(image_file.fileno())
+        os.replace(temp_path, path)
+        try:
+            dir_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+        return ref
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def _delete_nutrition_image(image_ref):
+    path = _nutrition_image_path(image_ref)
+    if not path or not os.path.exists(path):
+        return True
+    try:
+        os.remove(path)
+        return True
+    except OSError as exc:
+        print(f"⚠️ 刪除營養圖片失敗，保留參照供下次重試：{exc}")
+        return False
+
+
+def _queue_nutrition_outbox(conn, entity_type, entity_id):
+    now = tw_now().isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO nutrition_sheet_outbox
+           (outbox_id, entity_type, entity_id, status, attempts, last_error,
+            claimed_at, lease_owner, resync_required, created_at, synced_at)
+           VALUES (?, ?, ?, 'pending', 0, '', '', '', 0, ?, '')
+           ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+             status=CASE WHEN status='processing' THEN status ELSE 'pending' END,
+             resync_required=CASE WHEN status='processing' THEN 1 ELSE resync_required END,
+             claimed_at=CASE WHEN status='processing' THEN claimed_at ELSE '' END,
+             lease_owner=CASE WHEN status='processing' THEN lease_owner ELSE '' END,
+             synced_at=CASE WHEN status='processing' THEN synced_at ELSE '' END""",
+        (f"outbox_{secrets.token_hex(8)}", entity_type, entity_id, now),
+    )
+
+
+def cleanup_nutrition_images():
+    """刪除成功後才清除參照；失敗的檔案會在下一輪再次嘗試。"""
+    image_root = os.path.join(DB_DIR, "nutrition_images")
+    if os.path.isdir(image_root):
+        for filename in os.listdir(image_root):
+            temp_path = os.path.join(image_root, filename)
+            if not filename.endswith(".tmp") or not os.path.isfile(temp_path):
+                continue
+            try:
+                if tw_now().timestamp() - os.path.getmtime(temp_path) > 3600:
+                    os.remove(temp_path)
+            except OSError:
+                pass
+    now = tw_now().isoformat(timespec="seconds")
+    cutoff = (tw_now() - timedelta(days=90)).isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_nutrition_schema(conn)
+        pending_rows = conn.execute(
+            """SELECT token, source_image_ref FROM pending_nutrition_logs
+               WHERE source_image_ref<>'' AND (
+                   (status IN ('pending','expired') AND expires_at<>'' AND expires_at<?)
+                   OR status='cancelled'
+               )""",
+            (now,),
+        ).fetchall()
+        conn.execute(
+            """UPDATE pending_nutrition_logs SET status='expired'
+               WHERE status='pending' AND expires_at<>'' AND expires_at<?""",
+            (now,),
+        )
+        conn.commit()
+    for token, ref in pending_rows:
+        if _delete_nutrition_image(ref):
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE pending_nutrition_logs SET source_image_ref='' WHERE token=? AND source_image_ref=?",
+                    (token, ref),
+                )
+                conn.commit()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        old_logs = conn.execute(
+            """SELECT log_id, food_id, source_image_ref FROM food_logs
+               WHERE created_at<? AND source_image_ref<>''""",
+            (cutoff,),
+        ).fetchall()
+    for log_id, food_id, ref in old_logs:
+        if not _delete_nutrition_image(ref):
+            continue
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE food_logs SET source_image_ref='' WHERE log_id=? AND source_image_ref=?",
+                (log_id, ref),
+            )
+            conn.execute(
+                "UPDATE food_catalog SET original_image_ref='' WHERE food_id=? AND original_image_ref=?",
+                (food_id, ref),
+            )
+            _queue_nutrition_outbox(conn, "food", food_id)
+            _queue_nutrition_outbox(conn, "food_log", log_id)
+            conn.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6107,17 +6739,25 @@ async def callback(request: Request):
 def handle_image_message(event):
     """收到 Garmin 截圖 → GPT-4o Vision 解析 → 寫入 SQLite → 回覆用戶"""
     uid = event.source.user_id
+    message_id = event.message.id
+    if message_id in processed_messages:
+        return
+    if len(processed_messages) >= 1000:
+        processed_messages.clear()
+    processed_messages.add(message_id)
 
     try:
+        cleanup_nutrition_images()
         # Step 1：下載 LINE 圖片原始 binary
-        message_id = event.message.id
         message_content = line_bot_api.get_message_content(message_id)
-        image_bytes = message_content.content  # binary
+        image_bytes = message_content.content
+        extension = _validate_image_bytes(image_bytes)
 
-        # Step 2：轉成 base64（不寫入磁碟，記憶體內處理）
+        # Step 2：轉成 base64（不另建暫存檔）
         import base64
         b64_str = base64.b64encode(image_bytes).decode("utf-8")
-        data_url = f"data:image/jpeg;base64,{b64_str}"
+        mime_type = {".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}[extension]
+        data_url = f"data:{mime_type};base64,{b64_str}"
 
         # Step 3：GPT-4o Vision 解析
         response = client.chat.completions.create(
@@ -6133,34 +6773,34 @@ def handle_image_message(event):
                         {
                             "type": "text",
                             "text": (
-                                "你是一位專業的運動教練數據辨識助理。請從這張 Garmin 運動記錄截圖中，"
-                                "提取所有運動相關數值，不論是中文或英文介面都請正確辨識，並以標準單位回傳。\n\n"
-                                "重要規則：\n"
-                                "1. 如果這張圖不是 Garmin 的運動數據截圖，請回傳：\n"
-                                "   {\"status\": \"error\", \"message\": \"這似乎不是 Garmin 的數據截圖喔！請再確認一次。\"}\n"
-                                "2. 如果是 Garmin 截圖，請以以下 JSON 格式回覆（只回 JSON，不要任何其他文字）：\n"
-                                "{\n"
-                                "  \"status\": \"success\",\n"
-                                "  \"workout_type\": \"跑步\" 或 \"室內自行車\" 或 \"游泳\" 或 \"其他\",\n"
-                                "  \"duration_min\": 數字（分鐘，整數），\n"
-                                "  \"avg_hr\": 數字（bpm），\n"
-                                "  \"max_hr\": 數字（bpm），\n"
-                                "  \"aerobic_te\": 數字（如 2.2），\n"
-                                "  \"anaerobic_te\": 數字（如 0.0），\n"
-                                "  \"primary_benefit\": \"有氧\" 或 \"無氧\" 或 \"節奏\" 或 \"恢復\"，\n"
-                                "  \"load_value\": 數字（運動負荷），\n"
-                                "  \"np_w\": 數字（Normalized Power，瓦，若無請填 0），\n"
-                                "  \"if_value\": 數字（強度係數，如 0.645，若無請填 0），\n"
-                                "  \"tss\": 數字（訓練壓力分數，如 20.5，若無請填 0），\n"
-                                "  \"ftp_w\": 數字（FTP 設定，瓦，若無請填 0）\n"
-                                "}\n"
-                                "3. 只回 JSON，絕對不要加任何前缀文字或 markdown。"
+                                "你是一位專業的圖片資料辨識助理。先判斷圖片類型，再只回傳單一 JSON 物件，不要 markdown。\n\n"
+                                "image_type 只能是 garmin_workout、nutrition_label、food_photo、unknown。\n"
+                                "若是 Garmin 運動截圖，回傳：{\"status\":\"success\",\"image_type\":\"garmin_workout\","
+                                "\"workout_type\":\"跑步/室內自行車/游泳/其他\",\"duration_min\":0,\"avg_hr\":0,"
+                                "\"max_hr\":0,\"aerobic_te\":0,\"anaerobic_te\":0,\"primary_benefit\":\"\","
+                                "\"load_value\":0,\"np_w\":0,\"if_value\":0,\"tss\":0,\"ftp_w\":0}。\n"
+                                "若是包裝食品營養標示，請逐字辨識標示，不可猜測看不到的數值，回傳："
+                                "{\"status\":\"success\",\"image_type\":\"nutrition_label\",\"product_name\":\"\","
+                                "\"brand\":\"\",\"barcode\":\"\",\"package_amount\":0,\"package_unit\":\"g或ml等\","
+                                "\"servings_per_package\":1,\"per_serving\":{\"calories_kcal\":0,\"protein_g\":0,"
+                                "\"fat_g\":0,\"saturated_fat_g\":0,\"trans_fat_g\":0,\"cholesterol_mg\":0,"
+                                "\"carbohydrate_g\":0,\"sugar_g\":0,\"fiber_g\":0,\"sodium_mg\":0},"
+                                "\"per_100\":{\"calories_kcal\":0,\"protein_g\":0,\"fat_g\":0,"
+                                "\"saturated_fat_g\":0,\"trans_fat_g\":0,\"cholesterol_mg\":0,"
+                                "\"carbohydrate_g\":0,\"sugar_g\":0,\"fiber_g\":0,\"sodium_mg\":0},"
+                                "\"observed_at\":\"圖片上明確顯示的ISO時間，沒有則空字串\",\"confidence\":0到1,\"notes\":\"\"}。\n"
+                                "package_amount 必須是整個包裝容量；若只看到每份量，且本包裝含1份，可用每份量。"
+                                "如果數字模糊、缺少品名或缺少包裝/每份容量，回傳 status=error 並用繁體中文 message 說明需補拍哪裡。\n"
+                                "若只有餐盤照片，回傳 {\"status\":\"success\",\"image_type\":\"food_photo\","
+                                "\"message\":\"目前第一版先支援營養標示，請補拍包裝背面的營養標示。\"}。"
+                                "其他圖片回傳 status=error、image_type=unknown 和繁體中文 message。"
                             )
                         }
                     ]
                 }
             ],
-            max_tokens=512
+            response_format={"type": "json_object"},
+            max_tokens=1000
         )
 
         raw = response.choices[0].message.content.strip()
@@ -6172,15 +6812,84 @@ def handle_image_message(event):
         parsed = json.loads(raw)
         del b64_str, data_url  # 立刻釋放記憶體
 
-        # Step 4：檢查是否非 Garmin 截圖
+        # Step 4：依圖片類型分流
+        image_type = parsed.get("image_type", "unknown")
         if parsed.get("status") == "error":
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=parsed.get("message", "無法辨識這張圖片，請上傳 Garmin 運動截圖。"))
+                TextSendMessage(text=parsed.get("message", "無法辨識這張圖片，請確認營養標示或 Garmin 數據是否清楚。"))
             )
             return
 
-        # Step 5：寫入 SQLite
+        if image_type == "nutrition_label":
+            label = normalize_label_payload(parsed)
+            if label["confidence"] < 0.65:
+                raise ValueError("營養標示辨識信心不足，請重新拍攝清楚完整的標示")
+            with sqlite3.connect(DB_PATH) as conn:
+                ensure_nutrition_schema(conn)
+                token = save_pending_label(
+                    conn,
+                    user_id=uid,
+                    payload=label,
+                    source_image_ref="",
+                    source_message_id=str(message_id),
+                    consumed_servings=1,
+                    meal_slot=current_meal_slot(),
+                    # 圖片上的時間只保留作辨識參考，不直接當作食用時間。
+                    consumed_at=tw_now().isoformat(timespec="seconds"),
+                )
+                existing_ref = conn.execute(
+                    "SELECT source_image_ref FROM pending_nutrition_logs WHERE token=?",
+                    (token,),
+                ).fetchone()
+                source_image_ref = existing_ref[0] if existing_ref else ""
+                if not source_image_ref:
+                    proposed_ref = f"nutrition-image:{secrets.token_hex(16)}{extension}"
+                    changed = conn.execute(
+                        """UPDATE pending_nutrition_logs SET source_image_ref=?
+                           WHERE token=? AND source_image_ref=''""",
+                        (proposed_ref, token),
+                    ).rowcount
+                    conn.commit()
+                    if changed == 1:
+                        source_image_ref = proposed_ref
+                    else:
+                        refreshed = conn.execute(
+                            "SELECT source_image_ref FROM pending_nutrition_logs WHERE token=?",
+                            (token,),
+                        ).fetchone()
+                        source_image_ref = refreshed[0] if refreshed else ""
+                if not source_image_ref:
+                    raise RuntimeError("無法保留營養圖片參照")
+                image_path = _nutrition_image_path(source_image_ref)
+                if not image_path or not os.path.exists(image_path):
+                    _store_nutrition_image(image_bytes, extension, source_image_ref)
+            from linebot.models import FlexSendMessage
+            line_bot_api.reply_message(
+                event.reply_token,
+                FlexSendMessage(
+                    alt_text=f"請確認營養標示：{label['product_name']}",
+                    contents=build_label_confirmation_bubble(label, token=token, consumed_servings=1),
+                ),
+            )
+            return
+
+        if image_type == "food_photo":
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=parsed.get("message", "目前第一版先支援營養標示，請補拍包裝背面的營養標示。")),
+            )
+            return
+
+        if image_type != "garmin_workout":
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="目前可辨識 Garmin 運動截圖或包裝食品營養標示，請重新拍攝清楚完整的圖片。"),
+            )
+            return
+        parsed = normalize_garmin_payload(parsed)
+
+        # Step 5：寫入 SQLite（Garmin）
         # 🌟 檢查這個人是不是剛剛選了補登日期？
         if uid in pending_image_date:
             workout_date = pending_image_date[uid] # 取出補登日期 (例如昨天的日期)
@@ -6264,33 +6973,210 @@ def handle_image_message(event):
 
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(reply_lines)))
 
-    except json.JSONDecodeError:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="😵 教練無法解析這張圖片，請再傳一次 Garmin 截圖，或聯繫教練確認。")
-        )
-    except Exception as e:
-        print(f"⚠️ 圖片處理錯誤：{e}")
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"⚠️ 圖片內容驗證失敗：{exc}")
         try:
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=f"⚠️ 系統處理失敗：{str(e)}")
+                TextSendMessage(text="😵 圖片資料無法安全辨識，請重新拍攝清楚完整的營養標示或 Garmin 截圖。")
             )
-        except:
-            pass
+        except Exception:
+            processed_messages.discard(message_id)
+            raise
+    except Exception as exc:
+        processed_messages.discard(message_id)
+        print(f"⚠️ 圖片處理暫時性錯誤，允許 LINE 重送：{exc}")
+        raise
 
 
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
+def _handle_message_impl(event):
     msg_id = event.message.id
-    if msg_id in processed_messages: return 
+    if msg_id in processed_messages:
+        return
+    if len(processed_messages) >= 1000:
+        processed_messages.clear()
     processed_messages.add(msg_id)
-    if len(processed_messages) > 1000: processed_messages.clear()
 
     msg, uid = event.message.text.strip(), event.source.user_id
 
     if uid != ADMIN_UID and is_admin_only_command(msg):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⛔ 這是管理員專用指令，若需要協助請直接留言給客服喔。"))
+        return
+
+    # 營養標示確認流程必須先於 VIP／靜音檢查，確保剛上傳圖片的用戶可完成確認。
+    confirm_match = re.fullmatch(r"確認營養紀錄:([0-9a-f]{12})", msg)
+    if confirm_match:
+        try:
+            token = confirm_match.group(1)
+            with sqlite3.connect(DB_PATH) as conn:
+                ensure_nutrition_schema(conn)
+                pending_context = conn.execute(
+                    "SELECT meal_slot, consumed_at FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+                    (token, uid),
+                ).fetchone()
+            plan_id = ""
+            plan_link_status = "pending"
+            if pending_context:
+                try:
+                    active_plan = get_active_nutrition_target(uid, pending_context[0] or "", pending_context[1] or "")
+                    if active_plan:
+                        plan_id = active_plan["plan_id"]
+                        plan_link_status = "linked"
+                    else:
+                        plan_link_status = "no_plan"
+                except Exception as plan_exc:
+                    print(f"⚠️ 飲食紀錄連結營養計畫失敗，將由排程重試：{plan_exc}")
+            with sqlite3.connect(DB_PATH) as conn:
+                ensure_nutrition_schema(conn)
+                result = confirm_pending_label(
+                    conn, token=token, user_id=uid, plan_id=plan_id,
+                    plan_link_status=plan_link_status,
+                )
+            sync_confirmed_nutrition_to_sheet(result)
+            dashboard_flex = apply_confirmed_nutrition_to_legacy_dashboard(uid, result)
+            if dashboard_flex:
+                line_bot_api.reply_message(event.reply_token, dashboard_flex)
+            else:
+                n = result["log"]["nutrition"]
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=(f"✅ 已記錄並加入你的私人食品庫：{result['food']['product_name']}\n"
+                          f"熱量 {n.get('calories_kcal', 0):g} kcal｜蛋白質 {n.get('protein_g', 0):g}g\n"
+                          "份量代號目前標記為待營養師審核，不會自動污染官方菜單。")
+                ))
+        except Exception as exc:
+            print(f"⚠️ 確認營養紀錄失敗：{exc}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 目前無法確認這筆營養紀錄，請稍後再試或聯繫客服。"))
+        return
+
+    cancel_match = re.fullmatch(r"取消營養紀錄:([0-9a-f]{12})", msg)
+    if cancel_match:
+        image_ref = ""
+        image_deleted = True
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute("SELECT status, source_image_ref FROM pending_nutrition_logs WHERE token=? AND user_id=?", (cancel_match.group(1), uid)).fetchone()
+            if row and row[0] == "pending":
+                image_ref = row[1] or ""
+                image_deleted = _delete_nutrition_image(image_ref) if image_ref else True
+                if image_deleted:
+                    conn.execute("UPDATE pending_nutrition_logs SET status='cancelled', source_image_ref='' WHERE token=? AND user_id=?", (cancel_match.group(1), uid))
+                else:
+                    conn.execute("UPDATE pending_nutrition_logs SET status='cancelled' WHERE token=? AND user_id=?", (cancel_match.group(1), uid))
+                conn.commit()
+                text = "已取消，這筆資料沒有寫入食品庫或飲食紀錄；原圖已排入安全刪除。"
+            else:
+                text = "找不到待取消的紀錄，或這筆已經處理。"
+        if image_ref and not image_deleted:
+            print(f"⚠️ 取消紀錄的圖片將於清理排程重試：{image_ref}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+        return
+
+    modify_match = re.fullmatch(r"修改營養份量:([0-9a-f]{12})", msg)
+    if modify_match:
+        token = modify_match.group(1)
+        try:
+            get_pending_nutrition_label(uid, token)
+            quick = QuickReply(items=[
+                QuickReplyButton(action=MessageAction(label="半份", text=f"設定營養份量:{token}:0.5")),
+                QuickReplyButton(action=MessageAction(label="1份", text=f"設定營養份量:{token}:1")),
+                QuickReplyButton(action=MessageAction(label="1.5份", text=f"設定營養份量:{token}:1.5")),
+                QuickReplyButton(action=MessageAction(label="2份", text=f"設定營養份量:{token}:2")),
+            ])
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請選擇實際吃了幾份：", quick_reply=quick))
+        except Exception as exc:
+            print(f"⚠️ 讀取待修改營養份量失敗：{exc}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 找不到可修改的待確認紀錄，請重新上傳營養標示。"))
+        return
+
+    time_modify_match = re.fullmatch(r"修改營養時間:([0-9a-f]{12})", msg)
+    if time_modify_match:
+        token = time_modify_match.group(1)
+        try:
+            get_pending_nutrition_label(uid, token)
+            quick = QuickReply(items=[
+                QuickReplyButton(action=MessageAction(label="現在", text=f"設定營養時間:{token}:now")),
+                QuickReplyButton(action=MessageAction(label="今天早餐", text=f"設定營養時間:{token}:breakfast")),
+                QuickReplyButton(action=MessageAction(label="今天午餐", text=f"設定營養時間:{token}:lunch")),
+                QuickReplyButton(action=MessageAction(label="今天晚餐", text=f"設定營養時間:{token}:dinner")),
+            ])
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請選擇實際食用時間：", quick_reply=quick))
+        except Exception as exc:
+            print(f"⚠️ 讀取待修改營養時間失敗：{exc}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 找不到可修改的待確認紀錄，請重新上傳營養標示。"))
+        return
+
+    time_set_match = re.fullmatch(r"設定營養時間:([0-9a-f]{12}):(now|breakfast|lunch|dinner)", msg)
+    if time_set_match:
+        token, choice = time_set_match.groups()
+        try:
+            now = tw_now()
+            choices = {
+                "now": (now, current_meal_slot(now)),
+                "breakfast": (now.replace(hour=8, minute=0, second=0, microsecond=0), "早餐"),
+                "lunch": (now.replace(hour=12, minute=0, second=0, microsecond=0), "午餐"),
+                "dinner": (now.replace(hour=18, minute=0, second=0, microsecond=0), "晚餐"),
+            }
+            consumed_time, meal_slot = choices[choice]
+            with sqlite3.connect(DB_PATH) as conn:
+                changed = conn.execute(
+                    "UPDATE pending_nutrition_logs SET consumed_at=?, meal_slot=? WHERE token=? AND user_id=? AND status='pending'",
+                    (consumed_time.isoformat(timespec="seconds"), meal_slot, token, uid),
+                ).rowcount
+                conn.commit()
+            if not changed:
+                raise ValueError("找不到待修改的營養紀錄")
+            label, servings = get_pending_nutrition_label(uid, token)
+            from linebot.models import FlexSendMessage
+            line_bot_api.reply_message(event.reply_token, FlexSendMessage(
+                alt_text=f"請確認營養標示：{label['product_name']}",
+                contents=build_label_confirmation_bubble(label, token=token, consumed_servings=servings),
+            ))
+        except Exception as exc:
+            print(f"⚠️ 修改營養時間失敗：{exc}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 無法修改時間，請重新開啟確認卡或重新上傳營養標示。"))
+        return
+
+    serving_match = re.fullmatch(r"設定營養份量:([0-9a-f]{12}):(0\.5|1|1\.5|2)", msg)
+    if serving_match:
+        token, serving_text = serving_match.groups()
+        try:
+            servings = float(serving_text)
+            with sqlite3.connect(DB_PATH) as conn:
+                changed = conn.execute(
+                    "UPDATE pending_nutrition_logs SET consumed_servings=? WHERE token=? AND user_id=? AND status='pending'",
+                    (servings, token, uid),
+                ).rowcount
+                conn.commit()
+            if not changed:
+                raise ValueError("找不到待修改的營養紀錄")
+            label, _ = get_pending_nutrition_label(uid, token)
+            from linebot.models import FlexSendMessage
+            line_bot_api.reply_message(event.reply_token, FlexSendMessage(
+                alt_text=f"請確認營養標示：{label['product_name']}",
+                contents=build_label_confirmation_bubble(label, token=token, consumed_servings=servings),
+            ))
+        except Exception as exc:
+            print(f"⚠️ 修改營養份量失敗：{exc}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 無法修改份量，請重新開啟確認卡或重新上傳營養標示。"))
+        return
+
+    if msg in ("推薦一日樂食", "營養推薦", "我的營養計畫", "推薦早餐", "推薦午餐", "推薦晚餐"):
+        explicit_meal = {"推薦早餐": "早餐", "推薦午餐": "午餐", "推薦晚餐": "晚餐"}.get(msg, "")
+        try:
+            recommendation = nutrition_menu_recommendations(uid, explicit_meal)
+            if not recommendation:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=("目前還沒有找到今天有效的客製化營養計畫。\n"
+                          "請由營養師在「客製化營養計畫」分頁填入你的 User_ID、星期、餐別與份量目標後，再按一次「推薦一日樂食」。")
+                ))
+            else:
+                from linebot.models import FlexSendMessage
+                line_bot_api.reply_message(event.reply_token, FlexSendMessage(
+                    alt_text="一日樂食個人餐點推薦",
+                    contents=build_nutrition_recommendation_flex(recommendation),
+                ))
+        except Exception as exc:
+            print(f"⚠️ 營養推薦失敗：{exc}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="目前無法計算個人餐點推薦，請稍後再試或聯繫營養師。"))
         return
 
     # ======================================================
@@ -7479,7 +8365,7 @@ def handle_message(event):
             print(f"❌ 安排課表發生錯誤: {e}")
             line_bot_api.push_message(
                 target_user_id, 
-                TextSendMessage(text=f"⚠️ 系統編排課表時發生錯誤，請稍後再試。\n錯誤訊息: {str(e)}")
+                TextSendMessage(text="⚠️ 系統編排課表時發生錯誤，請稍後再試。")
             )
         return # 處理完畢，直接返回
      # 🟢 顧客一般對話 (串接 AI) 🟢
@@ -7491,6 +8377,18 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, meal_flex)
         else:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"{ai_text}\n\n{q_msg}"))
+
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    message_id = str(event.message.id)
+    try:
+        return _handle_message_impl(event)
+    except Exception:
+        processed_messages.discard(message_id)
+        raise
+
+
 # ==========================================
 # 🤖 隱形店長專用函數 (自動化排程任務)
 
