@@ -49,6 +49,19 @@ NUTRIENT_LIMITS = {
     "sodium_mg": 200000,
 }
 
+NUTRIENT_LABELS = {
+    "calories_kcal": "熱量",
+    "protein_g": "蛋白質",
+    "fat_g": "脂肪",
+    "saturated_fat_g": "飽和脂肪",
+    "trans_fat_g": "反式脂肪",
+    "cholesterol_mg": "膽固醇",
+    "carbohydrate_g": "碳水",
+    "sugar_g": "糖",
+    "fiber_g": "膳食纖維",
+    "sodium_mg": "鈉",
+}
+
 
 def _number(
     value: Any, field: str, *, allow_zero: bool = True, max_value: float | None = None
@@ -76,7 +89,9 @@ def _normalize_nutrients(values: Mapping[str, Any] | None) -> dict[str, float]:
     }
 
 
-def normalize_label_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+def normalize_label_payload(
+    payload: Mapping[str, Any], *, require_product_name: bool = True
+) -> dict[str, Any]:
     """驗證並正規化 Vision 回傳的營養標示資料。"""
     if payload.get("status") not in (None, "success"):
         raise ValueError(str(payload.get("message") or "營養標示辨識失敗"))
@@ -84,13 +99,19 @@ def normalize_label_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("圖片不是營養標示")
 
     product_name = str(payload.get("product_name") or "").strip()
-    if not product_name:
+    if require_product_name and not product_name:
         raise ValueError("product_name 不可空白")
+    if len(product_name) > 120:
+        raise ValueError("product_name 過長")
 
     package_amount = _number(
         payload.get("package_amount"), "package_amount", allow_zero=False, max_value=100000
     )
     package_unit = str(payload.get("package_unit") or "").strip().lower()
+    package_unit = {
+        "毫升": "ml", "公撮": "ml", "cc": "ml",
+        "公克": "g", "克": "g", "公斤": "kg", "升": "l",
+    }.get(package_unit, package_unit)
     if package_unit not in {"g", "kg", "ml", "l", "份", "顆", "包", "瓶", "盒"}:
         raise ValueError("package_unit 不支援")
 
@@ -104,13 +125,6 @@ def normalize_label_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         per_serving[key] > 0 for key in ("protein_g", "fat_g", "carbohydrate_g")
     ):
         raise ValueError("營養標示缺少有效的每份熱量或三大營養素")
-    if package_unit in {"g", "ml"} and per_100["calories_kcal"] > 0:
-        serving_amount = package_amount / servings
-        expected = per_100["calories_kcal"] * serving_amount / 100
-        tolerance = max(5.0, per_serving["calories_kcal"] * 0.25)
-        if abs(expected - per_serving["calories_kcal"]) > tolerance:
-            raise ValueError("每份與每100單位的熱量資料不一致，請重新拍攝或人工確認")
-
     return {
         "status": "success",
         "image_type": "nutrition_label",
@@ -125,6 +139,67 @@ def normalize_label_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "observed_at": str(payload.get("observed_at") or "").strip(),
         "confidence": confidence,
         "notes": str(payload.get("notes") or "").strip(),
+    }
+
+
+def nutrition_consistency_warnings(label: Mapping[str, Any]) -> list[str]:
+    unit = str(label.get("package_unit") or "").lower()
+    package_amount = float(label.get("package_amount") or 0)
+    servings = float(label.get("servings_per_package") or 0)
+    per_serving = label.get("per_serving") or {}
+    per_100 = label.get("per_100") or {}
+    warnings = []
+
+    calories = float(per_serving.get("calories_kcal") or 0)
+    macro_calories = (
+        float(per_serving.get("protein_g") or 0) * 4
+        + float(per_serving.get("carbohydrate_g") or 0) * 4
+        + float(per_serving.get("fat_g") or 0) * 9
+    )
+    if calories > 0 and macro_calories > 0:
+        tolerance = max(50.0, calories * 0.25)
+        if abs(calories - macro_calories) > tolerance:
+            warnings.append("calories_kcal")
+
+    if unit not in {"g", "ml", "kg", "l"} or package_amount <= 0 or servings <= 0:
+        return warnings
+    if not any(float(per_100.get(key) or 0) > 0 for key in NUTRIENT_KEYS):
+        return warnings
+    base_amount = package_amount * 1000 if unit in {"kg", "l"} else package_amount
+    serving_amount = base_amount / servings
+    for key in NUTRIENT_KEYS:
+        serving_value = float(per_serving.get(key) or 0)
+        actual_per_100 = float(per_100.get(key) or 0)
+        expected_per_100 = serving_value * 100 / serving_amount
+        if key == "calories_kcal":
+            tolerance = max(1.0, expected_per_100 * 0.08)
+        elif key.endswith("_mg"):
+            tolerance = max(1.0, expected_per_100 * 0.12)
+        else:
+            tolerance = max(0.2, expected_per_100 * 0.12)
+        if abs(actual_per_100 - expected_per_100) > tolerance and key not in warnings:
+            warnings.append(key)
+    return warnings
+
+
+def normalize_product_identity_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if payload.get("status") != "success" or payload.get("image_type") != "product_front":
+        raise ValueError(str(payload.get("message") or "不是有效的商品正面資料"))
+    product_name = str(payload.get("product_name") or "").strip()
+    brand = str(payload.get("brand") or "").strip()
+    barcode = str(payload.get("barcode") or "").strip()
+    if not product_name:
+        raise ValueError("product_name 不可空白")
+    if len(product_name) > 120 or len(brand) > 120 or len(barcode) > 64:
+        raise ValueError("商品識別文字過長")
+    confidence = _number(payload.get("confidence", 0), "confidence", max_value=1.0)
+    return {
+        "status": "success",
+        "image_type": "product_front",
+        "product_name": product_name,
+        "brand": brand,
+        "barcode": barcode,
+        "confidence": confidence,
     }
 
 
@@ -260,6 +335,18 @@ def build_label_confirmation_bubble(
         {"type": "text", "text": f"纖維 {nutrition['fiber_g']:g}g　鈉 {nutrition['sodium_mg']:g}mg", "size": "sm", "color": "#333333", "margin": "sm"},
         {"type": "text", "text": "確認後會加入你的私人食品庫與今日飲食紀錄；營養份量代號需營養師審核。", "size": "xs", "color": "#8A6D3B", "margin": "md", "wrap": True},
     ]
+    warning_fields = nutrition_consistency_warnings(normalized)
+    if warning_fields:
+        warning_text = "、".join(f"{NUTRIENT_LABELS[key]}換算不一致" for key in warning_fields)
+        body.insert(-1, {
+            "type": "text",
+            "text": f"⚠️ {warning_text}，確認前請按『修正營養』。",
+            "size": "sm",
+            "weight": "bold",
+            "color": "#B91C1C",
+            "margin": "md",
+            "wrap": True,
+        })
     return {
         "type": "bubble",
         "size": "mega",
@@ -270,6 +357,10 @@ def build_label_confirmation_bubble(
         "body": {"type": "box", "layout": "vertical", "paddingAll": "18px", "contents": body},
         "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "14px", "contents": [
             {"type": "button", "style": "primary", "color": "#06C755", "height": "sm", "action": {"type": "message", "label": "確認並記錄", "text": f"確認營養紀錄:{token}"}},
+            {"type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
+                {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "message", "label": "修改品名", "text": f"修改營養品名:{token}"}},
+                {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "message", "label": "修正營養", "text": f"修改營養數字:{token}"}},
+            ]},
             {"type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
                 {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "message", "label": "修改份量", "text": f"修改營養份量:{token}"}},
                 {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "message", "label": "修改時間", "text": f"修改營養時間:{token}"}},
@@ -329,8 +420,15 @@ def nutrition_sheet_specs() -> dict[str, dict[str, list[list[Any]] | list[str]]]
 
 def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
     """建立營養功能所需資料表；只新增，不刪除或覆寫既有表。"""
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS nutrition_schema_versions (
+            component TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            applied_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS food_catalog (
             food_id TEXT PRIMARY KEY,
             product_name TEXT NOT NULL,
@@ -409,13 +507,33 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             label_payload_json TEXT NOT NULL,
             source_image_ref TEXT DEFAULT '',
             source_message_id TEXT DEFAULT '',
+            identity_message_id TEXT DEFAULT '',
             consumed_servings REAL NOT NULL DEFAULT 1,
             meal_slot TEXT DEFAULT '',
             consumed_at TEXT DEFAULT '',
             status TEXT NOT NULL DEFAULT 'pending',
             confirmed_log_id TEXT DEFAULT '',
             created_at TEXT NOT NULL,
-            expires_at TEXT DEFAULT ''
+            expires_at TEXT DEFAULT '',
+            retired_at TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS nutrition_input_states (
+            user_id TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            input_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY(token) REFERENCES pending_nutrition_logs(token)
+        );
+
+        CREATE TABLE IF NOT EXISTS nutrition_message_events (
+            message_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            token TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(token) REFERENCES pending_nutrition_logs(token)
         );
 
         CREATE TABLE IF NOT EXISTS nutrition_sheet_outbox (
@@ -440,10 +558,28 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_plan_user_effective ON nutrition_plans(user_id, effective_from);
         """
     )
+    schema_component = "nutrition_system"
+    schema_version = 1
+    version_row = conn.execute(
+        "SELECT version FROM nutrition_schema_versions WHERE component=?",
+        (schema_component,),
+    ).fetchone()
+    if version_row and int(version_row[0]) >= schema_version:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    version_row = conn.execute(
+        "SELECT version FROM nutrition_schema_versions WHERE component=?",
+        (schema_component,),
+    ).fetchone()
+    if version_row and int(version_row[0]) >= schema_version:
+        conn.commit()
+        return
     migrations = {
         "pending_nutrition_logs": {
             "source_message_id": "TEXT DEFAULT ''",
+            "identity_message_id": "TEXT DEFAULT ''",
             "confirmed_log_id": "TEXT DEFAULT ''",
+            "retired_at": "TEXT DEFAULT ''",
         },
         "food_logs": {
             "legacy_applied_at": "TEXT DEFAULT ''",
@@ -493,10 +629,82 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_nutrition_outbox_entity
            ON nutrition_sheet_outbox(entity_type, entity_id)"""
     )
+    # 舊版資料可能在unique index上線前已產生重複LINE message ID；保留最新草稿，
+    # 清除較舊列的冪等鍵，再建立索引，避免部署啟動時migration失敗。
+    duplicate_source_messages = conn.execute(
+        """SELECT user_id,source_message_id FROM pending_nutrition_logs
+           WHERE source_message_id<>'' GROUP BY user_id,source_message_id HAVING COUNT(*)>1"""
+    ).fetchall()
+    for user_id, message_id in duplicate_source_messages:
+        rows = conn.execute(
+            """SELECT rowid FROM pending_nutrition_logs
+               WHERE user_id=? AND source_message_id=?
+               ORDER BY created_at DESC,rowid DESC""",
+            (user_id, message_id),
+        ).fetchall()
+        for (rowid,) in rows[1:]:
+            conn.execute(
+                "UPDATE pending_nutrition_logs SET source_message_id='' WHERE rowid=?",
+                (rowid,),
+            )
+    duplicate_identity_messages = conn.execute(
+        """SELECT identity_message_id FROM pending_nutrition_logs
+           WHERE identity_message_id<>'' GROUP BY identity_message_id HAVING COUNT(*)>1"""
+    ).fetchall()
+    for (message_id,) in duplicate_identity_messages:
+        rows = conn.execute(
+            """SELECT rowid FROM pending_nutrition_logs
+               WHERE identity_message_id=? ORDER BY created_at DESC,rowid DESC""",
+            (message_id,),
+        ).fetchall()
+        for (rowid,) in rows[1:]:
+            conn.execute(
+                "UPDATE pending_nutrition_logs SET identity_message_id='' WHERE rowid=?",
+                (rowid,),
+            )
     conn.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_source_message
            ON pending_nutrition_logs(user_id, source_message_id)
            WHERE source_message_id <> ''"""
+    )
+    duplicate_awaiting_users = conn.execute(
+        """SELECT user_id FROM pending_nutrition_logs
+           WHERE status='awaiting_identity' GROUP BY user_id HAVING COUNT(*) > 1"""
+    ).fetchall()
+    for (user_id,) in duplicate_awaiting_users:
+        rows = conn.execute(
+            """SELECT rowid FROM pending_nutrition_logs
+               WHERE user_id=? AND status='awaiting_identity'
+               ORDER BY created_at DESC, rowid DESC""",
+            (user_id,),
+        ).fetchall()
+        for (rowid,) in rows[1:]:
+            conn.execute(
+                """UPDATE pending_nutrition_logs
+                   SET status='expired',label_payload_json='{}',
+                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+                   WHERE rowid=?""",
+                (datetime.now().astimezone().isoformat(timespec="seconds"), rowid),
+            )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_one_awaiting_identity_per_user
+           ON pending_nutrition_logs(user_id) WHERE status='awaiting_identity'"""
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_identity_message
+           ON pending_nutrition_logs(identity_message_id)
+           WHERE identity_message_id <> ''"""
+    )
+    conn.execute(
+        """INSERT INTO nutrition_schema_versions(component,version,applied_at)
+           VALUES (?,?,?)
+           ON CONFLICT(component) DO UPDATE SET
+             version=excluded.version,applied_at=excluded.applied_at""",
+        (
+            schema_component,
+            schema_version,
+            datetime.now().astimezone().isoformat(timespec="seconds"),
+        ),
     )
     conn.commit()
 
@@ -511,8 +719,10 @@ def save_pending_label(
     consumed_servings: float = 1,
     meal_slot: str = "",
     consumed_at: str = "",
+    allow_missing_identity: bool = False,
 ) -> str:
-    normalized = normalize_label_payload(payload)
+    normalized = normalize_label_payload(payload, require_product_name=not allow_missing_identity)
+    status = "pending" if normalized["product_name"] else "awaiting_identity"
     if source_message_id:
         existing = conn.execute(
             "SELECT token FROM pending_nutrition_logs WHERE user_id=? AND source_message_id=?",
@@ -520,6 +730,10 @@ def save_pending_label(
         ).fetchone()
         if existing:
             return existing[0]
+    if status == "awaiting_identity":
+        active = get_latest_awaiting_identity(conn, user_id=user_id)
+        if active:
+            raise ValueError("已有一筆營養標示等待商品正面，請先完成或取消後再上傳下一項")
     token = uuid.uuid4().hex[:12]
     now_dt = datetime.now().astimezone()
     now = now_dt.isoformat(timespec="seconds")
@@ -531,7 +745,7 @@ def save_pending_label(
             (token, user_id, label_payload_json, source_image_ref, source_message_id,
              consumed_servings, meal_slot, consumed_at, status, confirmed_log_id,
              created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
             """,
             (
                 token,
@@ -542,6 +756,7 @@ def save_pending_label(
                 _number(consumed_servings, "consumed_servings", allow_zero=False, max_value=100),
                 meal_slot,
                 consumed_at or now,
+                status,
                 now,
                 expires_at,
             ),
@@ -556,6 +771,543 @@ def save_pending_label(
             ).fetchone()
             if existing:
                 return existing[0]
+        if status == "awaiting_identity":
+            raise ValueError("已有一筆營養標示等待商品正面，請先完成或取消後再上傳下一項")
+        raise
+
+
+def _pending_is_expired(expires_at: str) -> bool:
+    if not expires_at:
+        return False
+    try:
+        expires = datetime.fromisoformat(expires_at)
+        now = datetime.now(expires.tzinfo) if expires.tzinfo else datetime.now()
+        return expires < now
+    except (TypeError, ValueError):
+        return True
+
+
+def set_nutrition_input_state(
+    conn: sqlite3.Connection, *, user_id: str, token: str, input_type: str
+) -> None:
+    if input_type not in {"name", "nutrient"}:
+        raise ValueError("不支援的營養輸入狀態")
+    row = conn.execute(
+        """SELECT status, expires_at FROM pending_nutrition_logs
+           WHERE token=? AND user_id=?""",
+        (token, user_id),
+    ).fetchone()
+    if not row or row[0] not in {"pending", "awaiting_identity"}:
+        raise ValueError("找不到可修改的營養草稿")
+    if _pending_is_expired(row[1]):
+        conn.execute(
+            """UPDATE pending_nutrition_logs
+               SET status='expired',label_payload_json='{}',
+                   retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+               WHERE token=? AND user_id=?""",
+            (datetime.now().astimezone().isoformat(timespec="seconds"), token, user_id),
+        )
+        conn.commit()
+        raise ValueError("這筆營養草稿已逾時")
+    now_dt = datetime.now().astimezone()
+    now = now_dt.isoformat(timespec="seconds")
+    expires_at = (now_dt + timedelta(minutes=30)).isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO nutrition_input_states (user_id,token,input_type,created_at,expires_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET token=excluded.token,
+             input_type=excluded.input_type, created_at=excluded.created_at,
+             expires_at=excluded.expires_at""",
+        (user_id, token, input_type, now, expires_at),
+    )
+    conn.commit()
+
+
+def get_nutrition_input_state(
+    conn: sqlite3.Connection, *, user_id: str
+) -> dict[str, str] | None:
+    row = conn.execute(
+        "SELECT token,input_type,expires_at FROM nutrition_input_states WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return None
+    token, input_type, expires_at = row
+    pending = conn.execute(
+        "SELECT status,expires_at FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+        (token, user_id),
+    ).fetchone()
+    if (
+        _pending_is_expired(expires_at)
+        or not pending
+        or pending[0] not in {"pending", "awaiting_identity"}
+        or _pending_is_expired(pending[1])
+    ):
+        clear_nutrition_input_state(conn, user_id=user_id)
+        return None
+    return {"token": token, "input_type": input_type}
+
+
+def clear_nutrition_input_state(conn: sqlite3.Connection, *, user_id: str) -> None:
+    conn.execute("DELETE FROM nutrition_input_states WHERE user_id=?", (user_id,))
+    conn.commit()
+
+
+def get_latest_awaiting_identity(
+    conn: sqlite3.Connection, *, user_id: str
+) -> dict[str, Any] | None:
+    rows = conn.execute(
+        """SELECT token, label_payload_json, expires_at FROM pending_nutrition_logs
+           WHERE user_id=? AND status='awaiting_identity'
+           ORDER BY created_at DESC, rowid DESC""",
+        (user_id,),
+    ).fetchall()
+    for token, payload_json, expires_at in rows:
+        if _pending_is_expired(expires_at):
+            conn.execute(
+                """UPDATE pending_nutrition_logs
+                   SET status='expired',label_payload_json='{}',
+                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+                   WHERE token=? AND status='awaiting_identity'""",
+                (datetime.now().astimezone().isoformat(timespec="seconds"), token),
+            )
+            continue
+        conn.commit()
+        return {
+            "token": token,
+            "label": normalize_label_payload(
+                json.loads(payload_json), require_product_name=False
+            ),
+        }
+    conn.commit()
+    return None
+
+
+def _editable_pending_row(
+    conn: sqlite3.Connection, *, user_id: str, token: str
+) -> tuple[dict[str, Any], str]:
+    row = conn.execute(
+        """SELECT label_payload_json, status, expires_at FROM pending_nutrition_logs
+           WHERE token=? AND user_id=?""",
+        (token, user_id),
+    ).fetchone()
+    if not row:
+        raise ValueError("找不到待確認的營養紀錄")
+    payload_json, status, expires_at = row
+    if _pending_is_expired(expires_at):
+        conn.execute(
+            """UPDATE pending_nutrition_logs
+               SET status='expired',label_payload_json='{}',
+                   retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+               WHERE token=? AND user_id=?""",
+            (datetime.now().astimezone().isoformat(timespec="seconds"), token, user_id),
+        )
+        conn.commit()
+        raise ValueError("這筆營養草稿已逾時")
+    if status not in {"pending", "awaiting_identity"}:
+        raise ValueError("這筆營養紀錄已處理")
+    return json.loads(payload_json), status
+
+
+def attach_latest_pending_identity(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    identity: Mapping[str, Any],
+    message_id: str,
+) -> dict[str, Any]:
+    normalized_identity = normalize_product_identity_payload(identity)
+    if normalized_identity["confidence"] < 0.65:
+        raise ValueError("商品正面辨識信心不足")
+    message_id = str(message_id or "").strip()
+    if not message_id or len(message_id) > 255:
+        raise ValueError("商品正面訊息識別碼無效")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        event = conn.execute(
+            "SELECT user_id,event_type,token FROM nutrition_message_events WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+        if event:
+            if event[0] != user_id or event[1] != "product_front":
+                raise ValueError("訊息識別碼已由其他流程使用")
+            row = conn.execute(
+                "SELECT label_payload_json FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+                (event[2], user_id),
+            ).fetchone()
+            if not row:
+                raise ValueError("找不到原商品正面配對結果")
+            label = normalize_label_payload(json.loads(row[0]))
+            conn.commit()
+            return {"token": event[2], "label": label, "replayed": True}
+
+        row = conn.execute(
+            """SELECT token,label_payload_json,expires_at FROM pending_nutrition_logs
+               WHERE user_id=? AND status='awaiting_identity'
+               ORDER BY created_at DESC,rowid DESC LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("找不到等待商品正面的營養草稿")
+        token, payload_json, expires_at = row
+        if _pending_is_expired(expires_at):
+            conn.execute(
+                """UPDATE pending_nutrition_logs
+                   SET status='expired',label_payload_json='{}',
+                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+                   WHERE token=? AND user_id=? AND status='awaiting_identity'""",
+                (datetime.now().astimezone().isoformat(timespec="seconds"), token, user_id),
+            )
+            conn.commit()
+            raise ValueError("這筆營養草稿已逾時")
+        payload = json.loads(payload_json)
+        old_barcode = str(payload.get("barcode") or "").strip()
+        new_barcode = normalized_identity["barcode"]
+        if old_barcode and new_barcode and old_barcode != new_barcode:
+            raise ValueError("商品正面與營養標示條碼不一致")
+        payload.update(
+            product_name=normalized_identity["product_name"],
+            brand=normalized_identity["brand"],
+            barcode=new_barcode or old_barcode,
+        )
+        label = normalize_label_payload(payload)
+        changed = conn.execute(
+            """UPDATE pending_nutrition_logs
+               SET label_payload_json=?,status='pending',identity_message_id=?
+               WHERE token=? AND user_id=? AND status='awaiting_identity'""",
+            (
+                json.dumps(label, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                message_id,
+                token,
+                user_id,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("商品照片配對狀態衝突")
+        conn.execute(
+            """INSERT INTO nutrition_message_events
+               (message_id,user_id,event_type,token,created_at)
+               VALUES (?,?, 'product_front', ?,?)""",
+            (message_id, user_id, token, datetime.now().astimezone().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return {"token": token, "label": label, "replayed": False}
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def apply_nutrition_text_edit(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    message_id: str,
+    product_name: str = "",
+    field: str = "",
+    value: Any = None,
+) -> dict[str, Any]:
+    message_id = str(message_id or "").strip()
+    if not message_id or len(message_id) > 255:
+        raise ValueError("文字訊息識別碼無效")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        event = conn.execute(
+            "SELECT user_id,event_type,token FROM nutrition_message_events WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+        if event:
+            if event[0] != user_id or event[1] != "text_edit":
+                raise ValueError("訊息識別碼已由其他流程使用")
+            row = conn.execute(
+                "SELECT label_payload_json FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+                (event[2], user_id),
+            ).fetchone()
+            if not row:
+                raise ValueError("找不到原營養修改結果")
+            label = normalize_label_payload(json.loads(row[0]))
+            conn.commit()
+            return {"token": event[2], "label": label, "replayed": True}
+
+        state = conn.execute(
+            """SELECT s.token,s.input_type,s.expires_at,p.label_payload_json,p.status,p.expires_at
+               FROM nutrition_input_states s
+               JOIN pending_nutrition_logs p ON p.token=s.token AND p.user_id=s.user_id
+               WHERE s.user_id=?""",
+            (user_id,),
+        ).fetchone()
+        if not state:
+            raise ValueError("找不到等待輸入的營養修改")
+        token, input_type, state_expires, payload_json, status, draft_expires = state
+        if _pending_is_expired(state_expires) or _pending_is_expired(draft_expires):
+            conn.execute("DELETE FROM nutrition_input_states WHERE user_id=?", (user_id,))
+            if _pending_is_expired(draft_expires):
+                conn.execute(
+                    """UPDATE pending_nutrition_logs
+                       SET status='expired',label_payload_json='{}',
+                           retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+                       WHERE token=? AND user_id=? AND status IN ('pending','awaiting_identity')""",
+                    (datetime.now().astimezone().isoformat(timespec="seconds"), token, user_id),
+                )
+            conn.commit()
+            raise ValueError("營養修改已逾時")
+        if status not in {"pending", "awaiting_identity"}:
+            raise ValueError("這筆營養紀錄已處理")
+        payload = json.loads(payload_json)
+        if input_type == "name":
+            name = str(product_name or "").strip()
+            if not name or len(name) > 120:
+                raise ValueError("商品名稱不可空白或超過120字")
+            payload["product_name"] = name
+        elif input_type == "nutrient":
+            if status != "pending" or field not in NUTRIENT_KEYS:
+                raise ValueError("不支援的營養欄位或尚未補上商品名稱")
+            corrected = _number(value, field, max_value=NUTRIENT_LIMITS[field])
+            payload.setdefault("per_serving", {})[field] = corrected
+            package_amount = float(payload.get("package_amount") or 0)
+            servings = float(payload.get("servings_per_package") or 0)
+            unit = str(payload.get("package_unit") or "").lower()
+            base_amount = package_amount * 1000 if unit in {"kg", "l"} else package_amount
+            if unit in {"g", "ml", "kg", "l"} and base_amount > 0 and servings > 0:
+                serving_amount = base_amount / servings
+                payload.setdefault("per_100", {})[field] = round(corrected * 100 / serving_amount, 4)
+        else:
+            raise ValueError("不支援的營養輸入狀態")
+        label = normalize_label_payload(payload)
+        changed = conn.execute(
+            """UPDATE pending_nutrition_logs SET label_payload_json=?,status='pending'
+               WHERE token=? AND user_id=? AND status IN ('pending','awaiting_identity')""",
+            (
+                json.dumps(label, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                token,
+                user_id,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("營養修改狀態衝突")
+        conn.execute("DELETE FROM nutrition_input_states WHERE user_id=?", (user_id,))
+        conn.execute(
+            """INSERT INTO nutrition_message_events
+               (message_id,user_id,event_type,token,created_at)
+               VALUES (?,?, 'text_edit', ?,?)""",
+            (message_id, user_id, token, datetime.now().astimezone().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return {"token": token, "label": label, "replayed": False}
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def update_pending_consumption(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    token: str,
+    consumed_servings: Any = None,
+    meal_slot: str | None = None,
+    consumed_at: str | None = None,
+) -> dict[str, Any]:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        payload, status = _editable_pending_row(conn, user_id=user_id, token=token)
+        if status != "pending":
+            raise ValueError("請先補上商品名稱")
+        updates = []
+        params: list[Any] = []
+        if consumed_servings is not None:
+            updates.append("consumed_servings=?")
+            params.append(
+                _number(consumed_servings, "consumed_servings", allow_zero=False, max_value=100)
+            )
+        if meal_slot is not None:
+            if meal_slot not in {"早餐", "午餐", "晚餐", "點心"}:
+                raise ValueError("meal_slot 不支援")
+            updates.append("meal_slot=?")
+            params.append(meal_slot)
+        if consumed_at is not None:
+            try:
+                datetime.fromisoformat(consumed_at)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("consumed_at 格式錯誤") from exc
+            updates.append("consumed_at=?")
+            params.append(consumed_at)
+        if not updates:
+            row = conn.execute(
+                "SELECT consumed_servings,meal_slot,consumed_at FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+                (token, user_id),
+            ).fetchone()
+            conn.commit()
+            return {
+                "label": normalize_label_payload(payload),
+                "consumed_servings": float(row[0]),
+                "meal_slot": row[1],
+                "consumed_at": row[2],
+            }
+        params.extend([token, user_id])
+        changed = conn.execute(
+            f"UPDATE pending_nutrition_logs SET {', '.join(updates)} WHERE token=? AND user_id=? AND status='pending'",
+            params,
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("營養份量或時間修改狀態衝突")
+        row = conn.execute(
+            "SELECT consumed_servings,meal_slot,consumed_at FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+            (token, user_id),
+        ).fetchone()
+        conn.commit()
+        return {
+            "label": normalize_label_payload(payload),
+            "consumed_servings": float(row[0]),
+            "meal_slot": row[1],
+            "consumed_at": row[2],
+        }
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def cancel_pending_label(
+    conn: sqlite3.Connection, *, user_id: str, token: str
+) -> dict[str, Any]:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        changed = conn.execute(
+            """UPDATE pending_nutrition_logs
+               SET status='cancelled',label_payload_json='{}',
+                   retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+               WHERE token=? AND user_id=? AND status IN ('pending','awaiting_identity')""",
+            (datetime.now().astimezone().isoformat(timespec="seconds"), token, user_id),
+        ).rowcount
+        if changed != 1:
+            conn.commit()
+            return {"cancelled": False, "source_image_ref": ""}
+        row = conn.execute(
+            "SELECT source_image_ref FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+            (token, user_id),
+        ).fetchone()
+        conn.execute("DELETE FROM nutrition_input_states WHERE user_id=? AND token=?", (user_id, token))
+        conn.commit()
+        return {"cancelled": True, "source_image_ref": (row[0] if row else "") or ""}
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def attach_pending_identity(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    token: str,
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized_identity = normalize_product_identity_payload(identity)
+    if normalized_identity["confidence"] < 0.65:
+        raise ValueError("商品正面辨識信心不足")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        payload, status = _editable_pending_row(conn, user_id=user_id, token=token)
+        if status != "awaiting_identity":
+            raise ValueError("這筆草稿目前不需要補商品正面")
+        old_barcode = str(payload.get("barcode") or "").strip()
+        new_barcode = normalized_identity["barcode"]
+        if old_barcode and new_barcode and old_barcode != new_barcode:
+            raise ValueError("商品正面與營養標示條碼不一致")
+        payload.update(
+            product_name=normalized_identity["product_name"],
+            brand=normalized_identity["brand"],
+            barcode=new_barcode or old_barcode,
+        )
+        normalized = normalize_label_payload(payload)
+        changed = conn.execute(
+            """UPDATE pending_nutrition_logs SET label_payload_json=?, status='pending'
+               WHERE token=? AND user_id=? AND status='awaiting_identity'""",
+            (
+                json.dumps(normalized, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                token,
+                user_id,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("商品照片配對狀態衝突")
+        conn.commit()
+        return normalized
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def update_pending_label_name(
+    conn: sqlite3.Connection, *, user_id: str, token: str, product_name: str
+) -> dict[str, Any]:
+    name = str(product_name or "").strip()
+    if not name or len(name) > 120:
+        raise ValueError("商品名稱不可空白或超過120字")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        payload, _ = _editable_pending_row(conn, user_id=user_id, token=token)
+        payload["product_name"] = name
+        normalized = normalize_label_payload(payload)
+        conn.execute(
+            """UPDATE pending_nutrition_logs SET label_payload_json=?, status='pending'
+               WHERE token=? AND user_id=? AND status IN ('pending','awaiting_identity')""",
+            (
+                json.dumps(normalized, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                token,
+                user_id,
+            ),
+        )
+        conn.commit()
+        return normalized
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def update_pending_label_nutrient(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    token: str,
+    field: str,
+    value: Any,
+) -> dict[str, Any]:
+    if field not in NUTRIENT_KEYS:
+        raise ValueError("不支援的營養欄位")
+    corrected = _number(value, field, max_value=NUTRIENT_LIMITS[field])
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        payload, status = _editable_pending_row(conn, user_id=user_id, token=token)
+        if status != "pending":
+            raise ValueError("請先補上商品名稱")
+        payload.setdefault("per_serving", {})[field] = corrected
+        package_amount = float(payload.get("package_amount") or 0)
+        servings = float(payload.get("servings_per_package") or 0)
+        unit = str(payload.get("package_unit") or "").lower()
+        base_amount = package_amount * 1000 if unit in {"kg", "l"} else package_amount
+        if unit in {"g", "ml", "kg", "l"} and base_amount > 0 and servings > 0:
+            serving_amount = base_amount / servings
+            payload.setdefault("per_100", {})[field] = round(corrected * 100 / serving_amount, 4)
+        normalized = normalize_label_payload(payload)
+        conn.execute(
+            """UPDATE pending_nutrition_logs SET label_payload_json=?
+               WHERE token=? AND user_id=? AND status='pending'""",
+            (
+                json.dumps(normalized, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                token,
+                user_id,
+            ),
+        )
+        conn.commit()
+        return normalized
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
         raise
 
 
@@ -615,12 +1367,21 @@ def confirm_pending_label(
         if status != "pending":
             raise ValueError("這筆營養紀錄已處理")
         now = utcish_now()
-        if expires_at and expires_at < now:
-            conn.execute("UPDATE pending_nutrition_logs SET status='expired' WHERE token=?", (token,))
+        if _pending_is_expired(expires_at):
+            conn.execute(
+                """UPDATE pending_nutrition_logs
+                   SET status='expired',label_payload_json='{}',retired_at=?
+                   WHERE token=? AND user_id=? AND status='pending'""",
+                (now, token, user_id),
+            )
             conn.commit()
             raise ValueError("這筆確認已逾時，請重新上傳營養標示")
 
         label = normalize_label_payload(json.loads(payload_json))
+        warning_fields = nutrition_consistency_warnings(label)
+        if warning_fields:
+            names = "、".join(NUTRIENT_LABELS[key] for key in warning_fields)
+            raise ValueError(f"{names}的每份與每100單位換算不一致，請先修正營養數字")
         fingerprint = food_fingerprint(
             label["product_name"], label["brand"], label["package_amount"],
             label["package_unit"], label["per_serving"], barcode=label["barcode"],

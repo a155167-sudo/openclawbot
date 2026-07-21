@@ -1,20 +1,35 @@
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from nutrition_system import (
+    apply_nutrition_text_edit,
+    attach_latest_pending_identity,
+    attach_pending_identity,
     build_label_confirmation_bubble,
+    cancel_pending_label,
     confirm_pending_label,
     daily_consumed_totals,
     ensure_nutrition_schema,
     food_fingerprint,
+    get_latest_awaiting_identity,
+    get_nutrition_input_state,
     normalize_garmin_payload,
     normalize_label_payload,
+    normalize_product_identity_payload,
+    nutrition_consistency_warnings,
     nutrition_sheet_specs,
     rank_menu_candidates,
     remaining_targets,
     save_pending_label,
     scale_nutrition,
+    set_nutrition_input_state,
+    clear_nutrition_input_state,
+    update_pending_label_name,
+    update_pending_label_nutrient,
+    update_pending_consumption,
 )
 
 
@@ -55,6 +70,8 @@ def test_normalize_label_payload_accepts_soy_milk_label():
     assert item["package_amount"] == 375.0
     assert item["per_serving"]["protein_g"] == 19.1
     assert item["per_serving"]["sodium_mg"] == 60.0
+    chinese_unit = normalize_label_payload({**SOY_MILK_PAYLOAD, "package_unit": "毫升"})
+    assert chinese_unit["package_unit"] == "ml"
 
 
 def test_normalize_label_payload_rejects_negative_nutrition():
@@ -103,6 +120,48 @@ def test_ensure_nutrition_schema_creates_required_tables():
     ensure_nutrition_schema(conn)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"food_catalog", "nutrition_plans", "nutrition_plan_slots", "food_logs", "pending_nutrition_logs"} <= tables
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
+    ).fetchone()[0] == 1
+
+
+def test_schema_migration_deduplicates_legacy_line_message_ids_before_unique_indexes():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    first = save_pending_label(
+        conn, user_id="U_DUP", payload=SOY_MILK_PAYLOAD, source_message_id="BACK_A"
+    )
+    second = save_pending_label(
+        conn, user_id="U_DUP", payload=SOY_MILK_PAYLOAD, source_message_id="BACK_B"
+    )
+    conn.execute("DROP INDEX idx_pending_source_message")
+    conn.execute("DROP INDEX idx_pending_identity_message")
+    conn.execute(
+        "UPDATE pending_nutrition_logs SET identity_message_id='FRONT_DUP' WHERE token IN (?,?)",
+        (first, second),
+    )
+    conn.execute(
+        "UPDATE pending_nutrition_logs SET source_message_id='BACK_DUP' WHERE token IN (?,?)",
+        (first, second),
+    )
+    conn.execute(
+        "DELETE FROM nutrition_schema_versions WHERE component='nutrition_system'"
+    )
+    conn.commit()
+    ensure_nutrition_schema(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM pending_nutrition_logs WHERE source_message_id='BACK_DUP'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM pending_nutrition_logs WHERE identity_message_id='FRONT_DUP'"
+    ).fetchone()[0] == 1
+    indexes = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    }
+    assert {"idx_pending_source_message", "idx_pending_identity_message"} <= indexes
 
 
 def test_sheet_specs_include_four_required_tabs_and_exchange_seed_rows():
@@ -190,7 +249,7 @@ def test_daily_consumed_totals_sums_confirmed_logs_only():
     assert totals["protein_g"] == pytest.approx(28.65)
 
 
-def test_rejects_nan_infinity_zero_and_inconsistent_labels():
+def test_rejects_nan_infinity_zero_and_flags_inconsistent_labels():
     for bad in ("nan", "inf", "-inf"):
         payload = {**SOY_MILK_PAYLOAD, "per_serving": {**SOY_MILK_PAYLOAD["per_serving"], "protein_g": bad}}
         with pytest.raises(ValueError):
@@ -199,8 +258,8 @@ def test_rejects_nan_infinity_zero_and_inconsistent_labels():
     with pytest.raises(ValueError, match="營養"):
         normalize_label_payload(zero)
     inconsistent = {**SOY_MILK_PAYLOAD, "per_100": {**SOY_MILK_PAYLOAD["per_100"], "calories_kcal": 500}}
-    with pytest.raises(ValueError, match="每份.*每100"):
-        normalize_label_payload(inconsistent)
+    normalized = normalize_label_payload(inconsistent)
+    assert "calories_kcal" in nutrition_consistency_warnings(normalized)
 
 
 def test_pending_creation_is_idempotent_by_line_message_id_and_confirmation_replay():
@@ -253,3 +312,290 @@ def test_normalize_garmin_payload_rejects_missing_and_out_of_range_values():
         normalize_garmin_payload({"status": "success", "image_type": "garmin_workout", "workout_type": "跑步"})
     with pytest.raises(ValueError):
         normalize_garmin_payload({**valid, "avg_hr": 999})
+
+
+def incomplete_soy_label():
+    return {
+        "status": "success", "image_type": "nutrition_label", "product_name": "", "brand": "",
+        "barcode": "4710126206298", "package_amount": 400, "package_unit": "ml",
+        "servings_per_package": 1,
+        "per_serving": {
+            "calories_kcal": 228, "protein_g": 21.2, "fat_g": 10.9,
+            "saturated_fat_g": 1.7, "trans_fat_g": 0, "cholesterol_mg": 0,
+            "carbohydrate_g": 13.9, "sugar_g": 4.3, "fiber_g": 5.2, "sodium_mg": 48,
+        },
+        "per_100": {
+            "calories_kcal": 57, "protein_g": 5.3, "fat_g": 2.725,
+            "saturated_fat_g": 0.425, "trans_fat_g": 0, "cholesterol_mg": 0,
+            "carbohydrate_g": 3.475, "sugar_g": 1.075, "fiber_g": 1.3, "sodium_mg": 12,
+        },
+        "observed_at": "2026-07-21T20:42:00+08:00", "confidence": 0.9,
+    }
+
+
+def test_missing_identity_draft_pairs_only_with_same_user():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    token = save_pending_label(
+        conn, user_id="U1", payload=incomplete_soy_label(), source_message_id="M_BACK",
+        allow_missing_identity=True,
+    )
+    assert conn.execute("SELECT status FROM pending_nutrition_logs WHERE token=?", (token,)).fetchone()[0] == "awaiting_identity"
+    assert get_latest_awaiting_identity(conn, user_id="U1")["token"] == token
+    assert get_latest_awaiting_identity(conn, user_id="U2") is None
+    with pytest.raises(ValueError):
+        attach_pending_identity(
+            conn, user_id="U2", token=token,
+            identity={"status": "success", "image_type": "product_front", "product_name": "高蛋白豆漿", "brand": "測試品牌", "barcode": "4710126206298", "confidence": 0.98},
+        )
+    label = attach_pending_identity(
+        conn, user_id="U1", token=token,
+        identity={"status": "success", "image_type": "product_front", "product_name": "高蛋白豆漿", "brand": "測試品牌", "barcode": "4710126206298", "confidence": 0.98},
+    )
+    assert label["product_name"] == "高蛋白豆漿"
+    assert label["brand"] == "測試品牌"
+    assert conn.execute("SELECT status FROM pending_nutrition_logs WHERE token=?", (token,)).fetchone()[0] == "pending"
+
+
+def test_expired_identity_draft_cannot_be_paired():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    token = save_pending_label(conn, user_id="U1", payload=incomplete_soy_label(), allow_missing_identity=True)
+    conn.execute("UPDATE pending_nutrition_logs SET expires_at='2000-01-01T00:00:00+08:00' WHERE token=?", (token,))
+    conn.commit()
+    assert get_latest_awaiting_identity(conn, user_id="U1") is None
+    with pytest.raises(ValueError, match="逾時"):
+        attach_pending_identity(
+            conn, user_id="U1", token=token,
+            identity={"status": "success", "image_type": "product_front", "product_name": "豆漿", "confidence": 0.9},
+        )
+
+
+def test_pending_name_and_nutrient_are_editable_before_confirmation():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    payload = {**incomplete_soy_label(), "product_name": "高蛋白豆漿"}
+    token = save_pending_label(conn, user_id="U1", payload=payload)
+    renamed = update_pending_label_name(conn, user_id="U1", token=token, product_name="無加糖高蛋白豆漿")
+    assert renamed["product_name"] == "無加糖高蛋白豆漿"
+    corrected = update_pending_label_nutrient(conn, user_id="U1", token=token, field="sodium_mg", value=48)
+    assert corrected["per_serving"]["sodium_mg"] == 48
+    assert corrected["per_100"]["sodium_mg"] == 12
+    with pytest.raises(ValueError):
+        update_pending_label_nutrient(conn, user_id="U1", token=token, field="caffeine_mg", value=100)
+
+
+def test_product_front_identity_validation_and_confirmation_edit_actions():
+    identity = normalize_product_identity_payload({
+        "status": "success", "image_type": "product_front", "product_name": "Monster Ultra",
+        "brand": "Monster", "barcode": "", "confidence": 0.95,
+    })
+    assert identity["product_name"] == "Monster Ultra"
+    with pytest.raises(ValueError):
+        normalize_product_identity_payload({"status": "success", "image_type": "product_front", "product_name": ""})
+    bubble = build_label_confirmation_bubble(
+        normalize_label_payload({**incomplete_soy_label(), "product_name": "高蛋白豆漿"}),
+        token="abc123", consumed_servings=1,
+    )
+    text = str(bubble)
+    assert "修改營養品名:abc123" in text
+    assert "修改營養數字:abc123" in text
+
+
+def test_nutrition_input_state_is_persistent_owned_and_clearable():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    token = save_pending_label(
+        conn, user_id="U1", payload={**incomplete_soy_label(), "product_name": "高蛋白豆漿"}
+    )
+    set_nutrition_input_state(conn, user_id="U1", token=token, input_type="nutrient")
+    assert get_nutrition_input_state(conn, user_id="U1") == {"token": token, "input_type": "nutrient"}
+    assert get_nutrition_input_state(conn, user_id="U2") is None
+    with pytest.raises(ValueError):
+        set_nutrition_input_state(conn, user_id="U2", token=token, input_type="name")
+    clear_nutrition_input_state(conn, user_id="U1")
+    assert get_nutrition_input_state(conn, user_id="U1") is None
+
+
+def test_expired_nutrition_input_state_is_not_returned():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    token = save_pending_label(
+        conn, user_id="U1", payload={**incomplete_soy_label(), "product_name": "高蛋白豆漿"}
+    )
+    set_nutrition_input_state(conn, user_id="U1", token=token, input_type="name")
+    conn.execute("UPDATE nutrition_input_states SET expires_at='2000-01-01T00:00:00+08:00'")
+    conn.commit()
+    assert get_nutrition_input_state(conn, user_id="U1") is None
+
+
+def test_inconsistent_per_serving_and_per100_blocks_confirmation_until_corrected():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    bad = incomplete_soy_label()
+    bad["product_name"] = "高蛋白豆漿"
+    bad["per_serving"]["sodium_mg"] = 58
+    normalized = normalize_label_payload(bad)
+    assert nutrition_consistency_warnings(normalized) == ["sodium_mg"]
+    token = save_pending_label(conn, user_id="U1", payload=bad)
+    bubble_text = str(build_label_confirmation_bubble(normalized, token=token))
+    assert "鈉換算不一致" in bubble_text
+    with pytest.raises(ValueError, match="換算不一致"):
+        confirm_pending_label(conn, token=token, user_id="U1")
+    corrected = update_pending_label_nutrient(
+        conn, user_id="U1", token=token, field="sodium_mg", value=48
+    )
+    assert nutrition_consistency_warnings(corrected) == []
+    result = confirm_pending_label(conn, token=token, user_id="U1")
+    assert result["log"]["nutrition"]["sodium_mg"] == 48
+
+
+def test_gross_calorie_macro_mismatch_is_editable_but_not_confirmable():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    bad = {**incomplete_soy_label(), "product_name": "高蛋白豆漿"}
+    bad["per_serving"] = {**bad["per_serving"], "calories_kcal": 900}
+    bad["per_100"] = {**bad["per_100"], "calories_kcal": 225}
+    normalized = normalize_label_payload(bad)
+    assert "calories_kcal" in nutrition_consistency_warnings(normalized)
+    token = save_pending_label(conn, user_id="U1", payload=bad)
+    with pytest.raises(ValueError, match="熱量"):
+        confirm_pending_label(conn, token=token, user_id="U1")
+    corrected = update_pending_label_nutrient(
+        conn, user_id="U1", token=token, field="calories_kcal", value=228
+    )
+    assert nutrition_consistency_warnings(corrected) == []
+
+
+def test_only_one_awaiting_identity_draft_per_user():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    first = save_pending_label(
+        conn, user_id="U1", payload=incomplete_soy_label(),
+        source_message_id="BACK_A", allow_missing_identity=True,
+    )
+    with pytest.raises(ValueError, match="等待商品正面"):
+        save_pending_label(
+            conn, user_id="U1", payload=incomplete_soy_label(),
+            source_message_id="BACK_B", allow_missing_identity=True,
+        )
+    assert get_latest_awaiting_identity(conn, user_id="U1")["token"] == first
+
+
+def test_product_front_message_replay_returns_original_token():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    first = save_pending_label(
+        conn, user_id="U1", payload=incomplete_soy_label(),
+        source_message_id="BACK_A", allow_missing_identity=True,
+    )
+    identity = {
+        "status": "success", "image_type": "product_front", "product_name": "高蛋白豆漿",
+        "brand": "測試", "barcode": "4710126206298", "confidence": 0.99,
+    }
+    paired = attach_latest_pending_identity(
+        conn, user_id="U1", identity=identity, message_id="FRONT_A"
+    )
+    assert paired["token"] == first
+    second = save_pending_label(
+        conn, user_id="U1", payload=incomplete_soy_label(),
+        source_message_id="BACK_B", allow_missing_identity=True,
+    )
+    replay = attach_latest_pending_identity(
+        conn, user_id="U1", identity=identity, message_id="FRONT_A"
+    )
+    assert replay["token"] == first
+    assert replay["replayed"] is True
+    assert get_latest_awaiting_identity(conn, user_id="U1")["token"] == second
+
+
+def test_expired_pending_cannot_change_servings_or_time():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    token = save_pending_label(
+        conn, user_id="U1", payload={**incomplete_soy_label(), "product_name": "高蛋白豆漿"}
+    )
+    conn.execute(
+        "UPDATE pending_nutrition_logs SET expires_at='2000-01-01T00:00:00+08:00' WHERE token=?",
+        (token,),
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="逾時"):
+        update_pending_consumption(conn, user_id="U1", token=token, consumed_servings=2)
+    assert conn.execute(
+        "SELECT status,consumed_servings FROM pending_nutrition_logs WHERE token=?", (token,)
+    ).fetchone() == ("expired", 1.0)
+
+
+def test_cancel_cannot_overwrite_confirmed_log():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    token = save_pending_label(
+        conn, user_id="U1", payload={**incomplete_soy_label(), "product_name": "高蛋白豆漿"},
+        source_image_ref="nutrition-image:test.jpg",
+    )
+    confirm_pending_label(conn, token=token, user_id="U1")
+    cancelled = cancel_pending_label(conn, user_id="U1", token=token)
+    assert cancelled["cancelled"] is False
+    assert conn.execute(
+        "SELECT status,source_image_ref FROM pending_nutrition_logs WHERE token=?", (token,)
+    ).fetchone() == ("confirmed", "nutrition-image:test.jpg")
+
+
+def test_confirm_and_cancel_concurrent_connections_have_one_consistent_winner(tmp_path):
+    db = tmp_path / "confirm-cancel-race.db"
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        token = save_pending_label(
+            conn,
+            user_id="U_RACE",
+            payload={**incomplete_soy_label(), "product_name": "高蛋白豆漿"},
+        )
+    barrier = threading.Barrier(2)
+
+    def do_confirm():
+        with sqlite3.connect(db, timeout=10) as conn:
+            ensure_nutrition_schema(conn)
+            barrier.wait()
+            try:
+                confirm_pending_label(conn, token=token, user_id="U_RACE")
+                return True
+            except ValueError:
+                return False
+
+    def do_cancel():
+        with sqlite3.connect(db, timeout=10) as conn:
+            ensure_nutrition_schema(conn)
+            barrier.wait()
+            return cancel_pending_label(conn, user_id="U_RACE", token=token)["cancelled"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        confirm_future = pool.submit(do_confirm)
+        cancel_future = pool.submit(do_cancel)
+        confirm_won = confirm_future.result(timeout=15)
+        cancel_won = cancel_future.result(timeout=15)
+    assert confirm_won != cancel_won
+    with sqlite3.connect(db) as conn:
+        status = conn.execute(
+            "SELECT status FROM pending_nutrition_logs WHERE token=?", (token,)
+        ).fetchone()[0]
+        log_count = conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0]
+    assert (status, log_count) in {("confirmed", 1), ("cancelled", 0)}
+
+
+def test_nutrition_text_edit_message_is_replayable():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    token = save_pending_label(
+        conn, user_id="U1", payload={**incomplete_soy_label(), "product_name": "高蛋白豆漿"}
+    )
+    set_nutrition_input_state(conn, user_id="U1", token=token, input_type="nutrient")
+    first = apply_nutrition_text_edit(
+        conn, user_id="U1", message_id="TEXT_EDIT_1", field="sodium_mg", value=48
+    )
+    replay = apply_nutrition_text_edit(
+        conn, user_id="U1", message_id="TEXT_EDIT_1", field="sodium_mg", value=999
+    )
+    assert first["token"] == replay["token"] == token
+    assert replay["replayed"] is True
+    assert replay["label"]["per_serving"]["sodium_mg"] == 48

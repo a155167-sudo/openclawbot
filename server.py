@@ -25,16 +25,23 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from nutrition_system import (
+    apply_nutrition_text_edit,
+    attach_latest_pending_identity,
     build_label_confirmation_bubble,
+    cancel_pending_label,
     confirm_pending_label,
     daily_consumed_totals,
     ensure_nutrition_schema,
+    get_nutrition_input_state,
     normalize_garmin_payload,
     normalize_label_payload,
     nutrition_sheet_specs,
     rank_menu_candidates,
     remaining_targets,
     save_pending_label,
+    set_nutrition_input_state,
+    clear_nutrition_input_state,
+    update_pending_consumption,
 )
 
 # --- 1. 時區與基本工具設定 ---
@@ -290,6 +297,16 @@ def get_admin_notify_uid():
     return ADMIN_UID
 
 # 🔥 設定 FastAPI 的生命週期與隱形店長排程
+def register_nutrition_cleanup_job(scheduler):
+    scheduler.add_job(
+        cleanup_nutrition_images,
+        "interval",
+        hours=1,
+        max_instances=1,
+        coalesce=True,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 伺服器啟動時，喚醒隱形店長
@@ -304,7 +321,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(auto_weekly_coach_batch, 'cron', day_of_week='sun', hour=22, minute=5)
     scheduler.add_job(retry_pending_nutrition_plan_links, 'interval', minutes=10, max_instances=1, coalesce=True)
     scheduler.add_job(flush_nutrition_sheet_outbox, 'interval', minutes=10, max_instances=1, coalesce=True)
-    scheduler.add_job(cleanup_nutrition_images, 'cron', hour=3, minute=20, max_instances=1)
+    register_nutrition_cleanup_job(scheduler)
     try:
         retry_pending_nutrition_plan_links()
         flush_nutrition_sheet_outbox()
@@ -6358,10 +6375,8 @@ def apply_confirmed_nutrition_to_legacy_dashboard(user_id, result):
 
 def get_pending_nutrition_label(user_id, token):
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT label_payload_json, consumed_servings, status FROM pending_nutrition_logs WHERE token=? AND user_id=?", (token, user_id)).fetchone()
-    if not row or row[2] != "pending":
-        raise ValueError("找不到待確認的營養紀錄，或這筆已處理。")
-    return normalize_label_payload(json.loads(row[0])), float(row[1])
+        result = update_pending_consumption(conn, user_id=user_id, token=token)
+    return result["label"], result["consumed_servings"]
 
 
 def _sheet_number(row, key):
@@ -6380,6 +6395,100 @@ def current_meal_slot(now=None):
     if hour < 21:
         return "晚餐"
     return "點心"
+
+
+def build_nutrition_vision_prompt():
+    return (
+        "你是一位專業的圖片資料辨識助理。先判斷圖片類型，再只回傳單一 JSON 物件，不要 markdown。\n\n"
+        "image_type 只能是 garmin_workout、nutrition_label、product_front、food_photo、unknown。\n"
+        "若是 Garmin 運動截圖，回傳：{\"status\":\"success\",\"image_type\":\"garmin_workout\","
+        "\"workout_type\":\"跑步/室內自行車/游泳/其他\",\"duration_min\":0,\"avg_hr\":0,"
+        "\"max_hr\":0,\"aerobic_te\":0,\"anaerobic_te\":0,\"primary_benefit\":\"\","
+        "\"load_value\":0,\"np_w\":0,\"if_value\":0,\"tss\":0,\"ftp_w\":0}。\n"
+        "若是包裝食品營養標示，請逐字辨識標示，不可猜測看不到的數值，回傳："
+        "{\"status\":\"success\",\"image_type\":\"nutrition_label\",\"product_name\":\"\","
+        "\"brand\":\"\",\"barcode\":\"\",\"package_amount\":0,\"package_unit\":\"g或ml等\","
+        "\"servings_per_package\":1,\"per_serving\":{\"calories_kcal\":0,\"protein_g\":0,"
+        "\"fat_g\":0,\"saturated_fat_g\":0,\"trans_fat_g\":0,\"cholesterol_mg\":0,"
+        "\"carbohydrate_g\":0,\"sugar_g\":0,\"fiber_g\":0,\"sodium_mg\":0},"
+        "\"per_100\":{\"calories_kcal\":0,\"protein_g\":0,\"fat_g\":0,"
+        "\"saturated_fat_g\":0,\"trans_fat_g\":0,\"cholesterol_mg\":0,"
+        "\"carbohydrate_g\":0,\"sugar_g\":0,\"fiber_g\":0,\"sodium_mg\":0},"
+        "\"observed_at\":\"圖片上明確顯示的ISO時間，沒有則空字串\",\"confidence\":0到1,\"notes\":\"\"}。\n"
+        "package_amount 必須是整個包裝容量；若只看到每份量，且本包裝含1份，可用每份量。"
+        "缺少品名仍回傳 status=success，product_name與brand可留空；不可因缺少品名丟棄已讀到的營養資料。"
+        "只有營養數值或容量模糊到無法安全讀取時，才回傳 status=error 並說明需補拍位置。\n"
+        "若是商品正面、可看到品名但沒有完整營養表，回傳："
+        "{\"status\":\"success\",\"image_type\":\"product_front\",\"product_name\":\"完整品名與口味\","
+        "\"brand\":\"品牌\",\"barcode\":\"看得到才填\",\"confidence\":0到1}。不可猜測看不到的口味。\n"
+        "若只有餐盤照片，回傳 {\"status\":\"success\",\"image_type\":\"food_photo\","
+        "\"message\":\"目前第一版先支援營養標示，請補拍包裝背面的營養標示。\"}。"
+        "其他圖片回傳 status=error、image_type=unknown 和繁體中文 message。"
+    )
+
+
+def stage_nutrition_label(
+    conn, *, user_id, parsed, source_message_id, meal_slot, consumed_at
+):
+    label = normalize_label_payload(parsed, require_product_name=False)
+    if label["confidence"] < 0.65:
+        raise ValueError("營養標示辨識信心不足，請重新拍攝清楚完整的標示")
+    token = save_pending_label(
+        conn,
+        user_id=user_id,
+        payload=label,
+        source_message_id=str(source_message_id or ""),
+        consumed_servings=1,
+        meal_slot=meal_slot,
+        consumed_at=consumed_at,
+        allow_missing_identity=True,
+    )
+    row = conn.execute(
+        "SELECT label_payload_json,status FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+        (token, user_id),
+    ).fetchone()
+    if not row:
+        raise RuntimeError("營養草稿建立失敗")
+    stored_label = normalize_label_payload(
+        json.loads(row[0]), require_product_name=row[1] == "pending"
+    )
+    return {"token": token, "label": stored_label, "needs_identity": row[1] == "awaiting_identity"}
+
+
+def pair_product_front(conn, *, user_id, parsed, source_message_id):
+    return attach_latest_pending_identity(
+        conn,
+        user_id=user_id,
+        identity=parsed,
+        message_id=str(source_message_id or ""),
+    )
+
+
+_NUTRITION_CORRECTION_FIELDS = {
+    "熱量": "calories_kcal",
+    "蛋白質": "protein_g",
+    "脂肪": "fat_g",
+    "飽和脂肪": "saturated_fat_g",
+    "反式脂肪": "trans_fat_g",
+    "膽固醇": "cholesterol_mg",
+    "碳水": "carbohydrate_g",
+    "碳水化合物": "carbohydrate_g",
+    "糖": "sugar_g",
+    "纖維": "fiber_g",
+    "膳食纖維": "fiber_g",
+    "鈉": "sodium_mg",
+}
+
+
+def parse_nutrition_correction_command(text):
+    match = re.fullmatch(
+        r"修正營養\s+(熱量|蛋白質|飽和脂肪|反式脂肪|脂肪|膽固醇|碳水化合物|碳水|膳食纖維|纖維|糖|鈉)\s+([0-9]+(?:\.[0-9]+)?)\s*(?:kcal|mg|g)?",
+        str(text or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return _NUTRITION_CORRECTION_FIELDS[match.group(1)], float(match.group(2))
 
 
 def get_active_nutrition_target(user_id, meal_slot="", target_date=None):
@@ -6682,22 +6791,59 @@ def cleanup_nutrition_images():
                     os.remove(temp_path)
             except OSError:
                 pass
-    now = tw_now().isoformat(timespec="seconds")
-    cutoff = (tw_now() - timedelta(days=90)).isoformat(timespec="seconds")
+    now_dt = tw_now()
+    cutoff = (now_dt - timedelta(days=90)).isoformat(timespec="seconds")
+
+    def is_before(value, reference):
+        if not value:
+            return False
+        try:
+            parsed = datetime.fromisoformat(value)
+            comparable = reference.astimezone(parsed.tzinfo) if parsed.tzinfo else reference.replace(tzinfo=None)
+            return parsed < comparable
+        except (TypeError, ValueError):
+            return True
+
     with sqlite3.connect(DB_PATH) as conn:
         ensure_nutrition_schema(conn)
-        pending_rows = conn.execute(
-            """SELECT token, source_image_ref FROM pending_nutrition_logs
-               WHERE source_image_ref<>'' AND (
-                   (status IN ('pending','expired') AND expires_at<>'' AND expires_at<?)
-                   OR status='cancelled'
-               )""",
-            (now,),
+        candidates = conn.execute(
+            """SELECT token,source_image_ref,status,expires_at,retired_at
+               FROM pending_nutrition_logs
+               WHERE status IN ('pending','awaiting_identity','expired','cancelled')"""
         ).fetchall()
+        pending_rows = []
+        now_text = now_dt.isoformat(timespec="seconds")
+        for token, source_image_ref, status, expires_at, retired_at in candidates:
+            should_retire = status in {"expired", "cancelled"}
+            if status in {"pending", "awaiting_identity"} and is_before(expires_at, now_dt):
+                status = "expired"
+                should_retire = True
+            if not should_retire:
+                continue
+            conn.execute(
+                """UPDATE pending_nutrition_logs
+                   SET status=?,label_payload_json='{}',
+                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+                   WHERE token=?""",
+                (status, now_text, token),
+            )
+            conn.execute("DELETE FROM nutrition_input_states WHERE token=?", (token,))
+            if source_image_ref:
+                pending_rows.append((token, source_image_ref))
+        input_states = conn.execute(
+            "SELECT user_id,expires_at FROM nutrition_input_states"
+        ).fetchall()
+        for state_user_id, state_expires_at in input_states:
+            if is_before(state_expires_at, now_dt):
+                conn.execute(
+                    "DELETE FROM nutrition_input_states WHERE user_id=?", (state_user_id,)
+                )
         conn.execute(
-            """UPDATE pending_nutrition_logs SET status='expired'
-               WHERE status='pending' AND expires_at<>'' AND expires_at<?""",
-            (now,),
+            """DELETE FROM nutrition_input_states
+               WHERE token IN (
+                 SELECT token FROM pending_nutrition_logs
+                 WHERE status NOT IN ('pending','awaiting_identity')
+               )"""
         )
         conn.commit()
     for token, ref in pending_rows:
@@ -6708,6 +6854,35 @@ def cleanup_nutrition_images():
                     (token, ref),
                 )
                 conn.commit()
+
+    event_cutoff = now_dt - timedelta(days=30)
+    # event以token外鍵連到草稿；最小tombstone須與event同保留30天，
+    # 不能先刪父列而連帶提早移除尚未到期的冪等證據。
+    tombstone_cutoff = event_cutoff
+    with sqlite3.connect(DB_PATH) as conn:
+        for message_id, created_at in conn.execute(
+            "SELECT message_id,created_at FROM nutrition_message_events"
+        ).fetchall():
+            if is_before(created_at, event_cutoff):
+                conn.execute(
+                    "DELETE FROM nutrition_message_events WHERE message_id=?", (message_id,)
+                )
+        tombstones = conn.execute(
+            """SELECT token,retired_at,source_image_ref FROM pending_nutrition_logs
+               WHERE status IN ('expired','cancelled')"""
+        ).fetchall()
+        for token, retired_at, source_image_ref in tombstones:
+            has_retained_events = conn.execute(
+                "SELECT 1 FROM nutrition_message_events WHERE token=? LIMIT 1", (token,)
+            ).fetchone()
+            if (
+                not source_image_ref
+                and not has_retained_events
+                and is_before(retired_at, tombstone_cutoff)
+            ):
+                conn.execute("DELETE FROM nutrition_input_states WHERE token=?", (token,))
+                conn.execute("DELETE FROM pending_nutrition_logs WHERE token=?", (token,))
+        conn.commit()
 
     with sqlite3.connect(DB_PATH) as conn:
         old_logs = conn.execute(
@@ -6772,35 +6947,13 @@ def handle_image_message(event):
                         },
                         {
                             "type": "text",
-                            "text": (
-                                "你是一位專業的圖片資料辨識助理。先判斷圖片類型，再只回傳單一 JSON 物件，不要 markdown。\n\n"
-                                "image_type 只能是 garmin_workout、nutrition_label、food_photo、unknown。\n"
-                                "若是 Garmin 運動截圖，回傳：{\"status\":\"success\",\"image_type\":\"garmin_workout\","
-                                "\"workout_type\":\"跑步/室內自行車/游泳/其他\",\"duration_min\":0,\"avg_hr\":0,"
-                                "\"max_hr\":0,\"aerobic_te\":0,\"anaerobic_te\":0,\"primary_benefit\":\"\","
-                                "\"load_value\":0,\"np_w\":0,\"if_value\":0,\"tss\":0,\"ftp_w\":0}。\n"
-                                "若是包裝食品營養標示，請逐字辨識標示，不可猜測看不到的數值，回傳："
-                                "{\"status\":\"success\",\"image_type\":\"nutrition_label\",\"product_name\":\"\","
-                                "\"brand\":\"\",\"barcode\":\"\",\"package_amount\":0,\"package_unit\":\"g或ml等\","
-                                "\"servings_per_package\":1,\"per_serving\":{\"calories_kcal\":0,\"protein_g\":0,"
-                                "\"fat_g\":0,\"saturated_fat_g\":0,\"trans_fat_g\":0,\"cholesterol_mg\":0,"
-                                "\"carbohydrate_g\":0,\"sugar_g\":0,\"fiber_g\":0,\"sodium_mg\":0},"
-                                "\"per_100\":{\"calories_kcal\":0,\"protein_g\":0,\"fat_g\":0,"
-                                "\"saturated_fat_g\":0,\"trans_fat_g\":0,\"cholesterol_mg\":0,"
-                                "\"carbohydrate_g\":0,\"sugar_g\":0,\"fiber_g\":0,\"sodium_mg\":0},"
-                                "\"observed_at\":\"圖片上明確顯示的ISO時間，沒有則空字串\",\"confidence\":0到1,\"notes\":\"\"}。\n"
-                                "package_amount 必須是整個包裝容量；若只看到每份量，且本包裝含1份，可用每份量。"
-                                "如果數字模糊、缺少品名或缺少包裝/每份容量，回傳 status=error 並用繁體中文 message 說明需補拍哪裡。\n"
-                                "若只有餐盤照片，回傳 {\"status\":\"success\",\"image_type\":\"food_photo\","
-                                "\"message\":\"目前第一版先支援營養標示，請補拍包裝背面的營養標示。\"}。"
-                                "其他圖片回傳 status=error、image_type=unknown 和繁體中文 message。"
-                            )
+                            "text": build_nutrition_vision_prompt()
                         }
                     ]
                 }
             ],
             response_format={"type": "json_object"},
-            max_tokens=1000
+            max_tokens=1200
         )
 
         raw = response.choices[0].message.content.strip()
@@ -6822,22 +6975,19 @@ def handle_image_message(event):
             return
 
         if image_type == "nutrition_label":
-            label = normalize_label_payload(parsed)
-            if label["confidence"] < 0.65:
-                raise ValueError("營養標示辨識信心不足，請重新拍攝清楚完整的標示")
             with sqlite3.connect(DB_PATH) as conn:
                 ensure_nutrition_schema(conn)
-                token = save_pending_label(
+                staged = stage_nutrition_label(
                     conn,
                     user_id=uid,
-                    payload=label,
-                    source_image_ref="",
+                    parsed=parsed,
                     source_message_id=str(message_id),
-                    consumed_servings=1,
                     meal_slot=current_meal_slot(),
                     # 圖片上的時間只保留作辨識參考，不直接當作食用時間。
                     consumed_at=tw_now().isoformat(timespec="seconds"),
                 )
+                token = staged["token"]
+                label = staged["label"]
                 existing_ref = conn.execute(
                     "SELECT source_image_ref FROM pending_nutrition_logs WHERE token=?",
                     (token,),
@@ -6864,6 +7014,22 @@ def handle_image_message(event):
                 image_path = _nutrition_image_path(source_image_ref)
                 if not image_path or not os.path.exists(image_path):
                     _store_nutrition_image(image_bytes, extension, source_image_ref)
+            if staged["needs_identity"]:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(
+                        text=(
+                            "✅ 已讀到營養標示並暫存。\n"
+                            "請再拍商品正面（要看得到完整品名與口味），我會自動合併成同一筆。\n"
+                            "也可以點「輸入品名」後直接輸入商品名稱。"
+                        ),
+                        quick_reply=QuickReply(items=[
+                            QuickReplyButton(action=MessageAction(label="輸入品名", text=f"修改營養品名:{token}")),
+                            QuickReplyButton(action=MessageAction(label="取消", text=f"取消營養紀錄:{token}")),
+                        ]),
+                    ),
+                )
+                return
             from linebot.models import FlexSendMessage
             line_bot_api.reply_message(
                 event.reply_token,
@@ -6872,6 +7038,33 @@ def handle_image_message(event):
                     contents=build_label_confirmation_bubble(label, token=token, consumed_servings=1),
                 ),
             )
+            return
+
+        if image_type == "product_front":
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    ensure_nutrition_schema(conn)
+                    paired = pair_product_front(
+                        conn,
+                        user_id=uid,
+                        parsed=parsed,
+                        source_message_id=str(message_id),
+                    )
+                from linebot.models import FlexSendMessage
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    FlexSendMessage(
+                        alt_text=f"請確認營養標示：{paired['label']['product_name']}",
+                        contents=build_label_confirmation_bubble(
+                            paired["label"], token=paired["token"], consumed_servings=1
+                        ),
+                    ),
+                )
+            except ValueError as exc:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text=f"⚠️ {exc}。請先上傳商品背面的完整營養標示。"),
+                )
             return
 
         if image_type == "food_photo":
@@ -7004,8 +7197,59 @@ def _handle_message_impl(event):
         return
 
     # 營養標示確認流程必須先於 VIP／靜音檢查，確保剛上傳圖片的用戶可完成確認。
+    name_edit_match = re.fullmatch(r"修改營養品名:([0-9a-f]{12})", msg)
+    if name_edit_match:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                ensure_nutrition_schema(conn)
+                set_nutrition_input_state(
+                    conn, user_id=uid, token=name_edit_match.group(1), input_type="name"
+                )
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請輸入『商品名稱 完整名稱』，例如：商品名稱 無加糖高蛋白豆漿。若不修改請輸入『取消修改』。"),
+            )
+        except Exception as exc:
+            print(f"⚠️ 開啟營養品名修改失敗：{exc}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 找不到可修改的營養草稿，請重新上傳營養標示。"))
+        return
+
+    nutrient_edit_match = re.fullmatch(r"修改營養數字:([0-9a-f]{12})", msg)
+    if nutrient_edit_match:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                ensure_nutrition_schema(conn)
+                set_nutrition_input_state(
+                    conn, user_id=uid, token=nutrient_edit_match.group(1), input_type="nutrient"
+                )
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text=(
+                        "請輸入要修正的『每份』營養，例如：\n"
+                        "鈉 48\n熱量 228\n蛋白質 21.2\n\n"
+                        "可修改：熱量、蛋白質、脂肪、飽和脂肪、反式脂肪、膽固醇、碳水、糖、膳食纖維、鈉。"
+                    )
+                ),
+            )
+        except Exception as exc:
+            print(f"⚠️ 開啟營養數字修改失敗：{exc}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 找不到可修改的營養草稿，請重新上傳營養標示。"))
+        return
+
+    if msg == "取消修改":
+        with sqlite3.connect(DB_PATH) as conn:
+            ensure_nutrition_schema(conn)
+            clear_nutrition_input_state(conn, user_id=uid)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="已取消這次修改；原營養草稿仍保留，可回確認卡繼續操作。"),
+        )
+        return
+
     confirm_match = re.fullmatch(r"確認營養紀錄:([0-9a-f]{12})", msg)
     if confirm_match:
+        confirmation_committed = False
         try:
             token = confirm_match.group(1)
             with sqlite3.connect(DB_PATH) as conn:
@@ -7032,6 +7276,8 @@ def _handle_message_impl(event):
                     conn, token=token, user_id=uid, plan_id=plan_id,
                     plan_link_status=plan_link_status,
                 )
+                confirmation_committed = True
+                clear_nutrition_input_state(conn, user_id=uid)
             sync_confirmed_nutrition_to_sheet(result)
             dashboard_flex = apply_confirmed_nutrition_to_legacy_dashboard(uid, result)
             if dashboard_flex:
@@ -7043,7 +7289,19 @@ def _handle_message_impl(event):
                           f"熱量 {n.get('calories_kcal', 0):g} kcal｜蛋白質 {n.get('protein_g', 0):g}g\n"
                           "份量代號目前標記為待營養師審核，不會自動污染官方菜單。")
                 ))
+        except ValueError as exc:
+            if confirmation_committed:
+                processed_messages.discard(str(msg_id))
+                raise
+            print(f"⚠️ 確認營養紀錄被資料驗證阻擋：{exc}")
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"⚠️ 尚未記錄：{exc}。請回到確認卡按『修正營養』。"),
+            )
         except Exception as exc:
+            if confirmation_committed:
+                processed_messages.discard(str(msg_id))
+                raise
             print(f"⚠️ 確認營養紀錄失敗：{exc}")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 目前無法確認這筆營養紀錄，請稍後再試或聯繫客服。"))
         return
@@ -7053,18 +7311,24 @@ def _handle_message_impl(event):
         image_ref = ""
         image_deleted = True
         with sqlite3.connect(DB_PATH) as conn:
-            row = conn.execute("SELECT status, source_image_ref FROM pending_nutrition_logs WHERE token=? AND user_id=?", (cancel_match.group(1), uid)).fetchone()
-            if row and row[0] == "pending":
-                image_ref = row[1] or ""
-                image_deleted = _delete_nutrition_image(image_ref) if image_ref else True
-                if image_deleted:
-                    conn.execute("UPDATE pending_nutrition_logs SET status='cancelled', source_image_ref='' WHERE token=? AND user_id=?", (cancel_match.group(1), uid))
-                else:
-                    conn.execute("UPDATE pending_nutrition_logs SET status='cancelled' WHERE token=? AND user_id=?", (cancel_match.group(1), uid))
-                conn.commit()
-                text = "已取消，這筆資料沒有寫入食品庫或飲食紀錄；原圖已排入安全刪除。"
-            else:
-                text = "找不到待取消的紀錄，或這筆已經處理。"
+            ensure_nutrition_schema(conn)
+            cancelled = cancel_pending_label(
+                conn, user_id=uid, token=cancel_match.group(1)
+            )
+        if cancelled["cancelled"]:
+            image_ref = cancelled["source_image_ref"]
+            image_deleted = _delete_nutrition_image(image_ref) if image_ref else True
+            if image_ref and image_deleted:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute(
+                        """UPDATE pending_nutrition_logs SET source_image_ref=''
+                           WHERE token=? AND user_id=? AND status='cancelled' AND source_image_ref=?""",
+                        (cancel_match.group(1), uid, image_ref),
+                    )
+                    conn.commit()
+            text = "已取消，這筆資料沒有寫入食品庫或飲食紀錄；原圖已排入安全刪除。"
+        else:
+            text = "找不到待取消的紀錄，或這筆已經處理。"
         if image_ref and not image_deleted:
             print(f"⚠️ 取消紀錄的圖片將於清理排程重試：{image_ref}")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
@@ -7117,14 +7381,16 @@ def _handle_message_impl(event):
             }
             consumed_time, meal_slot = choices[choice]
             with sqlite3.connect(DB_PATH) as conn:
-                changed = conn.execute(
-                    "UPDATE pending_nutrition_logs SET consumed_at=?, meal_slot=? WHERE token=? AND user_id=? AND status='pending'",
-                    (consumed_time.isoformat(timespec="seconds"), meal_slot, token, uid),
-                ).rowcount
-                conn.commit()
-            if not changed:
-                raise ValueError("找不到待修改的營養紀錄")
-            label, servings = get_pending_nutrition_label(uid, token)
+                ensure_nutrition_schema(conn)
+                updated = update_pending_consumption(
+                    conn,
+                    user_id=uid,
+                    token=token,
+                    consumed_at=consumed_time.isoformat(timespec="seconds"),
+                    meal_slot=meal_slot,
+                )
+            label = updated["label"]
+            servings = updated["consumed_servings"]
             from linebot.models import FlexSendMessage
             line_bot_api.reply_message(event.reply_token, FlexSendMessage(
                 alt_text=f"請確認營養標示：{label['product_name']}",
@@ -7141,14 +7407,11 @@ def _handle_message_impl(event):
         try:
             servings = float(serving_text)
             with sqlite3.connect(DB_PATH) as conn:
-                changed = conn.execute(
-                    "UPDATE pending_nutrition_logs SET consumed_servings=? WHERE token=? AND user_id=? AND status='pending'",
-                    (servings, token, uid),
-                ).rowcount
-                conn.commit()
-            if not changed:
-                raise ValueError("找不到待修改的營養紀錄")
-            label, _ = get_pending_nutrition_label(uid, token)
+                ensure_nutrition_schema(conn)
+                updated = update_pending_consumption(
+                    conn, user_id=uid, token=token, consumed_servings=servings
+                )
+            label = updated["label"]
             from linebot.models import FlexSendMessage
             line_bot_api.reply_message(event.reply_token, FlexSendMessage(
                 alt_text=f"請確認營養標示：{label['product_name']}",
@@ -7157,6 +7420,118 @@ def _handle_message_impl(event):
         except Exception as exc:
             print(f"⚠️ 修改營養份量失敗：{exc}")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 無法修改份量，請重新開啟確認卡或重新上傳營養標示。"))
+        return
+
+    # 已完成的營養文字修改若因 LINE 回覆失敗而重送，只重建原確認卡。
+    nutrition_edit_replay = None
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_nutrition_schema(conn)
+        replay_row = conn.execute(
+            """SELECT e.token,p.label_payload_json,p.consumed_servings
+               FROM nutrition_message_events e
+               JOIN pending_nutrition_logs p ON p.token=e.token AND p.user_id=e.user_id
+               WHERE e.message_id=? AND e.user_id=? AND e.event_type='text_edit'""",
+            (str(msg_id), uid),
+        ).fetchone()
+        if replay_row:
+            nutrition_edit_replay = (
+                replay_row[0],
+                normalize_label_payload(json.loads(replay_row[1])),
+                float(replay_row[2]),
+            )
+    if nutrition_edit_replay:
+        token, label, servings = nutrition_edit_replay
+        from linebot.models import FlexSendMessage
+        line_bot_api.reply_message(
+            event.reply_token,
+            FlexSendMessage(
+                alt_text=f"請確認營養標示：{label['product_name']}",
+                contents=build_label_confirmation_bubble(
+                    label, token=token, consumed_servings=servings
+                ),
+            ),
+        )
+        return
+
+    # 「修改品名／修正營養」按鈕後的下一則文字，由 SQLite 狀態綁定到同一用戶與 token。
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_nutrition_schema(conn)
+        nutrition_input_state = get_nutrition_input_state(conn, user_id=uid)
+    if nutrition_input_state:
+        input_type = nutrition_input_state["input_type"]
+        edit_committed = False
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                ensure_nutrition_schema(conn)
+                if input_type == "name":
+                    name_match = re.fullmatch(r"商品名稱\s+(.+)", msg)
+                    if not name_match:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text="請輸入『商品名稱 完整名稱』，例如：商品名稱 無加糖高蛋白豆漿；若不修改請輸入『取消修改』。"),
+                        )
+                        return
+                    edited = apply_nutrition_text_edit(
+                        conn,
+                        user_id=uid,
+                        message_id=str(msg_id),
+                        product_name=name_match.group(1),
+                    )
+                else:
+                    correction = (
+                        parse_nutrition_correction_command(msg)
+                        or parse_nutrition_correction_command(f"修正營養 {msg}")
+                    )
+                    if not correction:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text="格式看不懂，請輸入例如：鈉 48、熱量 228、蛋白質 21.2；若不修改請輸入『取消修改』。"),
+                        )
+                        return
+                    field, value = correction
+                    edited = apply_nutrition_text_edit(
+                        conn,
+                        user_id=uid,
+                        message_id=str(msg_id),
+                        field=field,
+                        value=value,
+                    )
+                edit_committed = True
+                token = edited["token"]
+                label = edited["label"]
+                servings_row = conn.execute(
+                    "SELECT consumed_servings FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+                    (token, uid),
+                ).fetchone()
+                servings = float(servings_row[0]) if servings_row else 1.0
+            from linebot.models import FlexSendMessage
+            line_bot_api.reply_message(
+                event.reply_token,
+                FlexSendMessage(
+                    alt_text=f"請確認營養標示：{label['product_name']}",
+                    contents=build_label_confirmation_bubble(
+                        label, token=token, consumed_servings=servings
+                    ),
+                ),
+            )
+        except ValueError as exc:
+            if edit_committed:
+                processed_messages.discard(str(msg_id))
+                raise
+            print(f"⚠️ 修改營養草稿被資料驗證阻擋：{exc}")
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"⚠️ 無法套用修改：{exc}"),
+            )
+        except Exception as exc:
+            if edit_committed:
+                processed_messages.discard(str(msg_id))
+                raise
+            print(f"⚠️ 修改營養草稿失敗：{exc}")
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="⚠️ 目前無法修改這筆營養草稿，請稍後再試或重新上傳。"),
+            )
         return
 
     if msg in ("推薦一日樂食", "營養推薦", "我的營養計畫", "推薦早餐", "推薦午餐", "推薦晚餐"):
