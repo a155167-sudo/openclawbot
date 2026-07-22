@@ -17,6 +17,7 @@ from nutrition_system import (
     set_nutrition_input_state,
     update_pending_consumption,
 )
+from daily_health_report import ensure_daily_health_schema, get_daily_health_checkin
 
 
 class FakeWorksheet:
@@ -91,6 +92,33 @@ def test_all_day_plan_uses_all_day_consumption(monkeypatch):
     assert plan is not None
     assert plan["meal_slot"] == "全日"
     assert plan["consumption_meal_slot"] == ""
+
+
+def test_daily_target_prefers_all_day_row_over_meal_rows(monkeypatch):
+    rows = [
+        plan_row(plan_id="daily", 餐別="全日", 星期="週二", 主食份=6, 低脂蛋白份=13),
+        plan_row(plan_id="breakfast", 餐別="早餐", 星期="週二", 主食份=3, 低脂蛋白份=4),
+    ]
+    monkeypatch.setattr(server, "_nutrition_ws", lambda _: FakeWorksheet(rows))
+
+    target = server.get_daily_nutrition_target("U1", "2026-07-21")
+
+    assert target["starch_exchange"] == 6
+    assert target["protein_low_exchange"] == 13
+
+
+def test_daily_target_sums_latest_row_for_each_meal_when_no_all_day(monkeypatch):
+    rows = [
+        plan_row(plan_id="breakfast-old", 版本=1, 餐別="早餐", 星期="週二", 主食份=1, 低脂蛋白份=2),
+        plan_row(plan_id="breakfast-new", 版本=2, 餐別="早餐", 星期="週二", 主食份=2, 低脂蛋白份=3),
+        plan_row(plan_id="dinner", 版本=1, 餐別="晚餐", 星期="週二", 主食份=4, 低脂蛋白份=5),
+    ]
+    monkeypatch.setattr(server, "_nutrition_ws", lambda _: FakeWorksheet(rows))
+
+    target = server.get_daily_nutrition_target("U1", "2026-07-21")
+
+    assert target["starch_exchange"] == 6
+    assert target["protein_low_exchange"] == 8
 
 
 def test_legacy_outbox_migration_deduplicates_and_adds_unique_index(tmp_path):
@@ -990,3 +1018,140 @@ def test_food_log_sheet_exports_exchange_only_after_approval(tmp_path, monkeypat
         conn.commit()
     server._sync_food_log_outbox(confirmed["log"]["log_id"])
     assert captured[-1][1][16:24] == [0] * 8
+
+
+def test_jason_health_checkin_is_admin_scoped_and_saved_for_taipei_date(tmp_path, monkeypatch):
+    db = tmp_path / "health-checkin.db"
+    with sqlite3.connect(db) as conn:
+        ensure_daily_health_schema(conn)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "ADMIN_UID", "U_JASON")
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_OTHER")
+    now = datetime(2026, 7, 22, 22, 31, tzinfo=server.TW_TZ)
+    text = "健康回報｜體重70.2｜飲水2500｜排便有｜用藥無｜睡眠00:30-07:15｜品質良好"
+
+    confirmation = server.save_jason_health_checkin("U_JASON", text, now=now)
+
+    assert "2026/07/22" in confirmation
+    with sqlite3.connect(db) as conn:
+        saved = get_daily_health_checkin(
+            conn, user_id="U_JASON", report_date="2026-07-22"
+        )
+    assert saved["water_ml"] == 2500
+    with pytest.raises(PermissionError):
+        server.save_jason_health_checkin("U_OTHER", text, now=now)
+
+
+def test_intervals_global_fallback_is_denied_for_non_jason_uid(monkeypatch):
+    monkeypatch.setattr(server, "ADMIN_UID", "U_JASON")
+    monkeypatch.setenv("INTERVALS_ATHLETE_ID", "jason-athlete")
+    monkeypatch.setenv("INTERVALS_API_KEY", "secret-for-test")
+
+    assert server._jason_intervals_credentials("U_OTHER", "2026-07-22") is None
+
+
+def test_build_jason_daily_health_report_uses_db_plan_and_intervals(tmp_path, monkeypatch):
+    db = tmp_path / "daily-report.db"
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        ensure_daily_health_schema(conn)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "ADMIN_UID", "U_JASON")
+    monkeypatch.setattr(
+        server, "fetch_daily_intervals_summary",
+        lambda _uid, _date: {"items": [], "total_calories": 0, "total_duration_min": 0, "hr_load": 0},
+    )
+    monkeypatch.setattr(
+        server, "get_daily_nutrition_target",
+        lambda _uid, _date: {"starch_exchange": 6, "protein_low_exchange": 13},
+    )
+
+    report = server.build_jason_daily_health_report("U_JASON", "2026-07-22")
+
+    assert "2026/07/22 一日健康日報" in report
+    assert "今日無已確認飲食紀錄" in report
+    assert "主食：0／6｜尚缺6" in report
+    assert "蛋白質食物：0／13｜尚缺13" in report
+    assert "今日運動：無活動紀錄" in report
+    assert "休息日" not in report
+    with pytest.raises(PermissionError):
+        server.build_jason_daily_health_report("U_OTHER", "2026-07-22")
+
+
+def test_scheduled_daily_report_push_is_idempotent(tmp_path, monkeypatch):
+    db = tmp_path / "scheduled-report.db"
+    with sqlite3.connect(db) as conn:
+        ensure_daily_health_schema(conn)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "ADMIN_UID", "U_JASON")
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_OTHER")
+    monkeypatch.setattr(server, "build_jason_daily_health_report", lambda _uid, _date: "REPORT")
+
+    class FakeLineApi:
+        def __init__(self):
+            self.sent = []
+
+        def push_message(self, uid, message, timeout=None):
+            self.sent.append((uid, message.text, timeout))
+
+    fake = FakeLineApi()
+    monkeypatch.setattr(server, "line_bot_api", fake)
+    now = datetime(2026, 7, 22, 23, 30, tzinfo=server.TW_TZ)
+
+    assert server.send_jason_daily_health_report(now=now) is True
+    assert server.send_jason_daily_health_report(now=now) is False
+    assert fake.sent == [("U_JASON", "REPORT", 12)]
+
+
+def test_register_daily_health_jobs_uses_retry_minutes_and_single_instance():
+    jobs = []
+
+    class FakeScheduler:
+        def add_job(self, function, trigger, **kwargs):
+            jobs.append((function, trigger, kwargs))
+
+    server.register_daily_health_jobs(FakeScheduler())
+
+    assert jobs == [
+        (
+            server.send_jason_health_checkin_prompt,
+            "cron",
+            {"hour": 22, "minute": "30,40,50", "max_instances": 1, "coalesce": True},
+        ),
+        (
+            server.send_jason_daily_health_report,
+            "cron",
+            {"hour": 23, "minute": "30,40,50", "max_instances": 1, "coalesce": True},
+        ),
+    ]
+
+
+def test_line_text_handler_saves_checkin_and_supports_manual_report(tmp_path, monkeypatch):
+    db = tmp_path / "health-handler.db"
+    with sqlite3.connect(db) as conn:
+        ensure_daily_health_schema(conn)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "ADMIN_UID", "U_JASON")
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_OTHER")
+    replies = []
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(reply_message=lambda _, message: replies.append(message.text)),
+    )
+    text = "健康回報｜體重70.2｜飲水2500｜排便有｜用藥無｜睡眠00:30-07:15｜品質良好"
+    checkin_event = _text_event("health-checkin", text, user_id="U_JASON")
+    server.processed_messages.discard("health-checkin")
+
+    server._handle_message_impl(checkin_event)
+
+    assert "已更新" in replies[-1]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT water_ml FROM daily_health_checkins").fetchone()[0] == 2500
+
+    monkeypatch.setattr(
+        server, "build_jason_daily_health_report", lambda _uid, _date: "MANUAL REPORT"
+    )
+    report_event = _text_event("health-report", "今日健康日報", user_id="U_JASON")
+    server.processed_messages.discard("health-report")
+    server._handle_message_impl(report_event)
+    assert replies[-1] == "MANUAL REPORT"

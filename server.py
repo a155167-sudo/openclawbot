@@ -33,6 +33,7 @@ from nutrition_system import (
     cancel_pending_label,
     confirm_pending_label,
     daily_consumed_totals,
+    daily_food_summary,
     ensure_nutrition_schema,
     exchange_approval_hash,
     get_nutrition_input_state,
@@ -45,6 +46,16 @@ from nutrition_system import (
     set_nutrition_input_state,
     clear_nutrition_input_state,
     update_pending_consumption,
+)
+from daily_health_report import (
+    claim_daily_delivery,
+    ensure_daily_health_schema,
+    finish_daily_delivery,
+    format_daily_health_report,
+    get_daily_health_checkin,
+    parse_health_checkin,
+    save_daily_health_checkin,
+    summarize_intervals_activities,
 )
 
 # --- 1. 時區與基本工具設定 ---
@@ -299,7 +310,209 @@ def get_admin_notify_uid():
         print(f"⚠️ 讀取管理員通知 UID 失敗，改用預設 ADMIN_UID: {e}")
     return ADMIN_UID
 
+
+HEALTH_CHECKIN_TEMPLATE = (
+    "健康回報｜體重70.2｜飲水2500｜排便有｜用藥無｜"
+    "睡眠00:30-07:15｜品質良好"
+)
+
+
+def get_jason_health_report_uid() -> str:
+    """Return the immutable Jason principal; never follow mutable notification bindings."""
+    return str(ADMIN_UID or "").strip()
+
+
+def save_jason_health_checkin(user_id: str, text: str, *, now=None) -> str:
+    """Validate and upsert Jason's daily manual health fields."""
+    if not get_jason_health_report_uid() or user_id != get_jason_health_report_uid():
+        raise PermissionError("目前只有Jason啟用每日健康日報")
+    current = (now or tw_now()).astimezone(TW_TZ)
+    values = parse_health_checkin(text)
+    report_date = current.date().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_health_schema(conn)
+        save_daily_health_checkin(
+            conn,
+            user_id=user_id,
+            report_date=report_date,
+            values=values,
+            updated_at=current.isoformat(timespec="seconds"),
+        )
+    return (
+        f"✅ 已更新 {current.strftime('%Y/%m/%d')} 健康回報\n"
+        f"體重 {values['weight_kg']:g}kg｜飲水 {values['water_ml']}ml｜"
+        f"排便 {values['bowel_status']}｜用藥 {values['medication']}\n"
+        f"睡眠 {values['sleep_start']}–{values['sleep_end']}（{values['sleep_quality']}）\n\n"
+        "23:30會自動整合飲食、營養計畫與Intervals.icu運動紀錄。"
+    )
+
+
+def _jason_intervals_credentials(user_id: str, report_date: str):
+    """Read Jason's Intervals credentials without logging or returning them to LINE."""
+    if not get_jason_health_report_uid() or user_id != get_jason_health_report_uid():
+        return None
+    try:
+        records = sheet_main.get_all_records() if sheet_main else []
+        candidates = []
+        for row in records:
+            if str(row.get("User_ID", "")).strip() != user_id:
+                continue
+            athlete_id = str(row.get("Intervals_ID", "") or "").strip()
+            api_key = str(row.get("Intervals_API_Key", "") or "").strip()
+            if athlete_id and api_key:
+                row_date = normalize_date_str(row.get("Date", "")).replace("/", "-")
+                candidates.append((row_date == report_date, athlete_id, api_key))
+        if candidates:
+            _exact, athlete_id, api_key = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
+            return athlete_id, api_key
+    except Exception as exc:
+        print(f"⚠️ 讀取Intervals.icu設定失敗：{type(exc).__name__}")
+    athlete_id = os.environ.get("INTERVALS_ATHLETE_ID", "").strip()
+    api_key = os.environ.get("INTERVALS_API_KEY", "").strip()
+    return (athlete_id, api_key) if athlete_id and api_key else None
+
+
+def fetch_daily_intervals_summary(user_id: str, report_date: str):
+    credentials = _jason_intervals_credentials(user_id, report_date)
+    if not credentials:
+        return None
+    athlete_id, api_key = credentials
+    try:
+        response = requests.get(
+            f"https://intervals.icu/api/v1/athlete/{athlete_id}/activities",
+            params={"oldest": report_date, "newest": report_date},
+            auth=("API_KEY", api_key),
+            timeout=12,
+        )
+        if response.status_code != 200:
+            print(f"⚠️ Intervals.icu日報HTTP {response.status_code}")
+            return None
+        activities = response.json()
+        if not isinstance(activities, list):
+            return None
+        return summarize_intervals_activities(activities)
+    except Exception as exc:
+        print(f"⚠️ Intervals.icu日報讀取失敗：{type(exc).__name__}")
+        return None
+
+
+def build_jason_daily_health_report(user_id: str, report_date: str) -> str:
+    if not get_jason_health_report_uid() or user_id != get_jason_health_report_uid():
+        raise PermissionError("目前只有Jason啟用每日健康日報")
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        ensure_nutrition_schema(conn)
+        ensure_daily_health_schema(conn)
+        checkin = get_daily_health_checkin(
+            conn, user_id=user_id, report_date=report_date
+        )
+        food_summary = daily_food_summary(
+            conn, user_id=user_id, date_iso=report_date
+        )
+    try:
+        target = get_daily_nutrition_target(user_id, report_date)
+    except Exception as exc:
+        print(f"⚠️ 每日健康日報讀取營養計畫失敗：{type(exc).__name__}")
+        target = None
+    exercise = fetch_daily_intervals_summary(user_id, report_date)
+    return format_daily_health_report(
+        report_date=report_date,
+        checkin=checkin,
+        foods=food_summary["foods"],
+        totals=food_summary["totals"],
+        target=target,
+        exercise=exercise,
+        pending_reviews=food_summary["pending_reviews"],
+    )
+
+
+def _send_jason_daily_message(kind: str, text_factory, *, now=None) -> bool:
+    current = (now or tw_now()).astimezone(TW_TZ)
+    report_date = current.date().isoformat()
+    user_id = get_jason_health_report_uid()
+    if not user_id:
+        return False
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        ensure_daily_health_schema(conn)
+        claim_token = claim_daily_delivery(
+            conn,
+            user_id=user_id,
+            report_date=report_date,
+            kind=kind,
+            claimed_at=current.isoformat(timespec="seconds"),
+        )
+    if not claim_token:
+        return False
+    try:
+        text = text_factory(user_id, report_date)
+        line_bot_api.push_message(
+            user_id, TextSendMessage(text=text), timeout=12
+        )
+    except Exception as exc:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            ensure_daily_health_schema(conn)
+            finish_daily_delivery(
+                conn,
+                user_id=user_id,
+                report_date=report_date,
+                kind=kind,
+                claim_token=claim_token,
+                sent=False,
+                finished_at=tw_now().isoformat(timespec="seconds"),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        print(f"⚠️ Jason每日健康{kind}推送失敗：{type(exc).__name__}")
+        return False
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        ensure_daily_health_schema(conn)
+        finish_daily_delivery(
+            conn,
+            user_id=user_id,
+            report_date=report_date,
+            kind=kind,
+            claim_token=claim_token,
+            sent=True,
+            finished_at=tw_now().isoformat(timespec="seconds"),
+        )
+    return True
+
+
+def send_jason_health_checkin_prompt(*, now=None) -> bool:
+    def prompt(_user_id, report_date):
+        return (
+            f"🩺 {report_date.replace('-', '/')} 晚間健康回報\n\n"
+            "請複製下列一行、修改數字後直接傳回：\n"
+            f"{HEALTH_CHECKIN_TEMPLATE}\n\n"
+            "排便可填：有／無／NA；品質可填：良好／普通／不佳／NA。"
+        )
+
+    return _send_jason_daily_message("prompt", prompt, now=now)
+
+
+def send_jason_daily_health_report(*, now=None) -> bool:
+    return _send_jason_daily_message(
+        "report", build_jason_daily_health_report, now=now
+    )
+
 # 🔥 設定 FastAPI 的生命週期與隱形店長排程
+def register_daily_health_jobs(scheduler):
+    scheduler.add_job(
+        send_jason_health_checkin_prompt,
+        "cron",
+        hour=22,
+        minute="30,40,50",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        send_jason_daily_health_report,
+        "cron",
+        hour=23,
+        minute="30,40,50",
+        max_instances=1,
+        coalesce=True,
+    )
+
+
 def register_nutrition_cleanup_job(scheduler):
     scheduler.add_job(
         cleanup_nutrition_images,
@@ -322,6 +535,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(auto_expiry_reminder, 'cron', hour=10, minute=0)
     scheduler.add_job(send_subscription_expiry_reminders, 'cron', hour=11, minute=0)
     scheduler.add_job(auto_weekly_coach_batch, 'cron', day_of_week='sun', hour=22, minute=5)
+    register_daily_health_jobs(scheduler)
     scheduler.add_job(retry_pending_nutrition_plan_links, 'interval', minutes=10, max_instances=1, coalesce=True)
     scheduler.add_job(flush_nutrition_sheet_outbox, 'interval', minutes=10, max_instances=1, coalesce=True)
     register_nutrition_cleanup_job(scheduler)
@@ -1542,6 +1756,8 @@ def init_db():
                 pass
         # 營養辨識、客製化計畫與完整飲食紀錄資料表（只新增，不覆寫既有資料）
         ensure_nutrition_schema(conn)
+        # Jason 每日健康回報與23:30日報冪等推送狀態。
+        ensure_daily_health_schema(conn)
 
         # --- 以上結束 ---
 
@@ -6682,6 +6898,108 @@ def parse_nutrition_correction_command(text):
     return _NUTRITION_CORRECTION_FIELDS[match.group(1)], float(match.group(2))
 
 
+def _nutrition_targets_from_plan_row(row):
+    targets = {
+        "calories_kcal": _sheet_number(row, "熱量目標"),
+        "protein_g": _sheet_number(row, "蛋白質目標g"),
+        "fat_g": _sheet_number(row, "脂肪目標g"),
+        "carbohydrate_g": _sheet_number(row, "碳水目標g"),
+        "milk_exchange": _sheet_number(row, "奶份"),
+        "protein_low_exchange": _sheet_number(row, "低脂蛋白份"),
+        "protein_medium_exchange": _sheet_number(row, "中脂蛋白份"),
+        "protein_high_exchange": _sheet_number(row, "高脂蛋白份"),
+        "starch_exchange": _sheet_number(row, "主食份"),
+        "vegetable_exchange": _sheet_number(row, "蔬菜份"),
+        "fruit_exchange": _sheet_number(row, "水果份"),
+        "fat_exchange": _sheet_number(row, "油脂份"),
+    }
+    if str(row.get("蛋白質總份", "")).strip() != "":
+        targets["protein_total_exchange"] = _sheet_number(row, "蛋白質總份")
+    return targets
+
+
+def get_daily_nutrition_target(user_id, target_date):
+    """Prefer an all-day plan; otherwise sum the newest valid row per meal slot."""
+    try:
+        plan_date = datetime.fromisoformat(str(target_date)[:10]).date()
+    except ValueError:
+        return None
+    weekday_names = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
+    weekday = weekday_names[plan_date.weekday()]
+    try:
+        records = _nutrition_ws("客製化營養計畫").get_all_records()
+    except Exception as exc:
+        print(f"⚠️ 讀取全日客製化營養計畫失敗：{type(exc).__name__}")
+        raise RuntimeError("客製化營養計畫暫時無法讀取") from exc
+
+    matching = []
+    for row in records:
+        if not str(row.get("plan_id", "")).strip():
+            continue
+        if str(row.get("User_ID", "")).strip() != user_id:
+            continue
+        if str(row.get("狀態", "active")).strip().lower() not in ("active", "啟用", "有效", ""):
+            continue
+        row_weekday = str(row.get("星期", "")).strip()
+        exact_weekday = row_weekday in (weekday, str(plan_date.weekday() + 1))
+        if row_weekday and not exact_weekday and row_weekday not in ("每日", "全部"):
+            continue
+        start = normalize_date_str(row.get("生效日期", "")).replace("/", "-")
+        end = normalize_date_str(row.get("結束日期", "")).replace("/", "-")
+        if start and start > plan_date.isoformat():
+            continue
+        if end and end < plan_date.isoformat():
+            continue
+        matching.append((exact_weekday, row))
+    if not matching:
+        return None
+
+    def rank(item):
+        exact_weekday, row = item
+        return (
+            1 if exact_weekday else 0,
+            _sheet_number(row, "版本"),
+            normalize_date_str(row.get("生效日期", "")),
+        )
+
+    all_day = [item for item in matching if str(item[1].get("餐別", "")).strip() in ("全日", "每日")]
+    if all_day:
+        return _nutrition_targets_from_plan_row(max(all_day, key=rank)[1])
+
+    best_by_meal = {}
+    for item in matching:
+        meal = str(item[1].get("餐別", "")).strip()
+        if not meal:
+            continue
+        previous = best_by_meal.get(meal)
+        if previous is None or rank(item) > rank(previous):
+            best_by_meal[meal] = item
+    if not best_by_meal:
+        return None
+
+    summed = {}
+    protein_total = 0.0
+    has_explicit_protein_total = False
+    for _exact, row in best_by_meal.values():
+        row_targets = _nutrition_targets_from_plan_row(row)
+        for key, value in row_targets.items():
+            if key != "protein_total_exchange":
+                summed[key] = round(float(summed.get(key, 0)) + float(value or 0), 4)
+        if "protein_total_exchange" in row_targets:
+            has_explicit_protein_total = True
+            protein_total += float(row_targets["protein_total_exchange"] or 0)
+        else:
+            protein_total += sum(
+                float(row_targets.get(key, 0) or 0)
+                for key in (
+                    "protein_low_exchange", "protein_medium_exchange", "protein_high_exchange"
+                )
+            )
+    if has_explicit_protein_total:
+        summed["protein_total_exchange"] = round(protein_total, 4)
+    return summed
+
+
 def get_active_nutrition_target(user_id, meal_slot="", target_date=None):
     """依指定攝取日期取得有效版本；精確星期／餐別優先於萬用列。"""
     meal_slot = meal_slot or current_meal_slot()
@@ -6738,20 +7056,7 @@ def get_active_nutrition_target(user_id, meal_slot="", target_date=None):
     row = matching[0][1]
     row_meal = str(row.get("餐別", "")).strip()
     daily_scope = row_meal in ("全日", "每日")
-    targets = {
-        "calories_kcal": _sheet_number(row, "熱量目標"),
-        "protein_g": _sheet_number(row, "蛋白質目標g"),
-        "fat_g": _sheet_number(row, "脂肪目標g"),
-        "carbohydrate_g": _sheet_number(row, "碳水目標g"),
-        "milk_exchange": _sheet_number(row, "奶份"),
-        "protein_low_exchange": _sheet_number(row, "低脂蛋白份"),
-        "protein_medium_exchange": _sheet_number(row, "中脂蛋白份"),
-        "protein_high_exchange": _sheet_number(row, "高脂蛋白份"),
-        "starch_exchange": _sheet_number(row, "主食份"),
-        "vegetable_exchange": _sheet_number(row, "蔬菜份"),
-        "fruit_exchange": _sheet_number(row, "水果份"),
-        "fat_exchange": _sheet_number(row, "油脂份"),
-    }
+    targets = _nutrition_targets_from_plan_row(row)
     return {
         "plan_id": str(row.get("plan_id", "")).strip(),
         "meal_slot": "全日" if daily_scope else meal_slot,
@@ -7403,6 +7708,39 @@ def _handle_message_impl(event):
     if uid != ADMIN_UID and is_admin_only_command(msg):
         try:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⛔ 這是管理員專用指令，若需要協助請直接留言給客服喔。"))
+        except Exception:
+            processed_messages.discard(msg_id)
+            raise
+        return
+
+    if msg.startswith("健康回報"):
+        try:
+            reply_text = save_jason_health_checkin(uid, msg)
+        except (PermissionError, ValueError) as exc:
+            reply_text = f"⚠️ {exc}\n\n請使用範本：\n{HEALTH_CHECKIN_TEMPLATE}"
+        try:
+            line_bot_api.reply_message(
+                event.reply_token, TextSendMessage(text=reply_text)
+            )
+        except Exception:
+            processed_messages.discard(msg_id)
+            raise
+        return
+
+    if msg in {"今日健康日報", "重新整理今日報告"}:
+        try:
+            if uid != get_jason_health_report_uid():
+                raise PermissionError("目前只有Jason啟用每日健康日報")
+            reply_text = build_jason_daily_health_report(uid, tw_today().isoformat())
+        except PermissionError as exc:
+            reply_text = f"⚠️ {exc}"
+        except Exception as exc:
+            print(f"⚠️ 即時健康日報建立失敗：{type(exc).__name__}")
+            reply_text = "⚠️ 今日健康日報暫時無法建立，請稍後再試。"
+        try:
+            line_bot_api.reply_message(
+                event.reply_token, TextSendMessage(text=reply_text)
+            )
         except Exception:
             processed_messages.discard(msg_id)
             raise

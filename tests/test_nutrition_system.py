@@ -13,6 +13,7 @@ from nutrition_system import (
     cancel_pending_label,
     confirm_pending_label,
     daily_consumed_totals,
+    daily_food_summary,
     ensure_nutrition_schema,
     food_fingerprint,
     get_latest_awaiting_identity,
@@ -402,6 +403,40 @@ def test_daily_consumed_totals_sums_confirmed_logs_only():
     still_pending = daily_consumed_totals(conn, user_id="U_TEST", date_iso="2026-07-19")
     assert still_pending["protein_low_exchange"] == 0.0
     assert still_pending["starch_exchange"] == 0.0
+
+
+def test_daily_food_summary_is_scoped_sorted_and_counts_pending_reviews():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+
+    first_token = save_pending_label(
+        conn, user_id="U_TEST", payload=SOY_MILK_PAYLOAD,
+        consumed_at="2026-07-19T09:05:00+08:00",
+    )
+    first = confirm_pending_label(conn, token=first_token, user_id="U_TEST")
+    approve_food_exchange_suggestion(
+        conn, food_id=first["food"]["food_id"], reviewer="ADMIN"
+    )
+
+    second_payload = {**SOY_MILK_PAYLOAD, "product_name": "另一款無糖豆漿", "package_amount": 400}
+    second_token = save_pending_label(
+        conn, user_id="U_TEST", payload=second_payload,
+        consumed_at="2026-07-19T13:10:00+08:00",
+    )
+    confirm_pending_label(conn, token=second_token, user_id="U_TEST")
+    other_token = save_pending_label(
+        conn, user_id="OTHER", payload=SOY_MILK_PAYLOAD,
+        consumed_at="2026-07-19T08:00:00+08:00",
+    )
+    confirm_pending_label(conn, token=other_token, user_id="OTHER")
+
+    summary = daily_food_summary(conn, user_id="U_TEST", date_iso="2026-07-19")
+
+    assert [item["time"] for item in summary["foods"]] == ["09:05", "13:10"]
+    assert [item["name"] for item in summary["foods"]] == ["無加糖濃豆漿", "另一款無糖豆漿"]
+    assert summary["totals"]["calories_kcal"] == pytest.approx(380.4)
+    assert summary["totals"]["protein_low_exchange"] == pytest.approx(2.73)
+    assert summary["pending_reviews"] == 1
 
 
 def test_approving_exchange_suggestion_preserves_suggestion_and_creates_applied_snapshot():

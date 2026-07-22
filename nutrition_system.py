@@ -1925,6 +1925,74 @@ def daily_consumed_totals(
     return {key: round(value, 4) for key, value in totals.items()}
 
 
+def daily_food_summary(
+    conn: sqlite3.Connection, *, user_id: str, date_iso: str
+) -> dict[str, Any]:
+    """Return confirmed food details plus verified totals for one local consumption date."""
+    rows = conn.execute(
+        """
+        SELECT l.consumed_at,f.product_name,l.nutrition_snapshot_json,
+               l.exchange_approval_id,a.food_fingerprint,a.suggestion_rule_version,
+               a.approved_exchange_json,a.approved_exchange_hash,f.fingerprint,
+               l.approved_exchange_json,l.consumed_servings
+        FROM food_logs l
+        JOIN food_catalog f ON f.food_id=l.food_id
+        LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
+        WHERE l.user_id=? AND substr(l.consumed_at,1,10)=?
+          AND l.confirmation_status='confirmed'
+        ORDER BY l.consumed_at,l.log_id
+        """,
+        (user_id, date_iso),
+    ).fetchall()
+    foods: list[dict[str, Any]] = []
+    pending_reviews = 0
+    for (
+        consumed_at, product_name, nutrition_json, approval_id, approval_fingerprint,
+        rule_version, approved_json, approval_hash, food_fingerprint_value,
+        applied_json, consumed_servings,
+    ) in rows:
+        nutrition = json.loads(nutrition_json or "{}")
+        try:
+            consumed_time = datetime.fromisoformat(str(consumed_at)).strftime("%H:%M")
+        except ValueError:
+            consumed_time = str(consumed_at)[11:16] if len(str(consumed_at)) >= 16 else "--:--"
+        foods.append(
+            {
+                "time": consumed_time,
+                "consumed_at": consumed_at,
+                "name": product_name,
+                "calories_kcal": float(nutrition.get("calories_kcal", 0) or 0),
+                "protein_g": float(nutrition.get("protein_g", 0) or 0),
+            }
+        )
+        valid_approval = False
+        if approval_id and approval_fingerprint and approval_fingerprint == food_fingerprint_value:
+            approved_data = json.loads(approved_json or "{}")
+            expected_hash = exchange_approval_hash(
+                approval_fingerprint, rule_version, approved_data
+            )
+            expected_applied = {
+                key: round(
+                    float(approved_data.get(key, 0) or 0) * float(consumed_servings or 0), 4
+                )
+                for key in EXCHANGE_KEYS
+            }
+            applied_data = json.loads(applied_json or "{}")
+            valid_approval = secrets.compare_digest(
+                str(approval_hash or ""), expected_hash
+            ) and all(
+                abs(float(applied_data.get(key, 0) or 0) - value) <= 0.0001
+                for key, value in expected_applied.items()
+            )
+        if not valid_approval:
+            pending_reviews += 1
+    return {
+        "foods": foods,
+        "totals": daily_consumed_totals(conn, user_id=user_id, date_iso=date_iso),
+        "pending_reviews": pending_reviews,
+    }
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
