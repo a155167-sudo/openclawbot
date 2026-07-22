@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import secrets
 import string
 import csv
+import fcntl
 import random
 import re
 import requests
@@ -26,12 +27,14 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from nutrition_system import (
     apply_nutrition_text_edit,
+    approve_food_exchange_suggestion,
     attach_latest_pending_identity,
     build_label_confirmation_bubble,
     cancel_pending_label,
     confirm_pending_label,
     daily_consumed_totals,
     ensure_nutrition_schema,
+    exchange_approval_hash,
     get_nutrition_input_state,
     normalize_garmin_payload,
     normalize_label_payload,
@@ -234,11 +237,11 @@ pending_subscription_state = {}
 ADMIN_ONLY_EXACT_COMMANDS = {
     "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成", "#發送明日提醒",
     "#測試週報", "#測試晚報", "#生24", "#生48", "#延餐清單", "#待核訂單",
-    "#清空熱量", "#刪除檔案", "#重置", "重置本週", "檢查數據"
+    "#清空熱量", "#刪除檔案", "#重置", "重置本週", "檢查數據", "#待審營養份量"
 }
 ADMIN_ONLY_PREFIXES = (
     "@靜音 ", "@解除靜音 ", "#喚醒AI ", "#上傳點數\n", "#核准延餐 ", "#拒絕延餐 ",
-    "#核准訂單 ", "#拒絕訂單 ", "#開通訂單 "
+    "#核准訂單 ", "#拒絕訂單 ", "#開通訂單 ", "#核准營養份量 "
 )
 
 def is_admin_only_command(msg: str) -> bool:
@@ -4280,7 +4283,7 @@ def build_sport_carousel_flex(user_id: str):
 
     carousel = {"type": "carousel", "contents": [yesterday_bubble, today_bubble, tomorrow_bubble]}
     return FlexSendMessage(alt_text="📅 運動專區", contents=carousel)
-def build_meal_log_flex(logged_name, logged_cal, logged_pro, new_cal, tdee, new_pro, protein_goal):
+def build_meal_log_flex(logged_name, logged_cal, logged_pro, new_cal, tdee, new_pro, protein_goal, exchange_text="", exchange_review_status="pending_review"):
     """Task 2：記錄成功回饋卡"""
     cal_pct  = min(100, round(new_cal / tdee * 100)) if tdee > 0 else 0
     pro_pct  = min(100, round(new_pro / protein_goal * 100)) if protein_goal > 0 else 0
@@ -4355,6 +4358,20 @@ def build_meal_log_flex(logged_name, logged_cal, logged_pro, new_cal, tdee, new_
             ]
         }
     }
+    if exchange_text:
+        exchange_note = (
+            f"正式營養份數：{exchange_text}\n已納入個人計畫"
+            if exchange_review_status == "approved"
+            else f"推算營養份數：{exchange_text}\n待營養師審核，尚未扣入個人計畫"
+        )
+        bubble["body"]["contents"].append({
+            "type": "text",
+            "text": exchange_note,
+            "size": "xs",
+            "color": "#8A6D3B",
+            "margin": "md",
+            "wrap": True,
+        })
     from linebot.models import FlexSendMessage
     return FlexSendMessage(alt_text=f"✅ 已記錄：{logged_name}", contents=bubble)
 
@@ -6209,17 +6226,29 @@ def _upsert_raw_sheet_row(ws, entity_id, row_values):
 def _sync_food_outbox(entity_id):
     with sqlite3.connect(DB_PATH) as conn:
         food = conn.execute("""
-            SELECT food_id, product_name, brand, barcode, source_type, owner_user_id,
+            SELECT f.food_id, product_name, brand, barcode, source_type, owner_user_id,
                    visibility, package_amount, package_unit, servings_per_package,
                    per_serving_json, exchange_json, exchange_review_status,
                    original_image_ref, recognition_confidence, verification_status,
-                   fingerprint, created_at, updated_at
-            FROM food_catalog WHERE food_id=?
+                   fingerprint, created_at, updated_at,
+                   a.approved_exchange_json, a.food_fingerprint,
+                   a.suggestion_rule_version, a.approved_exchange_hash
+            FROM food_catalog f
+            LEFT JOIN food_exchange_approvals a ON a.approval_id=(
+                SELECT approval_id FROM food_exchange_approvals
+                WHERE food_id=f.food_id ORDER BY approved_at DESC LIMIT 1
+            )
+            WHERE f.food_id=?
         """, (entity_id,)).fetchone()
     if not food:
         raise RuntimeError("food outbox entity missing")
     per = json.loads(food[10] or "{}")
-    exch = json.loads(food[11] or "{}")
+    exch = {}
+    if food[12] == "approved" and food[20] and food[20] == food[16]:
+        candidate = json.loads(food[19] or "{}")
+        expected_hash = exchange_approval_hash(food[20], food[21], candidate)
+        if secrets.compare_digest(str(food[22] or ""), expected_hash):
+            exch = candidate
     ws = _nutrition_ws("食品資料庫")
     row_values = [
         food[0], food[1], food[2], food[3], food[4], food[5], food[6],
@@ -6240,14 +6269,38 @@ def _sync_food_log_outbox(entity_id):
         log = conn.execute("""
             SELECT l.log_id, l.user_id, l.food_id, f.product_name, l.consumed_at,
                    l.meal_slot, l.consumed_servings, l.consumed_amount, l.consumed_unit,
-                   l.nutrition_snapshot_json, l.exchange_snapshot_json, l.source_image_ref,
-                   l.plan_id, l.confirmation_status, l.created_at, l.updated_at
-            FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id WHERE l.log_id=?
+                   l.nutrition_snapshot_json, l.approved_exchange_json, l.source_image_ref,
+                   l.plan_id, l.confirmation_status, l.created_at, l.updated_at,
+                   l.exchange_approval_id, a.food_fingerprint, a.suggestion_rule_version,
+                   a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint
+            FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
+            LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
+            WHERE l.log_id=?
         """, (entity_id,)).fetchone()
     if not log:
         raise RuntimeError("food log outbox entity missing")
     nutrition = json.loads(log[9] or "{}")
     exch = json.loads(log[10] or "{}")
+    approval_values = json.loads(log[19] or "{}")
+    approval_valid = bool(log[16] and log[17] and log[17] == log[21])
+    if approval_valid:
+        expected_hash = exchange_approval_hash(log[17], log[18], approval_values)
+        approval_valid = secrets.compare_digest(str(log[20] or ""), expected_hash)
+    if approval_valid:
+        expected_applied = {
+            key: round(float(approval_values.get(key, 0) or 0) * float(log[6] or 0), 4)
+            for key in (
+                "milk_exchange", "protein_low_exchange", "protein_medium_exchange",
+                "protein_high_exchange", "starch_exchange", "vegetable_exchange",
+                "fruit_exchange", "fat_exchange",
+            )
+        }
+        approval_valid = all(
+            abs(float(exch.get(key, 0) or 0) - value) <= 0.0001
+            for key, value in expected_applied.items()
+        )
+    if not approval_valid:
+        exch = {}
     ws = _nutrition_ws("飲食紀錄")
     row_values = [
         log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7], log[8],
@@ -6263,6 +6316,20 @@ def _sync_food_log_outbox(entity_id):
 
 
 def flush_nutrition_sheet_outbox(limit=50):
+    """跨程序鎖定整段外部寫入，避免逾時lease worker以舊資料覆蓋Sheet。"""
+    if not sh:
+        return 0
+    lock_path = f"{DB_PATH}.nutrition-sheet.lock"
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    with open(lock_path, "a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            return _flush_nutrition_sheet_outbox_locked(limit)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _flush_nutrition_sheet_outbox_locked(limit=50):
     """用SQLite lease跨執行緒／worker認領事件，失敗或逾時後可安全重試。"""
     if not sh:
         return 0
@@ -6276,7 +6343,7 @@ def flush_nutrition_sheet_outbox(limit=50):
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """UPDATE nutrition_sheet_outbox
-                   SET status='pending', claimed_at='', lease_owner='', resync_required=0
+                   SET status='pending', claimed_at='', lease_owner=''
                    WHERE status='processing' AND claimed_at<?""",
                 (lease_cutoff,),
             )
@@ -6335,6 +6402,74 @@ def sync_confirmed_nutrition_to_sheet(result):
     return flush_nutrition_sheet_outbox()
 
 
+def format_exchange_summary(exchange):
+    labels = (
+        ("milk_exchange", "奶類"),
+        ("protein_low_exchange", "低脂蛋白"),
+        ("protein_medium_exchange", "中脂蛋白"),
+        ("protein_high_exchange", "高脂蛋白"),
+        ("starch_exchange", "主食"),
+        ("vegetable_exchange", "蔬菜"),
+        ("fruit_exchange", "水果"),
+    )
+    parts = [
+        f"{label_text} {float((exchange or {}).get(key, 0) or 0):g}份"
+        for key, label_text in labels
+        if float((exchange or {}).get(key, 0) or 0) > 0
+    ]
+    return "｜".join(parts) if parts else "目前無法安全推算"
+
+
+
+def handle_exchange_review_admin_command(msg, uid):
+    if uid != ADMIN_UID:
+        raise PermissionError("管理員限定")
+    msg = str(msg or "").strip()
+    if msg == "#待審營養份量":
+        with sqlite3.connect(DB_PATH) as conn:
+            ensure_nutrition_schema(conn)
+            rows = conn.execute(
+                """SELECT food_id,product_name,exchange_json
+                   FROM food_catalog WHERE exchange_review_status='pending_review'
+                   ORDER BY updated_at DESC,rowid DESC LIMIT 10"""
+            ).fetchall()
+        if not rows:
+            return "✅ 目前沒有待審核的營養份量。"
+        lines = [f"🧾 待審營養份量（{len(rows)}筆，最多顯示10筆）"]
+        for index, (food_id, product_name, exchange_json) in enumerate(rows, 1):
+            exchange = json.loads(exchange_json or "{}")
+            lines.extend([
+                f"\n{index}. {product_name}",
+                f"推算：{format_exchange_summary(exchange)}",
+                f"核准：#核准營養份量 {food_id}",
+            ])
+        return "\n".join(lines)
+
+    match = re.fullmatch(r"#核准營養份量\s+(\S{1,80})", msg)
+    if not match:
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_nutrition_schema(conn)
+        result = approve_food_exchange_suggestion(
+            conn, food_id=match.group(1), reviewer=uid
+        )
+    if result["already_approved"]:
+        return (
+            f"ℹ️ {result['product_name']} 的營養份量已經核准。\n"
+            f"正式份數：{format_exchange_summary(result['exchange'])}"
+        )
+    try:
+        flush_nutrition_sheet_outbox()
+    except Exception as exc:
+        print(f"⚠️ 營養份量核准後Sheet同步暫時失敗，已保留outbox：{exc}")
+    return (
+        f"✅ 核准完成：{result['product_name']}\n"
+        f"正式份數：{format_exchange_summary(result['exchange'])}\n"
+        f"更新 {result['updated_logs']} 筆飲食紀錄，已開始納入個人計畫統計。"
+    )
+
+
+
 def apply_confirmed_nutrition_to_legacy_dashboard(user_id, result):
     """兼容既有儀表板，並用 food_logs.legacy_applied_at 保證只累加一次。"""
     consumed_at = str(result["log"].get("consumed_at") or "")
@@ -6370,7 +6505,13 @@ def apply_confirmed_nutrition_to_legacy_dashboard(user_id, result):
         conn.execute("UPDATE food_logs SET legacy_applied_at=? WHERE log_id=?", (applied_at, log_id))
         conn.commit()
     upsert_frequent_food(user_id, result["food"]["product_name"], round(cal), round(pro))
-    return build_meal_log_flex(result["food"]["product_name"], round(cal, 1), round(pro, 1), new_cal, tdee or 2000, new_pro, protein_goal or 100)
+    exchange_text = format_exchange_summary(result["log"].get("exchange") or {})
+    return build_meal_log_flex(
+        result["food"]["product_name"], round(cal, 1), round(pro, 1),
+        new_cal, tdee or 2000, new_pro, protein_goal or 100,
+        exchange_text=exchange_text,
+        exchange_review_status=result["log"].get("exchange_review_status", "pending_review"),
+    )
 
 
 def get_pending_nutrition_label(user_id, token):
@@ -7193,7 +7334,36 @@ def _handle_message_impl(event):
     msg, uid = event.message.text.strip(), event.source.user_id
 
     if uid != ADMIN_UID and is_admin_only_command(msg):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⛔ 這是管理員專用指令，若需要協助請直接留言給客服喔。"))
+        try:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⛔ 這是管理員專用指令，若需要協助請直接留言給客服喔。"))
+        except Exception:
+            processed_messages.discard(msg_id)
+            raise
+        return
+
+    if msg == "#待審營養份量" or msg.startswith("#核准營養份量 "):
+        try:
+            reply_text = handle_exchange_review_admin_command(msg, uid)
+            if reply_text is None:
+                raise ValueError("營養份量管理指令格式錯誤")
+        except (PermissionError, ValueError) as exc:
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text=f"⚠️ {exc}"),
+                )
+            except Exception:
+                processed_messages.discard(msg_id)
+                raise
+            return
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=reply_text),
+            )
+        except Exception:
+            processed_messages.discard(msg_id)
+            raise
         return
 
     # 營養標示確認流程必須先於 VIP／靜音檢查，確保剛上傳圖片的用戶可完成確認。
@@ -7284,10 +7454,17 @@ def _handle_message_impl(event):
                 line_bot_api.reply_message(event.reply_token, dashboard_flex)
             else:
                 n = result["log"]["nutrition"]
+                exchange_text = format_exchange_summary(result["log"].get("exchange") or {})
+                exchange_status = result["log"].get("exchange_review_status", "pending_review")
+                exchange_note = (
+                    f"正式營養份數：{exchange_text}\n油脂份不計；已納入個人計畫。"
+                    if exchange_status == "approved"
+                    else f"推算營養份數：{exchange_text}\n油脂份不計；建議值待營養師審核，尚未扣入個人計畫。"
+                )
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
                     text=(f"✅ 已記錄並加入你的私人食品庫：{result['food']['product_name']}\n"
                           f"熱量 {n.get('calories_kcal', 0):g} kcal｜蛋白質 {n.get('protein_g', 0):g}g\n"
-                          "份量代號目前標記為待營養師審核，不會自動污染官方菜單。")
+                          f"{exchange_note}")
                 ))
         except ValueError as exc:
             if confirmation_committed:

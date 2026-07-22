@@ -6,6 +6,7 @@ import pytest
 
 from nutrition_system import (
     apply_nutrition_text_edit,
+    approve_food_exchange_suggestion,
     attach_latest_pending_identity,
     attach_pending_identity,
     build_label_confirmation_bubble,
@@ -25,6 +26,7 @@ from nutrition_system import (
     remaining_targets,
     save_pending_label,
     scale_nutrition,
+    suggest_exchange_portions,
     set_nutrition_input_state,
     clear_nutrition_input_state,
     update_pending_label_name,
@@ -87,6 +89,68 @@ def test_scale_nutrition_supports_half_package():
     assert scaled["sodium_mg"] == pytest.approx(30.0)
 
 
+def test_suggest_exchange_portions_splits_soy_milk_without_counting_fat_exchange():
+    result = suggest_exchange_portions(
+        product_name="高蛋白無加糖豆漿",
+        nutrition={"calories_kcal": 228, "protein_g": 21.2, "fat_g": 10.9, "carbohydrate_g": 13.9},
+    )
+
+    assert result["categories"] == ["protein", "starch"]
+    assert result["exchanges"] == {
+        "milk_exchange": 0.0,
+        "protein_low_exchange": 3.03,
+        "protein_medium_exchange": 0.0,
+        "protein_high_exchange": 0.0,
+        "starch_exchange": 0.93,
+        "vegetable_exchange": 0.0,
+        "fruit_exchange": 0.0,
+        "fat_exchange": 0.0,
+    }
+    assert result["review_status"] == "pending_review"
+    assert result["rule_version"] == "tw-exchange-v1"
+
+
+def test_suggest_exchange_portions_does_not_create_protein_for_energy_drink():
+    result = suggest_exchange_portions(
+        product_name="Monster 無糖能量飲料",
+        nutrition={"calories_kcal": 11.4, "protein_g": 0, "fat_g": 0, "carbohydrate_g": 2.8},
+    )
+
+    assert result["categories"] == ["starch"]
+    assert result["exchanges"]["starch_exchange"] == 0.19
+    assert result["exchanges"]["protein_low_exchange"] == 0.0
+
+
+def test_suggest_exchange_portions_keeps_milk_carbohydrate_inside_milk_exchange():
+    result = suggest_exchange_portions(
+        product_name="低脂鮮乳",
+        nutrition={"calories_kcal": 120, "protein_g": 8, "fat_g": 4, "carbohydrate_g": 12},
+    )
+
+    assert result["categories"] == ["milk"]
+    assert result["exchanges"]["milk_exchange"] == 1.0
+    assert result["exchanges"]["starch_exchange"] == 0.0
+    assert result["exchanges"]["fat_exchange"] == 0.0
+
+
+def test_suggest_exchange_portions_never_reuses_carbohydrate_across_categories():
+    juice = suggest_exchange_portions(
+        product_name="蘋果汁飲料",
+        nutrition={"calories_kcal": 120, "protein_g": 0, "fat_g": 0, "carbohydrate_g": 30},
+    )
+    mixed = suggest_exchange_portions(
+        product_name="雞肉蔬菜飯",
+        nutrition={"calories_kcal": 400, "protein_g": 21, "fat_g": 8, "carbohydrate_g": 45},
+    )
+    assert juice["categories"] == ["fruit"]
+    assert juice["exchanges"]["fruit_exchange"] == 2.0
+    assert juice["exchanges"]["starch_exchange"] == 0.0
+    assert mixed["categories"] == ["protein", "starch"]
+    assert mixed["exchanges"]["starch_exchange"] == 3.0
+    assert mixed["exchanges"]["vegetable_exchange"] == 0.0
+    assert "ambiguous_carbohydrate_category" in mixed["warnings"]
+
+
 def test_food_fingerprint_is_stable_for_equivalent_values():
     a = food_fingerprint(" 無加糖濃豆漿 ", "", 375, "ml", SOY_MILK_PAYLOAD["per_serving"])
     b = food_fingerprint("無加糖濃豆漿", "", 375.0, "ML", dict(reversed(list(SOY_MILK_PAYLOAD["per_serving"].items()))))
@@ -123,7 +187,7 @@ def test_ensure_nutrition_schema_creates_required_tables():
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 2
 
 
 def test_schema_migration_deduplicates_legacy_line_message_ids_before_unique_indexes():
@@ -164,6 +228,31 @@ def test_schema_migration_deduplicates_legacy_line_message_ids_before_unique_ind
     assert {"idx_pending_source_message", "idx_pending_identity_message"} <= indexes
 
 
+def test_existing_v1_marker_runs_v2_additive_migration():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE nutrition_schema_versions (
+            component TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at TEXT NOT NULL
+        );
+        INSERT INTO nutrition_schema_versions VALUES ('nutrition_system',1,'legacy');
+        CREATE TABLE nutrition_sheet_outbox (
+            outbox_id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT DEFAULT '', created_at TEXT NOT NULL, synced_at TEXT DEFAULT ''
+        );
+        """
+    )
+    ensure_nutrition_schema(conn)
+    outbox_columns = {row[1] for row in conn.execute("PRAGMA table_info(nutrition_sheet_outbox)")}
+    log_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_logs)")}
+    assert {"claimed_at", "lease_owner", "resync_required"} <= outbox_columns
+    assert {"approved_exchange_json", "exchange_approval_id"} <= log_columns
+    assert conn.execute(
+        "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
+    ).fetchone()[0] == 2
+
+
 def test_sheet_specs_include_four_required_tabs_and_exchange_seed_rows():
     specs = nutrition_sheet_specs()
     assert set(specs) == {"營養份量規則", "食品資料庫", "客製化營養計畫", "飲食紀錄"}
@@ -183,6 +272,11 @@ def test_confirmation_bubble_contains_nutrition_and_token_actions():
     assert "確認營養紀錄:abc123" in body_text
     assert "修改營養時間:abc123" in body_text
     assert "取消營養紀錄:abc123" in body_text
+    assert "推算營養份數" in body_text
+    assert "低脂蛋白 2.73份" in body_text
+    assert "主食 0.53份" in body_text
+    assert "尚未扣入個人計畫" in body_text
+    assert "油脂份不計" in body_text
 
 
 def test_pending_label_confirmation_creates_private_food_and_snapshot_log():
@@ -201,6 +295,15 @@ def test_pending_label_confirmation_creates_private_food_and_snapshot_log():
 
     assert result["food"]["source_type"] == "user_private_food"
     assert result["log"]["nutrition"]["calories_kcal"] == pytest.approx(190.2)
+    assert result["log"]["exchange"]["protein_low_exchange"] == 2.73
+    assert result["log"]["exchange"]["starch_exchange"] == 0.53
+    assert result["log"]["exchange"]["fat_exchange"] == 0.0
+    assert result["log"]["exchange"]["_review_status"] == "pending_review"
+    assert result["log"]["exchange"]["_rule_version"] == "tw-exchange-v1"
+    assert result["log"]["exchange"]["_categories"] == ["protein", "starch"]
+    assert conn.execute(
+        "SELECT exchange_review_status FROM food_catalog"
+    ).fetchone()[0] == "pending_review"
     assert conn.execute("SELECT COUNT(*) FROM food_catalog").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
     assert conn.execute("SELECT status FROM pending_nutrition_logs WHERE token=?", (token,)).fetchone()[0] == "confirmed"
@@ -247,6 +350,130 @@ def test_daily_consumed_totals_sums_confirmed_logs_only():
     totals = daily_consumed_totals(conn, user_id="U_TEST", date_iso="2026-07-19")
     assert totals["calories_kcal"] == pytest.approx(285.3)
     assert totals["protein_g"] == pytest.approx(28.65)
+    assert totals["protein_low_exchange"] == 0.0
+    assert totals["starch_exchange"] == 0.0
+    conn.execute("UPDATE food_catalog SET exchange_review_status='approved'")
+    conn.commit()
+    still_pending = daily_consumed_totals(conn, user_id="U_TEST", date_iso="2026-07-19")
+    assert still_pending["protein_low_exchange"] == 0.0
+    assert still_pending["starch_exchange"] == 0.0
+
+
+def test_approving_exchange_suggestion_preserves_suggestion_and_creates_applied_snapshot():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    token = save_pending_label(
+        conn, user_id="U_TEST", payload=SOY_MILK_PAYLOAD,
+        consumed_at="2026-07-19T21:53:00+08:00",
+    )
+    confirmed = confirm_pending_label(conn, token=token, user_id="U_TEST")
+    food_id = confirmed["food"]["food_id"]
+    original_suggestion = conn.execute(
+        "SELECT exchange_snapshot_json FROM food_logs WHERE log_id=?",
+        (confirmed["log"]["log_id"],),
+    ).fetchone()[0]
+
+    first = approve_food_exchange_suggestion(conn, food_id=food_id, reviewer="ADMIN")
+    replay = approve_food_exchange_suggestion(conn, food_id=food_id, reviewer="ADMIN")
+
+    assert first["already_approved"] is False
+    assert replay["already_approved"] is True
+    assert first["updated_logs"] == 1
+    assert replay["updated_logs"] == 0
+    totals = daily_consumed_totals(conn, user_id="U_TEST", date_iso="2026-07-19")
+    assert totals["protein_low_exchange"] == 2.73
+    assert totals["starch_exchange"] == 0.53
+    food_status, food_exchange_json = conn.execute(
+        "SELECT exchange_review_status,exchange_json FROM food_catalog WHERE food_id=?", (food_id,)
+    ).fetchone()
+    assert food_status == "approved"
+    assert __import__("json").loads(food_exchange_json)["_review_status"] == "pending_review"
+    log_exchange_json, approved_exchange_json, approval_id = conn.execute(
+        """SELECT exchange_snapshot_json,approved_exchange_json,exchange_approval_id
+           FROM food_logs WHERE food_id=?""", (food_id,)
+    ).fetchone()
+    assert log_exchange_json == original_suggestion
+    approved = __import__("json").loads(approved_exchange_json)
+    assert approved["protein_low_exchange"] == 2.73
+    assert approved["starch_exchange"] == 0.53
+    assert approval_id.startswith("approval_")
+    approval = conn.execute(
+        """SELECT food_fingerprint,approved_exchange_hash,reviewer
+           FROM food_exchange_approvals WHERE approval_id=?""", (approval_id,)
+    ).fetchone()
+    assert approval[0]
+    assert len(approval[1]) == 64
+    assert approval[2] == "ADMIN"
+    assert set(conn.execute(
+        "SELECT entity_type,status FROM nutrition_sheet_outbox WHERE entity_id IN (?,?)",
+        (food_id, confirmed["log"]["log_id"]),
+    ).fetchall()) == {("food", "pending"), ("food_log", "pending")}
+
+
+def test_reusing_valid_approved_food_keeps_suggestion_separate_and_applies_approval():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    first_token = save_pending_label(
+        conn, user_id="U_TEST", payload=SOY_MILK_PAYLOAD,
+        consumed_at="2026-07-19T08:00:00+08:00",
+    )
+    first = confirm_pending_label(conn, token=first_token, user_id="U_TEST")
+    approve_food_exchange_suggestion(conn, food_id=first["food"]["food_id"], reviewer="ADMIN")
+    second_token = save_pending_label(
+        conn, user_id="U_TEST", payload=SOY_MILK_PAYLOAD,
+        consumed_at="2026-07-19T12:00:00+08:00",
+    )
+    second = confirm_pending_label(conn, token=second_token, user_id="U_TEST")
+    assert second["log"]["exchange_review_status"] == "approved"
+    assert second["log"]["suggested_exchange"]["_review_status"] == "pending_review"
+    assert second["log"]["approved_exchange"]["protein_low_exchange"] == 2.73
+    totals = daily_consumed_totals(conn, user_id="U_TEST", date_iso="2026-07-19")
+    assert totals["protein_low_exchange"] == 5.46
+    tampered = __import__("json").loads(conn.execute(
+        "SELECT approved_exchange_json FROM food_logs WHERE log_id=?",
+        (second["log"]["log_id"],),
+    ).fetchone()[0])
+    tampered["protein_low_exchange"] = 99
+    conn.execute(
+        "UPDATE food_logs SET approved_exchange_json=? WHERE log_id=?",
+        (__import__("json").dumps(tampered), second["log"]["log_id"]),
+    )
+    conn.commit()
+    tampered_result = __import__("nutrition_system")._confirmed_result(
+        conn, second["log"]["log_id"], already_confirmed=True
+    )
+    assert tampered_result["log"]["exchange_review_status"] == "pending_review"
+    assert tampered_result["log"]["approved_exchange"] == {}
+    fail_closed = daily_consumed_totals(conn, user_id="U_TEST", date_iso="2026-07-19")
+    assert fail_closed["protein_low_exchange"] == 2.73
+
+
+def test_tampered_approval_hash_fails_closed_for_daily_totals_and_future_logs():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    token = save_pending_label(
+        conn, user_id="U_TEST", payload=SOY_MILK_PAYLOAD,
+        consumed_at="2026-07-19T08:00:00+08:00",
+    )
+    first = confirm_pending_label(conn, token=token, user_id="U_TEST")
+    approve_food_exchange_suggestion(conn, food_id=first["food"]["food_id"], reviewer="ADMIN")
+    conn.execute("UPDATE food_exchange_approvals SET approved_exchange_hash='tampered'")
+    conn.commit()
+    totals = daily_consumed_totals(conn, user_id="U_TEST", date_iso="2026-07-19")
+    assert totals["protein_low_exchange"] == 0.0
+    next_token = save_pending_label(
+        conn, user_id="U_TEST", payload=SOY_MILK_PAYLOAD,
+        consumed_at="2026-07-19T12:00:00+08:00",
+    )
+    second = confirm_pending_label(conn, token=next_token, user_id="U_TEST")
+    assert second["log"]["exchange_review_status"] == "pending_review"
+    replacement = approve_food_exchange_suggestion(
+        conn, food_id=first["food"]["food_id"], reviewer="ADMIN_2"
+    )
+    assert replacement["updated_logs"] == 2
+    restored = daily_consumed_totals(conn, user_id="U_TEST", date_iso="2026-07-19")
+    assert restored["protein_low_exchange"] == 5.46
+    assert conn.execute("SELECT COUNT(*) FROM food_exchange_approvals").fetchone()[0] == 2
 
 
 def test_rejects_nan_infinity_zero_and_flags_inconsistent_labels():

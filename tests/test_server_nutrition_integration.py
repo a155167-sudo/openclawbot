@@ -136,6 +136,29 @@ def test_outbox_keeps_partial_failure_pending(tmp_path, monkeypatch):
     assert attempts == 1
 
 
+def test_stale_outbox_lease_preserves_dirty_resync_signal(tmp_path, monkeypatch):
+    db = tmp_path / "stale-outbox.db"
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        conn.execute(
+            """INSERT INTO nutrition_sheet_outbox
+               (outbox_id,entity_type,entity_id,status,attempts,last_error,claimed_at,
+                lease_owner,resync_required,created_at,synced_at)
+               VALUES ('stale','food','f1','processing',0,'','2000-01-01T00:00:00+08:00',
+                       'dead-worker',1,'2000-01-01T00:00:00+08:00','')"""
+        )
+        conn.commit()
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "sh", object())
+    monkeypatch.setattr(server, "_sync_food_outbox", lambda _: None)
+    assert server.flush_nutrition_sheet_outbox() == 1
+    with sqlite3.connect(db) as conn:
+        status = conn.execute(
+            "SELECT status FROM nutrition_sheet_outbox WHERE outbox_id='stale'"
+        ).fetchone()[0]
+    assert status == "pending"
+
+
 def test_legacy_dashboard_is_idempotent(tmp_path, monkeypatch):
     db = tmp_path / "legacy.db"
     today = server.tw_today().isoformat()
@@ -160,16 +183,25 @@ def test_legacy_dashboard_is_idempotent(tmp_path, monkeypatch):
         conn.commit()
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "upsert_frequent_food", lambda *args: None)
-    monkeypatch.setattr(server, "build_meal_log_flex", lambda *args: {"ok": True})
+    flex_calls = []
+    monkeypatch.setattr(
+        server, "build_meal_log_flex",
+        lambda *args, **kwargs: flex_calls.append((args, kwargs)) or {"ok": True},
+    )
     result = {
         "food": {"product_name": "豆漿"},
-        "log": {"log_id": "l1", "consumed_at": today + "T18:00:00+08:00", "nutrition": {"calories_kcal": 190, "protein_g": 19}},
+        "log": {
+            "log_id": "l1", "consumed_at": today + "T18:00:00+08:00",
+            "nutrition": {"calories_kcal": 190, "protein_g": 19},
+            "exchange": {"protein_low_exchange": 2.71, "starch_exchange": 0.53},
+        },
     }
     server.apply_confirmed_nutrition_to_legacy_dashboard("U1", result)
     server.apply_confirmed_nutrition_to_legacy_dashboard("U1", result)
     with sqlite3.connect(db) as conn:
         values = conn.execute("SELECT today_extra_cal,today_extra_pro FROM health_profile WHERE user_id='U1'").fetchone()
     assert values == (190.0, 19.0)
+    assert flex_calls[0][1]["exchange_text"] == "低脂蛋白 2.71份｜主食 0.53份"
 
 
 def test_health_check_uses_configured_sqlite_schema(tmp_path, monkeypatch):
@@ -200,6 +232,18 @@ def valid_label():
         "per_100": {"calories_kcal": 50.67, "protein_g": 5.07, "fat_g": 2.4, "carbohydrate_g": 2.13},
         "confidence": 0.99,
     }
+
+
+
+def test_meal_log_flex_can_show_pending_exchange_suggestion():
+    flex = server.build_meal_log_flex(
+        "測試豆漿", 190, 19, 190, 2000, 19, 100,
+        exchange_text="低脂蛋白 2.71份｜主食 0.53份",
+    )
+    payload = str(flex.as_json_dict())
+    assert "推算營養份數" in payload
+    assert "低脂蛋白 2.71份" in payload
+    assert "尚未扣入個人計畫" in payload
 
 
 def test_failed_image_delete_keeps_reference_for_retry(tmp_path, monkeypatch):
@@ -642,3 +686,206 @@ def test_committed_confirmation_reply_failure_is_retriable(tmp_path, monkeypatch
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
     assert len(replies) == 1
+    reply_text = replies[0].text
+    assert "推算營養份數" in reply_text
+    assert "低脂蛋白 2.71份" in reply_text
+    assert "主食 0.53份" in reply_text
+    assert "尚未扣入個人計畫" in reply_text
+
+
+def test_exchange_review_admin_commands_list_approve_and_replay(tmp_path, monkeypatch):
+    db = tmp_path / "exchange-admin.db"
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        token = save_pending_label(conn, user_id="U_CUSTOMER", payload=valid_label())
+        confirmed = confirm_pending_label(conn, token=token, user_id="U_CUSTOMER")
+    food_id = confirmed["food"]["food_id"]
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "flush_nutrition_sheet_outbox", lambda: 2)
+
+    pending_text = server.handle_exchange_review_admin_command(
+        "#待審營養份量", server.ADMIN_UID
+    )
+    assert "測試豆漿" in pending_text
+    assert "低脂蛋白 2.71份｜主食 0.53份" in pending_text
+    assert f"#核准營養份量 {food_id}" in pending_text
+
+    with pytest.raises(PermissionError):
+        server.handle_exchange_review_admin_command(
+            f"#核准營養份量 {food_id}", "U_NOT_ADMIN"
+        )
+
+    approved_text = server.handle_exchange_review_admin_command(
+        f"#核准營養份量 {food_id}", server.ADMIN_UID
+    )
+    replay_text = server.handle_exchange_review_admin_command(
+        f"#核准營養份量 {food_id}", server.ADMIN_UID
+    )
+    assert "核准完成" in approved_text
+    assert "更新 1 筆飲食紀錄" in approved_text
+    assert "已經核准" in replay_text
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT exchange_review_status FROM food_catalog WHERE food_id=?", (food_id,)
+        ).fetchone()[0] == "approved"
+
+
+def test_exchange_review_commands_are_admin_only_and_intercepted_by_line_handler(tmp_path, monkeypatch):
+    assert server.is_admin_only_command("#待審營養份量")
+    assert server.is_admin_only_command("#核准營養份量 food_1234567890abcdef")
+    db = tmp_path / "exchange-admin-handler.db"
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        token = save_pending_label(conn, user_id="U_CUSTOMER", payload=valid_label())
+        confirmed = confirm_pending_label(conn, token=token, user_id="U_CUSTOMER")
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    replies = []
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(reply_message=lambda _, message: replies.append(message)),
+    )
+    event = _text_event("exchange-admin-list", "#待審營養份量", user_id=server.ADMIN_UID)
+    server.processed_messages.discard("exchange-admin-list")
+    server._handle_message_impl(event)
+    assert len(replies) == 1
+    assert "待審營養份量" in replies[0].text
+    assert "#核准營養份量 food_" in replies[0].text
+    replies.clear()
+    denied = _text_event(
+        "exchange-admin-denied",
+        f"#核准營養份量 {confirmed['food']['food_id']}",
+        user_id="U_NOT_ADMIN",
+    )
+    server.processed_messages.discard("exchange-admin-denied")
+    server._handle_message_impl(denied)
+    assert len(replies) == 1
+    assert "管理員專用" in replies[0].text
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT exchange_review_status FROM food_catalog WHERE food_id=?",
+            (confirmed["food"]["food_id"],),
+        ).fetchone()[0] == "pending_review"
+
+
+def test_exchange_approval_reply_failure_retries_idempotently(tmp_path, monkeypatch):
+    db = tmp_path / "exchange-admin-retry.db"
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        token = save_pending_label(conn, user_id="U_CUSTOMER", payload=valid_label())
+        confirmed = confirm_pending_label(conn, token=token, user_id="U_CUSTOMER")
+    food_id = confirmed["food"]["food_id"]
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "flush_nutrition_sheet_outbox", lambda: 2)
+    replies = []
+    attempts = {"count": 0}
+
+    def flaky_reply(_, message):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("LINE timeout")
+        replies.append(message)
+
+    monkeypatch.setattr(server, "line_bot_api", SimpleNamespace(reply_message=flaky_reply))
+    event = _text_event(
+        "exchange-admin-retry",
+        f"#核准營養份量 {food_id}",
+        user_id=server.ADMIN_UID,
+    )
+    server.processed_messages.discard("exchange-admin-retry")
+    with pytest.raises(RuntimeError, match="LINE timeout"):
+        server._handle_message_impl(event)
+    assert "exchange-admin-retry" not in server.processed_messages
+    server._handle_message_impl(event)
+    assert len(replies) == 1
+    assert "已經核准" in replies[0].text
+    with sqlite3.connect(db) as conn:
+        suggestion_json, applied_json = conn.execute(
+            """SELECT exchange_snapshot_json,approved_exchange_json
+               FROM food_logs WHERE food_id=?""", (food_id,)
+        ).fetchone()
+    assert __import__("json").loads(suggestion_json)["_review_status"] == "pending_review"
+    assert __import__("json").loads(applied_json)["_review_status"] == "approved"
+
+
+def test_exchange_admin_error_reply_failure_allows_webhook_retry(monkeypatch):
+    event = _text_event(
+        "exchange-admin-error-retry",
+        "#核准營養份量 food_missing",
+        user_id=server.ADMIN_UID,
+    )
+    server.processed_messages.discard("exchange-admin-error-retry")
+    monkeypatch.setattr(
+        server,
+        "handle_exchange_review_admin_command",
+        lambda *_: (_ for _ in ()).throw(ValueError("找不到待審核食品")),
+    )
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(reply_message=lambda *_: (_ for _ in ()).throw(RuntimeError("LINE timeout"))),
+    )
+    with pytest.raises(RuntimeError, match="LINE timeout"):
+        server._handle_message_impl(event)
+    assert "exchange-admin-error-retry" not in server.processed_messages
+
+
+def test_meal_log_flex_distinguishes_pending_and_approved_exchange_status():
+    args = ("測試食品", 100, 10, 100, 2000, 10, 100)
+    pending = server.build_meal_log_flex(
+        *args, exchange_text="主食 1份", exchange_review_status="pending_review"
+    )
+    approved = server.build_meal_log_flex(
+        *args, exchange_text="主食 1份", exchange_review_status="approved"
+    )
+    pending_payload = __import__("json").dumps(pending.as_json_dict(), ensure_ascii=False)
+    approved_payload = __import__("json").dumps(approved.as_json_dict(), ensure_ascii=False)
+    assert "待營養師審核，尚未扣入個人計畫" in pending_payload
+    assert "正式營養份數：主食 1份" in approved_payload
+    assert "已納入個人計畫" in approved_payload
+
+
+def test_food_log_sheet_exports_exchange_only_after_approval(tmp_path, monkeypatch):
+    db = tmp_path / "exchange-sheet.db"
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        token = save_pending_label(conn, user_id="U_CUSTOMER", payload=valid_label())
+        confirmed = confirm_pending_label(conn, token=token, user_id="U_CUSTOMER")
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    captured = []
+    monkeypatch.setattr(server, "_nutrition_ws", lambda _: object())
+    monkeypatch.setattr(
+        server, "_upsert_raw_sheet_row",
+        lambda _ws, entity_id, values: captured.append((entity_id, values)),
+    )
+
+    server._sync_food_outbox(confirmed["food"]["food_id"])
+    pending_food_row = captured[-1][1]
+    assert pending_food_row[17:25] == [0] * 8
+    server._sync_food_log_outbox(confirmed["log"]["log_id"])
+    pending_row = captured[-1][1]
+    assert pending_row[16:24] == [0] * 8
+
+    with sqlite3.connect(db) as conn:
+        server.approve_food_exchange_suggestion(
+            conn, food_id=confirmed["food"]["food_id"], reviewer="ADMIN"
+        )
+    server._sync_food_outbox(confirmed["food"]["food_id"])
+    approved_food_row = captured[-1][1]
+    assert approved_food_row[18] == 2.71
+    assert approved_food_row[21] == 0.53
+    server._sync_food_log_outbox(confirmed["log"]["log_id"])
+    approved_row = captured[-1][1]
+    assert approved_row[17] == 2.71
+    assert approved_row[20] == 0.53
+    with sqlite3.connect(db) as conn:
+        applied = __import__("json").loads(conn.execute(
+            "SELECT approved_exchange_json FROM food_logs WHERE log_id=?",
+            (confirmed["log"]["log_id"],),
+        ).fetchone()[0])
+        applied["protein_low_exchange"] = 99
+        conn.execute(
+            "UPDATE food_logs SET approved_exchange_json=? WHERE log_id=?",
+            (__import__("json").dumps(applied), confirmed["log"]["log_id"]),
+        )
+        conn.commit()
+    server._sync_food_log_outbox(confirmed["log"]["log_id"])
+    assert captured[-1][1][16:24] == [0] * 8

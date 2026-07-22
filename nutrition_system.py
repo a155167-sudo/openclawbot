@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
@@ -239,6 +240,99 @@ def scale_nutrition(per_serving: Mapping[str, Any], consumed_servings: float) ->
     return {key: round(value * servings, 4) for key, value in nutrients.items()}
 
 
+EXCHANGE_RULE_VERSION = "tw-exchange-v1"
+
+
+def suggest_exchange_portions(
+    *, product_name: str, nutrition: Mapping[str, Any]
+) -> dict[str, Any]:
+    """依正式營養規則產生可審核的份量建議；不等同營養師核准值。"""
+    name = " ".join(str(product_name or "").strip().lower().split())
+    nutrients = _normalize_nutrients(nutrition)
+    protein = nutrients["protein_g"]
+    fat = nutrients["fat_g"]
+    carbohydrate = nutrients["carbohydrate_g"]
+
+    milk_words = ("鮮乳", "牛奶", "乳飲", "優酪乳", "優格", "yogurt", "milk")
+    protein_words = (
+        "豆漿", "豆乳", "豆腐", "豆干", "雞", "豬", "牛", "羊", "魚", "蝦",
+        "海鮮", "蛋", "肉", "protein", "雞胸",
+    )
+    starch_words = ("飯", "麵", "麥", "吐司", "麵包", "餅", "穀", "燕麥", "薯", "粥")
+    drink_words = ("能量飲料", "汽水", "飲料", "energy drink")
+    vegetable_words = ("蔬菜", "青菜", "沙拉", "花椰菜", "菠菜")
+    fruit_words = ("水果", "果汁", "蘋果", "香蕉", "芭樂", "柳橙", "莓")
+
+    categories: list[str] = []
+    warnings: list[str] = []
+    if any(word in name for word in milk_words) and "豆" not in name:
+        categories.append("milk")
+    else:
+        if any(word in name for word in protein_words):
+            categories.append("protein")
+        carb_matches = []
+        if any(word in name for word in starch_words):
+            carb_matches.append("starch")
+        if any(word in name for word in vegetable_words):
+            carb_matches.append("vegetable")
+        if any(word in name for word in fruit_words):
+            carb_matches.append("fruit")
+        if len(carb_matches) > 1:
+            warnings.append("ambiguous_carbohydrate_category")
+        # 同一份碳水只能歸到一個類別：明確主食優先，其次水果、蔬菜；
+        # 泛稱飲料或無法辨識來源時才後備為主食建議。
+        if "starch" in carb_matches:
+            categories.append("starch")
+        elif "fruit" in carb_matches:
+            categories.append("fruit")
+        elif "vegetable" in carb_matches:
+            categories.append("vegetable")
+        elif any(word in name for word in drink_words) or carbohydrate >= 2.0:
+            categories.append("starch")
+        if not categories and protein >= 3.5:
+            categories.append("protein")
+
+    order = ("milk", "protein", "starch", "vegetable", "fruit")
+    categories = [category for category in order if category in categories]
+    exchanges = {key: 0.0 for key in EXCHANGE_KEYS}
+
+    if "milk" in categories:
+        protein_ratio = protein / 8.0 if protein > 0 else 0.0
+        carbohydrate_ratio = carbohydrate / 12.0 if carbohydrate > 0 else 0.0
+        if not protein_ratio or not carbohydrate_ratio:
+            warnings.append("milk_macro_incomplete")
+        elif abs(protein_ratio - carbohydrate_ratio) / max(protein_ratio, carbohydrate_ratio) > 0.35:
+            warnings.append("milk_macro_mismatch")
+        else:
+            exchanges["milk_exchange"] = round((protein_ratio + carbohydrate_ratio) / 2, 2)
+    if "protein" in categories and protein > 0:
+        protein_exchange = protein / 7.0
+        fat_per_exchange = fat / protein_exchange if protein_exchange else 0.0
+        fat_levels = {
+            "protein_low_exchange": 3.0,
+            "protein_medium_exchange": 5.0,
+            "protein_high_exchange": 12.0,
+        }
+        level = min(fat_levels, key=lambda key: abs(fat_levels[key] - fat_per_exchange))
+        exchanges[level] = round(protein_exchange, 2)
+    if "starch" in categories:
+        exchanges["starch_exchange"] = round(carbohydrate / 15.0, 2)
+    if "vegetable" in categories:
+        exchanges["vegetable_exchange"] = round(carbohydrate / 5.0, 2)
+    if "fruit" in categories:
+        exchanges["fruit_exchange"] = round(carbohydrate / 15.0, 2)
+
+    # 一日樂食目前不計油脂份；脂肪克數與熱量仍留在nutrition snapshot。
+    exchanges["fat_exchange"] = 0.0
+    return {
+        "categories": categories or ["unknown"],
+        "warnings": warnings,
+        "exchanges": exchanges,
+        "review_status": "pending_review",
+        "rule_version": EXCHANGE_RULE_VERSION,
+    }
+
+
 def food_fingerprint(
     product_name: str,
     brand: str,
@@ -259,6 +353,20 @@ def food_fingerprint(
         "servings_per_package": round(float(servings_per_package), 4),
         "per_serving": {key: round(float(per_serving.get(key, 0) or 0), 4) for key in sorted(NUTRIENT_KEYS)},
         "per_100": {key: round(float((per_100 or {}).get(key, 0) or 0), 4) for key in sorted(NUTRIENT_KEYS)},
+    }
+    raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def exchange_approval_hash(
+    food_fingerprint_value: str, rule_version: str, exchanges: Mapping[str, Any]
+) -> str:
+    canonical = {
+        "food_fingerprint": str(food_fingerprint_value),
+        "rule_version": str(rule_version),
+        "exchanges": {
+            key: round(float(exchanges.get(key, 0) or 0), 4) for key in EXCHANGE_KEYS
+        },
     }
     raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -324,6 +432,24 @@ def build_label_confirmation_bubble(
     amount = normalized["package_amount"] * float(consumed_servings) / normalized["servings_per_package"]
     brand_line = f"{normalized['brand']}｜" if normalized["brand"] else ""
     observed = normalized.get("observed_at") or "以LINE收到時間為準"
+    exchange_suggestion = suggest_exchange_portions(
+        product_name=normalized["product_name"], nutrition=nutrition
+    )
+    exchange_labels = {
+        "milk_exchange": "奶類",
+        "protein_low_exchange": "低脂蛋白",
+        "protein_medium_exchange": "中脂蛋白",
+        "protein_high_exchange": "高脂蛋白",
+        "starch_exchange": "主食",
+        "vegetable_exchange": "蔬菜",
+        "fruit_exchange": "水果",
+    }
+    exchange_parts = [
+        f"{label_text} {exchange_suggestion['exchanges'][key]:g}份"
+        for key, label_text in exchange_labels.items()
+        if exchange_suggestion["exchanges"][key] > 0
+    ]
+    exchange_text = "｜".join(exchange_parts) if exchange_parts else "目前無法安全推算，需人工審核"
     body = [
         {"type": "text", "text": normalized["product_name"], "size": "xl", "weight": "bold", "wrap": True},
         {"type": "text", "text": f"{brand_line}{amount:g}{normalized['package_unit']}｜{float(consumed_servings):g}份", "size": "sm", "color": "#666666", "margin": "sm", "wrap": True},
@@ -333,7 +459,10 @@ def build_label_confirmation_bubble(
         {"type": "text", "text": f"蛋白質 {nutrition['protein_g']:g}g　脂肪 {nutrition['fat_g']:g}g", "size": "sm", "color": "#333333", "margin": "sm"},
         {"type": "text", "text": f"碳水 {nutrition['carbohydrate_g']:g}g　糖 {nutrition['sugar_g']:g}g", "size": "sm", "color": "#333333", "margin": "sm"},
         {"type": "text", "text": f"纖維 {nutrition['fiber_g']:g}g　鈉 {nutrition['sodium_mg']:g}mg", "size": "sm", "color": "#333333", "margin": "sm"},
-        {"type": "text", "text": "確認後會加入你的私人食品庫與今日飲食紀錄；營養份量代號需營養師審核。", "size": "xs", "color": "#8A6D3B", "margin": "md", "wrap": True},
+        {"type": "separator", "margin": "md"},
+        {"type": "text", "text": "推算營養份數（待審核）", "size": "sm", "weight": "bold", "color": "#0F766E", "margin": "md"},
+        {"type": "text", "text": exchange_text, "size": "sm", "color": "#333333", "margin": "sm", "wrap": True},
+        {"type": "text", "text": "油脂份不計；脂肪克數與熱量仍完整記錄。此為公式建議值，尚未扣入個人計畫；確認後會加入私人食品庫與今日飲食紀錄。", "size": "xs", "color": "#8A6D3B", "margin": "sm", "wrap": True},
     ]
     warning_fields = nutrition_consistency_warnings(normalized)
     if warning_fields:
@@ -491,6 +620,8 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             consumed_unit TEXT DEFAULT '',
             nutrition_snapshot_json TEXT NOT NULL,
             exchange_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            approved_exchange_json TEXT NOT NULL DEFAULT '{}',
+            exchange_approval_id TEXT DEFAULT '',
             source_image_ref TEXT DEFAULT '',
             plan_id TEXT DEFAULT '',
             plan_link_status TEXT NOT NULL DEFAULT 'pending',
@@ -498,6 +629,18 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             legacy_applied_at TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            FOREIGN KEY(food_id) REFERENCES food_catalog(food_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS food_exchange_approvals (
+            approval_id TEXT PRIMARY KEY,
+            food_id TEXT NOT NULL,
+            food_fingerprint TEXT NOT NULL,
+            suggestion_rule_version TEXT NOT NULL,
+            approved_exchange_json TEXT NOT NULL,
+            approved_exchange_hash TEXT NOT NULL,
+            reviewer TEXT NOT NULL,
+            approved_at TEXT NOT NULL,
             FOREIGN KEY(food_id) REFERENCES food_catalog(food_id)
         );
 
@@ -556,10 +699,12 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_food_catalog_owner ON food_catalog(owner_user_id);
         CREATE INDEX IF NOT EXISTS idx_food_logs_user_time ON food_logs(user_id, consumed_at);
         CREATE INDEX IF NOT EXISTS idx_plan_user_effective ON nutrition_plans(user_id, effective_from);
+        CREATE INDEX IF NOT EXISTS idx_food_exchange_approvals_food
+            ON food_exchange_approvals(food_id, approved_at);
         """
     )
     schema_component = "nutrition_system"
-    schema_version = 1
+    schema_version = 2
     version_row = conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component=?",
         (schema_component,),
@@ -584,6 +729,8 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         "food_logs": {
             "legacy_applied_at": "TEXT DEFAULT ''",
             "plan_link_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "approved_exchange_json": "TEXT NOT NULL DEFAULT '{}'",
+            "exchange_approval_id": "TEXT DEFAULT ''",
         },
         "nutrition_sheet_outbox": {
             "claimed_at": "TEXT DEFAULT ''",
@@ -1317,14 +1464,38 @@ def _confirmed_result(conn: sqlite3.Connection, log_id: str, *, already_confirme
         SELECT f.food_id, f.product_name, f.brand, f.source_type,
                l.log_id, l.consumed_at, l.meal_slot, l.consumed_servings,
                l.consumed_amount, l.consumed_unit, l.nutrition_snapshot_json,
-               l.exchange_snapshot_json, l.plan_id
+               l.exchange_snapshot_json, l.approved_exchange_json,
+               l.exchange_approval_id, l.plan_id,
+               a.food_fingerprint, a.suggestion_rule_version,
+               a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint
         FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
+        LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
         WHERE l.log_id=?
         """,
         (log_id,),
     ).fetchone()
     if not row:
         raise ValueError("已確認紀錄遺失，請聯繫客服")
+    suggested = json.loads(row[11] or "{}")
+    approved = json.loads(row[12] or "{}")
+    applied: dict[str, Any] = {}
+    candidate_approval_id = row[13] or ""
+    approval_id = ""
+    if candidate_approval_id and approved and row[15] and row[15] == row[19]:
+        approved_definition = json.loads(row[17] or "{}")
+        expected_hash = exchange_approval_hash(row[15], row[16], approved_definition)
+        expected_applied = {
+            key: round(float(approved_definition.get(key, 0) or 0) * float(row[7] or 0), 4)
+            for key in EXCHANGE_KEYS
+        }
+        if secrets.compare_digest(str(row[18] or ""), expected_hash) and all(
+            abs(float(approved.get(key, 0) or 0) - value) <= 0.0001
+            for key, value in expected_applied.items()
+        ):
+            applied = approved
+            approval_id = candidate_approval_id
+        else:
+            approval_id = ""
     return {
         "already_confirmed": already_confirmed,
         "food": {"food_id": row[0], "product_name": row[1], "brand": row[2], "source_type": row[3]},
@@ -1332,7 +1503,12 @@ def _confirmed_result(conn: sqlite3.Connection, log_id: str, *, already_confirme
             "log_id": row[4], "consumed_at": row[5], "meal_slot": row[6],
             "consumed_servings": float(row[7]), "consumed_amount": float(row[8]),
             "consumed_unit": row[9], "nutrition": json.loads(row[10] or "{}"),
-            "exchange": json.loads(row[11] or "{}"), "plan_id": row[12] or "",
+            "suggested_exchange": suggested,
+            "approved_exchange": applied,
+            "exchange": applied or suggested,
+            "exchange_review_status": "approved" if applied else "pending_review",
+            "exchange_approval_id": approval_id,
+            "plan_id": row[14] or "",
         },
     }
 
@@ -1382,6 +1558,20 @@ def confirm_pending_label(
         if warning_fields:
             names = "、".join(NUTRIENT_LABELS[key] for key in warning_fields)
             raise ValueError(f"{names}的每份與每100單位換算不一致，請先修正營養數字")
+        per_serving_suggestion = suggest_exchange_portions(
+            product_name=label["product_name"], nutrition=label["per_serving"]
+        )
+        suggested_food_exchange = per_serving_suggestion["exchanges"]
+        suggested_food_payload = {
+            **suggested_food_exchange,
+            "_review_status": per_serving_suggestion["review_status"],
+            "_rule_version": per_serving_suggestion["rule_version"],
+            "_categories": per_serving_suggestion["categories"],
+            "_warnings": per_serving_suggestion["warnings"],
+        }
+        suggested_food_exchange_json = json.dumps(
+            suggested_food_payload, ensure_ascii=False, sort_keys=True, allow_nan=False
+        )
         fingerprint = food_fingerprint(
             label["product_name"], label["brand"], label["package_amount"],
             label["package_unit"], label["per_serving"], barcode=label["barcode"],
@@ -1389,14 +1579,35 @@ def confirm_pending_label(
         )
         existing = conn.execute(
             """
-            SELECT food_id FROM food_catalog
-            WHERE fingerprint=? AND (owner_user_id=? OR visibility='public')
-            ORDER BY CASE WHEN owner_user_id=? THEN 0 ELSE 1 END LIMIT 1
+            SELECT f.food_id,f.exchange_json,f.exchange_review_status,
+                   a.approval_id,a.food_fingerprint,a.suggestion_rule_version,
+                   a.approved_exchange_json,a.approved_exchange_hash
+            FROM food_catalog f
+            LEFT JOIN food_exchange_approvals a ON a.food_id=f.food_id
+            WHERE f.fingerprint=? AND (f.owner_user_id=? OR f.visibility='public')
+            ORDER BY CASE WHEN f.owner_user_id=? THEN 0 ELSE 1 END, a.approved_at DESC LIMIT 1
             """,
             (fingerprint, user_id, user_id),
         ).fetchone()
+        approved_food_payload: dict[str, Any] = {}
+        approval_id = ""
+        approved_valid = False
         if existing:
             food_id = existing[0]
+            if existing[2] == "approved" and existing[3] and existing[4] == fingerprint:
+                candidate = json.loads(existing[6] or "{}")
+                expected_hash = exchange_approval_hash(fingerprint, existing[5], candidate)
+                if secrets.compare_digest(str(existing[7] or ""), expected_hash):
+                    approved_food_payload = candidate
+                    approval_id = existing[3]
+                    approved_valid = True
+            if not approved_valid:
+                conn.execute(
+                    """UPDATE food_catalog
+                       SET exchange_json=?,exchange_review_status='pending_review',updated_at=?
+                       WHERE food_id=?""",
+                    (suggested_food_exchange_json, now, food_id),
+                )
         else:
             food_id = new_id("food")
             conn.execute(
@@ -1407,7 +1618,7 @@ def confirm_pending_label(
                  per_serving_json, per_100_json, exchange_json, exchange_review_status,
                  fingerprint, original_image_ref, recognition_confidence,
                  verification_status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'user_private_food', ?, 'private', ?, ?, ?, ?, ?, '{}',
+                VALUES (?, ?, ?, ?, 'user_private_food', ?, 'private', ?, ?, ?, ?, ?, ?,
                         'pending_review', ?, ?, ?, 'user_confirmed', ?, ?)
                 """,
                 (
@@ -1415,11 +1626,39 @@ def confirm_pending_label(
                     label["package_amount"], label["package_unit"], label["servings_per_package"],
                     json.dumps(label["per_serving"], ensure_ascii=False, sort_keys=True, allow_nan=False),
                     json.dumps(label["per_100"], ensure_ascii=False, sort_keys=True, allow_nan=False),
-                    fingerprint, source_image_ref, label["confidence"], now, now,
+                    suggested_food_exchange_json, fingerprint, source_image_ref, label["confidence"], now, now,
                 ),
             )
 
         nutrition = scale_nutrition(label["per_serving"], servings)
+        log_suggestion = suggest_exchange_portions(
+            product_name=label["product_name"], nutrition=nutrition
+        )
+        log_suggestion_payload = {
+            **log_suggestion["exchanges"],
+            "_review_status": "pending_review",
+            "_rule_version": log_suggestion["rule_version"],
+            "_categories": log_suggestion["categories"],
+            "_warnings": log_suggestion["warnings"],
+        }
+        log_exchange_json = json.dumps(
+            log_suggestion_payload, ensure_ascii=False, sort_keys=True, allow_nan=False
+        )
+        applied_payload: dict[str, Any] = {}
+        if approved_valid:
+            applied_payload = {
+                key: round(float(approved_food_payload.get(key, 0) or 0) * float(servings), 4)
+                for key in EXCHANGE_KEYS
+            }
+            applied_payload.update(
+                _review_status="approved",
+                _rule_version=existing[5],
+                _categories=approved_food_payload.get("_categories", []),
+                _approval_id=approval_id,
+            )
+        applied_exchange_json = json.dumps(
+            applied_payload, ensure_ascii=False, sort_keys=True, allow_nan=False
+        )
         consumed_amount = round(label["package_amount"] * float(servings) / label["servings_per_package"], 4)
         log_id = new_id("log")
         conn.execute(
@@ -1427,14 +1666,16 @@ def confirm_pending_label(
             INSERT INTO food_logs
             (log_id, user_id, food_id, consumed_at, meal_slot, consumed_servings,
              consumed_amount, consumed_unit, nutrition_snapshot_json,
-             exchange_snapshot_json, source_image_ref, plan_id, plan_link_status,
+             exchange_snapshot_json, approved_exchange_json, exchange_approval_id,
+             source_image_ref, plan_id, plan_link_status,
              confirmation_status, legacy_applied_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, 'confirmed', '', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', '', ?, ?)
             """,
             (
                 log_id, user_id, food_id, consumed_at or now, meal_slot, float(servings),
                 consumed_amount, label["package_unit"],
                 json.dumps(nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                log_exchange_json, applied_exchange_json, approval_id,
                 source_image_ref, str(plan_id or "").strip(), plan_link_status, now, now,
             ),
         )
@@ -1459,27 +1700,197 @@ def confirm_pending_label(
         raise
 
 
+def approve_food_exchange_suggestion(
+    conn: sqlite3.Connection, *, food_id: str, reviewer: str
+) -> dict[str, Any]:
+    food_id = str(food_id or "").strip()
+    reviewer = str(reviewer or "").strip()
+    if not food_id or len(food_id) > 80:
+        raise ValueError("food_id 無效")
+    if not reviewer or len(reviewer) > 120:
+        raise ValueError("reviewer 無效")
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            """SELECT product_name,exchange_json,exchange_review_status,fingerprint
+               FROM food_catalog WHERE food_id=?""",
+            (food_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("找不到待審核食品")
+        product_name, exchange_json, review_status, fingerprint = row
+        current_payload = json.loads(exchange_json or "{}")
+        if review_status == "approved":
+            approval = conn.execute(
+                """SELECT approval_id,suggestion_rule_version,approved_exchange_json,
+                          approved_exchange_hash,food_fingerprint
+                   FROM food_exchange_approvals WHERE food_id=?
+                   ORDER BY approved_at DESC LIMIT 1""",
+                (food_id,),
+            ).fetchone()
+            if not approval:
+                raise ValueError("核准紀錄遺失，已停止套用")
+            approved_payload = json.loads(approval[2] or "{}")
+            expected_hash = exchange_approval_hash(approval[4], approval[1], approved_payload)
+            if approval[4] != fingerprint or not secrets.compare_digest(approval[3], expected_hash):
+                raise ValueError("核准紀錄驗證失敗，已停止套用")
+            conn.commit()
+            return {
+                "food_id": food_id, "product_name": product_name,
+                "exchange": approved_payload, "updated_logs": 0,
+                "already_approved": True,
+            }
+        if review_status != "pending_review":
+            raise ValueError("這筆食品目前不可核准")
+
+        approved_at = utcish_now()
+        rule_version = str(current_payload.get("_rule_version") or EXCHANGE_RULE_VERSION)
+        approved_payload: dict[str, Any] = {
+            key: round(_number(current_payload.get(key, 0), key, max_value=10000), 4)
+            for key in EXCHANGE_KEYS
+        }
+        approved_payload.update(
+            _review_status="approved",
+            _rule_version=rule_version,
+            _categories=current_payload.get("_categories", []),
+            _warnings=current_payload.get("_warnings", []),
+            _approved_by=reviewer,
+            _approved_at=approved_at,
+        )
+        approved_json = json.dumps(
+            approved_payload, ensure_ascii=False, sort_keys=True, allow_nan=False
+        )
+        approval_id = new_id("approval")
+        approval_hash = exchange_approval_hash(fingerprint, rule_version, approved_payload)
+        conn.execute(
+            """INSERT INTO food_exchange_approvals
+               (approval_id,food_id,food_fingerprint,suggestion_rule_version,
+                approved_exchange_json,approved_exchange_hash,reviewer,approved_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                approval_id, food_id, fingerprint, rule_version, approved_json,
+                approval_hash, reviewer, approved_at,
+            ),
+        )
+        changed = conn.execute(
+            """UPDATE food_catalog
+               SET exchange_review_status='approved',updated_at=?
+               WHERE food_id=? AND exchange_review_status='pending_review'""",
+            (approved_at, food_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("營養份數核准狀態衝突")
+
+        updated_log_ids = []
+        logs = conn.execute(
+            "SELECT log_id,consumed_servings FROM food_logs WHERE food_id=?",
+            (food_id,),
+        ).fetchall()
+        for log_id, consumed_servings in logs:
+            applied: dict[str, Any] = {
+                key: round(approved_payload[key] * float(consumed_servings or 0), 4)
+                for key in EXCHANGE_KEYS
+            }
+            applied.update(
+                _review_status="approved",
+                _rule_version=rule_version,
+                _categories=approved_payload.get("_categories", []),
+                _approval_id=approval_id,
+                _approved_by=reviewer,
+                _approved_at=approved_at,
+            )
+            conn.execute(
+                """UPDATE food_logs
+                   SET approved_exchange_json=?,exchange_approval_id=?,updated_at=?
+                   WHERE log_id=?""",
+                (
+                    json.dumps(applied, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                    approval_id, approved_at, log_id,
+                ),
+            )
+            updated_log_ids.append(log_id)
+
+        entities = [("food", food_id), *[("food_log", value) for value in updated_log_ids]]
+        for entity_type, entity_id in entities:
+            outbox = conn.execute(
+                "SELECT status FROM nutrition_sheet_outbox WHERE entity_type=? AND entity_id=?",
+                (entity_type, entity_id),
+            ).fetchone()
+            if not outbox:
+                conn.execute(
+                    """INSERT INTO nutrition_sheet_outbox
+                       (outbox_id,entity_type,entity_id,status,attempts,last_error,created_at,synced_at)
+                       VALUES (?,?,?,'pending',0,'',?,'')""",
+                    (new_id("outbox"), entity_type, entity_id, approved_at),
+                )
+            elif outbox[0] == "processing":
+                conn.execute(
+                    """UPDATE nutrition_sheet_outbox SET resync_required=1
+                       WHERE entity_type=? AND entity_id=?""",
+                    (entity_type, entity_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE nutrition_sheet_outbox
+                       SET status='pending',last_error='',synced_at='',resync_required=0
+                       WHERE entity_type=? AND entity_id=?""",
+                    (entity_type, entity_id),
+                )
+        conn.commit()
+        return {
+            "food_id": food_id, "product_name": product_name,
+            "exchange": approved_payload, "updated_logs": len(updated_log_ids),
+            "already_approved": False,
+        }
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+
 def daily_consumed_totals(
     conn: sqlite3.Connection, *, user_id: str, date_iso: str, meal_slot: str = ""
 ) -> dict[str, float]:
     totals = {key: 0.0 for key in (*NUTRIENT_KEYS, *EXCHANGE_KEYS)}
     sql = """
-        SELECT nutrition_snapshot_json, exchange_snapshot_json
-        FROM food_logs
-        WHERE user_id=? AND substr(consumed_at, 1, 10)=? AND confirmation_status='confirmed'
+        SELECT l.nutrition_snapshot_json,l.approved_exchange_json,l.exchange_approval_id,
+               l.consumed_servings,
+               a.food_fingerprint,a.suggestion_rule_version,a.approved_exchange_json,
+               a.approved_exchange_hash,f.fingerprint
+        FROM food_logs l
+        JOIN food_catalog f ON f.food_id=l.food_id
+        LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
+        WHERE l.user_id=? AND substr(l.consumed_at, 1, 10)=? AND l.confirmation_status='confirmed'
     """
     params: list[Any] = [user_id, date_iso]
     if meal_slot:
-        sql += " AND meal_slot=?"
+        sql += " AND l.meal_slot=?"
         params.append(meal_slot)
     rows = conn.execute(sql, params).fetchall()
-    for nutrition_json, exchange_json in rows:
+    for nutrition_json, applied_json, approval_id, consumed_servings, approval_fingerprint, rule_version, approved_json, approval_hash, food_fp in rows:
         for key, value in json.loads(nutrition_json or "{}").items():
             if key in totals:
                 totals[key] += float(value or 0)
-        for key, value in json.loads(exchange_json or "{}").items():
-            if key in totals:
-                totals[key] += float(value or 0)
+        if not approval_id or not approval_fingerprint or approval_fingerprint != food_fp:
+            continue
+        approved_data = json.loads(approved_json or "{}")
+        expected_hash = exchange_approval_hash(approval_fingerprint, rule_version, approved_data)
+        if not secrets.compare_digest(str(approval_hash or ""), expected_hash):
+            continue
+        applied_data = json.loads(applied_json or "{}")
+        expected_applied = {
+            key: round(float(approved_data.get(key, 0) or 0) * float(consumed_servings or 0), 4)
+            for key in EXCHANGE_KEYS
+        }
+        if any(
+            abs(float(applied_data.get(key, 0) or 0) - expected_applied[key]) > 0.0001
+            for key in EXCHANGE_KEYS
+        ):
+            continue
+        for key, value in expected_applied.items():
+            totals[key] += value
     return {key: round(value, 4) for key, value in totals.items()}
 
 
