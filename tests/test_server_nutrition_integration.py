@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from nutrition_system import (
     ensure_nutrition_schema,
     save_pending_label,
     set_nutrition_input_state,
+    update_pending_consumption,
 )
 
 
@@ -532,11 +534,110 @@ def test_server_stages_missing_identity_and_pairs_product_front():
     assert conn.execute("SELECT status FROM pending_nutrition_logs WHERE token=?", (staged["token"],)).fetchone()[0] == "pending"
 
 
+def test_photo_time_source_and_servings_survive_product_front_replay():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    partial = {
+        **valid_label(),
+        "product_name": "",
+        "brand": "",
+        "observed_at": "2026-07-21T18:00:00+08:00",
+        "observed_at_confidence": 0.99,
+    }
+    staged = server.stage_nutrition_label(
+        conn,
+        user_id="U1",
+        parsed=partial,
+        source_message_id="BACK_REPLAY",
+        meal_slot="晚餐",
+        consumed_at="2026-07-21T18:00:00+08:00",
+        consumed_time_source="photo_timestamp",
+    )
+    front = {
+        "status": "success", "image_type": "product_front",
+        "product_name": "高蛋白豆漿", "brand": "測試", "barcode": "123", "confidence": 0.95,
+    }
+    server.pair_product_front(
+        conn, user_id="U1", parsed=front, source_message_id="FRONT_REPLAY"
+    )
+    update_pending_consumption(
+        conn,
+        user_id="U1",
+        token=staged["token"],
+        consumed_servings=2,
+        consumed_at="2026-07-21T18:00:00+08:00",
+        meal_slot="晚餐",
+        consumed_time_source="manual",
+    )
+    replayed = server.pair_product_front(
+        conn, user_id="U1", parsed=front, source_message_id="FRONT_REPLAY"
+    )
+    assert replayed["consumed_servings"] == 2
+    assert replayed["consumed_at"] == "2026-07-21T18:00:00+08:00"
+    assert replayed["consumed_time_source"] == "manual"
+
+
 def test_nutrition_vision_prompt_supports_two_photo_flow():
     prompt = server.build_nutrition_vision_prompt()
     assert "product_front" in prompt
     assert "缺少品名仍回傳 status=success" in prompt
     assert "不可因缺少品名丟棄已讀到的營養資料" in prompt
+
+
+def test_photo_timestamp_becomes_consumed_time_when_confident_and_reasonable():
+    received = datetime(2026, 7, 22, 15, 0, tzinfo=server.TW_TZ)
+    consumed, source = server.resolve_nutrition_consumed_at(
+        {
+            "observed_at": "2026-07-21T20:42:00+08:00",
+            "observed_at_confidence": 0.98,
+        },
+        received_at=received,
+    )
+    assert consumed.isoformat() == "2026-07-21T20:42:00+08:00"
+    assert source == "photo_timestamp"
+    assert server.current_meal_slot(consumed) == "晚餐"
+    prompt = server.build_nutrition_vision_prompt()
+    assert "observed_at_confidence" in prompt
+    assert "Asia/Taipei" in prompt
+
+
+@pytest.mark.parametrize(
+    "observed_at,confidence",
+    [
+        ("2026-07-21T20:42:00", 0.99),
+        ("2026-07-21T20:42:00+08:00", 0.84),
+        ("2026-07-22T15:11:00+08:00", 0.99),
+        ("2026-06-21T14:59:59+08:00", 0.99),
+        ("不是時間", 0.99),
+        ("2026-07-21T20:42:00+08:00", float("nan")),
+        ("2026-07-21T20:42:00+08:00", float("inf")),
+    ],
+)
+def test_photo_timestamp_falls_back_for_low_confidence_or_implausible_values(
+    observed_at, confidence
+):
+    received = datetime(2026, 7, 22, 15, 0, tzinfo=server.TW_TZ)
+    consumed, source = server.resolve_nutrition_consumed_at(
+        {"observed_at": observed_at, "observed_at_confidence": confidence},
+        received_at=received,
+    )
+    assert consumed == received
+    assert source == "line_timestamp"
+
+
+def test_photo_timestamp_exact_reasonableness_boundaries_are_accepted():
+    received = datetime(2026, 7, 22, 15, 0, tzinfo=server.TW_TZ)
+    for value in (
+        "2026-06-22T15:00:00+08:00",
+        "2026-07-22T15:10:00+08:00",
+        "2026-07-21T12:42:00Z",
+    ):
+        consumed, source = server.resolve_nutrition_consumed_at(
+            {"observed_at": value, "observed_at_confidence": 0.99},
+            received_at=received,
+        )
+        assert source == "photo_timestamp"
+        assert consumed.tzinfo == server.TW_TZ
 
 
 def test_parse_manual_nutrition_correction_command():

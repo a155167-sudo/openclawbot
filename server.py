@@ -6538,6 +6538,31 @@ def current_meal_slot(now=None):
     return "點心"
 
 
+def resolve_nutrition_consumed_at(parsed, *, received_at):
+    """Only promote a high-confidence, plausible photo watermark to event time."""
+    fallback = received_at
+    if fallback.tzinfo is None:
+        fallback = fallback.replace(tzinfo=TW_TZ)
+    else:
+        fallback = fallback.astimezone(TW_TZ)
+    try:
+        confidence = float(parsed.get("observed_at_confidence", 0) or 0)
+        if not 0.85 <= confidence <= 1:
+            return fallback, "line_timestamp"
+        raw = str(parsed.get("observed_at") or "").strip()
+        candidate = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if candidate.tzinfo is None:
+            return fallback, "line_timestamp"
+        candidate = candidate.astimezone(TW_TZ).replace(microsecond=0)
+    except (TypeError, ValueError, OverflowError):
+        return fallback, "line_timestamp"
+    if candidate < fallback - timedelta(days=30):
+        return fallback, "line_timestamp"
+    if candidate > fallback + timedelta(minutes=10):
+        return fallback, "line_timestamp"
+    return candidate, "photo_timestamp"
+
+
 def build_nutrition_vision_prompt():
     return (
         "你是一位專業的圖片資料辨識助理。先判斷圖片類型，再只回傳單一 JSON 物件，不要 markdown。\n\n"
@@ -6555,7 +6580,11 @@ def build_nutrition_vision_prompt():
         "\"per_100\":{\"calories_kcal\":0,\"protein_g\":0,\"fat_g\":0,"
         "\"saturated_fat_g\":0,\"trans_fat_g\":0,\"cholesterol_mg\":0,"
         "\"carbohydrate_g\":0,\"sugar_g\":0,\"fiber_g\":0,\"sodium_mg\":0},"
-        "\"observed_at\":\"圖片上明確顯示的ISO時間，沒有則空字串\",\"confidence\":0到1,\"notes\":\"\"}。\n"
+        "\"observed_at\":\"圖片浮水印明確顯示的Asia/Taipei ISO 8601時間，沒有則空字串\","
+        "\"observed_at_confidence\":0到1,\"confidence\":0到1,\"notes\":\"\"}。\n"
+        "若圖片角落有日期時間浮水印（例如2026年7月21日、晚上8:42），轉為Asia/Taipei的"
+        "2026-07-21T20:42:00+08:00；只有年月日、時、分均清楚時才填observed_at，"
+        "否則留空且observed_at_confidence=0，不可猜測。"
         "package_amount 必須是整個包裝容量；若只看到每份量，且本包裝含1份，可用每份量。"
         "缺少品名仍回傳 status=success，product_name與brand可留空；不可因缺少品名丟棄已讀到的營養資料。"
         "只有營養數值或容量模糊到無法安全讀取時，才回傳 status=error 並說明需補拍位置。\n"
@@ -6569,7 +6598,8 @@ def build_nutrition_vision_prompt():
 
 
 def stage_nutrition_label(
-    conn, *, user_id, parsed, source_message_id, meal_slot, consumed_at
+    conn, *, user_id, parsed, source_message_id, meal_slot, consumed_at,
+    consumed_time_source="line_timestamp",
 ):
     label = normalize_label_payload(parsed, require_product_name=False)
     if label["confidence"] < 0.65:
@@ -6582,10 +6612,12 @@ def stage_nutrition_label(
         consumed_servings=1,
         meal_slot=meal_slot,
         consumed_at=consumed_at,
+        consumed_time_source=consumed_time_source,
         allow_missing_identity=True,
     )
     row = conn.execute(
-        "SELECT label_payload_json,status FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+        """SELECT label_payload_json,status,consumed_at,consumed_time_source,
+                  consumed_servings FROM pending_nutrition_logs WHERE token=? AND user_id=?""",
         (token, user_id),
     ).fetchone()
     if not row:
@@ -6593,16 +6625,34 @@ def stage_nutrition_label(
     stored_label = normalize_label_payload(
         json.loads(row[0]), require_product_name=row[1] == "pending"
     )
-    return {"token": token, "label": stored_label, "needs_identity": row[1] == "awaiting_identity"}
+    return {
+        "token": token,
+        "label": stored_label,
+        "needs_identity": row[1] == "awaiting_identity",
+        "consumed_at": row[2],
+        "consumed_time_source": row[3],
+        "consumed_servings": float(row[4]),
+    }
 
 
 def pair_product_front(conn, *, user_id, parsed, source_message_id):
-    return attach_latest_pending_identity(
+    result = attach_latest_pending_identity(
         conn,
         user_id=user_id,
         identity=parsed,
         message_id=str(source_message_id or ""),
     )
+    row = conn.execute(
+        """SELECT consumed_at,consumed_time_source,consumed_servings
+           FROM pending_nutrition_logs WHERE token=? AND user_id=?""",
+        (result["token"], user_id),
+    ).fetchone()
+    if not row:
+        raise RuntimeError("營養草稿時間遺失")
+    result["consumed_at"] = row[0]
+    result["consumed_time_source"] = row[1]
+    result["consumed_servings"] = float(row[2])
+    return result
 
 
 _NUTRITION_CORRECTION_FIELDS = {
@@ -7116,6 +7166,13 @@ def handle_image_message(event):
             return
 
         if image_type == "nutrition_label":
+            try:
+                received_at = datetime.fromtimestamp(float(event.timestamp) / 1000, TW_TZ)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                received_at = tw_now()
+            consumed_time, consumed_time_source = resolve_nutrition_consumed_at(
+                parsed, received_at=received_at
+            )
             with sqlite3.connect(DB_PATH) as conn:
                 ensure_nutrition_schema(conn)
                 staged = stage_nutrition_label(
@@ -7123,9 +7180,9 @@ def handle_image_message(event):
                     user_id=uid,
                     parsed=parsed,
                     source_message_id=str(message_id),
-                    meal_slot=current_meal_slot(),
-                    # 圖片上的時間只保留作辨識參考，不直接當作食用時間。
-                    consumed_at=tw_now().isoformat(timespec="seconds"),
+                    meal_slot=current_meal_slot(consumed_time),
+                    consumed_at=consumed_time.isoformat(timespec="seconds"),
+                    consumed_time_source=consumed_time_source,
                 )
                 token = staged["token"]
                 label = staged["label"]
@@ -7176,7 +7233,13 @@ def handle_image_message(event):
                 event.reply_token,
                 FlexSendMessage(
                     alt_text=f"請確認營養標示：{label['product_name']}",
-                    contents=build_label_confirmation_bubble(label, token=token, consumed_servings=1),
+                    contents=build_label_confirmation_bubble(
+                        label,
+                        token=token,
+                        consumed_servings=staged["consumed_servings"],
+                        consumed_at=staged["consumed_at"],
+                        consumed_time_source=staged["consumed_time_source"],
+                    ),
                 ),
             )
             return
@@ -7197,7 +7260,11 @@ def handle_image_message(event):
                     FlexSendMessage(
                         alt_text=f"請確認營養標示：{paired['label']['product_name']}",
                         contents=build_label_confirmation_bubble(
-                            paired["label"], token=paired["token"], consumed_servings=1
+                            paired["label"],
+                            token=paired["token"],
+                            consumed_servings=paired["consumed_servings"],
+                            consumed_at=paired["consumed_at"],
+                            consumed_time_source=paired["consumed_time_source"],
                         ),
                     ),
                 )
@@ -7565,13 +7632,20 @@ def _handle_message_impl(event):
                     token=token,
                     consumed_at=consumed_time.isoformat(timespec="seconds"),
                     meal_slot=meal_slot,
+                    consumed_time_source="manual",
                 )
             label = updated["label"]
             servings = updated["consumed_servings"]
             from linebot.models import FlexSendMessage
             line_bot_api.reply_message(event.reply_token, FlexSendMessage(
                 alt_text=f"請確認營養標示：{label['product_name']}",
-                contents=build_label_confirmation_bubble(label, token=token, consumed_servings=servings),
+                contents=build_label_confirmation_bubble(
+                    label,
+                    token=token,
+                    consumed_servings=servings,
+                    consumed_at=updated["consumed_at"],
+                    consumed_time_source="manual",
+                ),
             ))
         except Exception as exc:
             print(f"⚠️ 修改營養時間失敗：{exc}")
@@ -7592,7 +7666,13 @@ def _handle_message_impl(event):
             from linebot.models import FlexSendMessage
             line_bot_api.reply_message(event.reply_token, FlexSendMessage(
                 alt_text=f"請確認營養標示：{label['product_name']}",
-                contents=build_label_confirmation_bubble(label, token=token, consumed_servings=servings),
+                contents=build_label_confirmation_bubble(
+                    label,
+                    token=token,
+                    consumed_servings=servings,
+                    consumed_at=updated["consumed_at"],
+                    consumed_time_source=updated["consumed_time_source"],
+                ),
             ))
         except Exception as exc:
             print(f"⚠️ 修改營養份量失敗：{exc}")
@@ -7604,7 +7684,8 @@ def _handle_message_impl(event):
     with sqlite3.connect(DB_PATH) as conn:
         ensure_nutrition_schema(conn)
         replay_row = conn.execute(
-            """SELECT e.token,p.label_payload_json,p.consumed_servings
+            """SELECT e.token,p.label_payload_json,p.consumed_servings,p.consumed_at,
+                      p.consumed_time_source
                FROM nutrition_message_events e
                JOIN pending_nutrition_logs p ON p.token=e.token AND p.user_id=e.user_id
                WHERE e.message_id=? AND e.user_id=? AND e.event_type='text_edit'""",
@@ -7615,16 +7696,20 @@ def _handle_message_impl(event):
                 replay_row[0],
                 normalize_label_payload(json.loads(replay_row[1])),
                 float(replay_row[2]),
+                replay_row[3],
+                replay_row[4],
             )
     if nutrition_edit_replay:
-        token, label, servings = nutrition_edit_replay
+        token, label, servings, consumed_at, consumed_time_source = nutrition_edit_replay
         from linebot.models import FlexSendMessage
         line_bot_api.reply_message(
             event.reply_token,
             FlexSendMessage(
                 alt_text=f"請確認營養標示：{label['product_name']}",
                 contents=build_label_confirmation_bubble(
-                    label, token=token, consumed_servings=servings
+                    label, token=token, consumed_servings=servings,
+                    consumed_at=consumed_at,
+                    consumed_time_source=consumed_time_source,
                 ),
             ),
         )
@@ -7677,17 +7762,22 @@ def _handle_message_impl(event):
                 token = edited["token"]
                 label = edited["label"]
                 servings_row = conn.execute(
-                    "SELECT consumed_servings FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+                    """SELECT consumed_servings,consumed_at,consumed_time_source
+                       FROM pending_nutrition_logs WHERE token=? AND user_id=?""",
                     (token, uid),
                 ).fetchone()
                 servings = float(servings_row[0]) if servings_row else 1.0
+                consumed_at = servings_row[1] if servings_row else ""
+                consumed_time_source = servings_row[2] if servings_row else "line_timestamp"
             from linebot.models import FlexSendMessage
             line_bot_api.reply_message(
                 event.reply_token,
                 FlexSendMessage(
                     alt_text=f"請確認營養標示：{label['product_name']}",
                     contents=build_label_confirmation_bubble(
-                        label, token=token, consumed_servings=servings
+                        label, token=token, consumed_servings=servings,
+                        consumed_at=consumed_at,
+                        consumed_time_source=consumed_time_source,
                     ),
                 ),
             )

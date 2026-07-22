@@ -76,6 +76,15 @@ def test_normalize_label_payload_accepts_soy_milk_label():
     assert chinese_unit["package_unit"] == "ml"
 
 
+@pytest.mark.parametrize("bad_confidence", [float("nan"), float("inf"), -1, 2, "錯誤"])
+def test_invalid_optional_observed_time_confidence_does_not_reject_nutrition_label(
+    bad_confidence,
+):
+    payload = {**SOY_MILK_PAYLOAD, "observed_at_confidence": bad_confidence}
+    normalized = normalize_label_payload(payload)
+    assert normalized["observed_at_confidence"] == 0
+
+
 def test_normalize_label_payload_rejects_negative_nutrition():
     payload = {**SOY_MILK_PAYLOAD, "per_serving": {**SOY_MILK_PAYLOAD["per_serving"], "protein_g": -1}}
     with pytest.raises(ValueError, match="protein_g"):
@@ -187,7 +196,7 @@ def test_ensure_nutrition_schema_creates_required_tables():
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
-    ).fetchone()[0] == 2
+    ).fetchone()[0] == 3
 
 
 def test_schema_migration_deduplicates_legacy_line_message_ids_before_unique_indexes():
@@ -228,7 +237,7 @@ def test_schema_migration_deduplicates_legacy_line_message_ids_before_unique_ind
     assert {"idx_pending_source_message", "idx_pending_identity_message"} <= indexes
 
 
-def test_existing_v1_marker_runs_v2_additive_migration():
+def test_existing_v1_marker_runs_latest_additive_migration():
     conn = sqlite3.connect(":memory:")
     conn.executescript(
         """
@@ -248,9 +257,31 @@ def test_existing_v1_marker_runs_v2_additive_migration():
     log_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_logs)")}
     assert {"claimed_at", "lease_owner", "resync_required"} <= outbox_columns
     assert {"approved_exchange_json", "exchange_approval_id"} <= log_columns
+    pending_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(pending_nutrition_logs)")
+    }
+    assert "consumed_time_source" in pending_columns
     assert conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
-    ).fetchone()[0] == 2
+    ).fetchone()[0] == 3
+
+
+def test_existing_v2_marker_runs_v3_time_source_migration():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    conn.execute("ALTER TABLE pending_nutrition_logs DROP COLUMN consumed_time_source")
+    conn.execute(
+        "UPDATE nutrition_schema_versions SET version=2 WHERE component='nutrition_system'"
+    )
+    conn.commit()
+    ensure_nutrition_schema(conn)
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(pending_nutrition_logs)")
+    }
+    assert "consumed_time_source" in columns
+    assert conn.execute(
+        "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
+    ).fetchone()[0] == 3
 
 
 def test_sheet_specs_include_four_required_tabs_and_exchange_seed_rows():
@@ -264,19 +295,33 @@ def test_sheet_specs_include_four_required_tabs_and_exchange_seed_rows():
 
 def test_confirmation_bubble_contains_nutrition_and_token_actions():
     label = normalize_label_payload(SOY_MILK_PAYLOAD)
-    bubble = build_label_confirmation_bubble(label, token="abc123", consumed_servings=1)
+    bubble = build_label_confirmation_bubble(
+        label,
+        token="abc123",
+        consumed_servings=1,
+        consumed_at="2026-07-21T20:42:00+08:00",
+        consumed_time_source="photo_timestamp",
+    )
     body_text = str(bubble)
     assert "無加糖濃豆漿" in body_text
     assert "190.2" in body_text
     assert "19.1" in body_text
     assert "確認營養紀錄:abc123" in body_text
     assert "修改營養時間:abc123" in body_text
+    assert "進食時間：2026/07/21 20:42（照片時間）" in body_text
     assert "取消營養紀錄:abc123" in body_text
     assert "推算營養份數" in body_text
     assert "低脂蛋白 2.73份" in body_text
     assert "主食 0.53份" in body_text
     assert "尚未扣入個人計畫" in body_text
     assert "油脂份不計" in body_text
+    manual_bubble = build_label_confirmation_bubble(
+        label,
+        token="abc123",
+        consumed_at="2026-07-21T20:42:00+08:00",
+        consumed_time_source="manual",
+    )
+    assert "進食時間：2026/07/21 20:42（手動設定）" in str(manual_bubble)
 
 
 def test_pending_label_confirmation_creates_private_food_and_snapshot_log():

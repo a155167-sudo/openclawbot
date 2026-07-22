@@ -120,6 +120,14 @@ def normalize_label_payload(
         payload.get("servings_per_package", 1), "servings_per_package", allow_zero=False, max_value=1000
     )
     confidence = _number(payload.get("confidence", 0), "confidence", max_value=1.0)
+    try:
+        observed_at_confidence = _number(
+            payload.get("observed_at_confidence", 0),
+            "observed_at_confidence",
+            max_value=1.0,
+        )
+    except ValueError:
+        observed_at_confidence = 0.0
     per_serving = _normalize_nutrients(payload.get("per_serving"))
     per_100 = _normalize_nutrients(payload.get("per_100"))
     if per_serving["calories_kcal"] <= 0 or not any(
@@ -138,6 +146,7 @@ def normalize_label_payload(
         "per_serving": per_serving,
         "per_100": per_100,
         "observed_at": str(payload.get("observed_at") or "").strip(),
+        "observed_at_confidence": observed_at_confidence,
         "confidence": confidence,
         "notes": str(payload.get("notes") or "").strip(),
     }
@@ -425,13 +434,21 @@ def rank_menu_candidates(
 
 
 def build_label_confirmation_bubble(
-    label: Mapping[str, Any], *, token: str, consumed_servings: float = 1
+    label: Mapping[str, Any], *, token: str, consumed_servings: float = 1,
+    consumed_at: str = "", consumed_time_source: str = "line_timestamp",
 ) -> dict[str, Any]:
     normalized = normalize_label_payload(label)
     nutrition = scale_nutrition(normalized["per_serving"], consumed_servings)
     amount = normalized["package_amount"] * float(consumed_servings) / normalized["servings_per_package"]
     brand_line = f"{normalized['brand']}｜" if normalized["brand"] else ""
-    observed = normalized.get("observed_at") or "以LINE收到時間為準"
+    try:
+        consumed_time_text = datetime.fromisoformat(consumed_at).strftime("%Y/%m/%d %H:%M")
+    except (TypeError, ValueError):
+        consumed_time_text = "以LINE收到時間為準"
+    source_text = {
+        "photo_timestamp": "照片時間",
+        "manual": "手動設定",
+    }.get(consumed_time_source, "LINE收到時間")
     exchange_suggestion = suggest_exchange_portions(
         product_name=normalized["product_name"], nutrition=nutrition
     )
@@ -453,7 +470,7 @@ def build_label_confirmation_bubble(
     body = [
         {"type": "text", "text": normalized["product_name"], "size": "xl", "weight": "bold", "wrap": True},
         {"type": "text", "text": f"{brand_line}{amount:g}{normalized['package_unit']}｜{float(consumed_servings):g}份", "size": "sm", "color": "#666666", "margin": "sm", "wrap": True},
-        {"type": "text", "text": f"辨識時間：{observed}", "size": "xs", "color": "#999999", "margin": "xs", "wrap": True},
+        {"type": "text", "text": f"進食時間：{consumed_time_text}（{source_text}）", "size": "xs", "color": "#666666", "margin": "xs", "wrap": True},
         {"type": "separator", "margin": "md"},
         {"type": "text", "text": f"熱量  {nutrition['calories_kcal']:g} kcal", "size": "md", "weight": "bold", "margin": "md"},
         {"type": "text", "text": f"蛋白質 {nutrition['protein_g']:g}g　脂肪 {nutrition['fat_g']:g}g", "size": "sm", "color": "#333333", "margin": "sm"},
@@ -654,6 +671,7 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             consumed_servings REAL NOT NULL DEFAULT 1,
             meal_slot TEXT DEFAULT '',
             consumed_at TEXT DEFAULT '',
+            consumed_time_source TEXT NOT NULL DEFAULT 'line_timestamp',
             status TEXT NOT NULL DEFAULT 'pending',
             confirmed_log_id TEXT DEFAULT '',
             created_at TEXT NOT NULL,
@@ -704,7 +722,7 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         """
     )
     schema_component = "nutrition_system"
-    schema_version = 2
+    schema_version = 3
     version_row = conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component=?",
         (schema_component,),
@@ -725,6 +743,7 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             "identity_message_id": "TEXT DEFAULT ''",
             "confirmed_log_id": "TEXT DEFAULT ''",
             "retired_at": "TEXT DEFAULT ''",
+            "consumed_time_source": "TEXT NOT NULL DEFAULT 'line_timestamp'",
         },
         "food_logs": {
             "legacy_applied_at": "TEXT DEFAULT ''",
@@ -866,9 +885,12 @@ def save_pending_label(
     consumed_servings: float = 1,
     meal_slot: str = "",
     consumed_at: str = "",
+    consumed_time_source: str = "line_timestamp",
     allow_missing_identity: bool = False,
 ) -> str:
     normalized = normalize_label_payload(payload, require_product_name=not allow_missing_identity)
+    if consumed_time_source not in {"photo_timestamp", "line_timestamp", "manual"}:
+        raise ValueError("consumed_time_source 不支援")
     status = "pending" if normalized["product_name"] else "awaiting_identity"
     if source_message_id:
         existing = conn.execute(
@@ -890,9 +912,9 @@ def save_pending_label(
             """
             INSERT INTO pending_nutrition_logs
             (token, user_id, label_payload_json, source_image_ref, source_message_id,
-             consumed_servings, meal_slot, consumed_at, status, confirmed_log_id,
-             created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+             consumed_servings, meal_slot, consumed_at, consumed_time_source,
+             status, confirmed_log_id, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
             """,
             (
                 token,
@@ -903,6 +925,7 @@ def save_pending_label(
                 _number(consumed_servings, "consumed_servings", allow_zero=False, max_value=100),
                 meal_slot,
                 consumed_at or now,
+                consumed_time_source,
                 status,
                 now,
                 expires_at,
@@ -1255,6 +1278,7 @@ def update_pending_consumption(
     consumed_servings: Any = None,
     meal_slot: str | None = None,
     consumed_at: str | None = None,
+    consumed_time_source: str | None = None,
 ) -> dict[str, Any]:
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1280,9 +1304,14 @@ def update_pending_consumption(
                 raise ValueError("consumed_at 格式錯誤") from exc
             updates.append("consumed_at=?")
             params.append(consumed_at)
+        if consumed_time_source is not None:
+            if consumed_time_source not in {"photo_timestamp", "line_timestamp", "manual"}:
+                raise ValueError("consumed_time_source 不支援")
+            updates.append("consumed_time_source=?")
+            params.append(consumed_time_source)
         if not updates:
             row = conn.execute(
-                "SELECT consumed_servings,meal_slot,consumed_at FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+                "SELECT consumed_servings,meal_slot,consumed_at,consumed_time_source FROM pending_nutrition_logs WHERE token=? AND user_id=?",
                 (token, user_id),
             ).fetchone()
             conn.commit()
@@ -1291,6 +1320,7 @@ def update_pending_consumption(
                 "consumed_servings": float(row[0]),
                 "meal_slot": row[1],
                 "consumed_at": row[2],
+                "consumed_time_source": row[3],
             }
         params.extend([token, user_id])
         changed = conn.execute(
@@ -1300,7 +1330,7 @@ def update_pending_consumption(
         if changed != 1:
             raise RuntimeError("營養份量或時間修改狀態衝突")
         row = conn.execute(
-            "SELECT consumed_servings,meal_slot,consumed_at FROM pending_nutrition_logs WHERE token=? AND user_id=?",
+            "SELECT consumed_servings,meal_slot,consumed_at,consumed_time_source FROM pending_nutrition_logs WHERE token=? AND user_id=?",
             (token, user_id),
         ).fetchone()
         conn.commit()
@@ -1309,6 +1339,7 @@ def update_pending_consumption(
             "consumed_servings": float(row[0]),
             "meal_slot": row[1],
             "consumed_at": row[2],
+            "consumed_time_source": row[3],
         }
     except Exception:
         if conn.in_transaction:
