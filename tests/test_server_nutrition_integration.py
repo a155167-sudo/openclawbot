@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 from datetime import datetime
 from types import SimpleNamespace
@@ -18,6 +19,12 @@ from nutrition_system import (
     update_pending_consumption,
 )
 from daily_health_report import ensure_daily_health_schema, get_daily_health_checkin
+from meal_photo_system import (
+    apply_meal_photo_action,
+    ensure_meal_photo_schema,
+    get_meal_photo_draft,
+    save_meal_photo_draft,
+)
 
 
 class FakeWorksheet:
@@ -243,7 +250,33 @@ def test_health_check_uses_configured_sqlite_schema(tmp_path, monkeypatch):
     assert server.health_check() == {"status": "ok", "service": "openclawbot"}
     with sqlite3.connect(db_path) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"usage", "health_profile", "food_catalog", "food_logs", "nutrition_sheet_outbox"} <= tables
+    assert {
+        "usage", "health_profile", "food_catalog", "food_logs",
+        "nutrition_sheet_outbox", "pending_meal_photo_drafts", "meal_photo_events",
+        "meal_photo_schema_versions",
+    } <= tables
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE meal_photo_events")
+        conn.commit()
+    with pytest.raises(server.HTTPException) as exc_info:
+        server.health_check()
+    assert exc_info.value.status_code == 503
+
+
+def test_health_check_rejects_meal_photo_schema_version_one(tmp_path, monkeypatch):
+    data_dir = tmp_path / "volume-version"
+    db_path = data_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(data_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db_path))
+    server.init_db()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE meal_photo_schema_versions SET version=1 WHERE component='meal_photo_system'"
+        )
+        conn.commit()
+    with pytest.raises(server.HTTPException) as exc_info:
+        server.health_check()
+    assert exc_info.value.status_code == 503
 
 
 def test_health_check_rejects_empty_database(tmp_path, monkeypatch):
@@ -1101,6 +1134,298 @@ def test_scheduled_daily_report_push_is_idempotent(tmp_path, monkeypatch):
     assert server.send_jason_daily_health_report(now=now) is True
     assert server.send_jason_daily_health_report(now=now) is False
     assert fake.sent == [("U_JASON", "REPORT", 12)]
+
+
+def meal_photo_payload():
+    return {
+        "status": "success",
+        "image_type": "food_photo",
+        "visible_items": [
+            {"name": "高麗菜", "category": "vegetable", "confidence": 0.98},
+            {"name": "青花菜", "category": "vegetable", "confidence": 0.97},
+        ],
+        "uncertain_items": ["上方棕色主菜種類不明"],
+        "starch_visibility": "not_visible",
+        "oil_sauce_status": "unknown",
+        "observed_at": "2026-07-22T22:37:00+08:00",
+        "observed_at_confidence": 0.99,
+    }
+
+
+def test_vision_prompt_requests_observations_not_fake_food_photo_nutrients():
+    prompt = server.build_nutrition_vision_prompt()
+    food_section = prompt.split("若只有餐盤照片", 1)[1]
+    assert "visible_items" in food_section
+    assert "uncertain_items" in food_section
+    assert "starch_visibility" in food_section
+    assert "不可估算熱量" in food_section
+    assert '"calories_kcal":0' not in food_section
+
+
+def test_unknown_image_reply_mentions_meal_photos(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "cleanup_nutrition_images", lambda: None)
+    monkeypatch.setattr(
+        server.line_bot_api, "get_message_content",
+        lambda _: SimpleNamespace(content=b"\xff\xd8\xff" + b"x" * 100),
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "status": "success", "image_type": "unknown"
+        })))]
+    )
+    monkeypatch.setattr(server.client.chat.completions, "create", lambda **_: response)
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    event = SimpleNamespace(
+        message=SimpleNamespace(id="unknown-image-message"),
+        source=SimpleNamespace(user_id="U_UNKNOWN"), reply_token="reply-unknown",
+        timestamp=1784740620000,
+    )
+    server.processed_messages.discard(event.message.id)
+
+    server.handle_image_message(event)
+
+    assert len(replies) == 1
+    assert "餐點照片" in replies[0].text
+    assert "Garmin" in replies[0].text
+    assert "營養標示" in replies[0].text
+
+
+def test_food_photo_image_handler_stages_durable_unknown_safe_flex(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-handler.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "cleanup_nutrition_images", lambda: None)
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "get_message_content",
+        lambda _: SimpleNamespace(content=b"\xff\xd8\xff" + b"x" * 100),
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=__import__("json").dumps(meal_photo_payload())))]
+    )
+    monkeypatch.setattr(server.client.chat.completions, "create", lambda **_: response)
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
+    event = SimpleNamespace(
+        message=SimpleNamespace(id="meal-photo-message"),
+        source=SimpleNamespace(user_id="U_MEAL"),
+        reply_token="reply",
+        timestamp=1784740620000,
+    )
+    server.processed_messages.discard(event.message.id)
+
+    server.handle_image_message(event)
+
+    assert len(replies) == 1
+    text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
+    assert "餐點照片辨識" in text
+    assert "NA（尚未估算）" in text
+    with sqlite3.connect(db) as conn:
+        ensure_meal_photo_schema(conn)
+        row = conn.execute(
+            "SELECT token,source_image_ref,status FROM pending_meal_photo_drafts WHERE user_id='U_MEAL'"
+        ).fetchone()
+    assert row[1].startswith("nutrition-image:")
+    assert row[2] == "awaiting_confirmation"
+    image_path = server._nutrition_image_path(row[1])
+    assert image_path is not None and os.path.exists(image_path)
+
+
+def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-postback-final.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        ensure_meal_photo_schema(conn)
+        token = save_meal_photo_draft(
+            conn, user_id="U_MEAL", source_message_id="M1", payload=meal_photo_payload()
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"PREP-{index}", user_id="U_MEAL", token=token,
+                expected_version=index, action="answer", field=field, value=value,
+            )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        source=SimpleNamespace(user_id="U_MEAL"), reply_token="reply-final",
+        webhook_event_id="WEBHOOK-FINAL", timestamp=1784740620000,
+    )
+
+    server.handle_meal_photo_postback(event)
+
+    assert len(replies) == 1
+    estimate_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
+    assert "照片估算" in estimate_text
+    with sqlite3.connect(db) as conn:
+        draft = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
+    assert draft["status"] == "estimated"
+    assert draft["estimate"]["starch_exchange"] == {"min": 0.0, "max": 0.0, "basis": "user_confirmed_none"}
+
+
+def test_meal_photo_postback_replays_after_reply_failure_without_double_update(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-postback.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_MEAL", source_message_id="M_POST", payload=meal_photo_payload()
+        )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:1:answer:scope:visible_only"),
+        source=SimpleNamespace(user_id="U_MEAL"),
+        reply_token="reply-postback",
+        webhook_event_id="WEBHOOK-EVENT-1",
+        timestamp=1784740620000,
+    )
+    calls = {"count": 0}
+
+    def fail_first_reply(_token, _message):
+        calls["count"] += 1
+        raise RuntimeError("LINE unavailable")
+
+    monkeypatch.setattr(server.line_bot_api, "reply_message", fail_first_reply)
+    with pytest.raises(RuntimeError, match="LINE unavailable"):
+        server.handle_meal_photo_postback(event)
+    with sqlite3.connect(db) as conn:
+        draft = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
+        events = conn.execute("SELECT COUNT(*) FROM meal_photo_events").fetchone()[0]
+    assert draft["version"] == 2
+    assert draft["answers"]["scope"] == "visible_only"
+    assert events == 1
+
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    server.handle_meal_photo_postback(event)
+    with sqlite3.connect(db) as conn:
+        replayed = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
+        events = conn.execute("SELECT COUNT(*) FROM meal_photo_events").fetchone()[0]
+    assert replayed["version"] == 2
+    assert events == 1
+    assert len(replies) == 1
+    assert "主要蛋白質食物" in replies[0].text
+    option_data = [item.action.data for item in replies[0].quick_reply.items]
+    answer_data = [data for data in option_data if ":answer:" in data]
+    assert answer_data and all(
+        data.startswith(f"mp:v1:{token}:2:answer:protein_type:") for data in answer_data
+    )
+    assert f"mp:v1:{token}:2:cancel" in option_data
+
+
+def test_cancel_meal_photo_deletes_file_before_clearing_reference(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-cancel.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        ensure_meal_photo_schema(conn)
+        token = save_meal_photo_draft(
+            conn,
+            user_id="U_MEAL",
+            source_message_id="M2",
+            payload=meal_photo_payload(),
+            source_image_ref="nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg",
+        )
+    deleted = []
+    monkeypatch.setattr(server, "_delete_nutrition_image", lambda ref: deleted.append(ref) or True)
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:1:cancel"),
+        source=SimpleNamespace(user_id="U_MEAL"), reply_token="reply-cancel",
+        webhook_event_id="WEBHOOK-CANCEL", timestamp=1784740620000,
+    )
+
+    server.handle_meal_photo_postback(event)
+
+    assert deleted == ["nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg"]
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT status,source_image_ref,observed_payload_json FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()
+    assert row == ("cancelled", "", "{}")
+    assert "已取消" in replies[0].text
+
+
+def test_cleanup_retries_expired_meal_photo_image_and_scrubs_payload(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-expiry.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    ref = "nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg"
+    with sqlite3.connect(db) as conn:
+        ensure_meal_photo_schema(conn)
+        token = save_meal_photo_draft(
+            conn, user_id="U_MEAL", source_message_id="M3",
+            payload=meal_photo_payload(), source_image_ref=ref,
+        )
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET expires_at='2000-01-01T00:00:00+08:00' WHERE token=?",
+            (token,),
+        )
+        conn.commit()
+    monkeypatch.setattr(server, "_delete_nutrition_image", lambda _ref: False)
+
+    server.cleanup_nutrition_images()
+
+    with sqlite3.connect(db) as conn:
+        status, payload, retained_ref = conn.execute(
+            "SELECT status,observed_payload_json,source_image_ref FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()
+    assert (status, payload, retained_ref) == ("expired", "{}", ref)
+
+    monkeypatch.setattr(server, "_delete_nutrition_image", lambda _ref: True)
+    server.cleanup_nutrition_images()
+    with sqlite3.connect(db) as conn:
+        cleared_ref = conn.execute(
+            "SELECT source_image_ref FROM pending_meal_photo_drafts WHERE token=?", (token,)
+        ).fetchone()[0]
+    assert cleared_ref == ""
+
+
+def test_cleanup_removes_old_meal_photo_event_before_parent_tombstone(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-retention.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_MEAL", source_message_id="M_OLD",
+            payload=meal_photo_payload(),
+        )
+        apply_meal_photo_action(
+            conn, event_id="OLD-CANCEL", user_id="U_MEAL", token=token,
+            expected_version=1, action="cancel",
+        )
+        conn.execute(
+            """UPDATE pending_meal_photo_drafts
+               SET retired_at='2000-01-01T00:00:00+08:00',source_image_ref=''
+               WHERE token=?""", (token,)
+        )
+        conn.execute(
+            "UPDATE meal_photo_events SET created_at='2000-01-01T00:00:00+08:00' WHERE token=?",
+            (token,),
+        )
+        conn.commit()
+
+    server.cleanup_nutrition_images()
+
+    with sqlite3.connect(db) as conn:
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM meal_photo_events WHERE token=?", (token,)
+        ).fetchone()[0]
+        draft_count = conn.execute(
+            "SELECT COUNT(*) FROM pending_meal_photo_drafts WHERE token=?", (token,)
+        ).fetchone()[0]
+    assert event_count == 0
+    assert draft_count == 0
 
 
 def test_register_daily_health_jobs_uses_retry_minutes_and_single_instance():

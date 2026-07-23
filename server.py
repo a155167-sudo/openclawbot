@@ -1,3 +1,4 @@
+import hashlib
 import os
 import json
 import sqlite3
@@ -18,7 +19,10 @@ from google.oauth2.service_account import Credentials
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextSendMessage, TextMessage, ImageMessage, QuickReply, QuickReplyButton, MessageAction
+from linebot.models import (
+    MessageEvent, TextSendMessage, TextMessage, ImageMessage, QuickReply,
+    QuickReplyButton, MessageAction, PostbackAction, PostbackEvent,
+)
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from contextlib import asynccontextmanager, closing
@@ -56,6 +60,19 @@ from daily_health_report import (
     parse_health_checkin,
     save_daily_health_checkin,
     summarize_intervals_activities,
+)
+from meal_photo_system import (
+    apply_meal_photo_action,
+    build_meal_photo_confirmation_bubble,
+    build_meal_photo_estimate_bubble,
+    clear_meal_photo_image_ref,
+    daily_pending_meal_photo_count,
+    ensure_meal_photo_schema,
+    get_meal_photo_draft,
+    meal_photo_step_options,
+    next_meal_photo_step,
+    normalize_meal_photo_payload,
+    save_meal_photo_draft,
 )
 
 # --- 1. 時區與基本工具設定 ---
@@ -402,10 +419,14 @@ def build_jason_daily_health_report(user_id: str, report_date: str) -> str:
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         ensure_nutrition_schema(conn)
         ensure_daily_health_schema(conn)
+        ensure_meal_photo_schema(conn)
         checkin = get_daily_health_checkin(
             conn, user_id=user_id, report_date=report_date
         )
         food_summary = daily_food_summary(
+            conn, user_id=user_id, date_iso=report_date
+        )
+        pending_meal_photos = daily_pending_meal_photo_count(
             conn, user_id=user_id, date_iso=report_date
         )
     try:
@@ -421,7 +442,7 @@ def build_jason_daily_health_report(user_id: str, report_date: str) -> str:
         totals=food_summary["totals"],
         target=target,
         exercise=exercise,
-        pending_reviews=food_summary["pending_reviews"],
+        pending_reviews=food_summary["pending_reviews"] + pending_meal_photos,
     )
 
 
@@ -567,10 +588,22 @@ def health_check():
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-            required = {"usage", "health_profile", "food_catalog", "food_logs", "nutrition_sheet_outbox"}
+            required = {
+                "usage", "health_profile", "food_catalog", "food_logs",
+                "nutrition_sheet_outbox", "pending_meal_photo_drafts", "meal_photo_events",
+                "meal_photo_schema_versions",
+            }
             missing = required - existing
             if missing:
                 raise sqlite3.OperationalError("required schema missing")
+            meal_version = conn.execute(
+                "SELECT version FROM meal_photo_schema_versions WHERE component='meal_photo_system'"
+            ).fetchone()
+            draft_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(pending_meal_photo_drafts)")
+            }
+            if not meal_version or int(meal_version[0]) < 2 or "version" not in draft_columns:
+                raise sqlite3.OperationalError("meal photo schema incomplete")
     except sqlite3.Error as exc:
         print(f"⚠️ 健康檢查資料庫失敗：{exc}")
         raise HTTPException(status_code=503, detail="database unavailable") from exc
@@ -1758,6 +1791,8 @@ def init_db():
         ensure_nutrition_schema(conn)
         # Jason 每日健康回報與23:30日報冪等推送狀態。
         ensure_daily_health_schema(conn)
+        # 無營養標示餐點照片的持久草稿與按鈕確認狀態。
+        ensure_meal_photo_schema(conn)
 
         # --- 以上結束 ---
 
@@ -6807,8 +6842,15 @@ def build_nutrition_vision_prompt():
         "若是商品正面、可看到品名但沒有完整營養表，回傳："
         "{\"status\":\"success\",\"image_type\":\"product_front\",\"product_name\":\"完整品名與口味\","
         "\"brand\":\"品牌\",\"barcode\":\"看得到才填\",\"confidence\":0到1}。不可猜測看不到的口味。\n"
-        "若只有餐盤照片，回傳 {\"status\":\"success\",\"image_type\":\"food_photo\","
-        "\"message\":\"目前第一版先支援營養標示，請補拍包裝背面的營養標示。\"}。"
+        "若只有餐盤照片，回傳："
+        "{\"status\":\"success\",\"image_type\":\"food_photo\","
+        "\"visible_items\":[{\"name\":\"只寫畫面可見食物\",\"category\":\"vegetable/protein/starch/fruit/milk/unknown\",\"confidence\":0到1}],"
+        "\"uncertain_items\":[\"看得到但無法確定種類的項目\"],"
+        "\"starch_visibility\":\"visible/not_visible/unknown\","
+        "\"oil_sauce_status\":\"visible/not_visible/unknown\","
+        "\"observed_at\":\"照片浮水印ISO時間或空字串\",\"observed_at_confidence\":0到1}。"
+        "只描述可觀察內容，不可猜肉類品種、食材重量、未入鏡食物、烹調油量；"
+        "不可估算熱量、營養素或交換份，也不可用0代表看不到或不知道。\n"
         "其他圖片回傳 status=error、image_type=unknown 和繁體中文 message。"
     )
 
@@ -7351,6 +7393,68 @@ def cleanup_nutrition_images():
                 )
                 conn.commit()
 
+    # 無標示餐點草稿同樣遵守24小時到期與delete-first/reference-clear-second。
+    meal_photo_rows = []
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_meal_photo_schema(conn)
+        now_text = now_dt.isoformat(timespec="seconds")
+        candidates = conn.execute(
+            """SELECT token,user_id,source_image_ref,status,expires_at
+               FROM pending_meal_photo_drafts
+               WHERE status IN ('awaiting_confirmation','confirming','estimated','expired','cancelled')"""
+        ).fetchall()
+        for token, user_id, ref, status, expires_at in candidates:
+            should_retire = status in {"expired", "cancelled"}
+            if status in {"awaiting_confirmation", "confirming", "estimated"} and is_before(expires_at, now_dt):
+                status = "expired"
+                should_retire = True
+            if not should_retire:
+                continue
+            conn.execute(
+                """UPDATE pending_meal_photo_drafts
+                   SET status=?,observed_payload_json='{}',answers_json='{}',estimate_json='{}',
+                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END,
+                       updated_at=? WHERE token=? AND user_id=?""",
+                (status, now_text, now_text, token, user_id),
+            )
+            if ref:
+                meal_photo_rows.append((token, user_id, ref))
+        conn.commit()
+    for token, user_id, ref in meal_photo_rows:
+        if _delete_nutrition_image(ref):
+            with sqlite3.connect(DB_PATH) as conn:
+                clear_meal_photo_image_ref(
+                    conn, user_id=user_id, token=token, expected_ref=ref
+                )
+
+    meal_tombstone_cutoff = now_dt - timedelta(days=30)
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_meal_photo_schema(conn)
+        old_events = conn.execute(
+            """SELECT event_id,created_at FROM meal_photo_events
+               WHERE token IN (
+                 SELECT token FROM pending_meal_photo_drafts
+                 WHERE status IN ('expired','cancelled')
+               )"""
+        ).fetchall()
+        for event_id, created_at in old_events:
+            if is_before(created_at, meal_tombstone_cutoff):
+                conn.execute("DELETE FROM meal_photo_events WHERE event_id=?", (event_id,))
+        tombstones = conn.execute(
+            """SELECT token,retired_at,source_image_ref
+               FROM pending_meal_photo_drafts WHERE status IN ('expired','cancelled')"""
+        ).fetchall()
+        for token, retired_at, source_image_ref in tombstones:
+            has_events = conn.execute(
+                "SELECT 1 FROM meal_photo_events WHERE token=? LIMIT 1", (token,)
+            ).fetchone()
+            if (
+                not source_image_ref and not has_events
+                and is_before(retired_at, meal_tombstone_cutoff)
+            ):
+                conn.execute("DELETE FROM pending_meal_photo_drafts WHERE token=?", (token,))
+        conn.commit()
+
     event_cutoff = now_dt - timedelta(days=30)
     # event以token外鍵連到草稿；最小tombstone須與event同保留30天，
     # 不能先刪父列而連帶提早移除尚未到期的冪等證據。
@@ -7466,7 +7570,7 @@ def handle_image_message(event):
         if parsed.get("status") == "error":
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=parsed.get("message", "無法辨識這張圖片，請確認營養標示或 Garmin 數據是否清楚。"))
+                TextSendMessage(text=parsed.get("message", "無法辨識這張圖片，請確認餐點照片、營養標示或 Garmin 數據是否清楚。"))
             )
             return
 
@@ -7581,16 +7685,51 @@ def handle_image_message(event):
             return
 
         if image_type == "food_photo":
+            observed = normalize_meal_photo_payload(parsed)
+            try:
+                received_at = datetime.fromtimestamp(float(event.timestamp) / 1000, TW_TZ)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                received_at = tw_now()
+            consumed_time, consumed_time_source = resolve_nutrition_consumed_at(
+                observed, received_at=received_at
+            )
+            proposed_ref = f"nutrition-image:{secrets.token_hex(16)}{extension}"
+            with sqlite3.connect(DB_PATH) as conn:
+                ensure_meal_photo_schema(conn)
+                token = save_meal_photo_draft(
+                    conn,
+                    user_id=uid,
+                    source_message_id=str(message_id),
+                    payload=observed,
+                    source_image_ref=proposed_ref,
+                    meal_slot=current_meal_slot(consumed_time),
+                    consumed_at=consumed_time.isoformat(timespec="seconds"),
+                    consumed_time_source=consumed_time_source,
+                )
+                draft = get_meal_photo_draft(conn, user_id=uid, token=token)
+            source_image_ref = draft["source_image_ref"]
+            image_path = _nutrition_image_path(source_image_ref)
+            if not image_path:
+                raise RuntimeError("餐點圖片參照無效")
+            if not os.path.exists(image_path):
+                _store_nutrition_image(image_bytes, extension, source_image_ref)
+            from linebot.models import FlexSendMessage
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=parsed.get("message", "目前第一版先支援營養標示，請補拍包裝背面的營養標示。")),
+                FlexSendMessage(
+                    alt_text="餐點照片已辨識，請確認內容",
+                    contents=build_meal_photo_confirmation_bubble(
+                        draft["payload"], token=token, consumed_at=draft["consumed_at"],
+                        version=draft["version"],
+                    ),
+                ),
             )
             return
 
         if image_type != "garmin_workout":
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="目前可辨識 Garmin 運動截圖或包裝食品營養標示，請重新拍攝清楚完整的圖片。"),
+                TextSendMessage(text="目前可辨識餐點照片、Garmin 運動截圖或包裝食品營養標示，請重新拍攝清楚完整的圖片。"),
             )
             return
         parsed = normalize_garmin_payload(parsed)
@@ -7684,7 +7823,7 @@ def handle_image_message(event):
         try:
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="😵 圖片資料無法安全辨識，請重新拍攝清楚完整的營養標示或 Garmin 截圖。")
+                TextSendMessage(text="😵 圖片資料無法安全辨識，請重新拍攝清楚完整的餐點照片、營養標示或 Garmin 截圖。")
             )
         except Exception:
             processed_messages.discard(message_id)
@@ -7693,6 +7832,115 @@ def handle_image_message(event):
         processed_messages.discard(message_id)
         print(f"⚠️ 圖片處理暫時性錯誤，允許 LINE 重送：{exc}")
         raise
+
+
+MEAL_PHOTO_STEP_QUESTIONS = {
+    "scope": "這餐是否還有照片外、未入鏡的食物或飲料？",
+    "protein_type": "主要蛋白質食物是哪一類？若看不出來請選『不確定』。",
+    "protein_portion": "蛋白質食物大約有幾個手掌大？",
+    "starch_portion": "這餐主食大約多少？照片沒拍到但有吃，也請照實選擇。",
+    "vegetable_portion": "蔬菜大約有幾碗？",
+    "cooking_oil": "這餐的烹調用油大約如何？照片看不出來請選『不確定』。",
+    "sauce_level": "湯汁／醬汁大約吃了多少？",
+}
+
+
+def build_meal_photo_step_message(token, step, version=1):
+    options = meal_photo_step_options(token, step, version=version)
+    items = [
+        QuickReplyButton(
+            action=PostbackAction(
+                label=item["label"], data=item["data"], display_text=item["label"]
+            )
+        )
+        for item in options
+    ]
+    items.append(
+        QuickReplyButton(
+            action=PostbackAction(
+                label="取消", data=f"mp:v1:{token}:{int(version)}:cancel",
+                display_text="取消餐點照片",
+            )
+        )
+    )
+    return TextSendMessage(
+        text=MEAL_PHOTO_STEP_QUESTIONS[step], quick_reply=QuickReply(items=items)
+    )
+
+
+@handler.add(PostbackEvent)
+def handle_meal_photo_postback(event):
+    data = str(getattr(event.postback, "data", "") or "")
+    start = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):start", data)
+    cancel = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):cancel", data)
+    answer = re.fullmatch(
+        r"mp:v1:([0-9a-f]{12}):(\d+):answer:([a-z_]+):([a-z_]+)", data
+    )
+    if not (start or cancel or answer):
+        return
+    uid = event.source.user_id
+    matched = start or cancel or answer
+    assert matched is not None
+    token, version = matched.group(1), int(matched.group(2))
+    event_id = str(getattr(event, "webhook_event_id", "") or "").strip()
+    if not event_id:
+        fallback = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
+        event_id = "postback:" + hashlib.sha256(fallback.encode()).hexdigest()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            ensure_meal_photo_schema(conn)
+            if start:
+                draft = get_meal_photo_draft(conn, user_id=uid, token=token)
+                if draft["status"] == "estimated":
+                    result = {"kind": "estimate", "version": draft["version"]}
+                elif draft["version"] != version:
+                    raise ValueError("餐點確認畫面已更新，請使用最新按鈕")
+                else:
+                    result = {
+                        "kind": "question", "step": next_meal_photo_step(draft),
+                        "version": draft["version"],
+                    }
+            elif cancel:
+                applied = apply_meal_photo_action(
+                    conn, event_id=event_id, user_id=uid, token=token,
+                    expected_version=version, action="cancel",
+                )
+                draft, result = applied["draft"], applied["result"]
+            else:
+                assert answer is not None
+                applied = apply_meal_photo_action(
+                    conn, event_id=event_id, user_id=uid, token=token,
+                    expected_version=version, action="answer",
+                    field=answer.group(3), value=answer.group(4),
+                )
+                draft, result = applied["draft"], applied["result"]
+        kind = result["kind"]
+        if kind == "question":
+            reply = build_meal_photo_step_message(
+                token, result["step"], result["version"]
+            )
+        elif kind == "estimate":
+            from linebot.models import FlexSendMessage
+            reply = FlexSendMessage(
+                alt_text="餐點照片估算完成，待營養師審核",
+                contents=build_meal_photo_estimate_bubble(draft),
+            )
+        elif kind == "cancel":
+            image_ref = str(result.get("source_image_ref") or "")
+            if image_ref and _delete_nutrition_image(image_ref):
+                with sqlite3.connect(DB_PATH) as conn:
+                    clear_meal_photo_image_ref(
+                        conn, user_id=uid, token=token, expected_ref=image_ref
+                    )
+            reply = TextSendMessage(text="✅ 已取消餐點照片紀錄，辨識內容已清除。")
+        else:
+            raise ValueError("餐點操作結果無效")
+        line_bot_api.reply_message(event.reply_token, reply)
+    except ValueError as exc:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"⚠️ {exc}。請回到最新餐點確認卡。"),
+        )
 
 
 def _handle_message_impl(event):
