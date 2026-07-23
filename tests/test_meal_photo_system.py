@@ -1,16 +1,21 @@
+import json
 import math
 import sqlite3
 from datetime import datetime, timedelta
 
 import pytest
 
+from nutrition_system import daily_consumed_totals
 from meal_photo_system import (
     build_meal_photo_confirmation_bubble,
     ensure_meal_photo_schema,
     get_meal_photo_draft,
     build_meal_photo_estimate_bubble,
     apply_meal_photo_action,
+    apply_meal_photo_review_action,
     daily_pending_meal_photo_count,
+    next_meal_photo_review_step,
+    meal_photo_review_options,
     next_meal_photo_step,
     meal_photo_step_options,
     save_meal_photo_draft,
@@ -270,6 +275,23 @@ def test_estimate_uses_ranges_and_keeps_unknown_as_na(tmp_path):
         assert "待營養師審核" in text
 
 
+def test_estimate_card_shows_review_start_only_to_authorized_admin(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="M1", payload=sample_payload()
+        )
+        draft = _answer_all(conn, token)
+
+    regular = json.dumps(build_meal_photo_estimate_bubble(draft), ensure_ascii=False)
+    admin = json.dumps(
+        build_meal_photo_estimate_bubble(draft, allow_admin_review=True), ensure_ascii=False
+    )
+
+    assert "審核並加入" not in regular
+    assert "審核並加入" in admin
+    assert f"mpr:v1:{token}:{draft['version']}:start" in admin
+
+
 def test_unknown_answers_render_na_and_never_zero(tmp_path):
     with sqlite3.connect(tmp_path / "meal-photo.db") as conn:
         ensure_meal_photo_schema(conn)
@@ -390,6 +412,80 @@ def test_durable_actions_finalize_estimate_atomically(tmp_path):
         assert event_count == len(answers)
 
 
+def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
+    db = tmp_path / "meal-photo-review.db"
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_ADMIN", source_message_id="M_REVIEW", payload=sample_payload(),
+            consumed_at="2026-07-23T12:10:00+08:00", meal_slot="午餐",
+        )
+        values = (
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("starch_portion", "one_half_bowl"),
+            ("vegetable_portion", "none"), ("cooking_oil", "light"),
+            ("sauce_level", "half"),
+        )
+        for index, (field, value) in enumerate(values, start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"ANSWER-{index}", user_id="U_ADMIN", token=token,
+                expected_version=index, action="answer", field=field, value=value,
+            )
+        draft = get_meal_photo_draft(conn, user_id="U_ADMIN", token=token)
+        assert draft["version"] == 8 and draft["status"] == "estimated"
+
+        with pytest.raises(PermissionError):
+            apply_meal_photo_review_action(
+                conn, event_id="UNAUTHORIZED", user_id="U_ADMIN", admin_user_id="OTHER",
+                token=token, expected_version=8, action="start",
+            )
+        assert get_meal_photo_draft(conn, user_id="U_ADMIN", token=token)["version"] == 8
+
+        started = apply_meal_photo_review_action(
+            conn, event_id="REVIEW-START", user_id="U_ADMIN", admin_user_id="U_ADMIN",
+            token=token, expected_version=8, action="start",
+        )
+        assert started["result"] == {"kind": "review_question", "step": "protein_class", "version": 9}
+        assert next_meal_photo_review_step(started["draft"]) == "protein_class"
+
+        sequence = (
+            ("protein_class", "medium"),
+            ("protein_exchange", "2.5"),
+            ("starch_exchange", "6"),
+            ("milk_exchange", "0"),
+            ("fruit_exchange", "0"),
+        )
+        current = started
+        for offset, (field, value) in enumerate(sequence, start=9):
+            option_values = {item["value"] for item in meal_photo_review_options(current["draft"], field)}
+            assert value in option_values
+            current = apply_meal_photo_review_action(
+                conn, event_id=f"REVIEW-{field}", user_id="U_ADMIN", admin_user_id="U_ADMIN",
+                token=token, expected_version=offset, action="set", field=field, value=value,
+            )
+        assert current["result"]["kind"] == "review_ready"
+        assert current["draft"]["review"]["vegetable_exchange"] == 0.0
+
+        approved = apply_meal_photo_review_action(
+            conn, event_id="REVIEW-APPROVE", user_id="U_ADMIN", admin_user_id="U_ADMIN",
+            token=token, expected_version=14, action="approve",
+        )
+        assert approved["result"]["kind"] == "approved"
+        assert approved["draft"]["status"] == "approved"
+        assert approved["draft"]["approved_log_id"]
+        totals = daily_consumed_totals(conn, user_id="U_ADMIN", date_iso="2026-07-23")
+        assert totals["protein_medium_exchange"] == 2.5
+        assert totals["starch_exchange"] == 6.0
+        assert totals["vegetable_exchange"] == 0.0
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+
+        replay = apply_meal_photo_review_action(
+            conn, event_id="REVIEW-APPROVE", user_id="U_ADMIN", admin_user_id="U_ADMIN",
+            token=token, expected_version=14, action="approve",
+        )
+        assert replay["replayed"] is True
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+
+
 def test_action_rolls_back_draft_when_event_insert_fails(tmp_path):
     with sqlite3.connect(tmp_path / "meal-photo.db") as conn:
         token = save_meal_photo_draft(
@@ -476,7 +572,9 @@ def test_schema_v1_migrates_to_versioned_events_without_dropping_drafts(tmp_path
             "SELECT name FROM sqlite_master WHERE type='table' AND name='meal_photo_events'"
         ).fetchone()
     assert "version" in columns
-    assert version == 2
+    for col in ("review_json", "approved_log_id", "approved_at", "approved_by"):
+        assert col in columns, f"migration should add {col}"
+    assert version == 3
     assert draft == ("U1", "M1", 1)
     assert event_table == ("meal_photo_events",)
 

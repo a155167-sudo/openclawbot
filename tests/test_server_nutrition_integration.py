@@ -13,6 +13,7 @@ os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy")
 import server
 from nutrition_system import (
     confirm_pending_label,
+    daily_consumed_totals,
     ensure_nutrition_schema,
     save_pending_label,
     set_nutrition_input_state,
@@ -1238,6 +1239,7 @@ def test_food_photo_image_handler_stages_durable_unknown_safe_flex(tmp_path, mon
 def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-postback-final.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "ADMIN_UID", "U_MEAL")
     with sqlite3.connect(db) as conn:
         ensure_meal_photo_schema(conn)
         token = save_meal_photo_draft(
@@ -1265,10 +1267,66 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     assert len(replies) == 1
     estimate_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
     assert "照片估算" in estimate_text
+    assert "審核並加入" in estimate_text
+    assert f"mpr:v1:{token}:8:start" in estimate_text
     with sqlite3.connect(db) as conn:
         draft = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
     assert draft["status"] == "estimated"
     assert draft["estimate"]["starch_exchange"] == {"min": 0.0, "max": 0.0, "basis": "user_confirmed_none"}
+
+
+def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-admin-review.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_ADMIN", source_message_id="M_ADMIN", payload=meal_photo_payload(),
+            consumed_at="2026-07-23T12:10:00+08:00", meal_slot="午餐",
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("starch_portion", "one_half_bowl"),
+            ("vegetable_portion", "none"), ("cooking_oil", "light"),
+            ("sauce_level", "half"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"PREP-ADMIN-{index}", user_id="U_ADMIN", token=token,
+                expected_version=index, action="answer", field=field, value=value,
+            )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
+
+    def send(data, event_id):
+        event = SimpleNamespace(
+            postback=SimpleNamespace(data=data), source=SimpleNamespace(user_id="U_ADMIN"),
+            reply_token=f"reply-{event_id}", webhook_event_id=event_id,
+            timestamp=1784740620000,
+        )
+        server.handle_meal_photo_postback(event)
+        return replies[-1]
+
+    first = send(f"mpr:v1:{token}:8:start", "ADMIN-START")
+    assert "蛋白質分類" in first.text
+    assert any(":9:set:protein_class:medium" in item.action.data for item in first.quick_reply.items)
+    send(f"mpr:v1:{token}:9:set:protein_class:medium", "ADMIN-CLASS")
+    send(f"mpr:v1:{token}:10:set:protein_exchange:2.5", "ADMIN-PROTEIN")
+    send(f"mpr:v1:{token}:11:set:starch_exchange:6", "ADMIN-STARCH")
+    send(f"mpr:v1:{token}:12:set:milk_exchange:0", "ADMIN-MILK")
+    ready = send(f"mpr:v1:{token}:13:set:fruit_exchange:0", "ADMIN-FRUIT")
+    ready_text = json.dumps(json.loads(str(ready.contents)), ensure_ascii=False)
+    assert "最終核准份量" in ready_text
+    assert f"mpr:v1:{token}:14:approve" in ready_text
+
+    done = send(f"mpr:v1:{token}:14:approve", "ADMIN-APPROVE")
+    done_text = json.dumps(json.loads(str(done.contents)), ensure_ascii=False)
+    assert "已核准｜已計入正式份量" in done_text
+    assert '"主食"' in done_text and '"6份"' in done_text
+    assert '"中脂蛋白"' in done_text and '"2.5份"' in done_text
+    with sqlite3.connect(db) as conn:
+        totals = daily_consumed_totals(conn, user_id="U_ADMIN", date_iso="2026-07-23")
+        assert totals["starch_exchange"] == 6.0
+        assert totals["protein_medium_exchange"] == 2.5
 
 
 def test_meal_photo_postback_replays_after_reply_failure_without_double_update(tmp_path, monkeypatch):

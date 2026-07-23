@@ -1731,6 +1731,125 @@ def confirm_pending_label(
         raise
 
 
+def insert_approved_meal_photo_log(
+    conn: sqlite3.Connection,
+    *,
+    token: str,
+    user_id: str,
+    reviewer: str,
+    consumed_at: str,
+    meal_slot: str,
+    source_image_ref: str,
+    observed_payload: Mapping[str, Any],
+    answers: Mapping[str, Any],
+    exact_exchange: Mapping[str, Any],
+) -> dict[str, Any]:
+    """在呼叫端交易內建立照片餐點的正式核准、食品與飲食快照；不自行commit。"""
+    token = str(token or "").strip()
+    user_id = str(user_id or "").strip()
+    reviewer = str(reviewer or "").strip()
+    if len(token) != 12 or any(ch not in "0123456789abcdef" for ch in token):
+        raise ValueError("餐點照片token無效")
+    if not user_id or len(user_id) > 120 or not reviewer or len(reviewer) > 120:
+        raise ValueError("餐點照片核准身分無效")
+    if reviewer != user_id:
+        raise PermissionError("目前只允許管理員核准自己的餐點照片")
+    approved_at = utcish_now()
+    values = {
+        key: round(_number(exact_exchange.get(key), key, max_value=100), 4)
+        for key in EXCHANGE_KEYS
+    }
+    if values["fat_exchange"] != 0:
+        raise ValueError("目前規則不計油脂交換份")
+    categories = [key for key in EXCHANGE_KEYS if values[key] > 0]
+    rule_version = "meal-photo-admin-v1"
+    approved_payload: dict[str, Any] = {
+        **values,
+        "_review_status": "approved",
+        "_rule_version": rule_version,
+        "_categories": categories,
+        "_warnings": ["calories_and_macros_na"],
+        "_approved_by": reviewer,
+        "_approved_at": approved_at,
+        "_source_type": "meal_photo",
+    }
+    approved_json = json.dumps(
+        approved_payload, ensure_ascii=False, sort_keys=True, allow_nan=False
+    )
+    identity = json.dumps(
+        {
+            "source_type": "meal_photo", "token": token, "user_id": user_id,
+            "observed_payload": dict(observed_payload or {}),
+            "answers": dict(answers or {}),
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    )
+    fingerprint = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    visible_names = [
+        str(item.get("name") or "").strip()
+        for item in list((observed_payload or {}).get("visible_items") or [])[:4]
+        if isinstance(item, Mapping) and str(item.get("name") or "").strip()
+    ]
+    product_name = "餐點照片" + ("：" + "、".join(visible_names) if visible_names else "")
+    food_id = new_id("food")
+    approval_id = new_id("approval")
+    log_id = new_id("log")
+    approval_hash = exchange_approval_hash(fingerprint, rule_version, approved_payload)
+    conn.execute(
+        """INSERT INTO food_catalog
+           (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+            package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+            exchange_json,exchange_review_status,fingerprint,original_image_ref,
+            recognition_confidence,verification_status,created_at,updated_at)
+           VALUES (?,?, '', '', 'user_meal_photo',?,'private',1,'meal',1,'{}','{}',
+                   ?,'approved',?,?,0,'admin_approved',?,?)""",
+        (
+            food_id, product_name[:160], user_id, approved_json, fingerprint,
+            str(source_image_ref or "")[:240], approved_at, approved_at,
+        ),
+    )
+    conn.execute(
+        """INSERT INTO food_exchange_approvals
+           (approval_id,food_id,food_fingerprint,suggestion_rule_version,
+            approved_exchange_json,approved_exchange_hash,reviewer,approved_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            approval_id, food_id, fingerprint, rule_version, approved_json,
+            approval_hash, reviewer, approved_at,
+        ),
+    )
+    applied_payload = {
+        **approved_payload,
+        "_approval_id": approval_id,
+    }
+    conn.execute(
+        """INSERT INTO food_logs
+           (log_id,user_id,food_id,consumed_at,meal_slot,consumed_servings,
+            consumed_amount,consumed_unit,nutrition_snapshot_json,exchange_snapshot_json,
+            approved_exchange_json,exchange_approval_id,source_image_ref,plan_id,
+            plan_link_status,confirmation_status,legacy_applied_at,created_at,updated_at)
+           VALUES (?,?,?,?,?,1,1,'meal','{}',?,?,?,?, '', 'pending','confirmed',
+                   'not_applicable',?,?)""",
+        (
+            log_id, user_id, food_id, str(consumed_at or approved_at)[:50],
+            str(meal_slot or "")[:30], approved_json,
+            json.dumps(applied_payload, ensure_ascii=False, sort_keys=True, allow_nan=False),
+            approval_id, str(source_image_ref or "")[:240], approved_at, approved_at,
+        ),
+    )
+    for entity_type, entity_id in (("food", food_id), ("food_log", log_id)):
+        conn.execute(
+            """INSERT OR IGNORE INTO nutrition_sheet_outbox
+               (outbox_id,entity_type,entity_id,status,attempts,last_error,created_at,synced_at)
+               VALUES (?,?,?,'pending',0,'',?,'')""",
+            (new_id("outbox"), entity_type, entity_id, approved_at),
+        )
+    return {
+        "food_id": food_id, "approval_id": approval_id, "log_id": log_id,
+        "product_name": product_name[:160], "approved_exchange": approved_payload,
+    }
+
+
 def approve_food_exchange_suggestion(
     conn: sqlite3.Connection, *, food_id: str, reviewer: str
 ) -> dict[str, Any]:

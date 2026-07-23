@@ -16,6 +16,7 @@ from nutrition_system import (
     daily_food_summary,
     ensure_nutrition_schema,
     food_fingerprint,
+    insert_approved_meal_photo_log,
     get_latest_awaiting_identity,
     get_nutrition_input_state,
     normalize_garmin_payload,
@@ -906,3 +907,63 @@ def test_nutrition_text_edit_message_is_replayable():
     assert first["token"] == replay["token"] == token
     assert replay["replayed"] is True
     assert replay["label"]["per_serving"]["sodium_mg"] == 48
+
+
+def test_insert_approved_meal_photo_log_uses_verified_approval_chain_and_na_nutrients():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    exact = {
+        "milk_exchange": 0.0,
+        "protein_low_exchange": 0.0,
+        "protein_medium_exchange": 2.5,
+        "protein_high_exchange": 0.0,
+        "starch_exchange": 6.0,
+        "vegetable_exchange": 1.0,
+        "fruit_exchange": 0.0,
+        "fat_exchange": 0.0,
+    }
+    conn.execute("BEGIN IMMEDIATE")
+    result = insert_approved_meal_photo_log(
+        conn,
+        token="abcdef123456",
+        user_id="U_MEAL",
+        reviewer="U_MEAL",
+        consumed_at="2026-07-23T12:10:00+08:00",
+        meal_slot="午餐",
+        source_image_ref="nutrition-image:meal.jpg",
+        observed_payload={
+            "visible_items": [
+                {"name": "雞肉", "category": "protein", "confidence": 0.9},
+                {"name": "白飯", "category": "starch", "confidence": 0.9},
+            ]
+        },
+        answers={"scope": "visible_only"},
+        exact_exchange=exact,
+    )
+    conn.commit()
+
+    totals = daily_consumed_totals(conn, user_id="U_MEAL", date_iso="2026-07-23")
+    assert totals["protein_medium_exchange"] == 2.5
+    assert totals["starch_exchange"] == 6.0
+    assert totals["vegetable_exchange"] == 1.0
+    assert totals["calories_kcal"] == 0.0
+    row = conn.execute(
+        """SELECT f.source_type,l.nutrition_snapshot_json,l.legacy_applied_at,
+                  l.exchange_approval_id,a.approved_exchange_hash
+           FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
+           JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
+           WHERE l.log_id=?""",
+        (result["log_id"],),
+    ).fetchone()
+    assert row[0] == "user_meal_photo"
+    assert row[1] == "{}"
+    assert row[2] == "not_applicable"
+    assert row[3] == result["approval_id"]
+
+    conn.execute(
+        "UPDATE food_exchange_approvals SET approved_exchange_hash='tampered' WHERE approval_id=?",
+        (result["approval_id"],),
+    )
+    tampered = daily_consumed_totals(conn, user_id="U_MEAL", date_iso="2026-07-23")
+    assert tampered["protein_medium_exchange"] == 0.0
+    assert tampered["starch_exchange"] == 0.0

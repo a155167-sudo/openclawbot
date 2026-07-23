@@ -276,10 +276,12 @@ def finish_daily_delivery(
 
 
 def _fmt_number(value: Any) -> str:
+    if value is None:
+        return "NA"
     try:
-        number = float(value or 0)
+        number = float(value)
     except (TypeError, ValueError):
-        number = 0.0
+        return "NA"
     return str(int(number)) if number.is_integer() else f"{number:.1f}".rstrip("0").rstrip(".")
 
 

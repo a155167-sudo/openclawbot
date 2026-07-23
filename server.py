@@ -7844,6 +7844,15 @@ MEAL_PHOTO_STEP_QUESTIONS = {
     "sauce_level": "湯汁／醬汁大約吃了多少？",
 }
 
+MEAL_PHOTO_REVIEW_QUESTIONS = {
+    "protein_class": "請選擇蛋白質分類：",
+    "protein_exchange": "請選擇蛋白質食物正式份量：",
+    "starch_exchange": "請選擇主食正式份量：",
+    "vegetable_exchange": "請選擇蔬菜正式份量：",
+    "milk_exchange": "請選擇奶類正式份量：",
+    "fruit_exchange": "請選擇水果正式份量：",
+}
+
 
 def build_meal_photo_step_message(token, step, version=1):
     options = meal_photo_step_options(token, step, version=version)
@@ -7868,6 +7877,127 @@ def build_meal_photo_step_message(token, step, version=1):
     )
 
 
+def build_meal_photo_review_step_message(draft, step, version=1):
+    from meal_photo_system import meal_photo_review_options
+    token = draft["token"]
+    options = meal_photo_review_options(draft, step)
+    items = [
+        QuickReplyButton(
+            action=PostbackAction(
+                label=item["label"],
+                data=f"mpr:v1:{token}:{int(version)}:set:{step}:{item['value']}",
+                display_text=item["label"],
+            )
+        )
+        for item in options
+    ]
+    items.append(
+        QuickReplyButton(
+            action=PostbackAction(
+                label="取消審核",
+                data=f"mpr:v1:{token}:{int(version)}:cancel_review",
+                display_text="取消這筆審核",
+            )
+        )
+    )
+    return TextSendMessage(
+        text=MEAL_PHOTO_REVIEW_QUESTIONS.get(step, "請選擇："),
+        quick_reply=QuickReply(items=items),
+    )
+
+
+def build_meal_photo_review_ready_bubble(draft):
+    from meal_photo_system import _meal_photo_exact_exchange
+    token, version = draft["token"], draft["version"]
+    review = draft.get("review") or {}
+    exact = _meal_photo_exact_exchange(review)
+    consumed_at = str(draft.get("consumed_at") or "").replace("T", " ")[:16] or "待確認"
+
+    def _kv(label, value):
+        return {"type": "box", "layout": "horizontal", "contents": [
+            {"type": "text", "text": label, "size": "sm", "color": "#555555", "flex": 3, "wrap": True},
+            {"type": "text", "text": str(value), "size": "sm", "color": "#111111", "align": "end", "flex": 2, "wrap": True},
+        ]}
+
+    def _exchange_label(count, label):
+        return f"{count:g}份" if count else "0份"
+
+    body_contents = [
+        _kv("時間", consumed_at),
+        _kv("主食", _exchange_label(exact["starch_exchange"], "主食")),
+    ]
+    for key, label in (
+        ("protein_low_exchange", "低脂蛋白"),
+        ("protein_medium_exchange", "中脂蛋白"),
+        ("protein_high_exchange", "高脂蛋白"),
+    ):
+        if exact[key] > 0:
+            body_contents.append(_kv(label, _exchange_label(exact[key], label)))
+    body_contents.append(_kv("蔬菜", _exchange_label(exact["vegetable_exchange"], "蔬菜")))
+    body_contents.append(_kv("水果", _exchange_label(exact["fruit_exchange"], "水果")))
+    body_contents.append(_kv("奶類", _exchange_label(exact["milk_exchange"], "奶類")))
+    body_contents.append({"type": "text", "text": "⚠️ 熱量／蛋白質／脂肪／碳水：NA", "size": "xs", "color": "#B00020", "wrap": True})
+    body_contents.append({"type": "text", "text": "油脂份：0份（目前不計入）", "size": "xs", "color": "#777777"})
+    body_contents.append({"type": "text", "text": "按『確認加入』後才會計入每日總量。", "size": "xs", "color": "#777777", "wrap": True})
+
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": "#DCFCE7",
+            "contents": [{"type": "text", "text": "✅ 最終核准份量", "weight": "bold", "size": "md", "color": "#166534"}],
+        },
+        "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body_contents},
+        "footer": {
+            "type": "box", "layout": "vertical", "spacing": "sm",
+            "contents": [
+                {"type": "button", "style": "primary", "color": "#0F766E",
+                 "action": {"type": "postback", "label": "確認加入正式份量",
+                            "data": f"mpr:v1:{token}:{version}:approve",
+                            "displayText": "確認加入正式份量"}},
+                {"type": "button", "style": "secondary",
+                 "action": {"type": "postback", "label": "取消審核",
+                            "data": f"mpr:v1:{token}:{version}:cancel_review",
+                            "displayText": "取消這筆審核"}},
+            ],
+        },
+    }
+
+
+def build_meal_photo_approved_bubble(draft, result):
+    token = draft["token"]
+    consumed_at = str(draft.get("consumed_at") or "").replace("T", " ")[:16] or "待確認"
+    exact = result.get("approved_exchange") or {}
+
+    def _kv(label, value):
+        return {"type": "box", "layout": "horizontal", "contents": [
+            {"type": "text", "text": label, "size": "sm", "color": "#555555", "flex": 3, "wrap": True},
+            {"type": "text", "text": str(value), "size": "sm", "color": "#111111", "align": "end", "flex": 2, "wrap": True},
+        ]}
+
+    body_contents = [_kv("時間", consumed_at), _kv("主食", f"{exact.get('starch_exchange', 0):g}份")]
+    for key, label in (
+        ("protein_low_exchange", "低脂蛋白"), ("protein_medium_exchange", "中脂蛋白"),
+        ("protein_high_exchange", "高脂蛋白"),
+    ):
+        if exact.get(key, 0) > 0:
+            body_contents.append(_kv(label, f"{exact[key]:g}份"))
+    body_contents.append(_kv("蔬菜", f"{exact.get('vegetable_exchange', 0):g}份"))
+    body_contents.append(_kv("水果", f"{exact.get('fruit_exchange', 0):g}份"))
+    body_contents.append(_kv("奶類", f"{exact.get('milk_exchange', 0):g}份"))
+    body_contents.append({"type": "text", "text": "🔥 熱量／蛋白質／脂肪／碳水：NA", "size": "xs", "color": "#B00020", "wrap": True})
+    body_contents.append({"type": "text", "text": "✅ 已計入正式份量與每日總量", "size": "sm", "color": "#166534", "weight": "bold", "wrap": True})
+    body_contents.append({"type": "text", "text": f"核准時間：{datetime.now(TW_TZ).strftime('%Y/%m/%d %H:%M')}", "size": "xs", "color": "#777777"})
+
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": "#D1FAE5",
+            "contents": [{"type": "text", "text": "✅ 營養師已核准｜已計入正式份量", "weight": "bold", "size": "md", "color": "#065F46"}],
+        },
+        "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body_contents},
+    }
+
+
 @handler.add(PostbackEvent)
 def handle_meal_photo_postback(event):
     data = str(getattr(event.postback, "data", "") or "")
@@ -7876,17 +8006,73 @@ def handle_meal_photo_postback(event):
     answer = re.fullmatch(
         r"mp:v1:([0-9a-f]{12}):(\d+):answer:([a-z_]+):([a-z_]+)", data
     )
-    if not (start or cancel or answer):
+    review_start = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):start", data)
+    review_set = re.fullmatch(
+        r"mpr:v1:([0-9a-f]{12}):(\d+):set:([a-z_]+):([a-z0-9_.]+)", data
+    )
+    review_cancel = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):cancel_review", data)
+    review_approve = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):approve", data)
+    if not (start or cancel or answer or review_start or review_set or review_cancel or review_approve):
         return
     uid = event.source.user_id
-    matched = start or cancel or answer
-    assert matched is not None
-    token, version = matched.group(1), int(matched.group(2))
+    if not (review_start or review_set or review_cancel or review_approve):
+        matched = start or cancel or answer
+        assert matched is not None
+        token, version = matched.group(1), int(matched.group(2))
     event_id = str(getattr(event, "webhook_event_id", "") or "").strip()
     if not event_id:
         fallback = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
         event_id = "postback:" + hashlib.sha256(fallback.encode()).hexdigest()
     try:
+        if review_start or review_set or review_cancel or review_approve:
+            matched = review_start or review_set or review_cancel or review_approve
+            assert matched is not None
+            token, version = matched.group(1), int(matched.group(2))
+            if review_start:
+                action, field, value = "start", "", ""
+            elif review_set:
+                action, field, value = "set", matched.group(3), matched.group(4)
+            elif review_cancel:
+                action, field, value = "cancel_review", "", ""
+            else:
+                action, field, value = "approve", "", ""
+            from meal_photo_system import apply_meal_photo_review_action, next_meal_photo_review_step
+            with sqlite3.connect(DB_PATH) as conn:
+                applied = apply_meal_photo_review_action(
+                    conn, event_id=event_id, user_id=uid, admin_user_id=uid,
+                    token=token, expected_version=version, action=action,
+                    field=field, value=value,
+                )
+                draft, result = applied["draft"], applied["result"]
+            kind = result["kind"]
+            if kind == "review_question":
+                reply = build_meal_photo_review_step_message(
+                    draft, result["step"], result["version"]
+                )
+            elif kind in {"review_ready"}:
+                from linebot.models import FlexSendMessage
+                reply = FlexSendMessage(
+                    alt_text="最終核准份量，請確認加入",
+                    contents=build_meal_photo_review_ready_bubble(draft),
+                )
+            elif kind == "approved":
+                from linebot.models import FlexSendMessage
+                reply = FlexSendMessage(
+                    alt_text="✅ 已核准｜已計入正式份量",
+                    contents=build_meal_photo_approved_bubble(draft, result),
+                )
+            elif kind == "review_cancelled":
+                from linebot.models import FlexSendMessage
+                reply = FlexSendMessage(
+                    alt_text="餐點照片估算完成，待營養師審核",
+                    contents=build_meal_photo_estimate_bubble(
+                        draft, allow_admin_review=(uid == ADMIN_UID)
+                    ),
+                )
+            else:
+                raise ValueError("餐點審核結果無效")
+            line_bot_api.reply_message(event.reply_token, reply)
+            return
         with sqlite3.connect(DB_PATH) as conn:
             ensure_meal_photo_schema(conn)
             if start:
@@ -7923,7 +8109,9 @@ def handle_meal_photo_postback(event):
             from linebot.models import FlexSendMessage
             reply = FlexSendMessage(
                 alt_text="餐點照片估算完成，待營養師審核",
-                contents=build_meal_photo_estimate_bubble(draft),
+                contents=build_meal_photo_estimate_bubble(
+                    draft, allow_admin_review=(uid == ADMIN_UID)
+                ),
             )
         elif kind == "cancel":
             image_ref = str(result.get("source_image_ref") or "")
