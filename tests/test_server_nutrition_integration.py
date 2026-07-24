@@ -15,9 +15,11 @@ from nutrition_system import (
     confirm_pending_label,
     daily_consumed_totals,
     ensure_nutrition_schema,
+    new_id,
     save_pending_label,
     set_nutrition_input_state,
     update_pending_consumption,
+    utcish_now,
 )
 from daily_health_report import ensure_daily_health_schema, get_daily_health_checkin
 from meal_photo_system import (
@@ -1538,3 +1540,87 @@ def test_line_text_handler_saves_checkin_and_supports_manual_report(tmp_path, mo
     server.processed_messages.discard("health-report")
     server._handle_message_impl(report_event)
     assert replies[-1] == "MANUAL REPORT"
+
+
+def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
+    db = tmp_path / "search-relog.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    now = utcish_now()
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        fid = new_id("food")
+        conn.execute(
+            """INSERT INTO food_catalog
+               (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                recognition_confidence,verification_status,created_at,updated_at)
+               VALUES (?,'舒肥雞胸','好市多','','user_private_food','U1','private',
+                       100,'g',1,'{"calories_kcal":120,"protein_g":25}','{}',
+                       '{"starch_exchange":0,"protein_medium_exchange":1}',
+                       'approved','fp_chicken','',0,'user_confirmed',?,?)""",
+            (fid, now, now),
+        )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    search_event = _text_event("SEARCH-1", "搜尋 雞胸", user_id="U1")
+    server._handle_message_impl(search_event)
+    assert len(replies) == 1
+    carousel = replies[0]
+    assert carousel.type == "flex"
+    # contents is a CarouselContainer; check structure via serialization
+    raw = json.loads(carousel.as_json_string())
+    bubble_inner = json.dumps(raw, ensure_ascii=False)
+    assert "舒肥雞胸" in bubble_inner
+    assert f"relog:v1:{fid}:start" in bubble_inner
+
+    start_event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"relog:v1:{fid}:start"),
+        source=SimpleNamespace(user_id="U1"),
+        reply_token="reply-relog-start", webhook_event_id="RELOG-START",
+        timestamp=1784740620000,
+    )
+    server.handle_meal_photo_postback(start_event)
+    assert "請選擇份量" in replies[-1].text
+    assert any(f"relog:v1:{fid}:servings:1" in item.action.data for item in replies[-1].quick_reply.items)
+
+    sv_event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"relog:v1:{fid}:servings:1.5"),
+        source=SimpleNamespace(user_id="U1"),
+        reply_token="reply-relog-sv", webhook_event_id="RELOG-SV",
+        timestamp=1784740620000,
+    )
+    server.handle_meal_photo_postback(sv_event)
+    assert "1.5" in replies[-1].text and "餐別" in replies[-1].text
+
+    meal_event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"relog:v1:{fid}:sv:1.5:meal:午餐"),
+        source=SimpleNamespace(user_id="U1"),
+        reply_token="reply-relog-meal", webhook_event_id="RELOG-MEAL",
+        timestamp=1784740620000,
+    )
+    server.handle_meal_photo_postback(meal_event)
+    assert "✅ 已記錄" in replies[-1].text
+    assert "舒肥雞胸" in replies[-1].text
+    assert "1.5" in replies[-1].text
+    assert "180" in replies[-1].text
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT consumed_servings,meal_slot FROM food_logs WHERE user_id='U1'"
+        ).fetchone()
+        assert row[0] == 1.5
+        assert row[1] == "午餐"
+
+
+def test_search_no_results_shows_guidance(tmp_path, monkeypatch):
+    db = tmp_path / "search-empty.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+    event = _text_event("SEARCH-EMPTY", "搜尋 不存在的食物", user_id="U1")
+    server._handle_message_impl(event)
+    assert "找不到" in replies[0].text

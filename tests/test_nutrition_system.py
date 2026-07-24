@@ -19,6 +19,7 @@ from nutrition_system import (
     insert_approved_meal_photo_log,
     get_latest_awaiting_identity,
     get_nutrition_input_state,
+    new_id,
     normalize_garmin_payload,
     normalize_label_payload,
     normalize_product_identity_payload,
@@ -28,12 +29,15 @@ from nutrition_system import (
     remaining_targets,
     save_pending_label,
     scale_nutrition,
+    search_food_catalog,
+    search_food_history,
     suggest_exchange_portions,
     set_nutrition_input_state,
     clear_nutrition_input_state,
     update_pending_label_name,
     update_pending_label_nutrient,
     update_pending_consumption,
+    utcish_now,
 )
 
 
@@ -967,3 +971,100 @@ def test_insert_approved_meal_photo_log_uses_verified_approval_chain_and_na_nutr
     tampered = daily_consumed_totals(conn, user_id="U_MEAL", date_iso="2026-07-23")
     assert tampered["protein_medium_exchange"] == 0.0
     assert tampered["starch_exchange"] == 0.0
+
+
+def test_search_food_catalog_returns_user_foods_by_name_prefix():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    now = utcish_now()
+    for name, uid in [("舒肥雞胸", "U1"), ("舒肥雞腿", "U1"), ("鮭魚生魚片", "U1"), ("舒肥雞胸", "U2")]:
+        fid = new_id("food")
+        conn.execute(
+            """INSERT INTO food_catalog
+               (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                recognition_confidence,verification_status,created_at,updated_at)
+               VALUES (?,'"""+name+"""','','','user_private_food',?,'private',100,'g',1,'{}','{}','{}',
+                       'approved',?,'',0,'user_confirmed',?,?)""",
+            (fid, uid, fid, now, now),
+        )
+    results = search_food_catalog(conn, user_id="U1", query="舒肥")
+    assert len(results) == 2
+    assert all("舒肥" in r["product_name"] for r in results)
+    assert all(r["owner_user_id"] == "U1" for r in results)
+
+    results2 = search_food_catalog(conn, user_id="U1", query="鮭魚")
+    assert len(results2) == 1
+    assert results2[0]["product_name"] == "鮭魚生魚片"
+
+    results3 = search_food_catalog(conn, user_id="U1", query="不存在")
+    assert results3 == []
+
+
+def test_search_food_history_returns_recent_user_logs():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    now = utcish_now()
+    food_id = new_id("food")
+    conn.execute(
+        """INSERT INTO food_catalog
+           (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+            package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+            exchange_json,exchange_review_status,fingerprint,original_image_ref,
+            recognition_confidence,verification_status,created_at,updated_at)
+           VALUES (?,'舒肥雞胸','好市多','','user_private_food','U1','private',
+                   100,'g',1,'{"calories_kcal":120}','{}','{}','approved',
+                   'fp_test','',0,'user_confirmed',?,?)""",
+        (food_id, now, now),
+    )
+    for i in range(3):
+        conn.execute(
+            """INSERT INTO food_logs
+               (log_id,user_id,food_id,consumed_at,meal_slot,consumed_servings,
+                consumed_amount,consumed_unit,nutrition_snapshot_json,exchange_snapshot_json,
+                approved_exchange_json,exchange_approval_id,source_image_ref,plan_id,
+                plan_link_status,confirmation_status,legacy_applied_at,created_at,updated_at)
+               VALUES (?,?,?,'2026-07-20T12:00:00+08:00','午餐',1,100,'g','{}','{}','{}',
+                       '','','','pending','confirmed','not_applicable',?,?)""",
+            (new_id("log"), "U1", food_id, now, now),
+        )
+    log_id = new_id("log")
+    conn.execute(
+        """INSERT INTO food_logs
+           (log_id,user_id,food_id,consumed_at,meal_slot,consumed_servings,
+            consumed_amount,consumed_unit,nutrition_snapshot_json,exchange_snapshot_json,
+            approved_exchange_json,exchange_approval_id,source_image_ref,plan_id,
+            plan_link_status,confirmation_status,legacy_applied_at,created_at,updated_at)
+           VALUES (?,?,?,'2026-07-23T12:00:00+08:00','午餐',1.5,150,'g',
+                   '{"calories_kcal":180}','{}','{}','','','','pending',
+                   'confirmed','not_applicable',?,?)""",
+        (log_id, "U1", food_id, now, now),
+    )
+    results = search_food_history(conn, user_id="U1", query="舒肥")
+    assert len(results) >= 1
+    assert results[0]["product_name"] == "舒肥雞胸"
+    assert results[0]["last_consumed_at"] is not None
+    assert results[0]["use_count"] == 4
+
+
+def test_search_food_catalog_includes_meal_photo_synthetic():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    now = utcish_now()
+    conn.execute(
+        """INSERT INTO food_catalog
+           (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+            package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+            exchange_json,exchange_review_status,fingerprint,original_image_ref,
+            recognition_confidence,verification_status,created_at,updated_at)
+           VALUES (?,'餐點照片：雞肉、白飯','','','user_meal_photo','U1','private',
+                   1,'meal',1,'{}','{}',
+                   '{"starch_exchange":6,"protein_medium_exchange":2.5}',
+                   'approved','fp_photo','',0,'admin_approved',?,?)""",
+        (new_id("food"), now, now),
+    )
+    results = search_food_catalog(conn, user_id="U1", query="餐點照片")
+    assert len(results) == 1
+    assert results[0]["source_type"] == "user_meal_photo"
+    assert "雞肉" in results[0]["product_name"]

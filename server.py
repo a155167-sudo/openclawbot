@@ -44,9 +44,12 @@ from nutrition_system import (
     normalize_garmin_payload,
     normalize_label_payload,
     nutrition_sheet_specs,
+    quick_log_from_catalog,
     rank_menu_candidates,
     remaining_targets,
     save_pending_label,
+    search_food_catalog,
+    search_food_history,
     set_nutrition_input_state,
     clear_nutrition_input_state,
     update_pending_consumption,
@@ -7877,6 +7880,75 @@ def build_meal_photo_step_message(token, step, version=1):
     )
 
 
+def build_food_search_result_bubble(item):
+    """食物搜尋結果的單張Flex bubble。"""
+    name = item["product_name"]
+    brand = item.get("brand") or ""
+    source_type = item.get("source_type") or ""
+    exchange = item.get("exchange") or {}
+    per_serving = item.get("per_serving") or {}
+    use_count = item.get("use_count") or 0
+    last_at = str(item.get("last_consumed_at") or "")
+    if last_at and "T" in last_at:
+        last_at = last_at.split("T")[0]
+    food_id = item["food_id"]
+
+    if source_type == "user_meal_photo":
+        header_text = "📷 餐點照片"
+        header_color = "#FFF3CD"
+        text_color = "#7A4E00"
+    else:
+        header_text = "🏷️ 包裝食品"
+        header_color = "#DBEAFE"
+        text_color = "#1E3A5F"
+
+    def _kv(label, value):
+        return {"type": "box", "layout": "horizontal", "contents": [
+            {"type": "text", "text": label, "size": "xs", "color": "#555555", "flex": 3},
+            {"type": "text", "text": str(value), "size": "xs", "color": "#111111", "align": "end", "flex": 2},
+        ]}
+
+    body = []
+    if brand:
+        body.append(_kv("品牌", brand))
+    if per_serving.get("calories_kcal"):
+        body.append(_kv("每份熱量", f"{float(per_serving['calories_kcal']):.0f} kcal"))
+        body.append(_kv("每份蛋白質", f"{float(per_serving.get('protein_g', 0)):.1f}g"))
+    for key, label in (
+        ("starch_exchange", "主食"), ("protein_medium_exchange", "中脂蛋白"),
+        ("protein_low_exchange", "低脂蛋白"), ("protein_high_exchange", "高脂蛋白"),
+        ("vegetable_exchange", "蔬菜"), ("fruit_exchange", "水果"), ("milk_exchange", "奶類"),
+    ):
+        val = float(exchange.get(key, 0) or 0)
+        if val > 0:
+            body.append(_kv(label, f"{val:g}份"))
+    if use_count > 0:
+        body.append({"type": "text", "text": f"📊 累計吃過 {use_count} 次", "size": "xs", "color": "#777777"})
+    if last_at:
+        body.append({"type": "text", "text": f"📅 最近：{last_at}", "size": "xs", "color": "#777777"})
+
+    return {
+        "type": "bubble", "size": "kilo",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": header_color,
+            "contents": [
+                {"type": "text", "text": header_text, "size": "xs", "color": text_color},
+                {"type": "text", "text": name[:40], "weight": "bold", "size": "sm", "color": "#111111", "wrap": True},
+            ],
+        },
+        "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body},
+        "footer": {
+            "type": "box", "layout": "vertical", "spacing": "sm",
+            "contents": [
+                {"type": "button", "style": "primary", "color": "#0F766E", "height": "sm",
+                 "action": {"type": "postback", "label": "快速記錄",
+                            "data": f"relog:v1:{food_id}:start",
+                            "displayText": f"記錄：{name[:20]}"}},
+            ],
+        },
+    }
+
+
 def build_meal_photo_review_step_message(draft, step, version=1):
     from meal_photo_system import meal_photo_review_options
     token = draft["token"]
@@ -8001,6 +8073,64 @@ def build_meal_photo_approved_bubble(draft, result):
 @handler.add(PostbackEvent)
 def handle_meal_photo_postback(event):
     data = str(getattr(event.postback, "data", "") or "")
+    uid = event.source.user_id
+
+    # ── relog:v1 快速重新記錄 ──
+    relog_start = re.fullmatch(r"relog:v1:([a-z0-9_]{8,40}):start", data)
+    relog_servings = re.fullmatch(r"relog:v1:([a-z0-9_]{8,40}):servings:([0-9.]+)", data)
+    relog_cancel = re.fullmatch(r"relog:v1:([a-z0-9_]{8,40}):servings:cancel", data)
+    relog_meal = re.fullmatch(r"relog:v1:([a-z0-9_]{8,40}):sv:([0-9.]+):meal:(早餐|午餐|晚餐|點心)", data)
+    if relog_start or relog_servings or relog_cancel or relog_meal:
+        matched = relog_start or relog_servings or relog_cancel or relog_meal
+        assert matched is not None
+        food_id = matched.group(1)
+        try:
+            if relog_start:
+                items = []
+                for sv in ("0.5", "1", "1.5", "2", "2.5", "3"):
+                    items.append(QuickReplyButton(action=PostbackAction(
+                        label=f"{sv}份", data=f"relog:v1:{food_id}:servings:{sv}",
+                        display_text=f"{sv}份",
+                    )))
+                items.append(QuickReplyButton(action=PostbackAction(
+                    label="取消", data=f"relog:v1:{food_id}:servings:cancel",
+                    display_text="取消快速記錄",
+                )))
+                reply = TextSendMessage(text="請選擇份量：", quick_reply=QuickReply(items=items))
+            elif relog_cancel:
+                reply = TextSendMessage(text="✅ 已取消快速記錄。")
+            elif relog_servings:
+                sv = matched.group(2)
+                items = []
+                for slot in ("早餐", "午餐", "晚餐", "點心"):
+                    items.append(QuickReplyButton(action=PostbackAction(
+                        label=slot, data=f"relog:v1:{food_id}:sv:{sv}:meal:{slot}",
+                        display_text=f"{sv}份・{slot}",
+                    )))
+                reply = TextSendMessage(
+                    text=f"已選 {sv} 份，請選擇餐別：",
+                    quick_reply=QuickReply(items=items),
+                )
+            else:
+                assert relog_meal is not None
+                sv = float(matched.group(2))
+                slot = matched.group(3)
+                with sqlite3.connect(DB_PATH) as conn:
+                    result = quick_log_from_catalog(
+                        conn, user_id=uid, food_id=food_id,
+                        consumed_servings=sv, meal_slot=slot,
+                    )
+                cal = result["nutrition"].get("calories_kcal")
+                cal_text = f"{cal:.0f} kcal" if cal else "NA"
+                reply = TextSendMessage(
+                    text=f"✅ 已記錄 {result['product_name']} {result['consumed_servings']}份"
+                         f"（{result['meal_slot']}）\n熱量：{cal_text}"
+                )
+            line_bot_api.reply_message(event.reply_token, reply)
+        except (ValueError, PermissionError) as exc:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"⚠️ {exc}"))
+        return
+
     start = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):start", data)
     cancel = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):cancel", data)
     answer = re.fullmatch(
@@ -8177,6 +8307,41 @@ def _handle_message_impl(event):
             line_bot_api.reply_message(
                 event.reply_token, TextSendMessage(text=reply_text)
             )
+        except Exception:
+            processed_messages.discard(msg_id)
+            raise
+        return
+
+    if msg.startswith("搜尋") or msg.startswith("查食物"):
+        query = msg.replace("搜尋", "", 1).replace("查食物", "", 1).strip()
+        if not query:
+            reply = TextSendMessage(text="請輸入搜尋關鍵字，例如：搜尋 雞胸")
+        else:
+            try:
+                from linebot.models import FlexSendMessage
+                with sqlite3.connect(DB_PATH) as conn:
+                    ensure_nutrition_schema(conn)
+                    catalog = search_food_catalog(conn, user_id=uid, query=query)
+                    history = search_food_history(conn, user_id=uid, query=query)
+                seen = set()
+                merged = []
+                for item in history + catalog:
+                    if item["food_id"] not in seen:
+                        seen.add(item["food_id"])
+                        merged.append(item)
+                if not merged:
+                    reply = TextSendMessage(text=f"🔍 找不到「{query}」相關的食物紀錄。\n\n你可以：\n• 換個關鍵字再試\n• 傳營養標示照片建立新卡片\n• 傳餐點照片由營養師估算")
+                else:
+                    bubbles = [build_food_search_result_bubble(item) for item in merged[:8]]
+                    reply = FlexSendMessage(
+                        alt_text=f"搜尋「{query}」找到 {len(bubbles)} 筆",
+                        contents={"type": "carousel", "contents": bubbles},
+                    )
+            except Exception as exc:
+                print(f"⚠️ 食物搜尋失敗：{type(exc).__name__}: {exc}")
+                reply = TextSendMessage(text="⚠️ 搜尋暫時無法使用，請稍後再試。")
+        try:
+            line_bot_api.reply_message(event.reply_token, reply)
         except Exception:
             processed_messages.discard(msg_id)
             raise

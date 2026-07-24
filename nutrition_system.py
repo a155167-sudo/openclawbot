@@ -1850,6 +1850,184 @@ def insert_approved_meal_photo_log(
     }
 
 
+def quick_log_from_catalog(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    food_id: str,
+    consumed_servings: float,
+    meal_slot: str,
+    consumed_at: str = "",
+) -> dict[str, Any]:
+    """從已有的food_catalog item快速建立一筆food_log，不經過pending流程。"""
+    user_id = str(user_id or "").strip()
+    food_id = str(food_id or "").strip()
+    if not user_id or not food_id:
+        raise ValueError("快速記錄缺少必要資訊")
+    try:
+        servings = float(consumed_servings)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("份量數值無效") from exc
+    if servings <= 0 or servings > 100:
+        raise ValueError("份量需介於0.1~100")
+    meal_slot = str(meal_slot or "").strip()
+    if meal_slot not in {"早餐", "午餐", "晚餐", "點心", ""}:
+        raise ValueError("餐別不支援")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        food = conn.execute(
+            """SELECT product_name,brand,package_amount,package_unit,servings_per_package,
+                      per_serving_json,exchange_json,exchange_review_status,
+                      source_type,fingerprint
+               FROM food_catalog WHERE food_id=? AND owner_user_id=?""",
+            (food_id, user_id),
+        ).fetchone()
+        if not food:
+            raise ValueError("找不到這筆食品紀錄")
+        product_name = food[0]
+        package_amount = float(food[2] or 0)
+        package_unit = food[3] or ""
+        servings_per_package = float(food[4] or 1)
+        per_serving = json.loads(food[5] or "{}")
+        exchange_json_raw = json.loads(food[6] or "{}")
+        source_type = food[8] or ""
+        now = utcish_now()
+        consumed_at = str(consumed_at or now)[:50]
+        if per_serving and source_type != "user_meal_photo":
+            nutrition = scale_nutrition(per_serving, servings)
+            consumed_amount = round(package_amount * servings / servings_per_package, 4)
+        else:
+            nutrition = {}
+            consumed_amount = 0
+        if source_type == "user_meal_photo":
+            applied = {
+                key: round(float(exchange_json_raw.get(key, 0) or 0) * servings, 4)
+                for key in EXCHANGE_KEYS
+            }
+            applied["_review_status"] = "approved"
+            applied["_source_type"] = "meal_photo"
+            applied["_warnings"] = ["calories_and_macros_na"]
+        else:
+            applied = {
+                key: round(float(exchange_json_raw.get(key, 0) or 0) * servings, 4)
+                for key in EXCHANGE_KEYS
+            }
+            applied["_review_status"] = exchange_json_raw.get("_review_status", "pending_review")
+        log_id = new_id("log")
+        conn.execute(
+            """INSERT INTO food_logs
+               (log_id,user_id,food_id,consumed_at,meal_slot,consumed_servings,
+                consumed_amount,consumed_unit,nutrition_snapshot_json,exchange_snapshot_json,
+                approved_exchange_json,exchange_approval_id,source_image_ref,plan_id,
+                plan_link_status,confirmation_status,legacy_applied_at,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                log_id, user_id, food_id, consumed_at, meal_slot, servings,
+                consumed_amount, package_unit,
+                json.dumps(nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                json.dumps(exchange_json_raw, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                json.dumps(applied, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                "", "", "", "pending", "confirmed", "not_applicable", now, now,
+            ),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO nutrition_sheet_outbox
+               (outbox_id,entity_type,entity_id,status,attempts,last_error,created_at,synced_at)
+               VALUES (?,'food_log',?,'pending',0,'',?,'')""",
+            (new_id("outbox"), log_id, now),
+        )
+        conn.commit()
+        return {
+            "log_id": log_id, "product_name": product_name,
+            "consumed_servings": servings, "meal_slot": meal_slot,
+            "consumed_at": consumed_at, "consumed_amount": consumed_amount,
+            "consumed_unit": package_unit,
+            "nutrition": nutrition, "applied_exchange": applied,
+        }
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def search_food_catalog(
+    conn: sqlite3.Connection, *, user_id: str, query: str, limit: int = 8
+) -> list[dict[str, Any]]:
+    """模糊搜尋用戶的food_catalog，包含包裝食品與餐點照片synthetic food。"""
+    user_id = str(user_id or "").strip()
+    query = str(query or "").strip()
+    if not user_id or not query:
+        return []
+    limit = max(1, min(int(limit or 8), 20))
+    pattern = f"%{query}%"
+    rows = conn.execute(
+        """SELECT food_id,product_name,brand,barcode,source_type,owner_user_id,
+                  package_amount,package_unit,servings_per_package,
+                  per_serving_json,exchange_json,exchange_review_status,
+                  created_at,updated_at
+           FROM food_catalog
+           WHERE owner_user_id=? AND product_name LIKE ?
+           ORDER BY updated_at DESC
+           LIMIT ?""",
+        (user_id, pattern, limit),
+    ).fetchall()
+    return [
+        {
+            "food_id": r[0], "product_name": r[1], "brand": r[2] or "", "barcode": r[3] or "",
+            "source_type": r[4], "owner_user_id": r[5],
+            "package_amount": float(r[6] or 0), "package_unit": r[7] or "",
+            "servings_per_package": float(r[8] or 1),
+            "per_serving": json.loads(r[9] or "{}"),
+            "exchange": json.loads(r[10] or "{}"),
+            "exchange_review_status": r[11] or "",
+            "created_at": r[12] or "", "updated_at": r[13] or "",
+            "last_consumed_at": None, "use_count": 0,
+        }
+        for r in rows
+    ]
+
+
+def search_food_history(
+    conn: sqlite3.Connection, *, user_id: str, query: str, limit: int = 8
+) -> list[dict[str, Any]]:
+    """搜尋用戶過去的飲食紀錄，join food_catalog找出最常吃與最近吃的。"""
+    user_id = str(user_id or "").strip()
+    query = str(query or "").strip()
+    if not user_id or not query:
+        return []
+    limit = max(1, min(int(limit or 8), 20))
+    pattern = f"%{query}%"
+    rows = conn.execute(
+        """SELECT f.food_id,f.product_name,f.brand,f.barcode,f.source_type,f.owner_user_id,
+                  f.package_amount,f.package_unit,f.servings_per_package,
+                  f.per_serving_json,f.exchange_json,f.exchange_review_status,
+                  MAX(l.consumed_at) AS last_consumed_at,
+                  COUNT(l.log_id) AS use_count
+           FROM food_logs l
+           JOIN food_catalog f ON f.food_id=l.food_id
+           WHERE l.user_id=? AND l.confirmation_status='confirmed'
+             AND f.product_name LIKE ?
+           GROUP BY f.food_id
+           ORDER BY use_count DESC, last_consumed_at DESC
+           LIMIT ?""",
+        (user_id, pattern, limit),
+    ).fetchall()
+    return [
+        {
+            "food_id": r[0], "product_name": r[1], "brand": r[2] or "", "barcode": r[3] or "",
+            "source_type": r[4], "owner_user_id": r[5],
+            "package_amount": float(r[6] or 0), "package_unit": r[7] or "",
+            "servings_per_package": float(r[8] or 1),
+            "per_serving": json.loads(r[9] or "{}"),
+            "exchange": json.loads(r[10] or "{}"),
+            "exchange_review_status": r[11] or "",
+            "last_consumed_at": r[12] or None,
+            "use_count": int(r[13] or 0),
+        }
+        for r in rows
+    ]
+
+
 def approve_food_exchange_suggestion(
     conn: sqlite3.Connection, *, food_id: str, reviewer: str
 ) -> dict[str, Any]:
