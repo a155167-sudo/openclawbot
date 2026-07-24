@@ -1951,26 +1951,39 @@ def quick_log_from_catalog(
 
 
 def search_food_catalog(
-    conn: sqlite3.Connection, *, user_id: str, query: str, limit: int = 8
+    conn: sqlite3.Connection, *, user_id: str, query: str = "", limit: int = 8
 ) -> list[dict[str, Any]]:
-    """模糊搜尋用戶的food_catalog，包含包裝食品與餐點照片synthetic food。"""
+    """模糊搜尋用戶的food_catalog，包含包裝食品與餐點照片synthetic food。query為空時回傳全部。"""
     user_id = str(user_id or "").strip()
     query = str(query or "").strip()
-    if not user_id or not query:
+    if not user_id:
         return []
     limit = max(1, min(int(limit or 8), 20))
-    pattern = f"%{query}%"
-    rows = conn.execute(
-        """SELECT food_id,product_name,brand,barcode,source_type,owner_user_id,
-                  package_amount,package_unit,servings_per_package,
-                  per_serving_json,exchange_json,exchange_review_status,
-                  created_at,updated_at
-           FROM food_catalog
-           WHERE owner_user_id=? AND product_name LIKE ?
-           ORDER BY updated_at DESC
-           LIMIT ?""",
-        (user_id, pattern, limit),
-    ).fetchall()
+    if query:
+        pattern = f"%{query}%"
+        rows = conn.execute(
+            """SELECT food_id,product_name,brand,barcode,source_type,owner_user_id,
+                      package_amount,package_unit,servings_per_package,
+                      per_serving_json,exchange_json,exchange_review_status,
+                      created_at,updated_at
+               FROM food_catalog
+               WHERE owner_user_id=? AND product_name LIKE ?
+               ORDER BY updated_at DESC
+               LIMIT ?""",
+            (user_id, pattern, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT food_id,product_name,brand,barcode,source_type,owner_user_id,
+                      package_amount,package_unit,servings_per_package,
+                      per_serving_json,exchange_json,exchange_review_status,
+                      created_at,updated_at
+               FROM food_catalog
+               WHERE owner_user_id=?
+               ORDER BY updated_at DESC
+               LIMIT ?""",
+            (user_id, limit),
+        ).fetchall()
     return [
         {
             "food_id": r[0], "product_name": r[1], "brand": r[2] or "", "barcode": r[3] or "",

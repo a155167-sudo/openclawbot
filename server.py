@@ -8314,32 +8314,33 @@ def _handle_message_impl(event):
 
     if msg.startswith("搜尋") or msg.startswith("查食物"):
         query = msg.replace("搜尋", "", 1).replace("查食物", "", 1).strip()
-        if not query:
-            reply = TextSendMessage(text="請輸入搜尋關鍵字，例如：搜尋 雞胸")
-        else:
-            try:
-                from linebot.models import FlexSendMessage
-                with sqlite3.connect(DB_PATH) as conn:
-                    ensure_nutrition_schema(conn)
-                    catalog = search_food_catalog(conn, user_id=uid, query=query)
-                    history = search_food_history(conn, user_id=uid, query=query)
-                seen = set()
-                merged = []
-                for item in history + catalog:
-                    if item["food_id"] not in seen:
-                        seen.add(item["food_id"])
-                        merged.append(item)
-                if not merged:
+        try:
+            from linebot.models import FlexSendMessage
+            with sqlite3.connect(DB_PATH) as conn:
+                ensure_nutrition_schema(conn)
+                catalog = search_food_catalog(conn, user_id=uid, query=query)
+                history = search_food_history(conn, user_id=uid, query=query) if query else []
+            seen = set()
+            merged = []
+            for item in history + catalog:
+                if item["food_id"] not in seen:
+                    seen.add(item["food_id"])
+                    merged.append(item)
+            if not merged:
+                if query:
                     reply = TextSendMessage(text=f"🔍 找不到「{query}」相關的食物紀錄。\n\n你可以：\n• 換個關鍵字再試\n• 傳營養標示照片建立新卡片\n• 傳餐點照片由營養師估算")
                 else:
-                    bubbles = [build_food_search_result_bubble(item) for item in merged[:8]]
-                    reply = FlexSendMessage(
-                        alt_text=f"搜尋「{query}」找到 {len(bubbles)} 筆",
-                        contents={"type": "carousel", "contents": bubbles},
-                    )
-            except Exception as exc:
-                print(f"⚠️ 食物搜尋失敗：{type(exc).__name__}: {exc}")
-                reply = TextSendMessage(text="⚠️ 搜尋暫時無法使用，請稍後再試。")
+                    reply = TextSendMessage(text="📭 你還沒有任何食物卡片。\n\n傳營養標示照片或餐點照片就可以建立第一張卡片！")
+            else:
+                bubbles = [build_food_search_result_bubble(item) for item in merged[:8]]
+                alt = f"找到 {len(bubbles)} 張卡片" if not query else f"搜尋「{query}」找到 {len(bubbles)} 筆"
+                reply = FlexSendMessage(
+                    alt_text=alt,
+                    contents={"type": "carousel", "contents": bubbles},
+                )
+        except Exception as exc:
+            print(f"⚠️ 食物搜尋失敗：{type(exc).__name__}: {exc}")
+            reply = TextSendMessage(text="⚠️ 搜尋暫時無法使用，請稍後再試。")
         try:
             line_bot_api.reply_message(event.reply_token, reply)
         except Exception:
