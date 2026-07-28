@@ -8333,6 +8333,8 @@ def _handle_message_impl(event):
         try:
             logged = []
             total_cal = 0
+            total_pro = 0
+            total_carb = 0
             with sqlite3.connect(DB_PATH) as conn:
                 ensure_nutrition_schema(conn)
                 for keyword, servings in combo:
@@ -8344,14 +8346,23 @@ def _handle_message_impl(event):
                         conn, user_id=uid, food_id=food["food_id"],
                         consumed_servings=servings, meal_slot="早餐",
                     )
-                    cal = result["nutrition"].get("calories_kcal")
+                    nutr = result.get("nutrition") or {}
+                    cal = nutr.get("calories_kcal")
+                    pro = nutr.get("protein_g")
+                    carb = nutr.get("carbohydrate_g")
                     if cal:
                         total_cal += float(cal)
+                    if pro:
+                        total_pro += float(pro)
+                    if carb:
+                        total_carb += float(carb)
                     logged.append(f"• {food['product_name']} {servings}份")
             summary = "\n".join(logged)
             cal_text = f"{total_cal:.0f}" if total_cal else "NA"
+            pro_text = f"{total_pro:.1f}" if total_pro else "NA"
+            carb_text = f"{total_carb:.1f}" if total_carb else "NA"
             reply = TextSendMessage(
-                text=f"✅ 已記錄 {msg}\n{summary}\n🔥 合計 {cal_text} kcal"
+                text=f"✅ 已記錄 {msg}\n{summary}\n🔥 {cal_text} kcal｜蛋白質 {pro_text}g｜碳水 {carb_text}g"
             )
         except (ValueError, PermissionError) as exc:
             reply = TextSendMessage(text=f"⚠️ {exc}")
