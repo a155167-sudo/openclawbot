@@ -1624,3 +1624,88 @@ def test_search_no_results_shows_guidance(tmp_path, monkeypatch):
     event = _text_event("SEARCH-EMPTY", "搜尋 不存在的食物", user_id="U1")
     server._handle_message_impl(event)
     assert "找不到" in replies[0].text
+
+
+def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
+    db = tmp_path / "combo.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    now = utcish_now()
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        for name, exch, kcal in [
+            ("燕麥棒", {"starch_exchange": 1, "protein_small_exchange": 0.5}, 196),
+            ("フルグラ", {"starch_exchange": 2, "fat_exchange": 0.5}, 221),
+            ("優格", {"milk_exchange": 1}, 62),
+        ]:
+            fid = new_id("food")
+            ps = json.dumps({"calories_kcal": kcal})
+            conn.execute(
+                """INSERT INTO food_catalog
+                   (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                    package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                    exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                    recognition_confidence,verification_status,created_at,updated_at)
+                   VALUES (?,?,'','','user_private_food','U1','private',
+                           100,'g',1,?, '{}',
+                           ?,'approved',?,'',0,'user_confirmed',?,?)""",
+                (fid, name, ps, json.dumps(exch), fid, now, now),
+            )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    event = _text_event("COMBO-1", "早餐1", user_id="U1")
+    server._handle_message_impl(event)
+    assert len(replies) == 1
+    text = replies[0].text
+    assert "✅ 已記錄" in text
+    assert "燕麥棒" in text
+    assert "優格" in text
+    assert "431" in text or "430" in text or "626" in text or "627" in text
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT meal_slot FROM food_logs WHERE user_id='U1'"
+        ).fetchall()
+        assert len(rows) == 3
+        assert all(r[0] == "早餐" for r in rows)
+
+
+def test_breakfast_combo2_logs_different_portions(tmp_path, monkeypatch):
+    db = tmp_path / "combo2.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    now = utcish_now()
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        for name, exch, kcal in [
+            ("燕麥棒", {"starch_exchange": 1, "protein_small_exchange": 0.5}, 196),
+            ("フルグラ", {"starch_exchange": 2, "fat_exchange": 0.5}, 221),
+            ("優格", {"milk_exchange": 1}, 62),
+        ]:
+            fid = new_id("food")
+            ps = json.dumps({"calories_kcal": kcal})
+            conn.execute(
+                """INSERT INTO food_catalog
+                   (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                    package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                    exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                    recognition_confidence,verification_status,created_at,updated_at)
+                   VALUES (?,?,'','','user_private_food','U1','private',
+                           100,'g',1,?, '{}',
+                           ?,'approved',?,'',0,'user_confirmed',?,?)""",
+                (fid, name, ps, json.dumps(exch), fid, now, now),
+            )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    event = _text_event("COMBO-2", "早餐2", user_id="U1")
+    server._handle_message_impl(event)
+    assert len(replies) == 1
+    text = replies[0].text
+    assert "✅ 已記錄" in text
+    assert "479" in text or "675" in text
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT consumed_servings,meal_slot FROM food_logs WHERE user_id='U1' ORDER BY consumed_servings"
+        ).fetchall()
+        assert len(rows) == 3

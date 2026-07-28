@@ -7856,6 +7856,21 @@ MEAL_PHOTO_REVIEW_QUESTIONS = {
     "fruit_exchange": "請選擇水果正式份量：",
 }
 
+# ── 快速早餐組合 ──
+# key = 用戶在LINE輸入的文字；items = [(品名搜尋關鍵字, 份量), ...]
+BREAKFAST_COMBOS = {
+    "早餐1": [
+        ("燕麥棒", 2.0),
+        ("フルグラ", 0.5),
+        ("優格", 2.0),
+    ],
+    "早餐2": [
+        ("燕麥棒", 2.0),
+        ("フルグラ", 1.0),
+        ("優格", 1.0),
+    ],
+}
+
 
 def build_meal_photo_step_message(token, step, version=1):
     options = meal_photo_step_options(token, step, version=version)
@@ -8307,6 +8322,41 @@ def _handle_message_impl(event):
             line_bot_api.reply_message(
                 event.reply_token, TextSendMessage(text=reply_text)
             )
+        except Exception:
+            processed_messages.discard(msg_id)
+            raise
+        return
+
+    # ── 快速早餐組合 ──
+    if msg in BREAKFAST_COMBOS:
+        combo = BREAKFAST_COMBOS[msg]
+        try:
+            logged = []
+            total_cal = 0
+            with sqlite3.connect(DB_PATH) as conn:
+                ensure_nutrition_schema(conn)
+                for keyword, servings in combo:
+                    matches = search_food_catalog(conn, user_id=uid, query=keyword, limit=1)
+                    if not matches:
+                        raise ValueError(f"找不到「{keyword}」的食物卡片，請先傳營養標示照片建立")
+                    food = matches[0]
+                    result = quick_log_from_catalog(
+                        conn, user_id=uid, food_id=food["food_id"],
+                        consumed_servings=servings, meal_slot="早餐",
+                    )
+                    cal = result["nutrition"].get("calories_kcal")
+                    if cal:
+                        total_cal += float(cal)
+                    logged.append(f"• {food['product_name']} {servings}份")
+            summary = "\n".join(logged)
+            cal_text = f"{total_cal:.0f}" if total_cal else "NA"
+            reply = TextSendMessage(
+                text=f"✅ 已記錄 {msg}\n{summary}\n🔥 合計 {cal_text} kcal"
+            )
+        except (ValueError, PermissionError) as exc:
+            reply = TextSendMessage(text=f"⚠️ {exc}")
+        try:
+            line_bot_api.reply_message(event.reply_token, reply)
         except Exception:
             processed_messages.discard(msg_id)
             raise
