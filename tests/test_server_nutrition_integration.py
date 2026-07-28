@@ -1633,9 +1633,9 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
         for name, exch, kcal in [
-            ("燕麥棒", {"starch_exchange": 1, "protein_small_exchange": 0.5}, 196),
-            ("フルグラ", {"starch_exchange": 2, "fat_exchange": 0.5}, 221),
-            ("優格", {"milk_exchange": 1}, 62),
+            ("穀麥高粱 OATS & HONEY", {"starch_exchange": 1.98}, 197),
+            ("草莓穀物脆片", {"starch_exchange": 2.37}, 223),
+            ("無糖優格", {"milk_exchange": 0.5}, 62),
         ]:
             fid = new_id("food")
             ps = json.dumps({"calories_kcal": kcal})
@@ -1658,9 +1658,8 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
     assert len(replies) == 1
     text = replies[0].text
     assert "✅ 已記錄" in text
-    assert "燕麥棒" in text
-    assert "優格" in text
-    assert "431" in text or "430" in text or "626" in text or "627" in text
+    assert "穀麥高粱" in text
+    assert "無糖優格" in text
 
     with sqlite3.connect(db) as conn:
         rows = conn.execute(
@@ -1677,9 +1676,9 @@ def test_breakfast_combo2_logs_different_portions(tmp_path, monkeypatch):
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
         for name, exch, kcal in [
-            ("燕麥棒", {"starch_exchange": 1, "protein_small_exchange": 0.5}, 196),
-            ("フルグラ", {"starch_exchange": 2, "fat_exchange": 0.5}, 221),
-            ("優格", {"milk_exchange": 1}, 62),
+            ("穀麥高粱 OATS & HONEY", {"starch_exchange": 1.98}, 197),
+            ("草莓穀物脆片", {"starch_exchange": 2.37}, 223),
+            ("無糖優格", {"milk_exchange": 0.5}, 62),
         ]:
             fid = new_id("food")
             ps = json.dumps({"calories_kcal": kcal})
@@ -1702,7 +1701,7 @@ def test_breakfast_combo2_logs_different_portions(tmp_path, monkeypatch):
     assert len(replies) == 1
     text = replies[0].text
     assert "✅ 已記錄" in text
-    assert "479" in text or "675" in text
+    assert "679" in text or "678" in text or "677" in text
 
     with sqlite3.connect(db) as conn:
         rows = conn.execute(
