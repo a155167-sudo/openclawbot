@@ -101,7 +101,40 @@ def test_confirmation_card_explicitly_distinguishes_not_visible_from_zero():
     actions = str(bubble)
     assert "mp:v1:abc123def456:1:start" in actions
     assert "mp:v1:abc123def456:1:cancel" in actions
+    assert "mp:v1:abc123def456:1:request_add" in actions
+    assert "'label': '移除'" in actions
+    assert "'label': '❌'" not in actions
     assert "'type': 'postback'" in actions
+
+
+def test_meal_photo_item_edit_is_versioned_and_persists_in_observed_payload(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo-edit.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="EDIT-1", payload=sample_payload()
+        )
+
+        removed = apply_meal_photo_action(
+            conn, event_id="REMOVE-1", user_id="U1", token=token,
+            expected_version=1, action="remove_item", value="青花菜",
+        )
+        assert removed["result"] == {"kind": "updated", "version": 2}
+        assert [item["name"] for item in removed["draft"]["payload"]["visible_items"]] == ["高麗菜"]
+
+        waiting = apply_meal_photo_action(
+            conn, event_id="REQUEST-ADD-1", user_id="U1", token=token,
+            expected_version=2, action="request_add",
+        )
+        assert waiting["result"] == {"kind": "ask_item_name", "version": 3}
+        assert waiting["draft"]["status"] == "awaiting_item_name"
+
+        added = apply_meal_photo_action(
+            conn, event_id="ADD-1", user_id="U1", token=token,
+            expected_version=3, action="add_item", field="protein", value="雞胸肉",
+        )
+        assert added["result"] == {"kind": "updated", "version": 4}
+        assert added["draft"]["status"] == "awaiting_confirmation"
+        assert [item["name"] for item in added["draft"]["payload"]["visible_items"]] == ["高麗菜", "雞胸肉"]
+        assert added["draft"]["payload"]["visible_items"][-1]["category"] == "protein"
 
 
 def test_meal_photo_draft_is_durable_idempotent_and_user_owned(tmp_path):

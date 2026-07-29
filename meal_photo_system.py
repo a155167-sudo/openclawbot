@@ -287,7 +287,8 @@ def get_meal_photo_draft(
     if not row:
         raise ValueError("找不到這筆餐點照片草稿")
     if _expired(row[11]) and row[8] in {
-        "awaiting_confirmation", "confirming", "estimated", "reviewing", "review_ready"
+        "awaiting_confirmation", "awaiting_item_name", "confirming",
+        "estimated", "reviewing", "review_ready"
     }:
         retired = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
         conn.execute(
@@ -344,7 +345,8 @@ def daily_pending_meal_photo_count(
         rows = conn.execute(
             """SELECT token,consumed_at,expires_at FROM pending_meal_photo_drafts
                WHERE user_id=? AND status IN (
-                 'awaiting_confirmation','confirming','estimated','reviewing','review_ready'
+                 'awaiting_confirmation','awaiting_item_name','confirming',
+                 'estimated','reviewing','review_ready'
                )""",
             (user_id,),
         ).fetchall()
@@ -357,7 +359,8 @@ def daily_pending_meal_photo_count(
                            estimate_json='{}',review_json='{}',retired_at=?,updated_at=?,version=version+1
                        WHERE token=? AND user_id=?
                          AND status IN (
-                           'awaiting_confirmation','confirming','estimated','reviewing','review_ready'
+                           'awaiting_confirmation','awaiting_item_name','confirming',
+                           'estimated','reviewing','review_ready'
                          )""",
                     (now, now, token, user_id),
                 )
@@ -514,6 +517,17 @@ def apply_meal_photo_action(
     elif action == "cancel":
         field = ""
         value = ""
+    elif action == "remove_item":
+        field = ""
+        value = _short_text(value, "食材名稱", maximum=60)
+    elif action == "add_item":
+        field = _short_text(field, "食材類別", maximum=20)
+        if field not in VISIBLE_CATEGORIES:
+            raise ValueError("食材類別不支援")
+        value = _short_text(value, "食材名稱", maximum=60)
+    elif action == "request_add":
+        field = ""
+        value = ""
     else:
         raise ValueError("餐點操作不支援")
     try:
@@ -550,7 +564,8 @@ def apply_meal_photo_action(
                 "draft": get_meal_photo_draft(conn, user_id=user_id, token=token),
             }
         row = conn.execute(
-            """SELECT answers_json,status,expires_at,version,source_image_ref
+            """SELECT answers_json,status,expires_at,version,source_image_ref,
+                      observed_payload_json
                FROM pending_meal_photo_drafts WHERE token=? AND user_id=?""",
             (token, user_id),
         ).fetchone()
@@ -560,7 +575,11 @@ def apply_meal_photo_action(
         status, expires_at, current_version = row[1], row[2], int(row[3])
         if _expired(expires_at):
             raise ValueError("這筆餐點照片草稿已逾時")
-        if status not in {"awaiting_confirmation", "confirming"}:
+        allowed_statuses = (
+            {"awaiting_item_name"} if action == "add_item"
+            else {"awaiting_confirmation", "confirming"}
+        )
+        if status not in allowed_statuses:
             raise ValueError("這筆餐點照片不能再修改")
         if current_version != expected_version:
             raise ValueError("餐點確認畫面已更新，請使用最新按鈕")
@@ -577,6 +596,60 @@ def apply_meal_photo_action(
                    WHERE token=? AND user_id=? AND version=?
                      AND status IN ('awaiting_confirmation','confirming')""",
                 (now, now, next_version, token, user_id, current_version),
+            ).rowcount
+        elif action == "remove_item":
+            if status != "awaiting_confirmation":
+                raise ValueError("開始份量確認後不能再刪除食材")
+            payload = normalize_meal_photo_payload(json.loads(row[5] or "{}"))
+            original_items = list(payload["visible_items"])
+            payload["visible_items"] = [
+                item for item in original_items if item["name"] != value
+            ]
+            if len(payload["visible_items"]) == len(original_items):
+                raise ValueError("找不到要移除的食材")
+            if not payload["visible_items"]:
+                raise ValueError("至少要保留一項食材；若全部不符請取消後重拍")
+            result = {"kind": "updated", "version": next_version}
+            changed = conn.execute(
+                """UPDATE pending_meal_photo_drafts
+                   SET observed_payload_json=?,updated_at=?,version=?
+                   WHERE token=? AND user_id=? AND version=?
+                     AND status='awaiting_confirmation'""",
+                (
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                    now, next_version, token, user_id, current_version,
+                ),
+            ).rowcount
+        elif action == "request_add":
+            if status != "awaiting_confirmation":
+                raise ValueError("開始份量確認後不能再新增食材")
+            result = {"kind": "ask_item_name", "version": next_version}
+            changed = conn.execute(
+                """UPDATE pending_meal_photo_drafts
+                   SET status='awaiting_item_name',updated_at=?,version=?
+                   WHERE token=? AND user_id=? AND version=?
+                     AND status='awaiting_confirmation'""",
+                (now, next_version, token, user_id, current_version),
+            ).rowcount
+        elif action == "add_item":
+            payload = normalize_meal_photo_payload(json.loads(row[5] or "{}"))
+            if any(item["name"] == value for item in payload["visible_items"]):
+                raise ValueError("這項食材已經在清單中")
+            if len(payload["visible_items"]) >= 12:
+                raise ValueError("一筆餐點最多確認12項食材")
+            payload["visible_items"].append(
+                {"name": value, "category": field, "confidence": 1.0}
+            )
+            result = {"kind": "updated", "version": next_version}
+            changed = conn.execute(
+                """UPDATE pending_meal_photo_drafts
+                   SET observed_payload_json=?,status='awaiting_confirmation',updated_at=?,version=?
+                   WHERE token=? AND user_id=? AND version=?
+                     AND status='awaiting_item_name'""",
+                (
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                    now, next_version, token, user_id, current_version,
+                ),
             ).rowcount
         else:
             expected_step = next_meal_photo_step({"answers": answers})
@@ -1000,9 +1073,9 @@ def build_meal_photo_confirmation_bubble(
             "type": "box", "layout": "horizontal", "spacing": "sm",
             "contents": [
                 {"type": "text", "text": f"{cat_label} {item['name']}", "flex": 5, "size": "sm", "wrap": True},
-                {"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                {"type": "button", "style": "secondary", "height": "sm", "flex": 2,
                  "action": {
-                     "type": "postback", "label": "❌",
+                     "type": "postback", "label": "移除",
                      "data": f"mp:v1:{token}:{int(version)}:remove:{item['name']}",
                      "displayText": f"移除{item['name']}",
                  }},
@@ -1049,7 +1122,7 @@ def build_meal_photo_confirmation_bubble(
                     "type": "button", "style": "secondary",
                     "action": {
                         "type": "postback", "label": "➕ 新增食材",
-                        "data": f"mp:v1:{token}:{int(version)}:add",
+                        "data": f"mp:v1:{token}:{int(version)}:request_add",
                         "displayText": "新增食材",
                     },
                 },

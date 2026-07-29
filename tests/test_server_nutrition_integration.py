@@ -1238,6 +1238,100 @@ def test_food_photo_image_handler_stages_durable_unknown_safe_flex(tmp_path, mon
     assert image_path is not None and os.path.exists(image_path)
 
 
+def test_meal_photo_postback_request_add_then_text_updates_confirmation_card(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-add-item.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_MEAL", source_message_id="M_ADD", payload=meal_photo_payload()
+        )
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    request_event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:1:add"),
+        source=SimpleNamespace(user_id="U_MEAL"), reply_token="reply-add-request",
+        webhook_event_id="WEBHOOK-ADD-REQUEST", timestamp=1784740620000,
+    )
+
+    server.handle_meal_photo_postback(request_event)
+
+    assert len(replies) == 1
+    assert "請直接輸入" in replies[0].text
+    with sqlite3.connect(db) as conn:
+        waiting = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
+    assert waiting["status"] == "awaiting_item_name"
+    assert waiting["version"] == 2
+
+    replies.clear()
+    text_event = _text_event("ADD-ITEM-NAME", "玉米筍", user_id="U_MEAL")
+    server.processed_messages.discard(text_event.message.id)
+    server._handle_message_impl(text_event)
+
+    assert len(replies) == 1
+    assert "選擇食材分類" in replies[0].text
+    category_actions = [item.action.data for item in replies[0].quick_reply.items]
+    assert any(f"mp:v1:{token}:2:add_item:vegetable:" in data for data in category_actions)
+    with sqlite3.connect(db) as conn:
+        still_waiting = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
+    assert still_waiting["status"] == "awaiting_item_name"
+    assert still_waiting["version"] == 2
+
+    replies.clear()
+    vegetable_data = next(
+        data for data in category_actions
+        if f"mp:v1:{token}:2:add_item:vegetable:" in data
+    )
+    category_event = SimpleNamespace(
+        postback=SimpleNamespace(data=vegetable_data),
+        source=SimpleNamespace(user_id="U_MEAL"), reply_token="reply-add-category",
+        webhook_event_id="WEBHOOK-ADD-CATEGORY", timestamp=1784740620000,
+    )
+    server.handle_meal_photo_postback(category_event)
+
+    assert len(replies) == 1
+    card_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
+    assert "玉米筍" in card_text
+    assert f"mp:v1:{token}:3:start" in card_text
+    with sqlite3.connect(db) as conn:
+        updated = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
+    assert updated["status"] == "awaiting_confirmation"
+    assert updated["version"] == 3
+    assert updated["payload"]["visible_items"][-1] == {
+        "name": "玉米筍", "category": "vegetable", "confidence": 1.0,
+    }
+
+
+def test_meal_photo_add_item_rejects_name_when_encoded_postback_exceeds_line_limit(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-long-item.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_LONG", source_message_id="M_LONG", payload=meal_photo_payload()
+        )
+        apply_meal_photo_action(
+            conn, event_id="REQUEST-LONG", user_id="U_LONG", token=token,
+            expected_version=1, action="request_add",
+        )
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    text_event = _text_event("ADD-LONG-NAME", "🍣" * 60, user_id="U_LONG")
+    server.processed_messages.discard(text_event.message.id)
+
+    server._handle_message_impl(text_event)
+
+    assert len(replies) == 1
+    assert "名稱過長" in replies[0].text
+    assert replies[0].quick_reply is None
+    with sqlite3.connect(db) as conn:
+        waiting = get_meal_photo_draft(conn, user_id="U_LONG", token=token)
+    assert waiting["status"] == "awaiting_item_name"
+    assert waiting["version"] == 2
+
+
 def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-postback-final.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
