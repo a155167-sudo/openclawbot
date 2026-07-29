@@ -971,13 +971,9 @@ def build_meal_photo_confirmation_bubble(
     normalized = normalize_meal_photo_payload(payload)
     if not re.fullmatch(r"[0-9a-f]{12}", str(token or "")):
         raise ValueError("餐點草稿token無效")
-    visible = "、".join(item["name"] for item in normalized["visible_items"])
+    visible_items = normalized["visible_items"]
     protein_names = "、".join(
-        item["name"] for item in normalized["visible_items"] if item["category"] == "protein"
-    )
-    protein = (
-        f"畫面可見 {protein_names}；種類／份量仍為NA（待確認）"
-        if protein_names else "NA（待確認；畫面未見不代表沒有吃）"
+        item["name"] for item in visible_items if item["category"] == "protein"
     )
     uncertain = "、".join(normalized["uncertain_items"]) or "目前沒有"
     starch = {
@@ -995,6 +991,33 @@ def build_meal_photo_confirmation_bubble(
     line = lambda text, color="#333333", size="sm": {
         "type": "text", "text": text, "wrap": True, "size": size, "color": color,
     }
+
+    # 每項食材顯示 ❌ 按鈕
+    item_rows = []
+    for item in visible_items:
+        cat_label = {"protein": "🥩", "starch": "🍚", "vegetable": "🥬", "other": "🍽️"}.get(item["category"], "🍽️")
+        item_rows.append({
+            "type": "box", "layout": "horizontal", "spacing": "sm",
+            "contents": [
+                {"type": "text", "text": f"{cat_label} {item['name']}", "flex": 5, "size": "sm", "wrap": True},
+                {"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                 "action": {
+                     "type": "postback", "label": "❌",
+                     "data": f"mp:v1:{token}:{int(version)}:remove:{item['name']}",
+                     "displayText": f"移除{item['name']}",
+                 }},
+            ],
+        })
+
+    # 如果沒有辨識到任何食材
+    if not item_rows:
+        item_rows.append(line("（未辨識到任何食材）", "#999999"))
+
+    protein = (
+        f"畫面可見 {protein_names}；種類／份量仍為NA（待確認）"
+        if protein_names else "NA（待確認；畫面未見不代表沒有吃）"
+    )
+
     return {
         "type": "bubble",
         "header": {
@@ -1008,11 +1031,12 @@ def build_meal_photo_confirmation_bubble(
             "type": "box", "layout": "vertical", "spacing": "md",
             "contents": [
                 line(f"時間：{display_time}"),
-                line(f"看見：{visible}"),
+                line("辨識到的食材：", "#333333", "sm"),
+                *item_rows,
+                {"type": "separator", "margin": "sm"},
                 line(f"不確定：{uncertain}", "#B26A00"),
                 line(f"蛋白質食物：{protein}"),
                 line(f"主食：{starch}"),
-                line("水果／奶類／其他未入鏡：NA（待確認）"),
                 line(f"烹調用油／醬汁：{sauce}"),
                 line("熱量與交換份：NA（尚未估算）", "#B00020"),
                 line("未知不會當成0；確認前不計入正式紀錄。", "#777777", "xs"),
@@ -1021,6 +1045,14 @@ def build_meal_photo_confirmation_bubble(
         "footer": {
             "type": "box", "layout": "vertical", "spacing": "sm",
             "contents": [
+                {
+                    "type": "button", "style": "secondary",
+                    "action": {
+                        "type": "postback", "label": "➕ 新增食材",
+                        "data": f"mp:v1:{token}:{int(version)}:add",
+                        "displayText": "新增食材",
+                    },
+                },
                 {
                     "type": "button", "style": "primary", "color": "#E69500",
                     "action": {

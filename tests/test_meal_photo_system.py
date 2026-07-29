@@ -89,11 +89,11 @@ def test_confirmation_card_explicitly_distinguishes_not_visible_from_zero():
     text = "\n".join(flatten_text(bubble))
 
     assert "餐點照片辨識｜待你確認" in text
-    assert "高麗菜、青花菜" in text
+    assert "高麗菜" in text
+    assert "青花菜" in text
     assert "上方棕色主菜種類不明" in text
     assert "主食：NA（待確認；畫面未見不代表沒有吃）" in text
     assert "蛋白質食物：NA（待確認" in text
-    assert "水果／奶類／其他未入鏡：NA（待確認）" in text
     assert "烹調用油／醬汁：NA（待確認；無法判定）" in text
     assert "熱量與交換份：NA（尚未估算）" in text
     assert "主食：0份" not in text

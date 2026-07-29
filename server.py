@@ -8197,17 +8197,19 @@ def handle_meal_photo_postback(event):
     answer = re.fullmatch(
         r"mp:v1:([0-9a-f]{12}):(\d+):answer:([a-z_]+):([a-z_]+)", data
     )
+    remove_item = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):remove:(.+)", data)
+    add_item = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):add", data)
     review_start = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):start", data)
     review_set = re.fullmatch(
         r"mpr:v1:([0-9a-f]{12}):(\d+):set:([a-z_]+):([a-z0-9_.]+)", data
     )
     review_cancel = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):cancel_review", data)
     review_approve = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):approve", data)
-    if not (start or cancel or answer or review_start or review_set or review_cancel or review_approve):
+    if not (start or cancel or answer or remove_item or add_item or review_start or review_set or review_cancel or review_approve):
         return
     uid = event.source.user_id
     if not (review_start or review_set or review_cancel or review_approve):
-        matched = start or cancel or answer
+        matched = start or cancel or answer or remove_item or add_item
         assert matched is not None
         token, version = matched.group(1), int(matched.group(2))
     event_id = str(getattr(event, "webhook_event_id", "") or "").strip()
@@ -8283,6 +8285,33 @@ def handle_meal_photo_postback(event):
                     expected_version=version, action="cancel",
                 )
                 draft, result = applied["draft"], applied["result"]
+            elif remove_item:
+                # 移除辨識到的食材
+                item_name = remove_item.group(3)
+                draft = get_meal_photo_draft(conn, user_id=uid, token=token)
+                items = list(draft.get("normalized", {}).get("visible_items", []))
+                items = [i for i in items if i["name"] != item_name]
+                draft["normalized"]["visible_items"] = items
+                conn.execute(
+                    "UPDATE meal_photo_drafts SET payload_json=?, version=version+1, updated_at=? WHERE token=? AND user_id=?",
+                    (json.dumps(draft.get("raw_payload", draft), ensure_ascii=False),
+                     datetime.now(TW_TZ).isoformat(timespec="seconds"), token, uid),
+                )
+                conn.commit()
+                draft = get_meal_photo_draft(conn, user_id=uid, token=token)
+                result = {"kind": "updated"}
+            elif add_item:
+                # 提示用戶輸入新食材名稱
+                draft = get_meal_photo_draft(conn, user_id=uid, token=token)
+                # 暫存token到用戶狀態，等待文字輸入
+                conn.execute(
+                    "UPDATE meal_photo_drafts SET status='awaiting_add', version=version+1, updated_at=? WHERE token=? AND user_id=?",
+                    (datetime.now(TW_TZ).isoformat(timespec="seconds"), token, uid),
+                )
+                conn.commit()
+                reply = TextSendMessage(text="請輸入要新增的食材名稱：")
+                line_bot_api.reply_message(event.reply_token, reply)
+                return
             else:
                 assert answer is not None
                 applied = apply_meal_photo_action(
@@ -8312,6 +8341,17 @@ def handle_meal_photo_postback(event):
                         conn, user_id=uid, token=token, expected_ref=image_ref
                     )
             reply = TextSendMessage(text="✅ 已取消餐點照片紀錄，辨識內容已清除。")
+        elif kind == "updated":
+            # 食材已更新，重新顯示確認卡
+            from linebot.models import FlexSendMessage
+            payload = draft.get("raw_payload") or draft.get("payload") or draft
+            reply = FlexSendMessage(
+                alt_text="餐點照片已更新",
+                contents=build_meal_photo_confirmation_bubble(
+                    payload, token=token, consumed_at=draft.get("consumed_at", ""),
+                    version=draft.get("version", version + 1),
+                ),
+            )
         else:
             raise ValueError("餐點操作結果無效")
         line_bot_api.reply_message(event.reply_token, reply)
@@ -8331,6 +8371,48 @@ def _handle_message_impl(event):
     processed_messages.add(msg_id)
 
     msg, uid = event.message.text.strip(), event.source.user_id
+
+    # 處理「新增食材」等待狀態
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            draft_row = conn.execute(
+                "SELECT token, version, payload_json FROM meal_photo_drafts WHERE user_id=? AND status='awaiting_add' ORDER BY updated_at DESC LIMIT 1",
+                (uid,),
+            ).fetchone()
+            if draft_row and msg and not msg.startswith(("搜尋", "查食物", "加入常吃")):
+                token_d, ver_d, payload_json = draft_row
+                payload = json.loads(payload_json)
+                normalized = normalize_meal_photo_payload(payload)
+                # 加入新食材
+                new_item = {"name": msg, "category": "other", "confidence": 1.0}
+                items = list(normalized.get("visible_items", []))
+                items.append(new_item)
+                normalized["visible_items"] = items
+                # 更新 payload
+                if "normalized" not in payload:
+                    payload["normalized"] = normalized
+                else:
+                    payload["normalized"] = normalized
+                from datetime import datetime as _dt2
+                conn.execute(
+                    "UPDATE meal_photo_drafts SET payload_json=?, status='pending', version=version+1, updated_at=? WHERE token=? AND user_id=?",
+                    (json.dumps(payload, ensure_ascii=False),
+                     _dt2.now(TW_TZ).isoformat(timespec="seconds"), token_d, uid),
+                )
+                conn.commit()
+                from linebot.models import FlexSendMessage
+                draft = get_meal_photo_draft(conn, user_id=uid, token=token_d)
+                reply = FlexSendMessage(
+                    alt_text=f"已新增{msg}",
+                    contents=build_meal_photo_confirmation_bubble(
+                        payload, token=token_d, consumed_at=draft.get("consumed_at", ""),
+                        version=draft.get("version", ver_d + 1),
+                    ),
+                )
+                line_bot_api.reply_message(event.reply_token, reply)
+                return
+    except Exception:
+        pass
 
     if uid != ADMIN_UID and is_admin_only_command(msg):
         try:
