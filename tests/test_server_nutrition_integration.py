@@ -1656,10 +1656,13 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
     event = _text_event("COMBO-1", "早餐1", user_id="U1")
     server._handle_message_impl(event)
     assert len(replies) == 1
-    text = replies[0].text
-    assert "✅ 已記錄" in text
-    assert "穀麥高粱" in text
-    assert "無糖優格" in text
+    reply = replies[0]
+    assert reply.type == "flex"
+    raw = json.loads(reply.as_json_string())
+    bubble_text = json.dumps(raw, ensure_ascii=False)
+    assert "已記錄" in bubble_text
+    assert "穀麥高粱" in bubble_text
+    assert "無糖優格" in bubble_text
 
     with sqlite3.connect(db) as conn:
         rows = conn.execute(
@@ -1699,9 +1702,12 @@ def test_breakfast_combo2_logs_different_portions(tmp_path, monkeypatch):
     event = _text_event("COMBO-2", "早餐2", user_id="U1")
     server._handle_message_impl(event)
     assert len(replies) == 1
-    text = replies[0].text
-    assert "✅ 已記錄" in text
-    assert "679" in text or "678" in text or "677" in text
+    reply = replies[0]
+    assert reply.type == "flex"
+    raw = json.loads(reply.as_json_string())
+    bubble_text = json.dumps(raw, ensure_ascii=False)
+    assert "已記錄" in bubble_text
+    assert "679" in bubble_text or "678" in bubble_text or "677" in bubble_text
 
     with sqlite3.connect(db) as conn:
         rows = conn.execute(

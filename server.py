@@ -8411,9 +8411,56 @@ def _handle_message_impl(event):
             cal_text = f"{total_cal:.0f}" if total_cal else "NA"
             pro_text = f"{total_pro:.1f}" if total_pro else "NA"
             carb_text = f"{total_carb:.1f}" if total_carb else "NA"
-            reply = TextSendMessage(
-                text=f"✅ 已記錄 {msg}\n{summary}\n🔥 {cal_text} kcal｜蛋白質 {pro_text}g｜碳水 {carb_text}g"
-            )
+
+            # Build Flex card rows for each food item
+            food_rows = []
+            for keyword, servings in combo:
+                matches = search_food_catalog(conn, user_id=uid, query=keyword, limit=1)
+                if matches:
+                    food_item = matches[0]
+                    per_srv = json.loads(conn.execute(
+                        "SELECT per_serving_json FROM food_catalog WHERE food_id=?",
+                        (food_item["food_id"],),
+                    ).fetchone()[0] or "{}")
+                    nutr_f = scale_nutrition(per_srv, servings)
+                    food_rows.append({
+                        "type": "box", "layout": "horizontal",
+                        "contents": [
+                            {"type": "text", "text": f"{food_item['product_name']} {servings}份",
+                             "size": "sm", "color": "#333333", "flex": 5, "wrap": True},
+                            {"type": "text", "text": f"{round(nutr_f.get('calories_kcal', 0))} kcal",
+                             "size": "sm", "color": "#666666", "align": "end", "flex": 2},
+                        ],
+                        "margin": "md",
+                    })
+
+            bubble = {
+                "type": "bubble",
+                "header": {
+                    "type": "box", "layout": "vertical", "backgroundColor": "#2E7D32",
+                    "contents": [
+                        {"type": "text", "text": f"✅ 已記錄 {msg}", "color": "#FFFFFF",
+                         "size": "lg", "weight": "bold"},
+                    ],
+                },
+                "body": {
+                    "type": "box", "layout": "vertical",
+                    "contents": [
+                        *food_rows,
+                        {"type": "separator", "margin": "lg"},
+                        {
+                            "type": "box", "layout": "horizontal", "margin": "lg",
+                            "contents": [
+                                {"type": "text", "text": f"🔥 {cal_text} kcal", "size": "sm", "color": "#E65100", "flex": 3},
+                                {"type": "text", "text": f"蛋白質 {pro_text}g", "size": "sm", "color": "#1565C0", "flex": 3},
+                                {"type": "text", "text": f"碳水 {carb_text}g", "size": "sm", "color": "#6A1B9A", "flex": 3},
+                            ],
+                        },
+                    ],
+                },
+            }
+            from linebot.models import FlexSendMessage
+            reply = FlexSendMessage(alt_text=f"已記錄 {msg} {cal_text}kcal", contents=bubble)
         except (ValueError, PermissionError) as exc:
             reply = TextSendMessage(text=f"⚠️ {exc}")
         try:
