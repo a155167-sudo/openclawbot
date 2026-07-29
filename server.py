@@ -8342,9 +8342,12 @@ def _handle_message_impl(event):
                     if not matches:
                         raise ValueError(f"找不到「{keyword}」的食物卡片，請先傳營養標示照片建立")
                     food = matches[0]
+                    from datetime import datetime as _dt
+                    now_tw = _dt.now(TW_TZ).isoformat(timespec="seconds")
                     result = quick_log_from_catalog(
                         conn, user_id=uid, food_id=food["food_id"],
                         consumed_servings=servings, meal_slot="早餐",
+                        consumed_at=now_tw,
                     )
                     nutr = result.get("nutrition") or {}
                     cal = nutr.get("calories_kcal")
