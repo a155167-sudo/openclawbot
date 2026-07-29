@@ -8535,8 +8535,35 @@ def _handle_message_impl(event):
             from linebot.models import FlexSendMessage
             with sqlite3.connect(DB_PATH) as conn:
                 ensure_nutrition_schema(conn)
-                catalog = search_food_catalog(conn, user_id=uid, query=query, limit=12)
-                history = search_food_history(conn, user_id=uid, query=query) if query else []
+                # "我的食物"：只搜用戶自己的卡片
+                if query == "_my":
+                    catalog = conn.execute(
+                        """SELECT food_id,product_name,brand,barcode,source_type,owner_user_id,
+                                  package_amount,package_unit,servings_per_package,
+                                  per_serving_json,exchange_json,exchange_review_status,
+                                  created_at,updated_at
+                           FROM food_catalog WHERE owner_user_id=?
+                           ORDER BY updated_at DESC LIMIT 12""",
+                        (uid,),
+                    ).fetchall()
+                    catalog = [
+                        {
+                            "food_id": r[0], "product_name": r[1], "brand": r[2] or "", "barcode": r[3] or "",
+                            "source_type": r[4], "owner_user_id": r[5],
+                            "package_amount": float(r[6] or 0), "package_unit": r[7] or "",
+                            "servings_per_package": float(r[8] or 1),
+                            "per_serving": json.loads(r[9] or "{}"),
+                            "exchange": json.loads(r[10] or "{}"),
+                            "exchange_review_status": r[11] or "",
+                            "created_at": r[12] or "", "updated_at": r[13] or "",
+                            "last_consumed_at": None, "use_count": 0,
+                        }
+                        for r in catalog
+                    ]
+                    history = []
+                else:
+                    catalog = search_food_catalog(conn, user_id=uid, query=query, limit=12)
+                    history = search_food_history(conn, user_id=uid, query=query) if query else []
             seen = set()
             merged = []
             for item in history + catalog:
@@ -8547,7 +8574,7 @@ def _handle_message_impl(event):
             # 無關鍵字時：顯示分類選單
             if not query:
                 categories = {
-                    "便當": "便當", "食蔬": "食蔬", "低碳": "低碳",
+                    "我的食物": "_my", "便當": "便當", "食蔬": "食蔬", "低碳": "低碳",
                     "沙拉": "沙拉", "番茄麵": "番茄麵", "青蔬麵": "青蔬麵",
                     "單品": "單品", "飲品": "飲品",
                 }
