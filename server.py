@@ -8386,6 +8386,10 @@ def _handle_message_impl(event):
                 # 同步更新 frequent_foods 讓常吃清單顯示
                 try:
                     now_iso = _dt.now(TW_TZ).isoformat(timespec="seconds")
+                    conn.execute("""CREATE TABLE IF NOT EXISTS frequent_foods (
+                        user_id TEXT, meal_name TEXT, last_cal INTEGER, last_pro INTEGER,
+                        use_count INTEGER DEFAULT 1, last_used_at TEXT,
+                        PRIMARY KEY (user_id, meal_name))""")
                     # 加入組合餐名稱（早餐1/早餐2）
                     conn.execute(
                         """INSERT INTO frequent_foods (user_id, meal_name, last_cal, last_pro, use_count, last_used_at)
