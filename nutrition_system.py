@@ -1967,7 +1967,7 @@ def search_food_catalog(
                       per_serving_json,exchange_json,exchange_review_status,
                       created_at,updated_at
                FROM food_catalog
-               WHERE owner_user_id=? AND product_name LIKE ?
+               WHERE (owner_user_id=? OR visibility='public') AND product_name LIKE ?
                ORDER BY updated_at DESC
                LIMIT ?""",
             (user_id, pattern, limit),
@@ -1979,7 +1979,7 @@ def search_food_catalog(
                       per_serving_json,exchange_json,exchange_review_status,
                       created_at,updated_at
                FROM food_catalog
-               WHERE owner_user_id=?
+               WHERE (owner_user_id=? OR visibility='public')
                ORDER BY updated_at DESC
                LIMIT ?""",
             (user_id, limit),
