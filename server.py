@@ -8386,6 +8386,16 @@ def _handle_message_impl(event):
                 # 同步更新 frequent_foods 讓常吃清單顯示
                 try:
                     now_iso = _dt.now(TW_TZ).isoformat(timespec="seconds")
+                    # 加入組合餐名稱（早餐1/早餐2）
+                    conn.execute(
+                        """INSERT INTO frequent_foods (user_id, meal_name, last_cal, last_pro, use_count, last_used_at)
+                           VALUES (?, ?, ?, ?, 1, ?)
+                           ON CONFLICT(user_id, meal_name) DO UPDATE SET
+                               last_cal=excluded.last_cal, last_pro=excluded.last_pro,
+                               use_count=frequent_foods.use_count + 1, last_used_at=excluded.last_used_at""",
+                        (uid, msg, round(total_cal), round(total_pro), now_iso),
+                    )
+                    # 加入個別食物
                     for keyword, servings in combo:
                         matches = search_food_catalog(conn, user_id=uid, query=keyword, limit=1)
                         if not matches:
@@ -9522,6 +9532,11 @@ def _handle_message_impl(event):
 
     if msg.startswith("加入常吃："):
         meal_name = msg.replace("加入常吃：", "", 1).strip()
+        # 組合餐：直接執行 combo 邏輯
+        if meal_name in BREAKFAST_COMBOS:
+            # 觸發 combo handler（複用同一段邏輯）
+            event.message.text = meal_name
+            return _handle_message_impl(event)
         meal_flex, meal_text = add_frequent_food_to_today(uid, meal_name)
         if meal_flex:
             line_bot_api.reply_message(event.reply_token, meal_flex)
