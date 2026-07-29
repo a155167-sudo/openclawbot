@@ -48,6 +48,7 @@ from nutrition_system import (
     rank_menu_candidates,
     remaining_targets,
     save_pending_label,
+    scale_nutrition,
     search_food_catalog,
     search_food_history,
     set_nutrition_input_state,
@@ -8381,6 +8382,31 @@ def _handle_message_impl(event):
                         conn.commit()
                 except Exception:
                     pass  # health_profile 不存在時不影響 food_logs
+
+                # 同步更新 frequent_foods 讓常吃清單顯示
+                try:
+                    now_iso = _dt.now(TW_TZ).isoformat(timespec="seconds")
+                    for keyword, servings in combo:
+                        matches = search_food_catalog(conn, user_id=uid, query=keyword, limit=1)
+                        if not matches:
+                            continue
+                        food_item = matches[0]
+                        per_srv = json.loads(conn.execute(
+                            "SELECT per_serving_json FROM food_catalog WHERE food_id=?",
+                            (food_item["food_id"],),
+                        ).fetchone()[0] or "{}")
+                        nutr_f = scale_nutrition(per_srv, servings)
+                        conn.execute(
+                            """INSERT INTO frequent_foods (user_id, meal_name, last_cal, last_pro, use_count, last_used_at)
+                               VALUES (?, ?, ?, ?, 1, ?)
+                               ON CONFLICT(user_id, meal_name) DO UPDATE SET
+                                   last_cal=excluded.last_cal, last_pro=excluded.last_pro,
+                                   use_count=frequent_foods.use_count + 1, last_used_at=excluded.last_used_at""",
+                            (uid, food_item["product_name"], round(nutr_f.get("calories_kcal", 0)), round(nutr_f.get("protein_g", 0)), now_iso),
+                        )
+                    conn.commit()
+                except Exception:
+                    pass
             summary = "\n".join(logged)
             cal_text = f"{total_cal:.0f}" if total_cal else "NA"
             pro_text = f"{total_pro:.1f}" if total_pro else "NA"
