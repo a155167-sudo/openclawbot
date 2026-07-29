@@ -8545,7 +8545,7 @@ def _handle_message_impl(event):
                     merged.append(item)
 
             # 無關鍵字時：顯示分類選單
-            if not query and not merged:
+            if not query:
                 categories = {
                     "便當": "便當", "食蔬": "食蔬", "低碳": "低碳",
                     "沙拉": "沙拉", "番茄麵": "番茄麵", "青蔬麵": "青蔬麵",
