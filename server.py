@@ -8360,6 +8360,27 @@ def _handle_message_impl(event):
                     if carb:
                         total_carb += float(carb)
                     logged.append(f"• {food['product_name']} {servings}份")
+
+                # 同步更新 health_profile 讓儀表板能讀取
+                try:
+                    today_str = tw_today().isoformat()
+                    row = conn.execute(
+                        "SELECT today_extra_cal, today_extra_pro, today_food_items, today_date FROM health_profile WHERE user_id=?",
+                        (uid,),
+                    ).fetchone()
+                    if row:
+                        old_cal, old_pro, old_items, old_date = row
+                        if old_date != today_str:
+                            old_cal, old_pro, old_items = 0, 0, ""
+                        new_cal = (old_cal or 0) + total_cal
+                        new_pro = (old_pro or 0) + total_pro
+                        conn.execute(
+                            "UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_date=? WHERE user_id=?",
+                            (round(new_cal), round(new_pro, 1), today_str, uid),
+                        )
+                        conn.commit()
+                except Exception:
+                    pass  # health_profile 不存在時不影響 food_logs
             summary = "\n".join(logged)
             cal_text = f"{total_cal:.0f}" if total_cal else "NA"
             pro_text = f"{total_pro:.1f}" if total_pro else "NA"
