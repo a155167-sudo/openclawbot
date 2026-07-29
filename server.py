@@ -11,6 +11,7 @@ import random
 import re
 import requests
 import threading
+import uuid
 from zoneinfo import ZoneInfo
 
 # Google & Web 相關套件
@@ -1609,6 +1610,49 @@ def load_menu():
     except Exception as e: 
         print(f"⚠️ 讀取 menu.csv 失敗: {e}")
         return "❌ 菜單更新失敗，請檢查檔案。"
+
+
+def sync_menu_to_food_catalog():
+    """同步 menu.csv 的餐點到 food_catalog，讓 LINE 搜尋與常吃清單可用。"""
+    if not MAIN_DISHES:
+        return
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            ensure_nutrition_schema(conn)
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            inserted = 0
+            for dish in MAIN_DISHES:
+                name = dish["name"]
+                existing = conn.execute(
+                    "SELECT food_id FROM food_catalog WHERE product_name=? AND source_type='label'",
+                    (name,),
+                ).fetchone()
+                if existing:
+                    continue
+                per_serving = {
+                    "calories_kcal": dish.get("calories_kcal", 0),
+                    "protein_g": dish.get("protein_g", 0),
+                    "fat_g": dish.get("fat_g", 0),
+                    "carbohydrate_g": dish.get("carbohydrate_g", 0),
+                }
+                fid = f"menu_{uuid.uuid4().hex[:16]}"
+                conn.execute(
+                    """INSERT INTO food_catalog
+                       (food_id, product_name, brand, barcode, source_type, owner_user_id, visibility,
+                        package_amount, package_unit, servings_per_package, per_serving_json, per_100_json,
+                        exchange_json, exchange_review_status, fingerprint, original_image_ref,
+                        recognition_confidence, verification_status, created_at, updated_at)
+                       VALUES (?,?,'','','label','system','public',
+                               1,'份',1,?,'{}',
+                               '{}','approved',?,'',1.0,'auto',?,?)""",
+                    (fid, name, json.dumps(per_serving), fid, now, now),
+                )
+                inserted += 1
+            conn.commit()
+            if inserted:
+                print(f"✅ 已同步 {inserted} 道菜單到 food_catalog")
+    except Exception as e:
+        print(f"⚠️ 同步菜單到 food_catalog 失敗: {e}")
 # ==========================================
 # 3. 資料庫初始化 (🔥 升級版：支援點數網址與發放紀錄)
 # ==========================================
@@ -1808,6 +1852,7 @@ def init_db():
         print(f"❌ 啟動保險箱失敗，錯誤原因: {e}")
 init_db()
 load_menu()  # 🔥 伺服器啟動時自動載入菜單
+sync_menu_to_food_catalog()  # 同步菜單到 food_catalog
 
 # ==========================================
 # 4. 接收表單與配餐 (過敏原雷達 + 完美排序)
