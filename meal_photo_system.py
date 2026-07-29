@@ -525,7 +525,7 @@ def apply_meal_photo_action(
         if field not in VISIBLE_CATEGORIES:
             raise ValueError("食材類別不支援")
         value = _short_text(value, "食材名稱", maximum=60)
-    elif action == "request_add":
+    elif action in {"request_add", "cancel_add"}:
         field = ""
         value = ""
     else:
@@ -576,7 +576,7 @@ def apply_meal_photo_action(
         if _expired(expires_at):
             raise ValueError("這筆餐點照片草稿已逾時")
         allowed_statuses = (
-            {"awaiting_item_name"} if action == "add_item"
+            {"awaiting_item_name"} if action in {"add_item", "cancel_add"}
             else {"awaiting_confirmation", "confirming"}
         )
         if status not in allowed_statuses:
@@ -602,11 +602,15 @@ def apply_meal_photo_action(
                 raise ValueError("開始份量確認後不能再刪除食材")
             payload = normalize_meal_photo_payload(json.loads(row[5] or "{}"))
             original_items = list(payload["visible_items"])
-            payload["visible_items"] = [
-                item for item in original_items if item["name"] != value
-            ]
-            if len(payload["visible_items"]) == len(original_items):
+            remove_index = next(
+                (index for index, item in enumerate(original_items) if item["name"] == value),
+                None,
+            )
+            if remove_index is None:
                 raise ValueError("找不到要移除的食材")
+            payload["visible_items"] = [
+                item for index, item in enumerate(original_items) if index != remove_index
+            ]
             if not payload["visible_items"]:
                 raise ValueError("至少要保留一項食材；若全部不符請取消後重拍")
             result = {"kind": "updated", "version": next_version}
@@ -629,6 +633,15 @@ def apply_meal_photo_action(
                    SET status='awaiting_item_name',updated_at=?,version=?
                    WHERE token=? AND user_id=? AND version=?
                      AND status='awaiting_confirmation'""",
+                (now, next_version, token, user_id, current_version),
+            ).rowcount
+        elif action == "cancel_add":
+            result = {"kind": "updated", "version": next_version}
+            changed = conn.execute(
+                """UPDATE pending_meal_photo_drafts
+                   SET status='awaiting_confirmation',updated_at=?,version=?
+                   WHERE token=? AND user_id=? AND version=?
+                     AND status='awaiting_item_name'""",
                 (now, next_version, token, user_id, current_version),
             ).rowcount
         elif action == "add_item":

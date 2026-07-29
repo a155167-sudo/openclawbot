@@ -137,6 +137,47 @@ def test_meal_photo_item_edit_is_versioned_and_persists_in_observed_payload(tmp_
         assert added["draft"]["payload"]["visible_items"][-1]["category"] == "protein"
 
 
+def test_remove_item_only_removes_one_matching_duplicate(tmp_path):
+    payload = sample_payload()
+    payload["visible_items"] = [
+        {"name": "雞胸肉", "category": "protein", "confidence": 0.91},
+        {"name": "雞胸肉", "category": "protein", "confidence": 0.83},
+        {"name": "青花菜", "category": "vegetable", "confidence": 0.88},
+    ]
+    with sqlite3.connect(tmp_path / "meal-photo-duplicate.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="DUP-1", payload=payload
+        )
+        removed = apply_meal_photo_action(
+            conn, event_id="REMOVE-DUP-1", user_id="U1", token=token,
+            expected_version=1, action="remove_item", value="雞胸肉",
+        )
+
+    names = [item["name"] for item in removed["draft"]["payload"]["visible_items"]]
+    assert names == ["雞胸肉", "青花菜"]
+
+
+def test_cancel_add_returns_draft_to_confirmation_without_changing_items(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo-cancel-add.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="CANCEL-ADD-1", payload=sample_payload()
+        )
+        apply_meal_photo_action(
+            conn, event_id="REQUEST-ADD-CANCEL", user_id="U1", token=token,
+            expected_version=1, action="request_add",
+        )
+        cancelled = apply_meal_photo_action(
+            conn, event_id="CANCEL-ADD-1", user_id="U1", token=token,
+            expected_version=2, action="cancel_add",
+        )
+
+    assert cancelled["result"] == {"kind": "updated", "version": 3}
+    assert cancelled["draft"]["status"] == "awaiting_confirmation"
+    assert [item["name"] for item in cancelled["draft"]["payload"]["visible_items"]] == [
+        "高麗菜", "青花菜"
+    ]
+
+
 def test_meal_photo_draft_is_durable_idempotent_and_user_owned(tmp_path):
     db = tmp_path / "meal-photo.db"
     with sqlite3.connect(db) as conn:

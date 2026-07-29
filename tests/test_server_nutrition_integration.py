@@ -1273,6 +1273,7 @@ def test_meal_photo_postback_request_add_then_text_updates_confirmation_card(tmp
     assert "選擇食材分類" in replies[0].text
     category_actions = [item.action.data for item in replies[0].quick_reply.items]
     assert any(f"mp:v1:{token}:2:add_item:vegetable:" in data for data in category_actions)
+    assert f"mp:v1:{token}:2:cancel_add" in category_actions
     with sqlite3.connect(db) as conn:
         still_waiting = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
     assert still_waiting["status"] == "awaiting_item_name"
@@ -1301,6 +1302,79 @@ def test_meal_photo_postback_request_add_then_text_updates_confirmation_card(tmp
     assert updated["payload"]["visible_items"][-1] == {
         "name": "玉米筍", "category": "vegetable", "confidence": 1.0,
     }
+
+
+def test_meal_photo_request_add_can_be_cancelled_from_quick_reply(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-cancel-add-postback.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CANCEL", source_message_id="M_CANCEL", payload=meal_photo_payload()
+        )
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    request_event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:1:request_add"),
+        source=SimpleNamespace(user_id="U_CANCEL"), reply_token="reply-request-cancel",
+        webhook_event_id="WEBHOOK-REQUEST-CANCEL", timestamp=1784740620000,
+    )
+    server.handle_meal_photo_postback(request_event)
+
+    cancel_data = next(
+        item.action.data for item in replies[0].quick_reply.items
+        if item.action.data.endswith(":cancel_add")
+    )
+    replies.clear()
+    cancel_event = SimpleNamespace(
+        postback=SimpleNamespace(data=cancel_data),
+        source=SimpleNamespace(user_id="U_CANCEL"), reply_token="reply-cancel-add",
+        webhook_event_id="WEBHOOK-CANCEL-ADD", timestamp=1784740620000,
+    )
+    server.handle_meal_photo_postback(cancel_event)
+
+    assert len(replies) == 1
+    assert replies[0].type == "flex"
+    with sqlite3.connect(db) as conn:
+        restored = get_meal_photo_draft(conn, user_id="U_CANCEL", token=token)
+    assert restored["status"] == "awaiting_confirmation"
+    assert restored["version"] == 3
+
+
+def test_meal_photo_typed_cancel_is_not_treated_as_an_ingredient(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-typed-cancel.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_TYPED_CANCEL", source_message_id="M_TYPED_CANCEL",
+            payload=meal_photo_payload(),
+        )
+        apply_meal_photo_action(
+            conn, event_id="REQUEST-TYPED-CANCEL", user_id="U_TYPED_CANCEL",
+            token=token, expected_version=1, action="request_add",
+        )
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    text_event = _text_event("TYPED-CANCEL", "取消新增", user_id="U_TYPED_CANCEL")
+    server.processed_messages.discard(text_event.message.id)
+
+    server._handle_message_impl(text_event)
+
+    assert len(replies) == 1
+    assert "不會加入" in replies[0].text
+    assert any(
+        item.action.data.endswith(":cancel_add")
+        for item in replies[0].quick_reply.items
+    )
+    with sqlite3.connect(db) as conn:
+        waiting = get_meal_photo_draft(conn, user_id="U_TYPED_CANCEL", token=token)
+    assert waiting["status"] == "awaiting_item_name"
+    assert [item["name"] for item in waiting["payload"]["visible_items"]] == [
+        "高麗菜", "青花菜"
+    ]
 
 
 def test_meal_photo_add_item_rejects_name_when_encoded_postback_exceeds_line_limit(tmp_path, monkeypatch):

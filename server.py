@@ -8202,6 +8202,9 @@ def handle_meal_photo_postback(event):
     request_add = re.fullmatch(
         r"mp:v1:([0-9a-f]{12}):(\d+):(?:request_add|add)", data
     )
+    cancel_add = re.fullmatch(
+        r"mp:v1:([0-9a-f]{12}):(\d+):cancel_add", data
+    )
     add_category = re.fullmatch(
         r"mp:v1:([0-9a-f]{12}):(\d+):add_item:"
         r"(vegetable|protein|starch|fruit|milk|unknown):([A-Za-z0-9_-]+)",
@@ -8213,11 +8216,11 @@ def handle_meal_photo_postback(event):
     )
     review_cancel = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):cancel_review", data)
     review_approve = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):approve", data)
-    if not (start or cancel or answer or remove_item or request_add or add_category or review_start or review_set or review_cancel or review_approve):
+    if not (start or cancel or answer or remove_item or request_add or cancel_add or add_category or review_start or review_set or review_cancel or review_approve):
         return
     uid = event.source.user_id
     if not (review_start or review_set or review_cancel or review_approve):
-        matched = start or cancel or answer or remove_item or request_add or add_category
+        matched = start or cancel or answer or remove_item or request_add or cancel_add or add_category
         assert matched is not None
         token, version = matched.group(1), int(matched.group(2))
     event_id = str(getattr(event, "webhook_event_id", "") or "").strip()
@@ -8306,6 +8309,13 @@ def handle_meal_photo_postback(event):
                     expected_version=version, action="request_add",
                 )
                 draft, result = applied["draft"], applied["result"]
+            elif cancel_add:
+                applied = apply_meal_photo_action(
+                    conn, event_id=event_id, user_id=uid,
+                    token=cancel_add.group(1),
+                    expected_version=int(cancel_add.group(2)), action="cancel_add",
+                )
+                draft, result = applied["draft"], applied["result"]
             elif add_category:
                 encoded_name = add_category.group(4)
                 try:
@@ -8356,8 +8366,15 @@ def handle_meal_photo_postback(event):
                 text=(
                     "➕ 請直接輸入要新增的食材名稱。\n"
                     "例如：玉米筍\n\n"
-                    "一次輸入一項，送出後會回到更新後的確認卡。"
-                )
+                    "一次輸入一項，送出後請選擇食材分類。"
+                ),
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=PostbackAction(
+                        label="取消新增",
+                        data=f"mp:v1:{draft['token']}:{result['version']}:cancel_add",
+                        display_text="取消新增食材",
+                    ))
+                ]),
             )
         elif kind == "updated":
             from linebot.models import FlexSendMessage
@@ -8400,7 +8417,19 @@ def _handle_message_impl(event):
         if draft_row:
             token_d, version_d = draft_row
             item_name = " ".join(msg.split())
-            if not item_name or len(item_name) > 60:
+            cancel_add_data = f"mp:v1:{token_d}:{int(version_d)}:cancel_add"
+            if item_name in {"取消", "取消新增", "取消新增食材"}:
+                reply = TextSendMessage(
+                    text="這段文字不會加入食材；請按下方按鈕返回原確認卡。",
+                    quick_reply=QuickReply(items=[
+                        QuickReplyButton(action=PostbackAction(
+                            label="確認取消新增",
+                            data=cancel_add_data,
+                            display_text="確認取消新增食材",
+                        ))
+                    ]),
+                )
+            elif not item_name or len(item_name) > 60:
                 reply = TextSendMessage(
                     text="⚠️ 食材名稱需為1～60個字。\n\n請重新輸入，例如：玉米筍"
                 )
@@ -8442,6 +8471,12 @@ def _handle_message_impl(event):
                                 display_text=f"{label}：{item_name}",
                             ))
                             for label, _, data in category_actions
+                        ] + [
+                            QuickReplyButton(action=PostbackAction(
+                                label="取消新增",
+                                data=cancel_add_data,
+                                display_text="取消新增食材",
+                            ))
                         ]),
                     )
             line_bot_api.reply_message(event.reply_token, reply)
