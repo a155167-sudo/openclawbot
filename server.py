@@ -8535,7 +8535,7 @@ def _handle_message_impl(event):
             from linebot.models import FlexSendMessage
             with sqlite3.connect(DB_PATH) as conn:
                 ensure_nutrition_schema(conn)
-                catalog = search_food_catalog(conn, user_id=uid, query=query)
+                catalog = search_food_catalog(conn, user_id=uid, query=query, limit=12)
                 history = search_food_history(conn, user_id=uid, query=query) if query else []
             seen = set()
             merged = []
@@ -8543,6 +8543,38 @@ def _handle_message_impl(event):
                 if item["food_id"] not in seen:
                     seen.add(item["food_id"])
                     merged.append(item)
+
+            # 無關鍵字時：顯示分類選單
+            if not query and not merged:
+                categories = {
+                    "便當": "便當", "食蔬": "食蔬", "低碳": "低碳",
+                    "沙拉": "沙拉", "番茄麵": "番茄麵", "青蔬麵": "青蔬麵",
+                    "單品": "單品", "飲品": "飲品",
+                }
+                cat_buttons = []
+                for label, keyword in categories.items():
+                    cat_buttons.append({
+                        "type": "box", "layout": "vertical", "margin": "sm",
+                        "contents": [{
+                            "type": "button",
+                            "action": {"type": "message", "label": f"🔍 {label}", "text": f"搜尋 {keyword}"},
+                            "style": "secondary", "height": "sm",
+                        }],
+                    })
+                bubble = {
+                    "type": "bubble",
+                    "body": {
+                        "type": "box", "layout": "vertical",
+                        "contents": [
+                            {"type": "text", "text": "📋 一日樂食菜單", "weight": "bold", "size": "lg"},
+                            {"type": "text", "text": "請選擇分類查看餐點", "size": "sm", "color": "#999999", "margin": "sm"},
+                            {"type": "separator", "margin": "md"},
+                            *cat_buttons,
+                        ],
+                    },
+                }
+                line_bot_api.reply_message(event.reply_token, FlexSendMessage(alt_text="菜單分類", contents=bubble))
+                return
             if not merged:
                 if query:
                     reply = TextSendMessage(text=f"🔍 找不到「{query}」相關的食物紀錄。\n\n你可以：\n• 換個關鍵字再試\n• 傳營養標示照片建立新卡片\n• 傳餐點照片由營養師估算")
