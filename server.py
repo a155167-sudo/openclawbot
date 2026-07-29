@@ -8531,20 +8531,33 @@ def _handle_message_impl(event):
 
     if msg.startswith("搜尋") or msg.startswith("查食物"):
         query = msg.replace("搜尋", "", 1).replace("查食物", "", 1).strip()
+        # 分頁支援：搜尋下一頁 2
+        page = 1
+        if query.startswith("下一頁"):
+            try:
+                page = int(query.replace("下一頁", "").strip())
+            except ValueError:
+                page = 1
+            query = ""
         try:
             from linebot.models import FlexSendMessage
+            page_limit = 12
+            offset = (page - 1) * page_limit
             with sqlite3.connect(DB_PATH) as conn:
                 ensure_nutrition_schema(conn)
                 # "我的食物"：只搜用戶自己的卡片
                 if query == "_my":
+                    total = conn.execute(
+                        "SELECT COUNT(*) FROM food_catalog WHERE owner_user_id=?", (uid,)
+                    ).fetchone()[0]
                     catalog = conn.execute(
                         """SELECT food_id,product_name,brand,barcode,source_type,owner_user_id,
                                   package_amount,package_unit,servings_per_package,
                                   per_serving_json,exchange_json,exchange_review_status,
                                   created_at,updated_at
                            FROM food_catalog WHERE owner_user_id=?
-                           ORDER BY updated_at DESC LIMIT 12""",
-                        (uid,),
+                           ORDER BY updated_at DESC LIMIT ? OFFSET ?""",
+                        (uid, page_limit, offset),
                     ).fetchall()
                     catalog = [
                         {
@@ -8561,9 +8574,16 @@ def _handle_message_impl(event):
                         for r in catalog
                     ]
                     history = []
+                    has_more = (offset + page_limit) < total
+                elif query:
+                    catalog = search_food_catalog(conn, user_id=uid, query=query, limit=page_limit + 1)
+                    has_more = len(catalog) > page_limit
+                    catalog = catalog[:page_limit]
+                    history = search_food_history(conn, user_id=uid, query=query) if page == 1 else []
                 else:
-                    catalog = search_food_catalog(conn, user_id=uid, query=query, limit=12)
-                    history = search_food_history(conn, user_id=uid, query=query) if query else []
+                    catalog = []
+                    history = []
+                    has_more = False
             seen = set()
             merged = []
             for item in history + catalog:
@@ -8608,8 +8628,24 @@ def _handle_message_impl(event):
                 else:
                     reply = TextSendMessage(text="📭 你還沒有任何食物卡片。\n\n傳營養標示照片或餐點照片就可以建立第一張卡片！")
             else:
-                bubbles = [build_food_search_result_bubble(item) for item in merged[:8]]
-                alt = f"找到 {len(bubbles)} 張卡片" if not query else f"搜尋「{query}」找到 {len(bubbles)} 筆"
+                bubbles = [build_food_search_result_bubble(item) for item in merged[:12]]
+                if has_more:
+                    next_page = page + 1
+                    next_label = f"搜尋下一頁 {next_page}"
+                    if query == "_my":
+                        next_label = "搜尋下一頁 2"
+                    bubbles.append({
+                        "type": "bubble",
+                        "body": {
+                            "type": "box", "layout": "vertical", "justifyContent": "center", "alignItems": "center",
+                            "contents": [
+                                {"type": "button",
+                                 "action": {"type": "message", "label": f"下一頁 ({next_page})", "text": next_label},
+                                 "style": "primary", "color": "#4CAF50"},
+                            ],
+                        },
+                    })
+                alt = f"找到 {len(merged)} 張卡片" if not query else f"搜尋「{query}」找到 {len(merged)} 筆"
                 reply = FlexSendMessage(
                     alt_text=alt,
                     contents={"type": "carousel", "contents": bubbles},
