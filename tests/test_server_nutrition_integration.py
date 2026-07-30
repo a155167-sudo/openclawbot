@@ -1783,6 +1783,39 @@ def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
         assert row[1] == "午餐"
 
 
+def test_search_my_food_natural_language_alias_returns_private_library(tmp_path, monkeypatch):
+    db = tmp_path / "search-my-alias.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    now = utcish_now()
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        for owner, name in (("U1", "Jason私人雞胸"), ("U2", "別人的私人雞胸")):
+            fid = new_id("food")
+            conn.execute(
+                """INSERT INTO food_catalog
+                   (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                    package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                    exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                    recognition_confidence,verification_status,created_at,updated_at)
+                   VALUES (?,?,'','','user_private_food',?,'private',1,'份',1,?,'{}','{}',
+                           'approved',?,'',1,'user_confirmed',?,?)""",
+                (fid, name, owner, json.dumps({"calories_kcal": 123}), fid, now, now),
+            )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    server._handle_message_impl(
+        _text_event("SEARCH-MY-ALIAS-1", "搜尋 我的食物", user_id="U1")
+    )
+
+    assert len(replies) == 1
+    assert replies[0].type == "flex"
+    payload = json.loads(replies[0].as_json_string())
+    text = json.dumps(payload, ensure_ascii=False)
+    assert "Jason私人雞胸" in text
+    assert "別人的私人雞胸" not in text
+
+
 def test_my_food_search_paginates_with_context_and_within_line_carousel_limit(tmp_path, monkeypatch):
     db = tmp_path / "search-my-pagination.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))

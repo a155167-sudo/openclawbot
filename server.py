@@ -8738,6 +8738,8 @@ def _handle_message_impl(event):
 
     if msg.startswith("搜尋") or msg.startswith("查食物"):
         query = msg.replace("搜尋", "", 1).replace("查食物", "", 1).strip()
+        if query in {"我的食物", "我的食品", "我的食物庫"}:
+            query = "_my"
         # 分頁支援：搜尋下一頁 2 _my／搜尋下一頁 2 雞胸
         page = 1
         next_page_match = re.fullmatch(r"下一頁\s+(\d+)(?:\s+(.+))?", query)
