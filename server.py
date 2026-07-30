@@ -8853,7 +8853,7 @@ def _handle_message_impl(event):
                     next_page = page + 1
                     next_label = f"搜尋下一頁 {next_page} {query}"
                     bubbles.append({
-                        "type": "bubble",
+                        "type": "bubble", "size": "kilo",
                         "body": {
                             "type": "box", "layout": "vertical", "justifyContent": "center", "alignItems": "center",
                             "contents": [

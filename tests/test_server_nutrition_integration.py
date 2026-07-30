@@ -1841,6 +1841,7 @@ def test_my_food_search_paginates_with_context_and_within_line_carousel_limit(tm
 
     page1 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
     assert len(page1) == 12
+    assert {bubble.get("size") for bubble in page1} == {"kilo"}
     next_action = page1[-1]["body"]["contents"][0]["action"]
     assert next_action["text"] == "搜尋下一頁 2 _my"
 
