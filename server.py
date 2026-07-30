@@ -53,6 +53,7 @@ from nutrition_system import (
     scale_nutrition,
     search_food_catalog,
     search_food_history,
+    search_food_page,
     set_nutrition_input_state,
     clear_nutrition_input_state,
     update_pending_consumption,
@@ -4028,6 +4029,7 @@ def get_dashboard_data(user_id: str) -> dict:
     checked_slots = set()
     workout_done = False
     frequent_foods = []
+    approved_photo_foods = []
     today_str = tw_today().isoformat()
 
     # 🌟 優化：將原本散落的 3 次資料庫連線，合併成 1 次安全連線！
@@ -4057,6 +4059,23 @@ def get_dashboard_data(user_id: str) -> dict:
                     {"name": r[0], "cal": r[1] or 0, "pro": r[2] or 0, "count": r[3] or 0}
                     for r in c.fetchall()
                 ]
+            except Exception:
+                pass
+
+            # 4. 照片餐點只有在管理員完成精確份量核准後，才從正式 food_logs 顯示。
+            # 餐點照片沒有可靠熱量／三大營養素，因此只合併名稱與餐次，不杜撰數值。
+            try:
+                c.execute(
+                    """SELECT fc.product_name
+                       FROM food_logs fl
+                       JOIN food_catalog fc ON fc.food_id=fl.food_id
+                       WHERE fl.user_id=? AND date(fl.consumed_at, '+8 hours')=?
+                         AND fl.confirmation_status='confirmed'
+                         AND fc.source_type='user_meal_photo'
+                       ORDER BY fl.consumed_at, fl.created_at""",
+                    (user_id, today_str),
+                )
+                approved_photo_foods = [str(r[0]).strip() for r in c.fetchall() if str(r[0]).strip()]
             except Exception:
                 pass
 
@@ -4135,6 +4154,7 @@ def get_dashboard_data(user_id: str) -> dict:
     dinner_checked = "晚餐" in checked_slots
 
     food_list = [f.strip() for f in food_items.split("、") if f.strip()] if food_items else []
+    food_list.extend(approved_photo_foods)
     recorded_count = len(food_list)
     task_logged_once = (extra_cal > 0 or extra_pro > 0 or recorded_count >= 1)
     task_two_meals = recorded_count >= 2
@@ -8395,6 +8415,185 @@ def handle_meal_photo_postback(event):
         )
 
 
+def _build_breakfast_combo_reply_once(
+    user_id: str, combo_name: str, message_id: str,
+):
+    """以單一交易記錄早餐組合；同一LINE message重送只重建回覆，不重複入帳。"""
+    from datetime import datetime as _dt
+    from linebot.models import FlexSendMessage
+
+    combo = BREAKFAST_COMBOS[combo_name]
+    now_tw = _dt.now(TW_TZ).isoformat(timespec="seconds")
+    event_id = "combo:" + hashlib.sha256(
+        f"{user_id}|{message_id}|{combo_name}".encode("utf-8")
+    ).hexdigest()
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_nutrition_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            stored = conn.execute(
+                """SELECT result_json FROM combo_log_events
+                   WHERE event_id=? AND user_id=? AND combo_name=?""",
+                (event_id, user_id, combo_name),
+            ).fetchone()
+            if stored:
+                payload = json.loads(stored[0])
+            else:
+                resolved = []
+                for keyword, servings in combo:
+                    matches = search_food_catalog(
+                        conn, user_id=user_id, query=keyword, limit=1
+                    )
+                    if not matches:
+                        raise ValueError(
+                            f"找不到「{keyword}」的食物卡片，請先傳營養標示照片建立"
+                        )
+                    resolved.append((matches[0], servings))
+
+                items = []
+                total_cal = total_pro = total_carb = 0.0
+                for food, servings in resolved:
+                    result = quick_log_from_catalog(
+                        conn, user_id=user_id, food_id=food["food_id"],
+                        consumed_servings=servings, meal_slot="早餐",
+                        consumed_at=now_tw, manage_transaction=False,
+                    )
+                    nutrition = result.get("nutrition") or {}
+                    cal = float(nutrition.get("calories_kcal") or 0)
+                    pro = float(nutrition.get("protein_g") or 0)
+                    carb = float(nutrition.get("carbohydrate_g") or 0)
+                    total_cal += cal
+                    total_pro += pro
+                    total_carb += carb
+                    items.append({
+                        "product_name": food["product_name"],
+                        "servings": float(servings),
+                        "calories_kcal": cal,
+                        "protein_g": pro,
+                        "carbohydrate_g": carb,
+                    })
+
+                table_exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='health_profile'"
+                ).fetchone()
+                if table_exists:
+                    today_str = tw_today().isoformat()
+                    row = conn.execute(
+                        """SELECT today_extra_cal,today_extra_pro,today_food_items,today_date
+                           FROM health_profile WHERE user_id=?""",
+                        (user_id,),
+                    ).fetchone()
+                    if row:
+                        old_cal, old_pro, old_items, old_date = row
+                        if old_date != today_str:
+                            old_cal, old_pro, old_items = 0, 0, ""
+                        new_items = (
+                            f"{old_items}、{combo_name}".strip("、")
+                            if old_items else combo_name
+                        )
+                        conn.execute(
+                            """UPDATE health_profile
+                               SET today_extra_cal=?,today_extra_pro=?,today_food_items=?,today_date=?
+                               WHERE user_id=?""",
+                            (
+                                round((old_cal or 0) + total_cal),
+                                round((old_pro or 0) + total_pro, 1),
+                                new_items, today_str, user_id,
+                            ),
+                        )
+
+                conn.execute("""CREATE TABLE IF NOT EXISTS frequent_foods (
+                    user_id TEXT, meal_name TEXT, last_cal INTEGER, last_pro INTEGER,
+                    use_count INTEGER DEFAULT 1, last_used_at TEXT,
+                    PRIMARY KEY (user_id, meal_name))""")
+                frequent_rows = [
+                    (combo_name, round(total_cal), round(total_pro)),
+                    *[
+                        (
+                            item["product_name"], round(item["calories_kcal"]),
+                            round(item["protein_g"]),
+                        )
+                        for item in items
+                    ],
+                ]
+                for meal_name, cal, pro in frequent_rows:
+                    conn.execute(
+                        """INSERT INTO frequent_foods
+                           (user_id,meal_name,last_cal,last_pro,use_count,last_used_at)
+                           VALUES (?,?,?,?,1,?)
+                           ON CONFLICT(user_id,meal_name) DO UPDATE SET
+                               last_cal=excluded.last_cal,last_pro=excluded.last_pro,
+                               use_count=frequent_foods.use_count+1,
+                               last_used_at=excluded.last_used_at""",
+                        (user_id, meal_name, cal, pro, now_tw),
+                    )
+                payload = {
+                    "items": items, "total_cal": total_cal,
+                    "total_pro": total_pro, "total_carb": total_carb,
+                }
+                conn.execute(
+                    """INSERT INTO combo_log_events
+                       (event_id,user_id,combo_name,result_json,created_at)
+                       VALUES (?,?,?,?,?)""",
+                    (
+                        event_id, user_id, combo_name,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True), now_tw,
+                    ),
+                )
+                conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+    food_rows = []
+    for item in payload["items"]:
+        servings_text = f"{float(item['servings']):g}"
+        food_rows.append({
+            "type": "box", "layout": "horizontal", "margin": "md",
+            "contents": [
+                {"type": "text", "text": f"{item['product_name']} {servings_text}份",
+                 "size": "sm", "color": "#333333", "flex": 5, "wrap": True},
+                {"type": "text", "text": f"{round(float(item['calories_kcal']))} kcal",
+                 "size": "sm", "color": "#666666", "align": "end", "flex": 2},
+            ],
+        })
+    total_cal = float(payload.get("total_cal") or 0)
+    total_pro = float(payload.get("total_pro") or 0)
+    total_carb = float(payload.get("total_carb") or 0)
+    cal_text = f"{total_cal:.0f}" if total_cal else "NA"
+    pro_text = f"{total_pro:.1f}" if total_pro else "NA"
+    carb_text = f"{total_carb:.1f}" if total_carb else "NA"
+    bubble = {
+        "type": "bubble",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": "#2E7D32",
+            "contents": [{
+                "type": "text", "text": f"✅ 已記錄 {combo_name}",
+                "color": "#FFFFFF", "size": "lg", "weight": "bold",
+            }],
+        },
+        "body": {
+            "type": "box", "layout": "vertical",
+            "contents": [
+                *food_rows,
+                {"type": "separator", "margin": "lg"},
+                {
+                    "type": "box", "layout": "horizontal", "margin": "lg",
+                    "contents": [
+                        {"type": "text", "text": f"🔥 {cal_text} kcal", "size": "sm", "color": "#E65100", "flex": 3},
+                        {"type": "text", "text": f"蛋白質 {pro_text}g", "size": "sm", "color": "#1565C0", "flex": 3},
+                        {"type": "text", "text": f"碳水 {carb_text}g", "size": "sm", "color": "#6A1B9A", "flex": 3},
+                    ],
+                },
+            ],
+        },
+    }
+    return FlexSendMessage(
+        alt_text=f"已記錄 {combo_name} {cal_text}kcal", contents=bubble
+    )
+
+
 def _handle_message_impl(event):
     msg_id = event.message.id
     if msg_id in processed_messages:
@@ -8525,173 +8724,41 @@ def _handle_message_impl(event):
 
     # ── 快速早餐組合 ──
     if msg in BREAKFAST_COMBOS:
-        combo = BREAKFAST_COMBOS[msg]
         try:
-            logged = []
-            total_cal = 0
-            total_pro = 0
-            total_carb = 0
-            with sqlite3.connect(DB_PATH) as conn:
-                ensure_nutrition_schema(conn)
-                for keyword, servings in combo:
-                    matches = search_food_catalog(conn, user_id=uid, query=keyword, limit=1)
-                    if not matches:
-                        raise ValueError(f"找不到「{keyword}」的食物卡片，請先傳營養標示照片建立")
-                    food = matches[0]
-                    from datetime import datetime as _dt
-                    now_tw = _dt.now(TW_TZ).isoformat(timespec="seconds")
-                    result = quick_log_from_catalog(
-                        conn, user_id=uid, food_id=food["food_id"],
-                        consumed_servings=servings, meal_slot="早餐",
-                        consumed_at=now_tw,
-                    )
-                    nutr = result.get("nutrition") or {}
-                    cal = nutr.get("calories_kcal")
-                    pro = nutr.get("protein_g")
-                    carb = nutr.get("carbohydrate_g")
-                    if cal:
-                        total_cal += float(cal)
-                    if pro:
-                        total_pro += float(pro)
-                    if carb:
-                        total_carb += float(carb)
-                    logged.append(f"• {food['product_name']} {servings}份")
-
-                # 同步更新 health_profile 讓儀表板能讀取
-                try:
-                    today_str = tw_today().isoformat()
-                    row = conn.execute(
-                        "SELECT today_extra_cal, today_extra_pro, today_food_items, today_date FROM health_profile WHERE user_id=?",
-                        (uid,),
-                    ).fetchone()
-                    if row:
-                        old_cal, old_pro, old_items, old_date = row
-                        if old_date != today_str:
-                            old_cal, old_pro, old_items = 0, 0, ""
-                        new_cal = (old_cal or 0) + total_cal
-                        new_pro = (old_pro or 0) + total_pro
-                        conn.execute(
-                            "UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_date=? WHERE user_id=?",
-                            (round(new_cal), round(new_pro, 1), today_str, uid),
-                        )
-                        conn.commit()
-                except Exception:
-                    pass  # health_profile 不存在時不影響 food_logs
-
-                # 同步更新 frequent_foods 讓常吃清單顯示
-                try:
-                    now_iso = _dt.now(TW_TZ).isoformat(timespec="seconds")
-                    conn.execute("""CREATE TABLE IF NOT EXISTS frequent_foods (
-                        user_id TEXT, meal_name TEXT, last_cal INTEGER, last_pro INTEGER,
-                        use_count INTEGER DEFAULT 1, last_used_at TEXT,
-                        PRIMARY KEY (user_id, meal_name))""")
-                    # 加入組合餐名稱（早餐1/早餐2）
-                    conn.execute(
-                        """INSERT INTO frequent_foods (user_id, meal_name, last_cal, last_pro, use_count, last_used_at)
-                           VALUES (?, ?, ?, ?, 1, ?)
-                           ON CONFLICT(user_id, meal_name) DO UPDATE SET
-                               last_cal=excluded.last_cal, last_pro=excluded.last_pro,
-                               use_count=frequent_foods.use_count + 1, last_used_at=excluded.last_used_at""",
-                        (uid, msg, round(total_cal), round(total_pro), now_iso),
-                    )
-                    # 加入個別食物
-                    for keyword, servings in combo:
-                        matches = search_food_catalog(conn, user_id=uid, query=keyword, limit=1)
-                        if not matches:
-                            continue
-                        food_item = matches[0]
-                        per_srv = json.loads(conn.execute(
-                            "SELECT per_serving_json FROM food_catalog WHERE food_id=?",
-                            (food_item["food_id"],),
-                        ).fetchone()[0] or "{}")
-                        nutr_f = scale_nutrition(per_srv, servings)
-                        conn.execute(
-                            """INSERT INTO frequent_foods (user_id, meal_name, last_cal, last_pro, use_count, last_used_at)
-                               VALUES (?, ?, ?, ?, 1, ?)
-                               ON CONFLICT(user_id, meal_name) DO UPDATE SET
-                                   last_cal=excluded.last_cal, last_pro=excluded.last_pro,
-                                   use_count=frequent_foods.use_count + 1, last_used_at=excluded.last_used_at""",
-                            (uid, food_item["product_name"], round(nutr_f.get("calories_kcal", 0)), round(nutr_f.get("protein_g", 0)), now_iso),
-                        )
-                    conn.commit()
-                except Exception:
-                    pass
-            summary = "\n".join(logged)
-            cal_text = f"{total_cal:.0f}" if total_cal else "NA"
-            pro_text = f"{total_pro:.1f}" if total_pro else "NA"
-            carb_text = f"{total_carb:.1f}" if total_carb else "NA"
-
-            # Build Flex card rows for each food item
-            food_rows = []
-            for keyword, servings in combo:
-                matches = search_food_catalog(conn, user_id=uid, query=keyword, limit=1)
-                if matches:
-                    food_item = matches[0]
-                    per_srv = json.loads(conn.execute(
-                        "SELECT per_serving_json FROM food_catalog WHERE food_id=?",
-                        (food_item["food_id"],),
-                    ).fetchone()[0] or "{}")
-                    nutr_f = scale_nutrition(per_srv, servings)
-                    food_rows.append({
-                        "type": "box", "layout": "horizontal",
-                        "contents": [
-                            {"type": "text", "text": f"{food_item['product_name']} {servings}份",
-                             "size": "sm", "color": "#333333", "flex": 5, "wrap": True},
-                            {"type": "text", "text": f"{round(nutr_f.get('calories_kcal', 0))} kcal",
-                             "size": "sm", "color": "#666666", "align": "end", "flex": 2},
-                        ],
-                        "margin": "md",
-                    })
-
-            bubble = {
-                "type": "bubble",
-                "header": {
-                    "type": "box", "layout": "vertical", "backgroundColor": "#2E7D32",
-                    "contents": [
-                        {"type": "text", "text": f"✅ 已記錄 {msg}", "color": "#FFFFFF",
-                         "size": "lg", "weight": "bold"},
-                    ],
-                },
-                "body": {
-                    "type": "box", "layout": "vertical",
-                    "contents": [
-                        *food_rows,
-                        {"type": "separator", "margin": "lg"},
-                        {
-                            "type": "box", "layout": "horizontal", "margin": "lg",
-                            "contents": [
-                                {"type": "text", "text": f"🔥 {cal_text} kcal", "size": "sm", "color": "#E65100", "flex": 3},
-                                {"type": "text", "text": f"蛋白質 {pro_text}g", "size": "sm", "color": "#1565C0", "flex": 3},
-                                {"type": "text", "text": f"碳水 {carb_text}g", "size": "sm", "color": "#6A1B9A", "flex": 3},
-                            ],
-                        },
-                    ],
-                },
-            }
-            from linebot.models import FlexSendMessage
-            reply = FlexSendMessage(alt_text=f"已記錄 {msg} {cal_text}kcal", contents=bubble)
+            reply = _build_breakfast_combo_reply_once(uid, msg, msg_id)
         except (ValueError, PermissionError) as exc:
             reply = TextSendMessage(text=f"⚠️ {exc}")
         try:
             line_bot_api.reply_message(event.reply_token, reply)
         except Exception:
+            # 資料已由持久化 combo_log_events 冪等保護；允許 LINE 安全重送回覆。
             processed_messages.discard(msg_id)
             raise
         return
 
     if msg.startswith("搜尋") or msg.startswith("查食物"):
         query = msg.replace("搜尋", "", 1).replace("查食物", "", 1).strip()
-        # 分頁支援：搜尋下一頁 2
+        # 分頁支援：搜尋下一頁 2 _my／搜尋下一頁 2 雞胸
         page = 1
-        if query.startswith("下一頁"):
-            try:
-                page = int(query.replace("下一頁", "").strip())
-            except ValueError:
-                page = 1
-            query = ""
+        next_page_match = re.fullmatch(r"下一頁\s+(\d+)(?:\s+(.+))?", query)
+        if next_page_match:
+            raw_page = next_page_match.group(1)
+            if len(raw_page) > 3 or int(raw_page) > 100:
+                try:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text="⚠️ 搜尋頁碼無效，請重新點選「搜尋我的食物」。"),
+                    )
+                except Exception:
+                    processed_messages.discard(msg_id)
+                    raise
+                return
+            page = max(1, int(raw_page))
+            # 舊卡未攜帶條件時回到我的食物；新卡會保留 _my 或原關鍵字。
+            query = str(next_page_match.group(2) or "_my").strip()
         try:
             from linebot.models import FlexSendMessage
-            page_limit = 12
+            page_limit = 11  # LINE carousel 最多12個bubble，保留1格給下一頁
             offset = (page - 1) * page_limit
             with sqlite3.connect(DB_PATH) as conn:
                 ensure_nutrition_schema(conn)
@@ -8726,10 +8793,11 @@ def _handle_message_impl(event):
                     history = []
                     has_more = (offset + page_limit) < total
                 elif query:
-                    catalog = search_food_catalog(conn, user_id=uid, query=query, limit=page_limit + 1)
-                    has_more = len(catalog) > page_limit
-                    catalog = catalog[:page_limit]
-                    history = search_food_history(conn, user_id=uid, query=query) if page == 1 else []
+                    catalog, has_more = search_food_page(
+                        conn, user_id=uid, query=query,
+                        limit=page_limit, offset=offset,
+                    )
+                    history = []
                 else:
                     catalog = []
                     history = []
@@ -8778,12 +8846,10 @@ def _handle_message_impl(event):
                 else:
                     reply = TextSendMessage(text="📭 你還沒有任何食物卡片。\n\n傳營養標示照片或餐點照片就可以建立第一張卡片！")
             else:
-                bubbles = [build_food_search_result_bubble(item) for item in merged[:12]]
+                bubbles = [build_food_search_result_bubble(item) for item in merged[:page_limit]]
                 if has_more:
                     next_page = page + 1
-                    next_label = f"搜尋下一頁 {next_page}"
-                    if query == "_my":
-                        next_label = "搜尋下一頁 2"
+                    next_label = f"搜尋下一頁 {next_page} {query}"
                     bubbles.append({
                         "type": "bubble",
                         "body": {
@@ -9828,7 +9894,9 @@ def _handle_message_impl(event):
         meal_name = msg.replace("加入常吃：", "", 1).strip()
         # 組合餐：直接執行 combo 邏輯
         if meal_name in BREAKFAST_COMBOS:
-            # 觸發 combo handler（複用同一段邏輯）
+            # 同一個 LINE 事件需重新進入組合餐 handler；先解除外層的處理中標記，
+            # 內層會立即重新加入，避免被誤判為重複事件而直接 return。
+            processed_messages.discard(msg_id)
             event.message.text = meal_name
             return _handle_message_impl(event)
         meal_flex, meal_text = add_frequent_food_to_today(uid, meal_name)

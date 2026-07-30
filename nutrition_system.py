@@ -712,6 +712,14 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(entity_type, entity_id)
         );
 
+        CREATE TABLE IF NOT EXISTS combo_log_events (
+            event_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            combo_name TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         CREATE UNIQUE INDEX IF NOT EXISTS idx_food_catalog_owner_fingerprint
             ON food_catalog(owner_user_id, fingerprint, source_type);
         CREATE INDEX IF NOT EXISTS idx_food_catalog_owner ON food_catalog(owner_user_id);
@@ -1858,6 +1866,7 @@ def quick_log_from_catalog(
     consumed_servings: float,
     meal_slot: str,
     consumed_at: str = "",
+    manage_transaction: bool = True,
 ) -> dict[str, Any]:
     """從已有的food_catalog item快速建立一筆food_log，不經過pending流程。"""
     user_id = str(user_id or "").strip()
@@ -1873,7 +1882,8 @@ def quick_log_from_catalog(
     meal_slot = str(meal_slot or "").strip()
     if meal_slot not in {"早餐", "午餐", "晚餐", "點心", ""}:
         raise ValueError("餐別不支援")
-    conn.execute("BEGIN IMMEDIATE")
+    if manage_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     try:
         food = conn.execute(
             """SELECT product_name,brand,package_amount,package_unit,servings_per_package,
@@ -1936,7 +1946,8 @@ def quick_log_from_catalog(
                VALUES (?,'food_log',?,'pending',0,'',?,'')""",
             (new_id("outbox"), log_id, now),
         )
-        conn.commit()
+        if manage_transaction:
+            conn.commit()
         return {
             "log_id": log_id, "product_name": product_name,
             "consumed_servings": servings, "meal_slot": meal_slot,
@@ -1945,7 +1956,7 @@ def quick_log_from_catalog(
             "nutrition": nutrition, "applied_exchange": applied,
         }
     except Exception:
-        if conn.in_transaction:
+        if manage_transaction and conn.in_transaction:
             conn.rollback()
         raise
 
@@ -2039,6 +2050,54 @@ def search_food_history(
         }
         for r in rows
     ]
+
+
+def search_food_page(
+    conn: sqlite3.Connection, *, user_id: str, query: str,
+    limit: int = 11, offset: int = 0,
+) -> tuple[list[dict[str, Any]], bool]:
+    """以單一SQL分頁搜尋，歷史常吃優先；多取一筆判斷下一頁。"""
+    user_id = str(user_id or "").strip()
+    query = str(query or "").strip()
+    if not user_id or not query:
+        return [], False
+    limit = max(1, min(int(limit or 11), 50))
+    offset = max(0, min(int(offset or 0), 10000))
+    rows = conn.execute(
+        """SELECT f.food_id,f.product_name,f.brand,f.barcode,f.source_type,f.owner_user_id,
+                  f.package_amount,f.package_unit,f.servings_per_package,
+                  f.per_serving_json,f.exchange_json,f.exchange_review_status,
+                  f.created_at,f.updated_at,
+                  MAX(l.consumed_at) AS last_consumed_at,
+                  COUNT(l.log_id) AS use_count
+           FROM food_catalog f
+           LEFT JOIN food_logs l
+             ON l.food_id=f.food_id AND l.user_id=?
+            AND l.confirmation_status='confirmed'
+           WHERE (f.owner_user_id=? OR f.visibility='public')
+             AND f.product_name LIKE ?
+           GROUP BY f.food_id
+           ORDER BY CASE WHEN COUNT(l.log_id)>0 THEN 0 ELSE 1 END,
+                    use_count DESC,last_consumed_at DESC,f.updated_at DESC,f.food_id
+           LIMIT ? OFFSET ?""",
+        (user_id, user_id, f"%{query}%", limit + 1, offset),
+    ).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return [
+        {
+            "food_id": r[0], "product_name": r[1], "brand": r[2] or "", "barcode": r[3] or "",
+            "source_type": r[4], "owner_user_id": r[5],
+            "package_amount": float(r[6] or 0), "package_unit": r[7] or "",
+            "servings_per_package": float(r[8] or 1),
+            "per_serving": json.loads(r[9] or "{}"),
+            "exchange": json.loads(r[10] or "{}"),
+            "exchange_review_status": r[11] or "",
+            "created_at": r[12] or "", "updated_at": r[13] or "",
+            "last_consumed_at": r[14] or None, "use_count": int(r[15] or 0),
+        }
+        for r in rows
+    ], has_more
 
 
 def approve_food_exchange_suggestion(

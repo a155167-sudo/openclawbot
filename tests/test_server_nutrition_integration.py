@@ -1,7 +1,7 @@
 import os
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +15,7 @@ from nutrition_system import (
     confirm_pending_label,
     daily_consumed_totals,
     ensure_nutrition_schema,
+    insert_approved_meal_photo_log,
     new_id,
     save_pending_label,
     set_nutrition_input_state,
@@ -1782,6 +1783,134 @@ def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
         assert row[1] == "午餐"
 
 
+def test_my_food_search_paginates_with_context_and_within_line_carousel_limit(tmp_path, monkeypatch):
+    db = tmp_path / "search-my-pagination.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        for index in range(13):
+            fid = new_id("food")
+            timestamp = f"2026-07-{index + 1:02d}T08:00:00+08:00"
+            conn.execute(
+                """INSERT INTO food_catalog
+                   (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                    package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                    exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                    recognition_confidence,verification_status,created_at,updated_at)
+                   VALUES (?,?,'','','user_private_food','U1','private',1,'份',1,?,'{}','{}',
+                           'approved',?,'',1,'user_confirmed',?,?)""",
+                (fid, f"我的食物{index:02d}", json.dumps({"calories_kcal": 100 + index}), fid, timestamp, timestamp),
+            )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    server._handle_message_impl(_text_event("SEARCH-MY-P1", "搜尋 _my", user_id="U1"))
+
+    page1 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
+    assert len(page1) == 12
+    next_action = page1[-1]["body"]["contents"][0]["action"]
+    assert next_action["text"] == "搜尋下一頁 2 _my"
+
+    server._handle_message_impl(
+        _text_event("SEARCH-MY-P2", next_action["text"], user_id="U1")
+    )
+
+    page2 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
+    page2_text = json.dumps(page2, ensure_ascii=False)
+    assert len(page2) == 2
+    assert "我的食物01" in page2_text
+    assert "我的食物00" in page2_text
+
+
+def test_keyword_food_search_second_page_does_not_repeat_first_page(tmp_path, monkeypatch):
+    db = tmp_path / "search-keyword-pagination.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        for index in range(13):
+            fid = new_id("food")
+            timestamp = f"2026-07-{index + 1:02d}T08:00:00+08:00"
+            conn.execute(
+                """INSERT INTO food_catalog
+                   (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                    package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                    exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                    recognition_confidence,verification_status,created_at,updated_at)
+                   VALUES (?,?,'','','user_private_food','U1','private',1,'份',1,?,'{}','{}',
+                           'approved',?,'',1,'user_confirmed',?,?)""",
+                (fid, f"雞胸餐{index:02d}", json.dumps({"calories_kcal": 100 + index}), fid, timestamp, timestamp),
+            )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    server._handle_message_impl(_text_event("SEARCH-CHICKEN-P1", "搜尋 雞胸", user_id="U1"))
+    page1 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
+    next_action = page1[-1]["body"]["contents"][0]["action"]
+    assert len(page1) == 12
+    assert next_action["text"] == "搜尋下一頁 2 雞胸"
+
+    server._handle_message_impl(
+        _text_event("SEARCH-CHICKEN-P2", next_action["text"], user_id="U1")
+    )
+    page2 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
+    page2_text = json.dumps(page2, ensure_ascii=False)
+    assert len(page2) == 2
+    assert "雞胸餐01" in page2_text
+    assert "雞胸餐00" in page2_text
+    assert "雞胸餐12" not in page2_text
+
+
+def test_keyword_food_search_reaches_items_after_twentieth_result(tmp_path, monkeypatch):
+    db = tmp_path / "search-keyword-page-three.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        for index in range(30):
+            fid = new_id("food")
+            timestamp = f"2026-07-30T00:{index:02d}:00+08:00"
+            conn.execute(
+                """INSERT INTO food_catalog
+                   (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                    package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                    exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                    recognition_confidence,verification_status,created_at,updated_at)
+                   VALUES (?,?,'','','user_private_food','U1','private',1,'份',1,?,'{}','{}',
+                           'approved',?,'',1,'user_confirmed',?,?)""",
+                (fid, f"雞胸大量{index:02d}", json.dumps({"calories_kcal": 100 + index}), fid, timestamp, timestamp),
+            )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    server._handle_message_impl(_text_event("SEARCH-30-P1", "搜尋 雞胸大量", user_id="U1"))
+    page1 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
+    next2 = page1[-1]["body"]["contents"][0]["action"]["text"]
+    server._handle_message_impl(_text_event("SEARCH-30-P2", next2, user_id="U1"))
+    page2 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
+    next3 = page2[-1]["body"]["contents"][0]["action"]["text"]
+    server._handle_message_impl(_text_event("SEARCH-30-P3", next3, user_id="U1"))
+
+    page3 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
+    page3_text = json.dumps(page3, ensure_ascii=False)
+    assert len(page3) == 8
+    assert "雞胸大量07" in page3_text
+    assert "雞胸大量00" in page3_text
+
+
+def test_search_rejects_pathologically_large_page_number(tmp_path, monkeypatch):
+    db = tmp_path / "search-invalid-page.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    server._handle_message_impl(
+        _text_event("SEARCH-HUGE-PAGE", "搜尋下一頁 " + ("9" * 5000) + " _my", user_id="U1")
+    )
+
+    assert "頁碼" in replies[-1].text
+
+
 def test_search_no_results_shows_guidance(tmp_path, monkeypatch):
     db = tmp_path / "search-empty.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
@@ -1838,6 +1967,251 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
         ).fetchall()
         assert len(rows) == 3
         assert all(r[0] == "早餐" for r in rows)
+
+
+def test_dashboard_lists_today_approved_meal_photo_without_inventing_macros(tmp_path, monkeypatch):
+    db_dir = tmp_path / "photo-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,today_extra_cal,today_extra_pro,today_food_items,today_date)
+               VALUES ('U1','Jason',2000,100,0,0,'',?)""",
+            (server.tw_today().isoformat(),),
+        )
+        ensure_nutrition_schema(conn)
+        insert_approved_meal_photo_log(
+            conn,
+            token="abcdef123456",
+            user_id="U1",
+            reviewer="U1",
+            consumed_at=server.tw_now().isoformat(),
+            meal_slot="早餐",
+            source_image_ref="photo.jpg",
+            observed_payload={
+                "visible_items": [
+                    {"name": "雞胸肉", "category": "protein", "confidence": 0.9},
+                    {"name": "青花菜", "category": "vegetable", "confidence": 0.9},
+                ]
+            },
+            answers={},
+            exact_exchange={
+                "milk_exchange": 0,
+                "protein_low_exchange": 0,
+                "protein_medium_exchange": 2,
+                "protein_high_exchange": 0,
+                "starch_exchange": 1,
+                "vegetable_exchange": 1,
+                "fruit_exchange": 0,
+                "fat_exchange": 0,
+            },
+        )
+        taipei_0030 = server.tw_now().replace(hour=0, minute=30, second=0, microsecond=0)
+        insert_approved_meal_photo_log(
+            conn,
+            token="abcdef123457",
+            user_id="U1",
+            reviewer="U1",
+            consumed_at=taipei_0030.astimezone(timezone.utc).isoformat(),
+            meal_slot="早餐",
+            source_image_ref="photo-utc.jpg",
+            observed_payload={
+                "visible_items": [
+                    {"name": "UTC跨日雞胸", "category": "protein", "confidence": 0.9},
+                ]
+            },
+            answers={},
+            exact_exchange={
+                "milk_exchange": 0,
+                "protein_low_exchange": 1,
+                "protein_medium_exchange": 0,
+                "protein_high_exchange": 0,
+                "starch_exchange": 0,
+                "vegetable_exchange": 0,
+                "fruit_exchange": 0,
+                "fat_exchange": 0,
+            },
+        )
+        conn.commit()
+
+    dashboard = server.get_dashboard_data("U1")
+
+    assert set(dashboard["food_list"]) == {
+        "餐點照片：雞胸肉、青花菜",
+        "餐點照片：UTC跨日雞胸",
+    }
+    assert dashboard["recorded_count"] == 2
+    assert dashboard["extra_cal"] == 0
+    assert dashboard["extra_pro"] == 0
+
+
+def test_dashboard_excludes_other_user_old_unconfirmed_and_non_photo_logs(tmp_path, monkeypatch):
+    db_dir = tmp_path / "photo-dashboard-isolation"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+    old_day = datetime.fromordinal(server.tw_today().toordinal() - 1).date().isoformat()
+
+    def add_photo(conn, token, user_id, name, consumed_at):
+        return insert_approved_meal_photo_log(
+            conn, token=token, user_id=user_id, reviewer=user_id,
+            consumed_at=consumed_at, meal_slot="早餐", source_image_ref=f"{token}.jpg",
+            observed_payload={
+                "visible_items": [{"name": name, "category": "protein", "confidence": 0.9}]
+            },
+            answers={},
+            exact_exchange={
+                "milk_exchange": 0, "protein_low_exchange": 1,
+                "protein_medium_exchange": 0, "protein_high_exchange": 0,
+                "starch_exchange": 0, "vegetable_exchange": 0,
+                "fruit_exchange": 0, "fat_exchange": 0,
+            },
+        )
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,today_extra_cal,today_extra_pro,today_food_items,today_date)
+               VALUES ('U1','Jason',2000,100,0,0,'',?)""",
+            (today,),
+        )
+        ensure_nutrition_schema(conn)
+        add_photo(conn, "a00000000001", "U2", "別人的雞胸", f"{today}T08:00:00+08:00")
+        add_photo(conn, "b00000000001", "U1", "昨天的雞胸", f"{old_day}T08:00:00+08:00")
+        pending = add_photo(conn, "c00000000001", "U1", "未確認雞胸", f"{today}T09:00:00+08:00")
+        conn.execute(
+            "UPDATE food_logs SET confirmation_status='pending' WHERE log_id=?",
+            (pending["log_id"],),
+        )
+        non_photo = add_photo(conn, "d00000000001", "U1", "一般食物卡", f"{today}T10:00:00+08:00")
+        conn.execute(
+            "UPDATE food_catalog SET source_type='user_private_food' WHERE food_id=?",
+            (non_photo["food_id"],),
+        )
+        conn.commit()
+
+    dashboard = server.get_dashboard_data("U1")
+
+    assert dashboard["food_list"] == []
+    assert dashboard["recorded_count"] == 0
+    assert dashboard["extra_cal"] == 0
+    assert dashboard["extra_pro"] == 0
+
+
+def test_dashboard_frequent_breakfast_combo_logs_three_foods(tmp_path, monkeypatch):
+    db = tmp_path / "combo-from-dashboard.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    now = utcish_now()
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        for name, exch, kcal in [
+            ("穀麥高粱 OATS & HONEY", {"starch_exchange": 1.98}, 197),
+            ("草莓穀物脆片", {"starch_exchange": 2.37}, 223),
+            ("無糖優格", {"milk_exchange": 0.5}, 62),
+        ]:
+            fid = new_id("food")
+            conn.execute(
+                """INSERT INTO food_catalog
+                   (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                    package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                    exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                    recognition_confidence,verification_status,created_at,updated_at)
+                   VALUES (?,?,'','','user_private_food','U1','private',100,'g',1,?,'{}',
+                           ?,'approved',?,'',0,'user_confirmed',?,?)""",
+                (fid, name, json.dumps({"calories_kcal": kcal}), json.dumps(exch), fid, now, now),
+            )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    server._handle_message_impl(
+        _text_event("COMBO-DASHBOARD-1", "加入常吃：早餐1", user_id="U1")
+    )
+
+    assert len(replies) == 1
+    assert replies[0].type == "flex"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM food_logs WHERE user_id='U1' AND meal_slot='早餐'"
+        ).fetchone()[0] == 3
+
+
+def test_dashboard_breakfast_combo_retry_after_reply_failure_is_idempotent(tmp_path, monkeypatch):
+    db = tmp_path / "combo-retry.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    now = utcish_now()
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        for name, kcal in [
+            ("穀麥高粱 OATS & HONEY", 197),
+            ("草莓穀物脆片", 223),
+            ("無糖優格", 62),
+        ]:
+            fid = new_id("food")
+            conn.execute(
+                """INSERT INTO food_catalog
+                   (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                    package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                    exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                    recognition_confidence,verification_status,created_at,updated_at)
+                   VALUES (?,?,'','','user_private_food','U1','private',1,'份',1,?,'{}','{}',
+                           'approved',?,'',1,'user_confirmed',?,?)""",
+                (fid, name, json.dumps({"calories_kcal": kcal}), fid, now, now),
+            )
+    attempts = 0
+
+    def flaky_reply(_token, _message):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("LINE unavailable")
+
+    monkeypatch.setattr(server.line_bot_api, "reply_message", flaky_reply)
+    with pytest.raises(RuntimeError, match="LINE unavailable"):
+        server._handle_message_impl(
+            _text_event("COMBO-RETRY-1", "加入常吃：早餐1", user_id="U1")
+        )
+    server._handle_message_impl(
+        _text_event("COMBO-RETRY-1", "加入常吃：早餐1", user_id="U1")
+    )
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM food_logs WHERE user_id='U1'"
+        ).fetchone()[0] == 3
+
+
+def test_breakfast_combo_missing_item_rolls_back_whole_combo(tmp_path, monkeypatch):
+    db = tmp_path / "combo-atomic.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    now = utcish_now()
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        fid = new_id("food")
+        conn.execute(
+            """INSERT INTO food_catalog
+               (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                recognition_confidence,verification_status,created_at,updated_at)
+               VALUES (?,?,'','','user_private_food','U1','private',1,'份',1,?,'{}','{}',
+                       'approved',?,'',1,'user_confirmed',?,?)""",
+            (fid, "穀麥高粱 OATS & HONEY", json.dumps({"calories_kcal": 197}), fid, now, now),
+        )
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    server._handle_message_impl(_text_event("COMBO-ATOMIC-1", "早餐1", user_id="U1"))
+
+    assert "找不到" in replies[-1].text
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
 
 
 def test_breakfast_combo2_logs_different_portions(tmp_path, monkeypatch):
