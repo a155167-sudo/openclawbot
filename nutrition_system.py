@@ -82,6 +82,53 @@ def _number(
     return result
 
 
+MEAL_PHOTO_NUTRITION_RULE_VERSION = "tw-exchange-macros-v1"
+
+# 每一核准交換份的巨量營養素基準。奶類在現行審核流程沒有脂肪等級欄位，
+# 因此採低脂奶基準並在快照中明確留下警示；油脂份依產品規則維持不計。
+MEAL_PHOTO_EXCHANGE_MACROS = {
+    "milk_exchange": {"protein_g": 8.0, "fat_g": 4.0, "carbohydrate_g": 12.0},
+    "protein_low_exchange": {"protein_g": 7.0, "fat_g": 3.0, "carbohydrate_g": 0.0},
+    "protein_medium_exchange": {"protein_g": 7.0, "fat_g": 5.0, "carbohydrate_g": 0.0},
+    "protein_high_exchange": {"protein_g": 7.0, "fat_g": 12.0, "carbohydrate_g": 0.0},
+    "starch_exchange": {"protein_g": 2.0, "fat_g": 0.0, "carbohydrate_g": 15.0},
+    "vegetable_exchange": {"protein_g": 1.0, "fat_g": 0.0, "carbohydrate_g": 5.0},
+    "fruit_exchange": {"protein_g": 0.0, "fat_g": 0.0, "carbohydrate_g": 15.0},
+    "fat_exchange": {"protein_g": 0.0, "fat_g": 5.0, "carbohydrate_g": 0.0},
+}
+
+
+def estimate_nutrition_from_exchanges(exchanges: Mapping[str, Any]) -> dict[str, Any]:
+    """將營養師核准的交換份換成可追溯的估計營養快照。"""
+    portions = {
+        key: _number(exchanges.get(key, 0), key, max_value=100)
+        for key in EXCHANGE_KEYS
+    }
+    if portions["fat_exchange"] != 0:
+        raise ValueError("目前規則不計油脂交換份")
+    totals = {"protein_g": 0.0, "fat_g": 0.0, "carbohydrate_g": 0.0}
+    for exchange_key, portion in portions.items():
+        for nutrient_key, per_exchange in MEAL_PHOTO_EXCHANGE_MACROS[exchange_key].items():
+            totals[nutrient_key] += portion * per_exchange
+    totals = {key: round(value, 4) for key, value in totals.items()}
+    calories = round(
+        totals["protein_g"] * 4
+        + totals["carbohydrate_g"] * 4
+        + totals["fat_g"] * 9,
+        4,
+    )
+    warnings = ["estimated_from_approved_exchanges", "unquantified_oil_and_sauce_excluded"]
+    if portions["milk_exchange"] > 0:
+        warnings.append("milk_assumed_low_fat")
+    return {
+        "calories_kcal": calories,
+        **totals,
+        "_estimate_type": "approved_exchange_estimate",
+        "_rule_version": MEAL_PHOTO_NUTRITION_RULE_VERSION,
+        "_warnings": warnings,
+    }
+
+
 def _normalize_nutrients(values: Mapping[str, Any] | None) -> dict[str, float]:
     values = values or {}
     return {
@@ -1769,6 +1816,10 @@ def insert_approved_meal_photo_log(
     }
     if values["fat_exchange"] != 0:
         raise ValueError("目前規則不計油脂交換份")
+    estimated_nutrition = estimate_nutrition_from_exchanges(values)
+    estimated_nutrition_json = json.dumps(
+        estimated_nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False
+    )
     categories = [key for key in EXCHANGE_KEYS if values[key] > 0]
     rule_version = "meal-photo-admin-v1"
     approved_payload: dict[str, Any] = {
@@ -1776,7 +1827,7 @@ def insert_approved_meal_photo_log(
         "_review_status": "approved",
         "_rule_version": rule_version,
         "_categories": categories,
-        "_warnings": ["calories_and_macros_na"],
+        "_warnings": list(estimated_nutrition["_warnings"]),
         "_approved_by": reviewer,
         "_approved_at": approved_at,
         "_source_type": "meal_photo",
@@ -1809,10 +1860,11 @@ def insert_approved_meal_photo_log(
             package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
             exchange_json,exchange_review_status,fingerprint,original_image_ref,
             recognition_confidence,verification_status,created_at,updated_at)
-           VALUES (?,?, '', '', 'user_meal_photo',?,'private',1,'meal',1,'{}','{}',
+           VALUES (?,?, '', '', 'user_meal_photo',?,'private',1,'meal',1,?,'{}',
                    ?,'approved',?,?,0,'admin_approved',?,?)""",
         (
-            food_id, product_name[:160], user_id, approved_json, fingerprint,
+            food_id, product_name[:160], user_id, estimated_nutrition_json,
+            approved_json, fingerprint,
             str(source_image_ref or "")[:240], approved_at, approved_at,
         ),
     )
@@ -1836,11 +1888,11 @@ def insert_approved_meal_photo_log(
             consumed_amount,consumed_unit,nutrition_snapshot_json,exchange_snapshot_json,
             approved_exchange_json,exchange_approval_id,source_image_ref,plan_id,
             plan_link_status,confirmation_status,legacy_applied_at,created_at,updated_at)
-           VALUES (?,?,?,?,?,1,1,'meal','{}',?,?,?,?, '', 'pending','confirmed',
+           VALUES (?,?,?,?,?,1,1,'meal',?,?,?,?,?, '', 'pending','confirmed',
                    'not_applicable',?,?)""",
         (
             log_id, user_id, food_id, str(consumed_at or approved_at)[:50],
-            str(meal_slot or "")[:30], approved_json,
+            str(meal_slot or "")[:30], estimated_nutrition_json, approved_json,
             json.dumps(applied_payload, ensure_ascii=False, sort_keys=True, allow_nan=False),
             approval_id, str(source_image_ref or "")[:240], approved_at, approved_at,
         ),
@@ -1855,6 +1907,7 @@ def insert_approved_meal_photo_log(
     return {
         "food_id": food_id, "approval_id": approval_id, "log_id": log_id,
         "product_name": product_name[:160], "approved_exchange": approved_payload,
+        "estimated_nutrition": estimated_nutrition,
     }
 
 
@@ -2258,21 +2311,23 @@ def daily_consumed_totals(
         SELECT l.nutrition_snapshot_json,l.approved_exchange_json,l.exchange_approval_id,
                l.consumed_servings,
                a.food_fingerprint,a.suggestion_rule_version,a.approved_exchange_json,
-               a.approved_exchange_hash,f.fingerprint
+               a.approved_exchange_hash,f.fingerprint,f.source_type
         FROM food_logs l
         JOIN food_catalog f ON f.food_id=l.food_id
         LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
-        WHERE l.user_id=? AND substr(l.consumed_at, 1, 10)=? AND l.confirmation_status='confirmed'
+        WHERE l.user_id=? AND date(l.consumed_at, '+8 hours')=? AND l.confirmation_status='confirmed'
     """
     params: list[Any] = [user_id, date_iso]
     if meal_slot:
         sql += " AND l.meal_slot=?"
         params.append(meal_slot)
     rows = conn.execute(sql, params).fetchall()
-    for nutrition_json, applied_json, approval_id, consumed_servings, approval_fingerprint, rule_version, approved_json, approval_hash, food_fp in rows:
-        for key, value in json.loads(nutrition_json or "{}").items():
-            if key in totals:
-                totals[key] += float(value or 0)
+    for nutrition_json, applied_json, approval_id, consumed_servings, approval_fingerprint, rule_version, approved_json, approval_hash, food_fp, source_type in rows:
+        nutrition_data = json.loads(nutrition_json or "{}")
+        if source_type != "user_meal_photo":
+            for key, value in nutrition_data.items():
+                if key in totals:
+                    totals[key] += float(value or 0)
         if not approval_id or not approval_fingerprint or approval_fingerprint != food_fp:
             continue
         approved_data = json.loads(approved_json or "{}")
@@ -2291,6 +2346,10 @@ def daily_consumed_totals(
             continue
         for key, value in expected_applied.items():
             totals[key] += value
+        if source_type == "user_meal_photo":
+            for key, value in nutrition_data.items():
+                if key in totals:
+                    totals[key] += float(value or 0)
     return {key: round(value, 4) for key, value in totals.items()}
 
 

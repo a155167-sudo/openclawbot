@@ -2003,7 +2003,7 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
         assert all(r[0] == "早餐" for r in rows)
 
 
-def test_dashboard_lists_today_approved_meal_photo_without_inventing_macros(tmp_path, monkeypatch):
+def test_dashboard_counts_approved_meal_photo_estimates_once_including_legacy_na_snapshot(tmp_path, monkeypatch):
     db_dir = tmp_path / "photo-dashboard"
     db = db_dir / "health.db"
     monkeypatch.setattr(server, "DB_DIR", str(db_dir))
@@ -2044,6 +2044,10 @@ def test_dashboard_lists_today_approved_meal_photo_without_inventing_macros(tmp_
                 "fat_exchange": 0,
             },
         )
+        # 模擬上線前已核准、但 nutrition_snapshot_json 仍為空的舊照片紀錄。
+        conn.execute(
+            "UPDATE food_logs SET nutrition_snapshot_json='{}' WHERE source_image_ref='photo.jpg'"
+        )
         taipei_0030 = server.tw_now().replace(hour=0, minute=30, second=0, microsecond=0)
         insert_approved_meal_photo_log(
             conn,
@@ -2079,8 +2083,12 @@ def test_dashboard_lists_today_approved_meal_photo_without_inventing_macros(tmp_
         "餐點照片：UTC跨日雞胸",
     }
     assert dashboard["recorded_count"] == 2
-    assert dashboard["extra_cal"] == 0
-    assert dashboard["extra_pro"] == 0
+    assert dashboard["extra_cal"] == 293.0
+    assert dashboard["extra_pro"] == 24.0
+
+    replayed_dashboard = server.get_dashboard_data("U1")
+    assert replayed_dashboard["extra_cal"] == 293.0
+    assert replayed_dashboard["extra_pro"] == 24.0
 
 
 def test_dashboard_excludes_other_user_old_unconfirmed_and_non_photo_logs(tmp_path, monkeypatch):
@@ -2129,6 +2137,18 @@ def test_dashboard_excludes_other_user_old_unconfirmed_and_non_photo_logs(tmp_pa
             "UPDATE food_catalog SET source_type='user_private_food' WHERE food_id=?",
             (non_photo["food_id"],),
         )
+        tampered = add_photo(conn, "e00000000001", "U1", "驗證鏈被改過", f"{today}T11:00:00+08:00")
+        conn.execute(
+            "UPDATE food_exchange_approvals SET approved_exchange_hash='tampered' WHERE approval_id=?",
+            (tampered["approval_id"],),
+        )
+        fingerprint_tampered = add_photo(
+            conn, "f00000000001", "U1", "指紋鏈被改過", f"{today}T12:00:00+08:00"
+        )
+        conn.execute(
+            "UPDATE food_exchange_approvals SET food_fingerprint='tampered' WHERE approval_id=?",
+            (fingerprint_tampered["approval_id"],),
+        )
         conn.commit()
 
     dashboard = server.get_dashboard_data("U1")
@@ -2137,6 +2157,121 @@ def test_dashboard_excludes_other_user_old_unconfirmed_and_non_photo_logs(tmp_pa
     assert dashboard["recorded_count"] == 0
     assert dashboard["extra_cal"] == 0
     assert dashboard["extra_pro"] == 0
+
+
+def test_meal_photo_final_confirmation_cards_show_exchange_estimate_and_confirm_button():
+    draft = {
+        "token": "abcdef123456",
+        "version": 8,
+        "consumed_at": "2026-08-02T12:00:00+08:00",
+        "review": {
+            "protein_class": "low",
+            "protein_exchange": 3,
+            "starch_exchange": 1.5,
+            "vegetable_exchange": 0.5,
+            "milk_exchange": 0,
+            "fruit_exchange": 0,
+        },
+    }
+    ready = server.build_meal_photo_review_ready_bubble(draft)
+    ready_text = json.dumps(ready, ensure_ascii=False)
+    assert "確認加入正式份量" in ready_text
+    assert "代換估算" in ready_text
+    assert "279 kcal" in ready_text
+    assert "蛋白質 24.5g" in ready_text
+    assert "NA" not in ready_text
+
+    approved = server.build_meal_photo_approved_bubble(
+        draft,
+        {
+            "approved_exchange": {
+                "protein_low_exchange": 3,
+                "starch_exchange": 1.5,
+                "vegetable_exchange": 0.5,
+                "milk_exchange": 0,
+                "fruit_exchange": 0,
+            },
+            "estimated_nutrition": {
+                "calories_kcal": 279,
+                "protein_g": 24.5,
+                "fat_g": 9,
+                "carbohydrate_g": 25,
+            },
+        },
+    )
+    approved_text = json.dumps(approved, ensure_ascii=False)
+    assert "代換估算" in approved_text
+    assert "279 kcal" in approved_text
+    assert "蛋白質 24.5g" in approved_text
+    assert "NA" not in approved_text
+
+
+def test_forged_meal_photo_review_postback_is_rejected_before_database_access(monkeypatch):
+    monkeypatch.setattr(server, "ADMIN_UID", "REAL_ADMIN")
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
+
+    def forbidden_connect(*_args, **_kwargs):
+        raise AssertionError("非管理員請求不應進入資料庫審核流程")
+
+    monkeypatch.setattr(server.sqlite3, "connect", forbidden_connect)
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data="mpr:v1:abcdef123456:8:approve"),
+        source=SimpleNamespace(user_id="REGULAR_USER"),
+        reply_token="REPLY",
+        webhook_event_id="FORGED-MPR-1",
+        timestamp=0,
+    )
+
+    server.handle_meal_photo_postback(event)
+
+    assert len(replies) == 1
+    assert "管理員限定" in replies[0].text
+
+
+
+def test_meal_photo_estimate_cards_disclose_low_fat_milk_assumption():
+    draft = {
+        "token": "abcdef123456",
+        "version": 8,
+        "consumed_at": "2026-08-02T12:00:00+08:00",
+        "review": {
+            "protein_class": "none",
+            "protein_exchange": 0,
+            "starch_exchange": 0,
+            "vegetable_exchange": 0,
+            "milk_exchange": 1,
+            "fruit_exchange": 0,
+        },
+    }
+    ready_text = json.dumps(server.build_meal_photo_review_ready_bubble(draft), ensure_ascii=False)
+    approved_text = json.dumps(
+        server.build_meal_photo_approved_bubble(
+            draft,
+            {
+                "approved_exchange": {
+                    "milk_exchange": 1,
+                    "protein_low_exchange": 0,
+                    "protein_medium_exchange": 0,
+                    "protein_high_exchange": 0,
+                    "starch_exchange": 0,
+                    "vegetable_exchange": 0,
+                    "fruit_exchange": 0,
+                    "fat_exchange": 0,
+                },
+                "estimated_nutrition": {
+                    "calories_kcal": 116,
+                    "protein_g": 8,
+                    "fat_g": 4,
+                    "carbohydrate_g": 12,
+                    "_warnings": ["milk_assumed_low_fat"],
+                },
+            },
+        ),
+        ensure_ascii=False,
+    )
+    assert "奶類以低脂奶估算" in ready_text
+    assert "奶類以低脂奶估算" in approved_text
 
 
 def test_dashboard_frequent_breakfast_combo_logs_three_foods(tmp_path, monkeypatch):

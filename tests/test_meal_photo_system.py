@@ -510,12 +510,14 @@ def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
         with pytest.raises(PermissionError):
             apply_meal_photo_review_action(
                 conn, event_id="UNAUTHORIZED", user_id="U_ADMIN", admin_user_id="OTHER",
+                required_admin_user_id="U_ADMIN",
                 token=token, expected_version=8, action="start",
             )
         assert get_meal_photo_draft(conn, user_id="U_ADMIN", token=token)["version"] == 8
 
         started = apply_meal_photo_review_action(
             conn, event_id="REVIEW-START", user_id="U_ADMIN", admin_user_id="U_ADMIN",
+            required_admin_user_id="U_ADMIN",
             token=token, expected_version=8, action="start",
         )
         assert started["result"] == {"kind": "review_question", "step": "protein_class", "version": 9}
@@ -534,6 +536,7 @@ def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
             assert value in option_values
             current = apply_meal_photo_review_action(
                 conn, event_id=f"REVIEW-{field}", user_id="U_ADMIN", admin_user_id="U_ADMIN",
+                required_admin_user_id="U_ADMIN",
                 token=token, expected_version=offset, action="set", field=field, value=value,
             )
         assert current["result"]["kind"] == "review_ready"
@@ -541,9 +544,12 @@ def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
 
         approved = apply_meal_photo_review_action(
             conn, event_id="REVIEW-APPROVE", user_id="U_ADMIN", admin_user_id="U_ADMIN",
+            required_admin_user_id="U_ADMIN",
             token=token, expected_version=14, action="approve",
         )
         assert approved["result"]["kind"] == "approved"
+        assert approved["result"]["estimated_nutrition"]["calories_kcal"] == 590.5
+        assert approved["result"]["estimated_nutrition"]["protein_g"] == 29.5
         assert approved["draft"]["status"] == "approved"
         assert approved["draft"]["approved_log_id"]
         totals = daily_consumed_totals(conn, user_id="U_ADMIN", date_iso="2026-07-23")
@@ -554,10 +560,27 @@ def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
 
         replay = apply_meal_photo_review_action(
             conn, event_id="REVIEW-APPROVE", user_id="U_ADMIN", admin_user_id="U_ADMIN",
+            required_admin_user_id="U_ADMIN",
             token=token, expected_version=14, action="approve",
         )
         assert replay["replayed"] is True
+        assert replay["result"]["estimated_nutrition"] == approved["result"]["estimated_nutrition"]
         assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+
+
+def test_review_action_rejects_actor_who_is_not_configured_admin():
+    with sqlite3.connect(":memory:") as conn:
+        with pytest.raises(PermissionError, match="管理員限定"):
+            apply_meal_photo_review_action(
+                conn,
+                event_id="FORGED-REVIEW",
+                user_id="REGULAR_USER",
+                admin_user_id="REGULAR_USER",
+                required_admin_user_id="REAL_ADMIN",
+                token="abcdef123456",
+                expected_version=1,
+                action="start",
+            )
 
 
 def test_action_rolls_back_draft_when_event_insert_fails(tmp_path):

@@ -15,6 +15,7 @@ from nutrition_system import (
     daily_consumed_totals,
     daily_food_summary,
     ensure_nutrition_schema,
+    estimate_nutrition_from_exchanges,
     food_fingerprint,
     insert_approved_meal_photo_log,
     get_latest_awaiting_identity,
@@ -913,7 +914,26 @@ def test_nutrition_text_edit_message_is_replayable():
     assert replay["label"]["per_serving"]["sodium_mg"] == 48
 
 
-def test_insert_approved_meal_photo_log_uses_verified_approval_chain_and_na_nutrients():
+def test_estimate_nutrition_from_approved_exchanges_uses_versioned_macro_rules():
+    estimate = estimate_nutrition_from_exchanges({
+        "milk_exchange": 0,
+        "protein_low_exchange": 3,
+        "protein_medium_exchange": 0,
+        "protein_high_exchange": 0,
+        "starch_exchange": 1.5,
+        "vegetable_exchange": 0.5,
+        "fruit_exchange": 0,
+        "fat_exchange": 0,
+    })
+    assert estimate["calories_kcal"] == 279.0
+    assert estimate["protein_g"] == 24.5
+    assert estimate["fat_g"] == 9.0
+    assert estimate["carbohydrate_g"] == 25.0
+    assert estimate["_estimate_type"] == "approved_exchange_estimate"
+    assert estimate["_rule_version"] == "tw-exchange-macros-v1"
+
+
+def test_insert_approved_meal_photo_log_uses_verified_approval_chain_and_estimated_nutrients():
     conn = sqlite3.connect(":memory:")
     ensure_nutrition_schema(conn)
     exact = {
@@ -950,7 +970,8 @@ def test_insert_approved_meal_photo_log_uses_verified_approval_chain_and_na_nutr
     assert totals["protein_medium_exchange"] == 2.5
     assert totals["starch_exchange"] == 6.0
     assert totals["vegetable_exchange"] == 1.0
-    assert totals["calories_kcal"] == 0.0
+    assert totals["calories_kcal"] == 614.5
+    assert totals["protein_g"] == 30.5
     row = conn.execute(
         """SELECT f.source_type,l.nutrition_snapshot_json,l.legacy_applied_at,
                   l.exchange_approval_id,a.approved_exchange_hash
@@ -960,7 +981,10 @@ def test_insert_approved_meal_photo_log_uses_verified_approval_chain_and_na_nutr
         (result["log_id"],),
     ).fetchone()
     assert row[0] == "user_meal_photo"
-    assert row[1] == "{}"
+    nutrition = __import__("json").loads(row[1])
+    assert nutrition["calories_kcal"] == 614.5
+    assert nutrition["protein_g"] == 30.5
+    assert nutrition["_estimate_type"] == "approved_exchange_estimate"
     assert row[2] == "not_applicable"
     assert row[3] == result["approval_id"]
 
@@ -971,6 +995,8 @@ def test_insert_approved_meal_photo_log_uses_verified_approval_chain_and_na_nutr
     tampered = daily_consumed_totals(conn, user_id="U_MEAL", date_iso="2026-07-23")
     assert tampered["protein_medium_exchange"] == 0.0
     assert tampered["starch_exchange"] == 0.0
+    assert tampered["calories_kcal"] == 0.0
+    assert tampered["protein_g"] == 0.0
 
 
 def test_search_food_catalog_returns_user_foods_by_name_prefix():

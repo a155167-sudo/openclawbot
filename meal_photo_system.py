@@ -824,6 +824,7 @@ def apply_meal_photo_review_action(
     event_id: str,
     user_id: str,
     admin_user_id: str,
+    required_admin_user_id: str,
     token: str,
     expected_version: int,
     action: str,
@@ -836,7 +837,13 @@ def apply_meal_photo_review_action(
     event_id = _short_text(event_id, "event_id", maximum=180)
     user_id = _short_text(user_id, "user_id", maximum=120)
     admin_user_id = _short_text(admin_user_id, "admin_user_id", maximum=120)
-    if user_id != admin_user_id:
+    required_admin_user_id = str(required_admin_user_id or "").strip()
+    if (
+        not required_admin_user_id
+        or len(required_admin_user_id) > 120
+        or admin_user_id != required_admin_user_id
+        or user_id != admin_user_id
+    ):
         raise PermissionError("管理員限定，且目前只能核准自己的餐點照片")
     if not re.fullmatch(r"[0-9a-f]{12}", str(token or "")):
         raise ValueError("餐點草稿token無效")
@@ -950,6 +957,7 @@ def apply_meal_photo_review_action(
                 "log_id": formal_result["log_id"],
                 "approval_id": formal_result["approval_id"],
                 "approved_exchange": exact,
+                "estimated_nutrition": formal_result["estimated_nutrition"],
             }
         changed = conn.execute(
             """UPDATE pending_meal_photo_drafts

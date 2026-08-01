@@ -41,6 +41,7 @@ from nutrition_system import (
     daily_consumed_totals,
     daily_food_summary,
     ensure_nutrition_schema,
+    estimate_nutrition_from_exchanges,
     exchange_approval_hash,
     get_nutrition_input_state,
     normalize_garmin_payload,
@@ -4030,6 +4031,8 @@ def get_dashboard_data(user_id: str) -> dict:
     workout_done = False
     frequent_foods = []
     approved_photo_foods = []
+    approved_photo_cal = 0.0
+    approved_photo_pro = 0.0
     today_str = tw_today().isoformat()
 
     # 🌟 優化：將原本散落的 3 次資料庫連線，合併成 1 次安全連線！
@@ -4063,19 +4066,38 @@ def get_dashboard_data(user_id: str) -> dict:
                 pass
 
             # 4. 照片餐點只有在管理員完成精確份量核准後，才從正式 food_logs 顯示。
-            # 餐點照片沒有可靠熱量／三大營養素，因此只合併名稱與餐次，不杜撰數值。
+            # 營養值只從通過 approval hash 的核准交換份重算，舊NA快照亦可安全納入。
             try:
                 c.execute(
-                    """SELECT fc.product_name
+                    """SELECT fc.product_name,fc.fingerprint,a.food_fingerprint,
+                              a.suggestion_rule_version,a.approved_exchange_json,
+                              a.approved_exchange_hash
                        FROM food_logs fl
                        JOIN food_catalog fc ON fc.food_id=fl.food_id
+                       JOIN food_exchange_approvals a
+                         ON a.approval_id=fl.exchange_approval_id AND a.food_id=fl.food_id
                        WHERE fl.user_id=? AND date(fl.consumed_at, '+8 hours')=?
                          AND fl.confirmation_status='confirmed'
                          AND fc.source_type='user_meal_photo'
                        ORDER BY fl.consumed_at, fl.created_at""",
                     (user_id, today_str),
                 )
-                approved_photo_foods = [str(r[0]).strip() for r in c.fetchall() if str(r[0]).strip()]
+                for row in c.fetchall():
+                    try:
+                        if str(row[2] or "") != str(row[1] or ""):
+                            continue
+                        approved_exchange = json.loads(row[4] or "{}")
+                        expected_hash = exchange_approval_hash(row[2], row[3], approved_exchange)
+                        if not secrets.compare_digest(str(row[5] or ""), expected_hash):
+                            continue
+                        estimated = estimate_nutrition_from_exchanges(approved_exchange)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    product_name = str(row[0] or "").strip()
+                    if product_name:
+                        approved_photo_foods.append(product_name)
+                    approved_photo_cal += float(estimated["calories_kcal"])
+                    approved_photo_pro += float(estimated["protein_g"])
             except Exception:
                 pass
 
@@ -4090,6 +4112,9 @@ def get_dashboard_data(user_id: str) -> dict:
 
     if today_date != today_str:
         extra_cal, extra_pro, food_items = 0, 0, ""
+
+    extra_cal = round(float(extra_cal) + approved_photo_cal, 4)
+    extra_pro = round(float(extra_pro) + approved_photo_pro, 4)
 
     cal_remaining = max(0, tdee - extra_cal)
     pro_remaining = max(0, protein_goal - extra_pro)
@@ -8065,6 +8090,7 @@ def build_meal_photo_review_ready_bubble(draft):
     token, version = draft["token"], draft["version"]
     review = draft.get("review") or {}
     exact = _meal_photo_exact_exchange(review)
+    estimated = estimate_nutrition_from_exchanges(exact)
     consumed_at = str(draft.get("consumed_at") or "").replace("T", " ")[:16] or "待確認"
 
     def _kv(label, value):
@@ -8090,7 +8116,19 @@ def build_meal_photo_review_ready_bubble(draft):
     body_contents.append(_kv("蔬菜", _exchange_label(exact["vegetable_exchange"], "蔬菜")))
     body_contents.append(_kv("水果", _exchange_label(exact["fruit_exchange"], "水果")))
     body_contents.append(_kv("奶類", _exchange_label(exact["milk_exchange"], "奶類")))
-    body_contents.append({"type": "text", "text": "⚠️ 熱量／蛋白質／脂肪／碳水：NA", "size": "xs", "color": "#B00020", "wrap": True})
+    body_contents.append({
+        "type": "text",
+        "text": f"📊 代換估算：{estimated['calories_kcal']:g} kcal｜蛋白質 {estimated['protein_g']:g}g",
+        "size": "xs", "color": "#0F766E", "weight": "bold", "wrap": True,
+    })
+    body_contents.append({
+        "type": "text",
+        "text": f"脂肪 {estimated['fat_g']:g}g｜碳水 {estimated['carbohydrate_g']:g}g",
+        "size": "xs", "color": "#555555", "wrap": True,
+    })
+    body_contents.append({"type": "text", "text": "⚠️ 未含未量化的烹調油與醬料", "size": "xs", "color": "#B45309", "wrap": True})
+    if "milk_assumed_low_fat" in estimated.get("_warnings", []):
+        body_contents.append({"type": "text", "text": "ℹ️ 奶類以低脂奶估算", "size": "xs", "color": "#1D4ED8", "wrap": True})
     body_contents.append({"type": "text", "text": "油脂份：0份（目前不計入）", "size": "xs", "color": "#777777"})
     body_contents.append({"type": "text", "text": "按『確認加入』後才會計入每日總量。", "size": "xs", "color": "#777777", "wrap": True})
 
@@ -8121,6 +8159,7 @@ def build_meal_photo_approved_bubble(draft, result):
     token = draft["token"]
     consumed_at = str(draft.get("consumed_at") or "").replace("T", " ")[:16] or "待確認"
     exact = result.get("approved_exchange") or {}
+    estimated = result.get("estimated_nutrition") or estimate_nutrition_from_exchanges(exact)
 
     def _kv(label, value):
         return {"type": "box", "layout": "horizontal", "contents": [
@@ -8138,7 +8177,19 @@ def build_meal_photo_approved_bubble(draft, result):
     body_contents.append(_kv("蔬菜", f"{exact.get('vegetable_exchange', 0):g}份"))
     body_contents.append(_kv("水果", f"{exact.get('fruit_exchange', 0):g}份"))
     body_contents.append(_kv("奶類", f"{exact.get('milk_exchange', 0):g}份"))
-    body_contents.append({"type": "text", "text": "🔥 熱量／蛋白質／脂肪／碳水：NA", "size": "xs", "color": "#B00020", "wrap": True})
+    body_contents.append({
+        "type": "text",
+        "text": f"📊 代換估算：{estimated['calories_kcal']:g} kcal｜蛋白質 {estimated['protein_g']:g}g",
+        "size": "xs", "color": "#0F766E", "weight": "bold", "wrap": True,
+    })
+    body_contents.append({
+        "type": "text",
+        "text": f"脂肪 {estimated['fat_g']:g}g｜碳水 {estimated['carbohydrate_g']:g}g",
+        "size": "xs", "color": "#555555", "wrap": True,
+    })
+    body_contents.append({"type": "text", "text": "⚠️ 未含未量化的烹調油與醬料", "size": "xs", "color": "#B45309", "wrap": True})
+    if "milk_assumed_low_fat" in estimated.get("_warnings", []):
+        body_contents.append({"type": "text", "text": "ℹ️ 奶類以低脂奶估算", "size": "xs", "color": "#1D4ED8", "wrap": True})
     body_contents.append({"type": "text", "text": "✅ 已計入正式份量與每日總量", "size": "sm", "color": "#166534", "weight": "bold", "wrap": True})
     body_contents.append({"type": "text", "text": f"核准時間：{datetime.now(TW_TZ).strftime('%Y/%m/%d %H:%M')}", "size": "xs", "color": "#777777"})
 
@@ -8249,6 +8300,12 @@ def handle_meal_photo_postback(event):
         event_id = "postback:" + hashlib.sha256(fallback.encode()).hexdigest()
     try:
         if review_start or review_set or review_cancel or review_approve:
+            if not ADMIN_UID or uid != ADMIN_UID:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="⚠️ 管理員限定，無法執行餐點審核。"),
+                )
+                return
             matched = review_start or review_set or review_cancel or review_approve
             assert matched is not None
             token, version = matched.group(1), int(matched.group(2))
@@ -8264,6 +8321,7 @@ def handle_meal_photo_postback(event):
             with sqlite3.connect(DB_PATH) as conn:
                 applied = apply_meal_photo_review_action(
                     conn, event_id=event_id, user_id=uid, admin_user_id=uid,
+                    required_admin_user_id=ADMIN_UID,
                     token=token, expected_version=version, action=action,
                     field=field, value=value,
                 )
