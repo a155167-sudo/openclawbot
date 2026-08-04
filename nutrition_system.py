@@ -1942,7 +1942,8 @@ def quick_log_from_catalog(
             """SELECT product_name,brand,package_amount,package_unit,servings_per_package,
                       per_serving_json,exchange_json,exchange_review_status,
                       source_type,fingerprint
-               FROM food_catalog WHERE food_id=? AND owner_user_id=?""",
+               FROM food_catalog
+               WHERE food_id=? AND (owner_user_id=? OR visibility='public')""",
             (food_id, user_id),
         ).fetchone()
         if not food:

@@ -27,6 +27,7 @@ from nutrition_system import (
     nutrition_consistency_warnings,
     nutrition_sheet_specs,
     rank_menu_candidates,
+    quick_log_from_catalog,
     remaining_targets,
     save_pending_label,
     scale_nutrition,
@@ -1094,3 +1095,38 @@ def test_search_food_catalog_includes_meal_photo_synthetic():
     assert len(results) == 1
     assert results[0]["source_type"] == "user_meal_photo"
     assert "雞肉" in results[0]["product_name"]
+
+
+def test_quick_log_allows_public_system_menu_item():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    now = utcish_now()
+    food_id = "menu_lowcarb01"
+    conn.execute(
+        """INSERT INTO food_catalog
+           (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+            package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+            exchange_json,exchange_review_status,fingerprint,original_image_ref,
+            recognition_confidence,verification_status,created_at,updated_at)
+           VALUES (?,'低碳嫩雞餐','','','label','system','public',1,'份',1,
+                   '{"calories_kcal":350,"protein_g":35}','{}','{}','approved',
+                   'fp_public_lowcarb','',1,'auto',?,?)""",
+        (food_id, now, now),
+    )
+    conn.commit()
+
+    result = quick_log_from_catalog(
+        conn,
+        user_id="U_CUSTOMER",
+        food_id=food_id,
+        consumed_servings=1.5,
+        meal_slot="午餐",
+        consumed_at="2026-08-04T12:00:00+08:00",
+    )
+
+    assert result["product_name"] == "低碳嫩雞餐"
+    assert result["nutrition"]["calories_kcal"] == 525
+    row = conn.execute(
+        "SELECT user_id,food_id,consumed_servings,meal_slot FROM food_logs"
+    ).fetchone()
+    assert row == ("U_CUSTOMER", food_id, 1.5, "午餐")
