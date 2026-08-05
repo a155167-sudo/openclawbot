@@ -3457,16 +3457,18 @@ def add_frequent_food_to_today(user_id: str, meal_name: str):
             return None, "找不到這筆常吃食物。"
         cal, pro = row
 
-        c.execute("SELECT today_extra_cal, today_extra_pro, today_food_items, tdee, protein FROM health_profile WHERE user_id=?", (user_id,))
+        c.execute("SELECT today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein FROM health_profile WHERE user_id=?", (user_id,))
         hp = c.fetchone()
         if not hp:
             return None, "找不到你的健康資料。"
 
-        today_extra_cal, today_extra_pro, today_food_items, tdee, protein_goal = hp
+        today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein_goal = hp
+        today = tw_today().isoformat()
+        if today_date != today:
+            today_extra_cal, today_extra_pro, today_food_items = 0, 0, ""
         new_extra_cal = (today_extra_cal or 0) + (cal or 0)
         new_extra_pro = (today_extra_pro or 0) + (pro or 0)
         new_food_items = f"{today_food_items}、{meal_name}".strip("、") if today_food_items else meal_name
-        today = tw_today().isoformat()
 
         c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=?, today_date=? WHERE user_id=?",
                   (new_extra_cal, new_extra_pro, new_food_items, today, user_id))
@@ -3617,12 +3619,14 @@ def mark_planned_meal_as_eaten(user_id: str, meal_slot: str):
             if c.fetchone():
                 return None, f"今天的{meal_slot}已經確認過了。"
 
-            c.execute("SELECT today_extra_cal, today_extra_pro, today_food_items, tdee, protein FROM health_profile WHERE user_id=?", (user_id,))
+            c.execute("SELECT today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein FROM health_profile WHERE user_id=?", (user_id,))
             hp = c.fetchone()
             if not hp:
                 return None, "找不到你的健康資料。"
 
-            today_extra_cal, today_extra_pro, today_food_items, tdee, protein_goal = hp
+            today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein_goal = hp
+            if today_date != today:
+                today_extra_cal, today_extra_pro, today_food_items = 0, 0, ""
             new_extra_cal = (today_extra_cal or 0) + (cal or 0)
             new_extra_pro = (today_extra_pro or 0) + (pro or 0)
             new_food_items = f"{today_food_items}、{meal_name}".strip("、") if today_food_items else meal_name

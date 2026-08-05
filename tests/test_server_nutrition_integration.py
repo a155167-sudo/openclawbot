@@ -245,6 +245,81 @@ def test_legacy_dashboard_is_idempotent(tmp_path, monkeypatch):
     assert flex_calls[0][1]["exchange_text"] == "低脂蛋白 2.71份｜主食 0.53份"
 
 
+def test_add_frequent_food_resets_stale_dashboard_totals_before_first_log(tmp_path, monkeypatch):
+    db = tmp_path / "frequent-food-cross-day.db"
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        conn.executescript("""
+            CREATE TABLE health_profile (
+                user_id TEXT PRIMARY KEY, today_extra_cal REAL, today_extra_pro REAL,
+                today_food_items TEXT, today_date TEXT, tdee REAL, protein REAL);
+            CREATE TABLE frequent_foods (
+                user_id TEXT, meal_name TEXT, last_cal REAL, last_pro REAL,
+                use_count INTEGER DEFAULT 1, last_used_at TEXT,
+                PRIMARY KEY (user_id, meal_name));
+            CREATE TABLE recent_meal_logs (
+                user_id TEXT PRIMARY KEY, meal_name TEXT, base_cal REAL, base_pro REAL,
+                current_cal REAL, current_pro REAL, meal_date TEXT,
+                source_text TEXT, updated_at TEXT);
+        """)
+        conn.execute(
+            "INSERT INTO health_profile VALUES ('U1',900,60,'昨天早餐、昨天晚餐','2000-01-01',2000,100)"
+        )
+        conn.execute(
+            "INSERT INTO frequent_foods VALUES ('U1','無糖優格',62,4,1,'2000-01-01')"
+        )
+        conn.commit()
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "build_meal_log_flex", lambda *args, **kwargs: {"ok": True})
+
+    server.add_frequent_food_to_today("U1", "無糖優格")
+
+    with sqlite3.connect(db) as conn:
+        values = conn.execute(
+            "SELECT today_extra_cal,today_extra_pro,today_food_items,today_date "
+            "FROM health_profile WHERE user_id='U1'"
+        ).fetchone()
+    assert values == (62.0, 4.0, "無糖優格", today)
+
+
+def test_mark_planned_meal_resets_stale_dashboard_totals_before_first_log(tmp_path, monkeypatch):
+    db = tmp_path / "planned-meal-cross-day.db"
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        conn.executescript("""
+            CREATE TABLE health_profile (
+                user_id TEXT PRIMARY KEY, today_extra_cal REAL, today_extra_pro REAL,
+                today_food_items TEXT, today_date TEXT, tdee REAL, protein REAL);
+            CREATE TABLE planned_meal_checks (
+                user_id TEXT, meal_date TEXT, meal_slot TEXT, meal_name TEXT,
+                cal REAL, pro REAL, checked_at TEXT,
+                PRIMARY KEY (user_id, meal_date, meal_slot));
+            CREATE TABLE recent_meal_logs (
+                user_id TEXT PRIMARY KEY, meal_name TEXT, base_cal REAL, base_pro REAL,
+                current_cal REAL, current_pro REAL, meal_date TEXT,
+                source_text TEXT, updated_at TEXT);
+        """)
+        conn.execute(
+            "INSERT INTO health_profile VALUES ('U1',900,60,'昨天早餐、昨天晚餐','2000-01-01',2000,100)"
+        )
+        conn.commit()
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(
+        server, "get_dashboard_data",
+        lambda user_id: {"today_lunch": "舒肥雞胸餐", "lunch_cal": 500, "lunch_pro": 40},
+    )
+    monkeypatch.setattr(server, "build_meal_log_flex", lambda *args, **kwargs: {"ok": True})
+
+    server.mark_planned_meal_as_eaten("U1", "午餐")
+
+    with sqlite3.connect(db) as conn:
+        values = conn.execute(
+            "SELECT today_extra_cal,today_extra_pro,today_food_items,today_date "
+            "FROM health_profile WHERE user_id='U1'"
+        ).fetchone()
+    assert values == (500.0, 40.0, "舒肥雞胸餐", today)
+
+
 def test_health_check_uses_configured_sqlite_schema(tmp_path, monkeypatch):
     data_dir = tmp_path / "volume"
     db_path = data_dir / "health.db"
