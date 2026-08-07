@@ -630,6 +630,7 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             source_type TEXT NOT NULL DEFAULT 'user_private_food',
             owner_user_id TEXT DEFAULT '',
             visibility TEXT NOT NULL DEFAULT 'private',
+            menu_category TEXT NOT NULL DEFAULT '',
             package_amount REAL DEFAULT 0,
             package_unit TEXT DEFAULT '',
             servings_per_package REAL DEFAULT 1,
@@ -778,7 +779,7 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         """
     )
     schema_component = "nutrition_system"
-    schema_version = 4
+    schema_version = 5
     version_row = conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component=?",
         (schema_component,),
@@ -806,6 +807,9 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             "plan_link_status": "TEXT NOT NULL DEFAULT 'pending'",
             "approved_exchange_json": "TEXT NOT NULL DEFAULT '{}'",
             "exchange_approval_id": "TEXT DEFAULT ''",
+        },
+        "food_catalog": {
+            "menu_category": "TEXT NOT NULL DEFAULT ''",
         },
         "nutrition_message_events": {
             "result_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -919,6 +923,10 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_identity_message
            ON pending_nutrition_logs(identity_message_id)
            WHERE identity_message_id <> ''"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_food_catalog_menu_category
+           ON food_catalog(menu_category)"""
     )
     conn.execute(
         """INSERT INTO nutrition_schema_versions(component,version,applied_at)
@@ -2146,17 +2154,22 @@ def search_food_history(
 
 def search_food_page(
     conn: sqlite3.Connection, *, user_id: str, query: str,
-    limit: int = 11, offset: int = 0,
+    menu_category: str = "", limit: int = 11, offset: int = 0,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """以單一SQL分頁搜尋，歷史常吃優先；多取一筆判斷下一頁。"""
+    """以單一SQL分頁搜尋，歷史常吃優先；可按菜單分類篩選。"""
     user_id = str(user_id or "").strip()
     query = str(query or "").strip()
-    if not user_id or not query:
+    menu_category = str(menu_category or "").strip()
+    if menu_category not in {"", "main", "side", "drink"}:
+        return [], False
+    if not user_id or (not query and not menu_category):
         return [], False
     limit = max(1, min(int(limit or 11), 50))
     offset = max(0, min(int(offset or 0), 10000))
+    category_clause = "f.menu_category=?" if menu_category else "f.product_name LIKE ?"
+    category_value = menu_category if menu_category else f"%{query}%"
     rows = conn.execute(
-        """SELECT f.food_id,f.product_name,f.brand,f.barcode,f.source_type,f.owner_user_id,
+        f"""SELECT f.food_id,f.product_name,f.brand,f.barcode,f.source_type,f.owner_user_id,
                   f.package_amount,f.package_unit,f.servings_per_package,
                   f.per_serving_json,f.exchange_json,f.exchange_review_status,
                   f.created_at,f.updated_at,
@@ -2167,12 +2180,12 @@ def search_food_page(
              ON l.food_id=f.food_id AND l.user_id=?
             AND l.confirmation_status='confirmed'
            WHERE (f.owner_user_id=? OR f.visibility='public')
-             AND f.product_name LIKE ?
+             AND {category_clause}
            GROUP BY f.food_id
            ORDER BY CASE WHEN COUNT(l.log_id)>0 THEN 0 ELSE 1 END,
                     use_count DESC,last_consumed_at DESC,f.updated_at DESC,f.food_id
            LIMIT ? OFFSET ?""",
-        (user_id, user_id, f"%{query}%", limit + 1, offset),
+        (user_id, user_id, category_value, limit + 1, offset),
     ).fetchall()
     has_more = len(rows) > limit
     rows = rows[:limit]

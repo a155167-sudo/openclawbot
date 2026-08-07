@@ -1601,7 +1601,10 @@ def load_menu():
                     price = int(row_clean.get("價錢", row_clean.get("價格", "150")).strip() or 150)
                     ingredients = row_clean.get("內容物", "新鮮食材製作").strip()
                     main_keywords = ["便當", "麵", "食蔬", "低碳", "沙拉", "原型"]
-                    if any(kw in name for kw in main_keywords):
+                    drink_keywords = ["豆漿", "茶"]
+                    if any(kw in name for kw in drink_keywords):
+                        category = "drink"
+                    elif any(kw in name for kw in main_keywords):
                         category = "main"
                     else:
                         category = "side"
@@ -1649,11 +1652,22 @@ def sync_menu_to_food_catalog():
             inserted = 0
             for dish in MAIN_DISHES:
                 name = dish["name"]
+                menu_category = str(dish.get("category") or "").strip()
+                if menu_category not in {"main", "side", "drink"}:
+                    menu_category = "side"
                 existing = conn.execute(
-                    "SELECT food_id FROM food_catalog WHERE product_name=? AND source_type='label'",
+                    """SELECT food_id FROM food_catalog
+                       WHERE product_name=? AND source_type='label'
+                         AND owner_user_id='system'""",
                     (name,),
                 ).fetchone()
                 if existing:
+                    conn.execute(
+                        """UPDATE food_catalog
+                           SET menu_category=?, visibility='public'
+                           WHERE food_id=?""",
+                        (menu_category, existing[0]),
+                    )
                     continue
                 per_serving = {
                     "calories_kcal": dish.get("calories_kcal", 0),
@@ -1665,13 +1679,14 @@ def sync_menu_to_food_catalog():
                 conn.execute(
                     """INSERT INTO food_catalog
                        (food_id, product_name, brand, barcode, source_type, owner_user_id, visibility,
+                        menu_category,
                         package_amount, package_unit, servings_per_package, per_serving_json, per_100_json,
                         exchange_json, exchange_review_status, fingerprint, original_image_ref,
                         recognition_confidence, verification_status, created_at, updated_at)
-                       VALUES (?,?,'','','label','system','public',
+                       VALUES (?,?,'','','label','system','public',?,
                                1,'份',1,?,'{}',
                                '{}','approved',?,'',1.0,'auto',?,?)""",
-                    (fid, name, json.dumps(per_serving), fid, now, now),
+                    (fid, name, menu_category, json.dumps(per_serving), fid, now, now),
                 )
                 inserted += 1
             conn.commit()
@@ -9207,6 +9222,7 @@ def _handle_message_impl(event):
             page = max(1, int(raw_page))
             # 舊卡未攜帶條件時回到我的食物；新卡會保留 _my 或原關鍵字。
             query = str(next_page_match.group(2) or "_my").strip()
+        menu_category = {"單品": "side", "飲品": "drink"}.get(query, "")
         try:
             from linebot.models import FlexSendMessage
             page_limit = 11  # LINE carousel 最多12個bubble，保留1格給下一頁
@@ -9245,7 +9261,9 @@ def _handle_message_impl(event):
                     has_more = (offset + page_limit) < total
                 elif query:
                     catalog, has_more = search_food_page(
-                        conn, user_id=uid, query=query,
+                        conn, user_id=uid,
+                        query="" if menu_category else query,
+                        menu_category=menu_category,
                         limit=page_limit, offset=offset,
                     )
                     history = []

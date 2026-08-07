@@ -2329,6 +2329,184 @@ def test_line_text_handler_saves_checkin_and_supports_manual_report(tmp_path, mo
     assert replies[-1] == "MANUAL REPORT"
 
 
+def test_search_category_button_lists_single_items_instead_of_searching_literal_label(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "search-menu-category.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(
+        server,
+        "MAIN_DISHES",
+        [
+            {
+                "name": "雞肉", "category": "side", "calories_kcal": 85,
+                "protein_g": 18, "fat_g": 2, "carbohydrate_g": 0,
+            },
+            {
+                "name": "冷泡茶", "category": "drink", "calories_kcal": 2,
+                "protein_g": 0, "fat_g": 0, "carbohydrate_g": 0,
+            },
+            {
+                "name": "雞肉便當", "category": "main", "calories_kcal": 484,
+                "protein_g": 35, "fat_g": 19, "carbohydrate_g": 17,
+            },
+        ],
+    )
+    server.sync_menu_to_food_catalog()
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+
+    server._handle_message_impl(
+        _text_event("SEARCH-CATEGORY-MENU", "搜尋", user_id="U1")
+    )
+    menu_payload = json.loads(replies[-1].as_json_string())
+    single_action = next(
+        item["action"]["text"]
+        for item in menu_payload["contents"]["body"]["contents"]
+        if item.get("type") == "box"
+        for item in item.get("contents", [])
+        if item.get("action", {}).get("label") == "🔍 單品"
+    )
+    assert single_action == "搜尋 單品"
+
+    server._handle_message_impl(
+        _text_event("SEARCH-CATEGORY-SIDE", single_action, user_id="U1")
+    )
+    assert replies[-1].type == "flex"
+    result_payload = json.dumps(
+        json.loads(replies[-1].as_json_string()), ensure_ascii=False
+    )
+    assert "雞肉" in result_payload
+    assert "冷泡茶" not in result_payload
+    assert "雞肉便當" not in result_payload
+    assert "找不到「單品」" not in result_payload
+
+
+def test_search_drink_category_excludes_single_items_and_main_dishes(tmp_path, monkeypatch):
+    db = tmp_path / "search-drink-category.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(
+        server,
+        "MAIN_DISHES",
+        [
+            {
+                "name": "豆腐", "category": "side", "calories_kcal": 137,
+                "protein_g": 15, "fat_g": 6, "carbohydrate_g": 9,
+            },
+            {
+                "name": "燕麥豆漿", "category": "drink", "calories_kcal": 287,
+                "protein_g": 11.3, "fat_g": 5, "carbohydrate_g": 49,
+            },
+            {
+                "name": "豆腐便當", "category": "main", "calories_kcal": 536,
+                "protein_g": 32, "fat_g": 23, "carbohydrate_g": 26,
+            },
+        ],
+    )
+    server.sync_menu_to_food_catalog()
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+
+    server._handle_message_impl(
+        _text_event("SEARCH-CATEGORY-DRINK", "搜尋 飲品", user_id="U1")
+    )
+    assert replies[-1].type == "flex"
+    result_payload = json.dumps(
+        json.loads(replies[-1].as_json_string()), ensure_ascii=False
+    )
+    assert "燕麥豆漿" in result_payload
+    assert "豆腐便當" not in result_payload
+    assert '"text": "豆腐"' not in result_payload
+
+
+def test_search_single_item_category_paginates_without_losing_category(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "search-single-category-pages.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    side_names = [f"配菜{index:02d}" for index in range(1, 14)]
+    monkeypatch.setattr(
+        server,
+        "MAIN_DISHES",
+        [
+            {
+                "name": name, "category": "side", "calories_kcal": 50 + index,
+                "protein_g": 5, "fat_g": 1, "carbohydrate_g": 5,
+            }
+            for index, name in enumerate(side_names, start=1)
+        ],
+    )
+    server.sync_menu_to_food_catalog()
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+
+    server._handle_message_impl(
+        _text_event("SEARCH-CATEGORY-SIDE-P1", "搜尋 單品", user_id="U1")
+    )
+    page1 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
+    assert len(page1) == 12
+    next_action = page1[-1]["body"]["contents"][0]["action"]
+    assert next_action["text"] == "搜尋下一頁 2 單品"
+    page1_text = json.dumps(page1[:-1], ensure_ascii=False)
+
+    server._handle_message_impl(
+        _text_event(
+            "SEARCH-CATEGORY-SIDE-P2", next_action["text"], user_id="U1"
+        )
+    )
+    page2 = json.loads(replies[-1].as_json_string())["contents"]["contents"]
+    assert len(page2) == 2
+    page2_text = json.dumps(page2, ensure_ascii=False)
+    assert all((name in page1_text) != (name in page2_text) for name in side_names)
+
+
+def test_menu_category_sync_never_publicizes_same_named_private_label(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "menu-category-private-collision.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    now = utcish_now()
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        conn.execute(
+            """INSERT INTO food_catalog
+               (food_id,product_name,source_type,owner_user_id,visibility,
+                per_serving_json,per_100_json,exchange_json,exchange_review_status,
+                fingerprint,verification_status,created_at,updated_at)
+               VALUES ('food_private_chicken','雞肉','label','U_PRIVATE','private',
+                       '{}','{}','{}','approved','private-chicken','user_confirmed',?,?)""",
+            (now, now),
+        )
+    monkeypatch.setattr(
+        server,
+        "MAIN_DISHES",
+        [{
+            "name": "雞肉", "category": "side", "calories_kcal": 85,
+            "protein_g": 18, "fat_g": 2, "carbohydrate_g": 0,
+        }],
+    )
+
+    server.sync_menu_to_food_catalog()
+
+    with sqlite3.connect(db) as conn:
+        private_row = conn.execute(
+            """SELECT visibility,menu_category FROM food_catalog
+               WHERE food_id='food_private_chicken'"""
+        ).fetchone()
+        official_row = conn.execute(
+            """SELECT visibility,menu_category FROM food_catalog
+               WHERE product_name='雞肉' AND owner_user_id='system'"""
+        ).fetchone()
+    assert private_row == ("private", "")
+    assert official_row == ("public", "side")
+
+
 def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
     db = tmp_path / "search-relog.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
