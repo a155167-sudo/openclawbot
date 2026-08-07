@@ -674,13 +674,18 @@ def test_schema_v1_migrates_to_versioned_events_without_dropping_drafts(tmp_path
             """SELECT name FROM sqlite_master
                WHERE type='table' AND name='meal_photo_notification_events'"""
         ).fetchone()
+        claim_table = conn.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type='table' AND name='meal_photo_notification_claims'"""
+        ).fetchone()
     assert "version" in columns
     for col in ("review_json", "approved_log_id", "approved_at", "approved_by"):
         assert col in columns, f"migration should add {col}"
-    assert version == 4
+    assert version == 5
     assert draft == ("U1", "M1", 1)
     assert event_table == ("meal_photo_events",)
     assert notification_table == ("meal_photo_notification_events",)
+    assert claim_table == ("meal_photo_notification_claims",)
 
 
 def test_durable_cancel_scrubs_content_but_retains_image_reference_for_delete(tmp_path):
@@ -758,7 +763,7 @@ def test_configured_admin_can_review_another_users_meal_and_log_stays_with_owner
         )["vegetable_exchange"] == 0.0
 
 
-def test_pending_review_list_returns_all_users_estimated_drafts_only(tmp_path):
+def test_pending_review_list_includes_estimated_and_in_progress_drafts(tmp_path):
     with sqlite3.connect(tmp_path / "pending-review-list.db") as conn:
         first = save_meal_photo_draft(
             conn, user_id="U1", source_message_id="M1", payload=sample_payload()
@@ -771,3 +776,13 @@ def test_pending_review_list_returns_all_users_estimated_drafts_only(tmp_path):
         assert [item["token"] for item in pending] == [first]
         assert pending[0]["user_id"] == "U1"
         assert waiting not in [item["token"] for item in pending]
+        current = get_meal_photo_draft(conn, user_id="U1", token=first)
+        started = apply_meal_photo_review_action(
+            conn, event_id="ADMIN-START-PENDING", user_id="U1",
+            admin_user_id="U_ADMIN", required_admin_user_id="U_ADMIN",
+            token=first, expected_version=current["version"], action="start",
+        )
+        assert started["draft"]["status"] in {"reviewing", "review_ready"}
+        resumed = list_pending_meal_photo_reviews(conn, limit=10)
+        assert [item["token"] for item in resumed] == [first]
+        assert resumed[0]["status"] == started["draft"]["status"]

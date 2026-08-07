@@ -1,6 +1,8 @@
 import os
 import json
 import sqlite3
+import threading
+import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -988,7 +990,8 @@ def test_committed_text_edit_reply_failure_is_retriable(tmp_path, monkeypatch):
     server._handle_message_impl(event)
     assert len(replies) == 1
     assert isinstance(replies[0], list)
-    assert "修改已完成" in replies[0][0].text
+    assert "已更新 1 個項目（重送確認）" in replies[0][0].text
+    assert "鈉：488 → 48 mg" in replies[0][0].text
     assert "0 個項目" not in replies[0][0].text
 
 def test_committed_confirmation_reply_failure_is_retriable(tmp_path, monkeypatch):
@@ -1623,6 +1626,7 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "ADMIN_UID", "U_FALLBACK_ADMIN")
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
             conn, user_id="U_CUSTOMER", source_message_id="M_CUSTOMER",
@@ -1670,6 +1674,7 @@ def test_owner_notification_retries_after_failure_and_then_deduplicates(tmp_path
     db = tmp_path / "meal-photo-notification-retry.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
             conn, user_id="U_CUSTOMER", source_message_id="M_NOTIFY",
@@ -1700,10 +1705,259 @@ def test_owner_notification_retries_after_failure_and_then_deduplicates(tmp_path
         ).fetchone()[0] == 1
 
 
+def test_notification_retry_postback_works_after_original_version_changes(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-notification-postback.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_NOTIFY_POSTBACK",
+            payload=meal_photo_payload(),
+        )
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET status='rejected',version=10 WHERE token=?",
+            (token,),
+        )
+        conn.commit()
+        draft = get_meal_photo_draft(conn, user_id="U_CUSTOMER", token=token)
+    attempts = {"count": 0}
+    replies = []
+
+    def flaky_push(*_args, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("transient")
+
+    api = SimpleNamespace(
+        push_message=flaky_push,
+        reply_message=lambda _token, message: replies.append(message),
+    )
+    monkeypatch.setattr(server, "line_bot_api", api)
+    assert server.push_meal_photo_return_to_owner(draft) is False
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mprn:v1:{token}:rejected"),
+        source=SimpleNamespace(user_id="U_ADMIN"),
+        reply_token="RETRY-REPLY",
+    )
+    server.handle_meal_photo_postback(event)
+    assert attempts["count"] == 2
+    assert replies[-1].text == "✅ 客戶通知已送達。"
+
+
+def test_approved_notification_retry_uses_exact_protein_exchange_shape(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-approved-notification-postback.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
+    review = {
+        "protein_class": "medium", "protein_exchange": 2.5,
+        "starch_exchange": 6, "vegetable_exchange": 2,
+        "milk_exchange": 0, "fruit_exchange": 1,
+    }
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_APPROVED_NOTIFY_RETRY",
+            payload=meal_photo_payload(),
+        )
+        conn.execute(
+            """UPDATE pending_meal_photo_drafts
+               SET status='approved',version=15,review_json=? WHERE token=?""",
+            (json.dumps(review), token),
+        )
+        conn.commit()
+    pushes = []
+    replies = []
+    api = SimpleNamespace(
+        push_message=lambda target, message, **kwargs: pushes.append((target, message, kwargs)),
+        reply_message=lambda _token, message: replies.append(message),
+    )
+    monkeypatch.setattr(server, "line_bot_api", api)
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mprn:v1:{token}:approved"),
+        source=SimpleNamespace(user_id="U_ADMIN"),
+        reply_token="APPROVED-RETRY-REPLY",
+    )
+    server.handle_meal_photo_postback(event)
+    assert len(pushes) == 1
+    assert "估算熱量 698.5 kcal" in pushes[0][1].text
+    assert "蛋白質 31.5g" in pushes[0][1].text
+    assert replies[-1].text == "✅ 客戶通知已送達。"
+
+
+def test_successful_push_with_marker_failure_is_not_immediately_released(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "meal-photo-marker-failure.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_MARKER_FAILURE",
+            payload=meal_photo_payload(),
+        )
+        draft = get_meal_photo_draft(conn, user_id="U_CUSTOMER", token=token)
+    api_attempts = []
+
+    def successful_push(_target, _message, **kwargs):
+        api_attempts.append(kwargs.get("retry_key"))
+
+    monkeypatch.setattr(
+        server, "line_bot_api", SimpleNamespace(push_message=successful_push)
+    )
+    monkeypatch.setattr(
+        server, "complete_meal_photo_notification",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("marker unavailable")),
+    )
+    result = {
+        "approved_exchange": {"starch_exchange": 1, "vegetable_exchange": 1},
+        "estimated_nutrition": {"calories_kcal": 200, "protein_g": 10},
+    }
+    assert server.push_meal_photo_approval_to_owner(draft, result) is True
+    assert server.push_meal_photo_approval_to_owner(draft, result) is False
+    assert len(api_attempts) == 1
+    assert api_attempts[0] == str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"meal-photo:{token}:owner_approved")
+    )
+    with sqlite3.connect(db) as conn:
+        status = conn.execute(
+            """SELECT status FROM meal_photo_notification_claims
+               WHERE token=? AND notification_kind='owner_approved'""",
+            (token,),
+        ).fetchone()[0]
+    assert status == "sending"
+
+
+def test_line_retry_conflict_with_accepted_request_id_completes_marker(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "meal-photo-accepted-retry.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_ACCEPTED_RETRY",
+            payload=meal_photo_payload(),
+        )
+        draft = get_meal_photo_draft(conn, user_id="U_CUSTOMER", token=token)
+
+    class AcceptedRetryConflict(Exception):
+        status_code = 409
+        accepted_request_id = "REQ-ALREADY-ACCEPTED"
+
+    def accepted_conflict(*_args, **_kwargs):
+        raise AcceptedRetryConflict("already accepted")
+
+    monkeypatch.setattr(
+        server, "line_bot_api", SimpleNamespace(push_message=accepted_conflict)
+    )
+    result = {
+        "approved_exchange": {"starch_exchange": 1, "vegetable_exchange": 1},
+        "estimated_nutrition": {"calories_kcal": 200, "protein_g": 10},
+    }
+    assert server.push_meal_photo_approval_to_owner(draft, result) is True
+    with sqlite3.connect(db) as conn:
+        marker_count = conn.execute(
+            """SELECT COUNT(*) FROM meal_photo_notification_events
+               WHERE token=? AND notification_kind='owner_approved'""",
+            (token,),
+        ).fetchone()[0]
+        claim_status = conn.execute(
+            """SELECT status FROM meal_photo_notification_claims
+               WHERE token=? AND notification_kind='owner_approved'""",
+            (token,),
+        ).fetchone()[0]
+    assert marker_count == 1
+    assert claim_status == "delivered"
+
+
+def test_retry_key_does_not_leak_into_shared_line_client_headers(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-retry-header.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_RETRY_HEADER",
+            payload=meal_photo_payload(),
+        )
+        draft = get_meal_photo_draft(conn, user_id="U_CUSTOMER", token=token)
+
+    class HeaderMutatingLineApi:
+        def __init__(self):
+            self.headers = {"Authorization": "Bearer test"}
+            self.calls = []
+
+        def push_message(self, target, message, **kwargs):
+            retry_key = kwargs.get("retry_key")
+            if retry_key:
+                self.headers["X-Line-Retry-Key"] = retry_key
+            self.calls.append((target, message, kwargs))
+
+    api = HeaderMutatingLineApi()
+    monkeypatch.setattr(server, "line_bot_api", api)
+    result = {
+        "approved_exchange": {"starch_exchange": 1, "vegetable_exchange": 1},
+        "estimated_nutrition": {"calories_kcal": 200, "protein_g": 10},
+    }
+    assert server.push_meal_photo_approval_to_owner(draft, result) is True
+    assert len(api.calls) == 1
+    assert "X-Line-Retry-Key" not in api.headers
+    assert api.headers == {"Authorization": "Bearer test"}
+
+
+def test_owner_notification_claim_blocks_concurrent_duplicate_push(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-notification-concurrent.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_NOTIFY_CONCURRENT",
+            payload=meal_photo_payload(),
+        )
+        draft = get_meal_photo_draft(conn, user_id="U_CUSTOMER", token=token)
+    entered = threading.Event()
+    release = threading.Event()
+    attempts = []
+
+    def blocking_push(*_args, **_kwargs):
+        attempts.append(1)
+        entered.set()
+        assert release.wait(timeout=5)
+
+    monkeypatch.setattr(server, "line_bot_api", SimpleNamespace(push_message=blocking_push))
+    result = {
+        "approved_exchange": {"starch_exchange": 1, "vegetable_exchange": 1},
+        "estimated_nutrition": {"calories_kcal": 200, "protein_g": 10},
+    }
+    first_result = []
+    worker = threading.Thread(
+        target=lambda: first_result.append(
+            server.push_meal_photo_approval_to_owner(draft, result)
+        )
+    )
+    worker.start()
+    assert entered.wait(timeout=5)
+    second_result = server.push_meal_photo_approval_to_owner(draft, result)
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert first_result == [True]
+    assert second_result is False
+    assert len(attempts) == 1
+
+
+def test_bound_admin_authorization_fails_closed_on_database_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "DB_PATH", str(tmp_path / "missing" / "db.sqlite"))
+    monkeypatch.setattr(server, "ADMIN_UID", "U" + "a" * 32)
+    with pytest.raises(PermissionError, match="無法驗證管理員"):
+        server.get_bound_admin_uid_for_authorization()
+
+
 def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-pending-command.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_BOUND_ADMIN")
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_BOUND_ADMIN")
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
             conn, user_id="U_CUSTOMER", source_message_id="M_PENDING",
@@ -1727,6 +1981,16 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
     assert "U_CUSTOMER"[-8:] in message.text
     actions = [item.action.data for item in message.quick_reply.items]
     assert actions == [f"mpr:v1:{token}:8:start"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE pending_meal_photo_drafts
+               SET status='reviewing',version=9,review_json='{}' WHERE token=?""",
+            (token,),
+        )
+        conn.commit()
+    resumed = server.build_pending_meal_photo_review_message("U_BOUND_ADMIN")
+    assert "審核中" in resumed.text
+    assert resumed.quick_reply.items[0].action.data == f"mpr:v1:{token}:9:resume"
 
 
 def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeypatch):
@@ -1734,6 +1998,7 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
             conn, user_id="U_CUSTOMER", source_message_id="M_CUSTOMER", payload=meal_photo_payload(),
@@ -1769,6 +2034,9 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     first = send(f"mpr:v1:{token}:8:start", "ADMIN-START")
     assert "蛋白質分類" in first.text
     assert any(":9:set:protein_class:medium" in item.action.data for item in first.quick_reply.items)
+    resumed_step = send(f"mpr:v1:{token}:9:resume", "ADMIN-RESUME")
+    assert "蛋白質分類" in resumed_step.text
+    assert any(":9:set:protein_class:medium" in item.action.data for item in resumed_step.quick_reply.items)
     send(f"mpr:v1:{token}:9:set:protein_class:medium", "ADMIN-CLASS")
     send(f"mpr:v1:{token}:10:set:protein_exchange:2.5", "ADMIN-PROTEIN")
     send(f"mpr:v1:{token}:11:set:starch_exchange:6", "ADMIN-STARCH")
@@ -1807,6 +2075,7 @@ def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(t
     db = tmp_path / "meal-photo-admin-reject.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
             conn, user_id="U_CUSTOMER", source_message_id="M_REJECT",
@@ -2557,6 +2826,9 @@ def test_meal_photo_final_confirmation_cards_show_exchange_estimate_and_confirm_
 
 def test_forged_meal_photo_review_postback_is_rejected_before_database_access(monkeypatch):
     monkeypatch.setattr(server, "ADMIN_UID", "REAL_ADMIN")
+    monkeypatch.setattr(
+        server, "get_bound_admin_uid_for_authorization", lambda: "REAL_ADMIN"
+    )
     replies = []
     monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
 

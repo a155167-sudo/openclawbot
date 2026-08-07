@@ -163,6 +163,19 @@ def ensure_meal_photo_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(token, notification_kind),
             FOREIGN KEY(token) REFERENCES pending_meal_photo_drafts(token)
         );
+        CREATE TABLE IF NOT EXISTS meal_photo_notification_claims (
+            token TEXT NOT NULL,
+            notification_kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            claim_token TEXT NOT NULL DEFAULT '',
+            lease_until TEXT NOT NULL DEFAULT '',
+            delivered_at TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(token, notification_kind),
+            FOREIGN KEY(token) REFERENCES pending_meal_photo_drafts(token)
+        );
         """
     )
     columns = {
@@ -191,7 +204,7 @@ def ensure_meal_photo_schema(conn: sqlite3.Connection) -> None:
     now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
     conn.execute(
         """INSERT INTO meal_photo_schema_versions(component,version,updated_at)
-           VALUES('meal_photo_system',4,?)
+           VALUES('meal_photo_system',5,?)
            ON CONFLICT(component) DO UPDATE SET
              version=MAX(version,excluded.version),updated_at=excluded.updated_at""",
         (now,),
@@ -356,13 +369,13 @@ def get_meal_photo_draft_for_admin(
 def list_pending_meal_photo_reviews(
     conn: sqlite3.Connection, *, limit: int = 10
 ) -> list[dict[str, Any]]:
-    """列出仍有效、已完成估算且尚未開始審核的跨使用者草稿。"""
+    """列出仍有效且可由管理員繼續或完成的餐點審核草稿。"""
     ensure_meal_photo_schema(conn)
     limit = max(1, min(int(limit), 10))
     now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
     rows = conn.execute(
         """SELECT token,user_id FROM pending_meal_photo_drafts
-           WHERE status='estimated' AND expires_at>?
+           WHERE status IN ('estimated','reviewing','review_ready') AND expires_at>?
            ORDER BY created_at ASC LIMIT ?""",
         (now, limit),
     ).fetchall()
@@ -370,6 +383,100 @@ def list_pending_meal_photo_reviews(
         get_meal_photo_draft(conn, user_id=user_id, token=token)
         for token, user_id in rows
     ]
+
+
+def claim_meal_photo_notification(
+    conn: sqlite3.Connection, *, token: str, notification_kind: str,
+    lease_seconds: int = 30,
+) -> dict[str, str]:
+    """原子取得通知租約；同一通知同時間只允許一個推播者。"""
+    ensure_meal_photo_schema(conn)
+    if notification_kind not in {"owner_approved", "owner_rejected"}:
+        raise ValueError("餐點通知類型無效")
+    now_dt = datetime.now(TAIPEI_TZ)
+    now = now_dt.isoformat(timespec="seconds")
+    lease_until = (now_dt + timedelta(seconds=max(5, min(int(lease_seconds), 300)))).isoformat(
+        timespec="seconds"
+    )
+    claim_token = secrets.token_hex(16)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        delivered = conn.execute(
+            """SELECT 1 FROM meal_photo_notification_events
+               WHERE token=? AND notification_kind=?""",
+            (token, notification_kind),
+        ).fetchone()
+        if delivered:
+            conn.commit()
+            return {"state": "delivered"}
+        row = conn.execute(
+            """SELECT status,lease_until FROM meal_photo_notification_claims
+               WHERE token=? AND notification_kind=?""",
+            (token, notification_kind),
+        ).fetchone()
+        if row and row[0] == "delivered":
+            conn.commit()
+            return {"state": "delivered"}
+        if row and row[0] == "sending" and str(row[1] or "") > now:
+            conn.commit()
+            return {"state": "busy"}
+        conn.execute(
+            """INSERT INTO meal_photo_notification_claims
+               (token,notification_kind,status,claim_token,lease_until,attempts,updated_at)
+               VALUES(?,?,'sending',?,?,1,?)
+               ON CONFLICT(token,notification_kind) DO UPDATE SET
+                 status='sending',claim_token=excluded.claim_token,
+                 lease_until=excluded.lease_until,attempts=attempts+1,
+                 last_error='',updated_at=excluded.updated_at""",
+            (token, notification_kind, claim_token, lease_until, now),
+        )
+        conn.commit()
+        return {"state": "claimed", "claim_token": claim_token}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def complete_meal_photo_notification(
+    conn: sqlite3.Connection, *, token: str, notification_kind: str,
+    claim_token: str,
+) -> bool:
+    ensure_meal_photo_schema(conn)
+    now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        changed = conn.execute(
+            """UPDATE meal_photo_notification_claims
+               SET status='delivered',claim_token='',lease_until='',delivered_at=?,updated_at=?
+               WHERE token=? AND notification_kind=? AND status='sending' AND claim_token=?""",
+            (now, now, token, notification_kind, claim_token),
+        ).rowcount
+        if changed:
+            conn.execute(
+                """INSERT OR IGNORE INTO meal_photo_notification_events
+                   (token,notification_kind,delivered_at) VALUES(?,?,?)""",
+                (token, notification_kind, now),
+            )
+        conn.commit()
+        return changed == 1
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def release_meal_photo_notification(
+    conn: sqlite3.Connection, *, token: str, notification_kind: str,
+    claim_token: str, error: str,
+) -> None:
+    ensure_meal_photo_schema(conn)
+    now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
+    conn.execute(
+        """UPDATE meal_photo_notification_claims
+           SET status='pending',claim_token='',lease_until='',last_error=?,updated_at=?
+           WHERE token=? AND notification_kind=? AND status='sending' AND claim_token=?""",
+        (str(error or "")[:300], now, token, notification_kind, claim_token),
+    )
+    conn.commit()
 
 
 def meal_photo_notification_delivered(

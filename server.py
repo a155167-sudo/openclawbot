@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import secrets
 import string
 import base64
+import copy
 import csv
 import fcntl
 import random
@@ -78,10 +79,11 @@ from meal_photo_system import (
     ensure_meal_photo_schema,
     get_meal_photo_draft,
     get_meal_photo_draft_for_admin,
+    claim_meal_photo_notification,
+    complete_meal_photo_notification,
     list_pending_meal_photo_reviews,
-    mark_meal_photo_notification_delivered,
-    meal_photo_notification_delivered,
     meal_photo_step_options,
+    release_meal_photo_notification,
     next_meal_photo_step,
     normalize_meal_photo_payload,
     save_meal_photo_draft,
@@ -328,17 +330,33 @@ SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
 ADMIN_UID = "Uefd72ca53a9a6ac39781fe673c398530"
 
 def get_admin_notify_uid():
-    """回傳目前應接收管理通知的 LINE UID；優先使用 #綁定老闆 寫入的 admin_settings。"""
+    """回傳管理通知目的地；僅通知用途可在讀取失敗時使用預設值。"""
     try:
         with closing(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
             row = c.fetchone()
             if row and row[0]:
-                return row[0]
+                return str(row[0]).strip()
     except Exception as e:
         print(f"⚠️ 讀取管理員通知 UID 失敗，改用預設 ADMIN_UID: {e}")
     return ADMIN_UID
+
+
+def get_bound_admin_uid_for_authorization() -> str:
+    """嚴格讀取目前綁定管理員；授權用途遇到缺值或DB錯誤一律拒絕。"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            row = conn.execute(
+                "SELECT value FROM admin_settings WHERE key='admin_id'"
+            ).fetchone()
+    except Exception as exc:
+        print(f"⛔ 讀取管理員授權綁定失敗，已拒絕跨使用者操作：{exc}")
+        raise PermissionError("目前無法驗證管理員身分，請稍後再試") from exc
+    admin_uid = str(row[0] if row else "").strip()
+    if not re.fullmatch(r"U[0-9a-fA-F]{32}", admin_uid):
+        raise PermissionError("尚未設定有效的管理員綁定")
+    return admin_uid
 
 
 HEALTH_CHECKIN_TEMPLATE = (
@@ -8296,8 +8314,8 @@ def build_meal_photo_admin_review_messages(draft):
 
 
 def build_pending_meal_photo_review_message(uid):
-    configured_admin_uid = str(get_admin_notify_uid() or "").strip()
-    if not configured_admin_uid or uid != configured_admin_uid:
+    configured_admin_uid = get_bound_admin_uid_for_authorization()
+    if uid != configured_admin_uid:
         raise PermissionError("管理員限定")
     with sqlite3.connect(DB_PATH) as conn:
         drafts = list_pending_meal_photo_reviews(conn, limit=10)
@@ -8314,13 +8332,19 @@ def build_pending_meal_photo_review_message(uid):
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         ]
         foods = "、".join(names[:4]) or "未辨識餐點"
+        status = str(draft.get("status") or "")
+        status_label = {
+            "estimated": "待開始", "reviewing": "審核中", "review_ready": "待核准",
+        }.get(status, "待處理")
         lines.append(
-            f"{index}. UID末8碼 {owner_suffix}｜{draft.get('meal_slot') or '未指定'}｜{consumed_at}\n   {foods}"
+            f"{index}. UID末8碼 {owner_suffix}｜{draft.get('meal_slot') or '未指定'}｜{consumed_at}｜{status_label}\n   {foods}"
         )
+        action = "start" if status == "estimated" else "resume"
+        button_label = "審核" if status == "estimated" else "繼續"
         buttons.append(QuickReplyButton(action=PostbackAction(
-            label=f"審核 {owner_suffix}",
-            data=f"mpr:v1:{draft['token']}:{draft['version']}:start",
-            display_text=f"審核 UID末8碼 {owner_suffix} 的餐點",
+            label=f"{button_label} {owner_suffix}",
+            data=f"mpr:v1:{draft['token']}:{draft['version']}:{action}",
+            display_text=f"{button_label} UID末8碼 {owner_suffix} 的餐點",
         )))
     return TextSendMessage(
         text="\n".join(lines),
@@ -8352,20 +8376,62 @@ def _push_meal_photo_owner_notification_once(draft, notification_kind, text):
     if owner_uid == admin_uid:
         return True
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            if meal_photo_notification_delivered(
-                conn, token=token, notification_kind=notification_kind
-            ):
-                return True
-        line_bot_api.push_message(owner_uid, TextSendMessage(text=text), timeout=12)
-        with sqlite3.connect(DB_PATH) as conn:
-            mark_meal_photo_notification_delivered(
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            claim = claim_meal_photo_notification(
                 conn, token=token, notification_kind=notification_kind
             )
-        return True
     except Exception as exc:
-        print(f"⚠️ 推播餐點結果給使用者失敗（{notification_kind}）：{exc}")
+        print(f"⚠️ 取得餐點通知租約失敗（{notification_kind}）：{exc}")
         return False
+    if claim["state"] == "delivered":
+        return True
+    if claim["state"] == "busy":
+        return False
+    claim_token = claim["claim_token"]
+    retry_key = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"meal-photo:{token}:{notification_kind}")
+    )
+    line_accepted = False
+    try:
+        retry_client = copy.copy(line_bot_api)
+        if hasattr(retry_client, "headers"):
+            retry_client.headers = dict(getattr(line_bot_api, "headers", {}) or {})
+        retry_client.push_message(
+            owner_uid, TextSendMessage(text=text), retry_key=retry_key, timeout=12
+        )
+        line_accepted = True
+    except Exception as exc:
+        line_accepted = (
+            getattr(exc, "status_code", None) == 409
+            and bool(str(getattr(exc, "accepted_request_id", "") or "").strip())
+        )
+        if not line_accepted:
+            try:
+                with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                    release_meal_photo_notification(
+                        conn, token=token, notification_kind=notification_kind,
+                        claim_token=claim_token, error=str(exc),
+                    )
+            except Exception as release_exc:
+                print(f"⚠️ 釋放餐點通知租約失敗：{release_exc}")
+            print(f"⚠️ 推播餐點結果給使用者失敗（{notification_kind}）：{exc}")
+            return False
+        print(
+            f"ℹ️ LINE 已接受相同 retry key 的餐點通知（{notification_kind}）："
+            f"{getattr(exc, 'accepted_request_id', '')}"
+        )
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            completed = complete_meal_photo_notification(
+                conn, token=token, notification_kind=notification_kind,
+                claim_token=claim_token,
+            )
+        if not completed:
+            print(f"⚠️ LINE 已接受餐點通知，但 delivered marker 未更新（{notification_kind}）")
+    except Exception as exc:
+        # LINE API 已回傳成功：保留 sending 租約且不立即重送；固定 retry_key 也由 LINE 端去重。
+        print(f"⚠️ LINE 已接受餐點通知，但寫入 delivered marker 失敗（{notification_kind}）：{exc}")
+    return True
 
 
 def push_meal_photo_return_to_owner(draft):
@@ -8393,10 +8459,61 @@ def push_meal_photo_approval_to_owner(draft, result):
     )
 
 
+def build_meal_photo_notification_retry_message(draft, kind):
+    label = "重試核准通知" if kind == "approved" else "重試退回通知"
+    return TextSendMessage(
+        text="⚠️ 餐點狀態已安全寫入，但客戶通知尚未送達。請按下方按鈕重試。",
+        quick_reply=QuickReply(items=[QuickReplyButton(action=PostbackAction(
+            label=label,
+            data=f"mprn:v1:{draft['token']}:{kind}",
+            display_text=label,
+        ))]),
+    )
+
+
 @handler.add(PostbackEvent)
 def handle_meal_photo_postback(event):
     data = str(getattr(event.postback, "data", "") or "")
     uid = event.source.user_id
+
+    notification_retry = re.fullmatch(
+        r"mprn:v1:([0-9a-f]{12}):(approved|rejected)", data
+    )
+    if notification_retry:
+        token, kind = notification_retry.group(1), notification_retry.group(2)
+        try:
+            configured_admin_uid = get_bound_admin_uid_for_authorization()
+            if uid != configured_admin_uid:
+                raise PermissionError("管理員限定")
+            with sqlite3.connect(DB_PATH) as conn:
+                draft = get_meal_photo_draft_for_admin(
+                    conn, token=token, admin_user_id=uid,
+                    required_admin_user_id=configured_admin_uid,
+                )
+            if draft["status"] != kind:
+                raise ValueError("餐點狀態與通知類型不符")
+            if kind == "approved":
+                from meal_photo_system import _meal_photo_exact_exchange
+                exact = _meal_photo_exact_exchange(draft.get("review") or {})
+                delivered = push_meal_photo_approval_to_owner(
+                    draft,
+                    {
+                        "approved_exchange": exact,
+                        "estimated_nutrition": estimate_nutrition_from_exchanges(exact),
+                    },
+                )
+            else:
+                delivered = push_meal_photo_return_to_owner(draft)
+            reply = (
+                TextSendMessage(text="✅ 客戶通知已送達。")
+                if delivered else build_meal_photo_notification_retry_message(draft, kind)
+            )
+        except PermissionError:
+            reply = TextSendMessage(text="⚠️ 管理員限定，無法重試餐點通知。")
+        except ValueError as exc:
+            reply = TextSendMessage(text=f"⚠️ {exc}")
+        line_bot_api.reply_message(event.reply_token, reply)
+        return
 
     # ── relog:v1 快速重新記錄 ──
     relog_start = re.fullmatch(r"relog:v1:([a-z0-9_]{8,40}):start", data)
@@ -8472,16 +8589,17 @@ def handle_meal_photo_postback(event):
         data,
     )
     review_start = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):start", data)
+    review_resume = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):resume", data)
     review_set = re.fullmatch(
         r"mpr:v1:([0-9a-f]{12}):(\d+):set:([a-z_]+):([a-z0-9_.]+)", data
     )
     review_cancel = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):cancel_review", data)
     review_reject = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):reject", data)
     review_approve = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):approve", data)
-    if not (start or cancel or answer or remove_item or request_add or cancel_add or add_category or review_start or review_set or review_cancel or review_reject or review_approve):
+    if not (start or cancel or answer or remove_item or request_add or cancel_add or add_category or review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
         return
     uid = event.source.user_id
-    if not (review_start or review_set or review_cancel or review_reject or review_approve):
+    if not (review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
         matched = start or cancel or answer or remove_item or request_add or cancel_add or add_category
         assert matched is not None
         token, version = matched.group(1), int(matched.group(2))
@@ -8491,17 +8609,47 @@ def handle_meal_photo_postback(event):
         event_id = "postback:" + hashlib.sha256(fallback.encode()).hexdigest()
     applied = None
     try:
-        if review_start or review_set or review_cancel or review_reject or review_approve:
-            configured_admin_uid = str(get_admin_notify_uid() or "").strip()
-            if not configured_admin_uid or uid != configured_admin_uid:
+        if review_start or review_resume or review_set or review_cancel or review_reject or review_approve:
+            configured_admin_uid = get_bound_admin_uid_for_authorization()
+            if uid != configured_admin_uid:
                 line_bot_api.reply_message(
                     event.reply_token,
                     TextSendMessage(text="⚠️ 管理員限定，無法執行餐點審核。"),
                 )
                 return
-            matched = review_start or review_set or review_cancel or review_reject or review_approve
+            matched = review_start or review_resume or review_set or review_cancel or review_reject or review_approve
             assert matched is not None
             token, version = matched.group(1), int(matched.group(2))
+            from meal_photo_system import apply_meal_photo_review_action, next_meal_photo_review_step
+            if review_resume:
+                with sqlite3.connect(DB_PATH) as conn:
+                    draft = get_meal_photo_draft_for_admin(
+                        conn, token=token, admin_user_id=uid,
+                        required_admin_user_id=configured_admin_uid,
+                    )
+                if draft["version"] != version:
+                    raise ValueError("餐點審核畫面已更新，請重新開啟待審清單")
+                if draft["status"] == "reviewing":
+                    step = next_meal_photo_review_step(draft)
+                    reply = build_meal_photo_review_step_message(draft, step, version)
+                elif draft["status"] == "review_ready":
+                    from linebot.models import FlexSendMessage
+                    reply = FlexSendMessage(
+                        alt_text="最終核准份量，請確認加入",
+                        contents=build_meal_photo_review_ready_bubble(draft),
+                    )
+                elif draft["status"] == "estimated":
+                    from linebot.models import FlexSendMessage
+                    reply = FlexSendMessage(
+                        alt_text="餐點照片估算完成，待營養師審核",
+                        contents=build_meal_photo_estimate_bubble(
+                            draft, allow_admin_review=True
+                        ),
+                    )
+                else:
+                    raise ValueError("這筆餐點目前無法繼續審核")
+                line_bot_api.reply_message(event.reply_token, reply)
+                return
             if review_start:
                 action, field, value = "start", "", ""
             elif review_set:
@@ -8512,7 +8660,6 @@ def handle_meal_photo_postback(event):
                 action, field, value = "reject", "", ""
             else:
                 action, field, value = "approve", "", ""
-            from meal_photo_system import apply_meal_photo_review_action, next_meal_photo_review_step
             with sqlite3.connect(DB_PATH) as conn:
                 admin_draft = get_meal_photo_draft_for_admin(
                     conn, token=token, admin_user_id=uid,
@@ -8561,17 +8708,13 @@ def handle_meal_photo_postback(event):
                 owner_notified = push_meal_photo_approval_to_owner(draft, result)
                 if not owner_notified:
                     reply = [
-                        TextSendMessage(
-                            text="⚠️ 正式紀錄已完成，但客戶通知尚未送達；請再按一次原核准按鈕重試通知。"
-                        ),
+                        build_meal_photo_notification_retry_message(draft, "approved"),
                         reply,
                     ]
             elif kind == "rejected":
                 owner_notified = push_meal_photo_return_to_owner(draft)
                 if not owner_notified:
-                    reply = TextSendMessage(
-                        text="⚠️ 已退回且未入帳，但客戶通知尚未送達；請再按一次原退回按鈕重試通知。"
-                    )
+                    reply = build_meal_photo_notification_retry_message(draft, "rejected")
             line_bot_api.reply_message(event.reply_token, reply)
             return
         with sqlite3.connect(DB_PATH) as conn:
@@ -8689,6 +8832,11 @@ def handle_meal_photo_postback(event):
         else:
             raise ValueError("餐點操作結果無效")
         line_bot_api.reply_message(event.reply_token, reply)
+    except PermissionError as exc:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"⚠️ {exc}。已拒絕這次管理操作。"),
+        )
     except ValueError as exc:
         line_bot_api.reply_message(
             event.reply_token,
@@ -8962,9 +9110,13 @@ def _handle_message_impl(event):
             line_bot_api.reply_message(event.reply_token, reply)
             return
 
-    admin_command_uid = (
-        str(get_admin_notify_uid() or "").strip() if msg == "#待審餐點" else ADMIN_UID
-    )
+    if msg == "#待審餐點":
+        try:
+            admin_command_uid = get_bound_admin_uid_for_authorization()
+        except PermissionError:
+            admin_command_uid = ""
+    else:
+        admin_command_uid = ADMIN_UID
     if uid != admin_command_uid and is_admin_only_command(msg):
         try:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⛔ 這是管理員專用指令，若需要協助請直接留言給客服喔。"))
@@ -9452,7 +9604,7 @@ def _handle_message_impl(event):
         ensure_nutrition_schema(conn)
         replay_row = conn.execute(
             """SELECT e.token,p.label_payload_json,p.consumed_servings,p.consumed_at,
-                      p.consumed_time_source
+                      p.consumed_time_source,e.result_json
                FROM nutrition_message_events e
                JOIN pending_nutrition_logs p ON p.token=e.token AND p.user_id=e.user_id
                WHERE e.message_id=? AND e.user_id=? AND e.event_type='text_edit'""",
@@ -9465,9 +9617,10 @@ def _handle_message_impl(event):
                 float(replay_row[2]),
                 replay_row[3],
                 replay_row[4],
+                json.loads(replay_row[5] or "{}"),
             )
     if nutrition_edit_replay:
-        token, label, servings, consumed_at, consumed_time_source = nutrition_edit_replay
+        token, label, servings, consumed_at, consumed_time_source, replay_result = nutrition_edit_replay
         from linebot.models import FlexSendMessage
         confirmation_message = FlexSendMessage(
             alt_text=f"請確認營養標示：{label['product_name']}",
@@ -9477,12 +9630,32 @@ def _handle_message_impl(event):
                 consumed_time_source=consumed_time_source,
             ),
         )
+        replay_changes = replay_result.get("changes", []) if isinstance(replay_result, dict) else []
+        if replay_changes:
+            field_labels = {
+                value: key for key, value in _NUTRITION_CORRECTION_FIELDS.items()
+                if key not in {"碳水", "纖維"}
+            }
+            field_units = {
+                "calories_kcal": "kcal", "sodium_mg": "mg",
+                "cholesterol_mg": "mg",
+            }
+            change_lines = [
+                f"{field_labels.get(change['field'], change['field'])}："
+                f"{change['old']:g} → {change['new']:g} {field_units.get(change['field'], 'g')}"
+                for change in replay_changes
+            ]
+            replay_summary = "\n".join([
+                f"✅ 已更新 {len(change_lines)} 個項目（重送確認）",
+                *change_lines,
+                "營養數值不會重複更新。",
+            ])
+        else:
+            replay_summary = "✅ 修改已完成，這是重送的確認卡；營養內容不會重複更新。"
         line_bot_api.reply_message(
             event.reply_token,
             [
-                TextSendMessage(
-                    text="✅ 修改已完成，這是重送的確認卡；營養內容不會重複更新。"
-                ),
+                TextSendMessage(text=replay_summary),
                 confirmation_message,
             ],
         )

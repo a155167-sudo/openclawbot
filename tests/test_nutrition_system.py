@@ -204,7 +204,7 @@ def test_ensure_nutrition_schema_creates_required_tables():
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
-    ).fetchone()[0] == 3
+    ).fetchone()[0] == 4
 
 
 def test_schema_migration_deduplicates_legacy_line_message_ids_before_unique_indexes():
@@ -271,7 +271,7 @@ def test_existing_v1_marker_runs_latest_additive_migration():
     assert "consumed_time_source" in pending_columns
     assert conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
-    ).fetchone()[0] == 3
+    ).fetchone()[0] == 4
 
 
 def test_existing_v2_marker_runs_v3_time_source_migration():
@@ -289,7 +289,7 @@ def test_existing_v2_marker_runs_v3_time_source_migration():
     assert "consumed_time_source" in columns
     assert conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
-    ).fetchone()[0] == 3
+    ).fetchone()[0] == 4
 
 
 def test_sheet_specs_include_four_required_tabs_and_exchange_seed_rows():

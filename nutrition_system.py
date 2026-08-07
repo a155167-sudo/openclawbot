@@ -741,6 +741,7 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             event_type TEXT NOT NULL,
             token TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            result_json TEXT NOT NULL DEFAULT '{}',
             FOREIGN KEY(token) REFERENCES pending_nutrition_logs(token)
         );
 
@@ -777,7 +778,7 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         """
     )
     schema_component = "nutrition_system"
-    schema_version = 3
+    schema_version = 4
     version_row = conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component=?",
         (schema_component,),
@@ -805,6 +806,9 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             "plan_link_status": "TEXT NOT NULL DEFAULT 'pending'",
             "approved_exchange_json": "TEXT NOT NULL DEFAULT '{}'",
             "exchange_approval_id": "TEXT DEFAULT ''",
+        },
+        "nutrition_message_events": {
+            "result_json": "TEXT NOT NULL DEFAULT '{}'",
         },
         "nutrition_sheet_outbox": {
             "claimed_at": "TEXT DEFAULT ''",
@@ -1239,7 +1243,7 @@ def apply_nutrition_text_edit(
     conn.execute("BEGIN IMMEDIATE")
     try:
         event = conn.execute(
-            "SELECT user_id,event_type,token FROM nutrition_message_events WHERE message_id=?",
+            "SELECT user_id,event_type,token,result_json FROM nutrition_message_events WHERE message_id=?",
             (message_id,),
         ).fetchone()
         if event:
@@ -1252,8 +1256,12 @@ def apply_nutrition_text_edit(
             if not row:
                 raise ValueError("找不到原營養修改結果")
             label = normalize_label_payload(json.loads(row[0]))
+            stored_result = json.loads(event[3] or "{}")
             conn.commit()
-            return {"token": event[2], "label": label, "replayed": True}
+            replayed = {"token": event[2], "label": label, "replayed": True}
+            if isinstance(stored_result.get("changes"), list):
+                replayed["changes"] = stored_result["changes"]
+            return replayed
 
         state = conn.execute(
             """SELECT s.token,s.input_type,s.expires_at,p.label_payload_json,p.status,p.expires_at
@@ -1335,11 +1343,16 @@ def apply_nutrition_text_edit(
         if changed != 1:
             raise RuntimeError("營養修改狀態衝突")
         conn.execute("DELETE FROM nutrition_input_states WHERE user_id=?", (user_id,))
+        event_result = {"changes": changes} if input_type == "nutrient" else {}
         conn.execute(
             """INSERT INTO nutrition_message_events
-               (message_id,user_id,event_type,token,created_at)
-               VALUES (?,?, 'text_edit', ?,?)""",
-            (message_id, user_id, token, datetime.now().astimezone().isoformat(timespec="seconds")),
+               (message_id,user_id,event_type,token,created_at,result_json)
+               VALUES (?,?, 'text_edit', ?,?,?)""",
+            (
+                message_id, user_id, token,
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+                json.dumps(event_result, ensure_ascii=False, sort_keys=True, allow_nan=False),
+            ),
         )
         conn.commit()
         result = {"token": token, "label": label, "replayed": False}
