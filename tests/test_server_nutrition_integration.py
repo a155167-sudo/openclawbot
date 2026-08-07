@@ -788,6 +788,34 @@ def test_parse_manual_nutrition_correction_command():
     assert server.parse_nutrition_correction_command("商品名稱 高蛋白豆漿") is None
 
 
+def test_parse_multiple_nutrition_corrections_accepts_common_chinese_punctuation():
+    corrections, errors = server.parse_nutrition_corrections(
+        "熱量 204、蛋白質 16.4；鈉：48mg"
+    )
+    assert errors == []
+    assert corrections == [
+        ("calories_kcal", 204.0),
+        ("protein_g", 16.4),
+        ("sodium_mg", 48.0),
+    ]
+
+
+def test_parse_multiple_nutrition_corrections_reports_invalid_fragment_atomically():
+    corrections, errors = server.parse_nutrition_corrections(
+        "熱量 204、蛋白質 很多、鈉 48"
+    )
+    assert corrections == [("calories_kcal", 204.0), ("sodium_mg", 48.0)]
+    assert errors == ["蛋白質 很多"]
+
+
+def test_parse_multiple_nutrition_corrections_rejects_conflicting_units():
+    corrections, errors = server.parse_nutrition_corrections(
+        "熱量 204g、鈉 48g、蛋白質 16.4mg"
+    )
+    assert corrections == []
+    assert errors == ["熱量單位應為 kcal", "鈉單位應為 mg", "蛋白質單位應為 g"]
+
+
 def _text_event(message_id, text, user_id="U_EDIT"):
     return SimpleNamespace(
         message=SimpleNamespace(id=message_id, text=text),
@@ -860,6 +888,73 @@ def test_text_handler_corrects_nutrient_and_recalculates_per100(tmp_path, monkey
     assert len(replies) == 3
 
 
+def test_text_handler_applies_multiple_nutrients_in_one_atomic_message(tmp_path, monkeypatch):
+    db = tmp_path / "edit-multiple-nutrients.db"
+    payload = {
+        **valid_label(), "package_amount": 400,
+        "per_serving": {
+            **valid_label()["per_serving"],
+            "calories_kcal": 228,
+            "protein_g": 21.2,
+            "sodium_mg": 488,
+        },
+    }
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        token = save_pending_label(conn, user_id="U_EDIT", payload=payload)
+    replies = []
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(reply_message=lambda _, message: replies.append(message)),
+    )
+    server._handle_message_impl(_text_event("multi-edit-button", f"修改營養數字:{token}"))
+    server._handle_message_impl(
+        _text_event("multi-edit-value", "熱量 204、蛋白質 16.4；鈉：48mg")
+    )
+    with sqlite3.connect(db) as conn:
+        stored = json.loads(conn.execute(
+            "SELECT label_payload_json FROM pending_nutrition_logs WHERE token=?", (token,)
+        ).fetchone()[0])
+        state_count = conn.execute("SELECT COUNT(*) FROM nutrition_input_states").fetchone()[0]
+    assert stored["per_serving"]["calories_kcal"] == 204
+    assert stored["per_serving"]["protein_g"] == 16.4
+    assert stored["per_serving"]["sodium_mg"] == 48
+    assert state_count == 0
+    assert isinstance(replies[-1], list)
+    assert "已更新 3 個項目" in replies[-1][0].text
+
+
+def test_text_handler_does_not_partially_apply_malformed_multiple_edit(tmp_path, monkeypatch):
+    db = tmp_path / "edit-multiple-invalid.db"
+    payload = {
+        **valid_label(),
+        "per_serving": {**valid_label()["per_serving"], "calories_kcal": 228, "protein_g": 21.2},
+    }
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        token = save_pending_label(conn, user_id="U_EDIT", payload=payload)
+    replies = []
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(reply_message=lambda _, message: replies.append(message)),
+    )
+    server._handle_message_impl(_text_event("invalid-multi-button", f"修改營養數字:{token}"))
+    server._handle_message_impl(
+        _text_event("invalid-multi-value", "熱量 204、蛋白質 很多")
+    )
+    with sqlite3.connect(db) as conn:
+        stored = json.loads(conn.execute(
+            "SELECT label_payload_json FROM pending_nutrition_logs WHERE token=?", (token,)
+        ).fetchone()[0])
+        state_count = conn.execute("SELECT COUNT(*) FROM nutrition_input_states").fetchone()[0]
+    assert stored["per_serving"]["calories_kcal"] == 228
+    assert stored["per_serving"]["protein_g"] == 21.2
+    assert state_count == 1
+    assert "蛋白質 很多" in replies[-1].text
+
+
 def test_committed_text_edit_reply_failure_is_retriable(tmp_path, monkeypatch):
     db = tmp_path / "edit-reply-failure.db"
     payload = {
@@ -892,7 +987,9 @@ def test_committed_text_edit_reply_failure_is_retriable(tmp_path, monkeypatch):
     )
     server._handle_message_impl(event)
     assert len(replies) == 1
-
+    assert isinstance(replies[0], list)
+    assert "修改已完成" in replies[0][0].text
+    assert "0 個項目" not in replies[0][0].text
 
 def test_committed_confirmation_reply_failure_is_retriable(tmp_path, monkeypatch):
     db = tmp_path / "confirm-reply-failure.db"
@@ -1521,13 +1618,125 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     assert draft["estimate"]["starch_exchange"] == {"min": 0.0, "max": 0.0, "basis": "user_confirmed_none"}
 
 
+def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-customer-push.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "ADMIN_UID", "U_FALLBACK_ADMIN")
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_CUSTOMER",
+            payload=meal_photo_payload(),
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"CUSTOMER-PREP-{index}", user_id="U_CUSTOMER",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+    replies = []
+    pushes = []
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(
+            reply_message=lambda _token, message: replies.append(message),
+            push_message=lambda target, message, **_kwargs: pushes.append((target, message)),
+        ),
+    )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        source=SimpleNamespace(user_id="U_CUSTOMER"), reply_token="reply-customer-final",
+        webhook_event_id="WEBHOOK-CUSTOMER-FINAL", timestamp=1784740620000,
+    )
+
+    server.handle_meal_photo_postback(event)
+
+    customer_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
+    assert "審核並加入" not in customer_text
+    assert len(pushes) == 1 and pushes[0][0] == "U_ADMIN"
+    admin_payload = pushes[0][1]
+    assert isinstance(admin_payload, list)
+    admin_text = json.dumps(
+        [json.loads(str(message)) for message in admin_payload], ensure_ascii=False
+    )
+    assert "新的餐點審核需求" in admin_text
+    assert f"mpr:v1:{token}:8:start" in admin_text
+
+
+def test_owner_notification_retries_after_failure_and_then_deduplicates(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-notification-retry.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_NOTIFY",
+            payload=meal_photo_payload(),
+        )
+        draft = get_meal_photo_draft(conn, user_id="U_CUSTOMER", token=token)
+    attempts = {"count": 0}
+
+    def flaky_push(_target, _message, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("LINE unavailable")
+
+    monkeypatch.setattr(server, "line_bot_api", SimpleNamespace(push_message=flaky_push))
+    result = {
+        "approved_exchange": {"starch_exchange": 1, "vegetable_exchange": 1},
+        "estimated_nutrition": {"calories_kcal": 200, "protein_g": 10},
+    }
+    assert server.push_meal_photo_approval_to_owner(draft, result) is False
+    assert server.push_meal_photo_approval_to_owner(draft, result) is True
+    assert server.push_meal_photo_approval_to_owner(draft, result) is True
+    assert attempts["count"] == 2
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            """SELECT COUNT(*) FROM meal_photo_notification_events
+               WHERE token=? AND notification_kind='owner_approved'""",
+            (token,),
+        ).fetchone()[0] == 1
+
+
+def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-pending-command.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_BOUND_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_PENDING",
+            payload=meal_photo_payload(),
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
+            ("sauce_level", "half"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"PENDING-PREP-{index}", user_id="U_CUSTOMER",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+
+    with pytest.raises(PermissionError, match="管理員限定"):
+        server.build_pending_meal_photo_review_message("U_FORGED")
+    message = server.build_pending_meal_photo_review_message("U_BOUND_ADMIN")
+    assert "待審餐點（1筆" in message.text
+    assert "U_CUSTOMER"[-8:] in message.text
+    actions = [item.action.data for item in message.quick_reply.items]
+    assert actions == [f"mpr:v1:{token}:8:start"]
+
+
 def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-admin-review.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
-            conn, user_id="U_ADMIN", source_message_id="M_ADMIN", payload=meal_photo_payload(),
+            conn, user_id="U_CUSTOMER", source_message_id="M_CUSTOMER", payload=meal_photo_payload(),
             consumed_at="2026-07-23T12:10:00+08:00", meal_slot="午餐",
         )
         for index, (field, value) in enumerate((
@@ -1537,11 +1746,16 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
             ("sauce_level", "half"),
         ), start=1):
             apply_meal_photo_action(
-                conn, event_id=f"PREP-ADMIN-{index}", user_id="U_ADMIN", token=token,
+                conn, event_id=f"PREP-ADMIN-{index}", user_id="U_CUSTOMER", token=token,
                 expected_version=index, action="answer", field=field, value=value,
             )
     replies = []
+    pushes = []
     monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
+    monkeypatch.setattr(
+        server.line_bot_api, "push_message",
+        lambda target, message, **_kwargs: pushes.append((target, message)),
+    )
 
     def send(data, event_id):
         event = SimpleNamespace(
@@ -1570,9 +1784,69 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     assert '"主食"' in done_text and '"6份"' in done_text
     assert '"中脂蛋白"' in done_text and '"2.5份"' in done_text
     with sqlite3.connect(db) as conn:
-        totals = daily_consumed_totals(conn, user_id="U_ADMIN", date_iso="2026-07-23")
+        totals = daily_consumed_totals(conn, user_id="U_CUSTOMER", date_iso="2026-07-23")
+        admin_totals = daily_consumed_totals(conn, user_id="U_ADMIN", date_iso="2026-07-23")
         assert totals["starch_exchange"] == 6.0
         assert totals["protein_medium_exchange"] == 2.5
+        assert admin_totals["starch_exchange"] == 0.0
+    assert pushes and pushes[-1][0] == "U_CUSTOMER"
+    assert "已由營養師核准" in pushes[-1][1].text
+    push_count = len(pushes)
+    replayed_done = send(f"mpr:v1:{token}:14:approve", "ADMIN-APPROVE")
+    assert "已核准｜已計入正式份量" in json.dumps(
+        json.loads(str(replayed_done.contents)), ensure_ascii=False
+    )
+    assert len(pushes) == push_count
+    with sqlite3.connect(db) as conn:
+        assert daily_consumed_totals(
+            conn, user_id="U_CUSTOMER", date_iso="2026-07-23"
+        )["starch_exchange"] == 6.0
+
+
+def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-admin-reject.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M_REJECT",
+            payload=meal_photo_payload(),
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
+            ("sauce_level", "half"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"REJECT-PREP-{index}", user_id="U_CUSTOMER",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+    replies, pushes = [], []
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(
+            reply_message=lambda _token, message: replies.append(message),
+            push_message=lambda target, message, **_kwargs: pushes.append((target, message)),
+        ),
+    )
+    server.handle_meal_photo_postback(SimpleNamespace(
+        postback=SimpleNamespace(data=f"mpr:v1:{token}:8:start"),
+        source=SimpleNamespace(user_id="U_ADMIN"), reply_token="reject-start",
+        webhook_event_id="REJECT-START", timestamp=1784740620000,
+    ))
+    server.handle_meal_photo_postback(SimpleNamespace(
+        postback=SimpleNamespace(data=f"mpr:v1:{token}:9:reject"),
+        source=SimpleNamespace(user_id="U_ADMIN"), reply_token="reject-final",
+        webhook_event_id="REJECT-FINAL", timestamp=1784740620001,
+    ))
+    with sqlite3.connect(db) as conn:
+        draft = get_meal_photo_draft(conn, user_id="U_CUSTOMER", token=token)
+        assert draft["status"] == "rejected"
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U_CUSTOMER'").fetchone()[0] == 0
+    assert "已退回客戶" in replies[-1].text
+    assert pushes[-1][0] == "U_CUSTOMER"
+    assert "退回" in pushes[-1][1].text
 
 
 def test_meal_photo_postback_replays_after_reply_failure_without_double_update(tmp_path, monkeypatch):

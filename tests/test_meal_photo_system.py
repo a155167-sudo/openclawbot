@@ -10,6 +10,8 @@ from meal_photo_system import (
     build_meal_photo_confirmation_bubble,
     ensure_meal_photo_schema,
     get_meal_photo_draft,
+    get_meal_photo_draft_for_admin,
+    list_pending_meal_photo_reviews,
     build_meal_photo_estimate_bubble,
     apply_meal_photo_action,
     apply_meal_photo_review_action,
@@ -668,12 +670,17 @@ def test_schema_v1_migrates_to_versioned_events_without_dropping_drafts(tmp_path
         event_table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='meal_photo_events'"
         ).fetchone()
+        notification_table = conn.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type='table' AND name='meal_photo_notification_events'"""
+        ).fetchone()
     assert "version" in columns
     for col in ("review_json", "approved_log_id", "approved_at", "approved_by"):
         assert col in columns, f"migration should add {col}"
-    assert version == 3
+    assert version == 4
     assert draft == ("U1", "M1", 1)
     assert event_table == ("meal_photo_events",)
+    assert notification_table == ("meal_photo_notification_events",)
 
 
 def test_durable_cancel_scrubs_content_but_retains_image_reference_for_delete(tmp_path):
@@ -697,3 +704,70 @@ def test_durable_cancel_scrubs_content_but_retains_image_reference_for_delete(tm
         )
         assert replay["replayed"] is True
         assert replay["result"] == first["result"]
+
+
+def test_configured_admin_can_review_another_users_meal_and_log_stays_with_owner(tmp_path):
+    with sqlite3.connect(tmp_path / "cross-user-review.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="M_CUSTOMER", payload=sample_payload(),
+            consumed_at="2026-07-23T12:10:00+08:00", meal_slot="午餐",
+        )
+        draft = _answer_all(conn, token)
+        assert draft["status"] == "estimated"
+
+        with pytest.raises(PermissionError, match="管理員限定"):
+            get_meal_photo_draft_for_admin(
+                conn, token=token, admin_user_id="U_FORGED",
+                required_admin_user_id="U_ADMIN",
+            )
+        admin_draft = get_meal_photo_draft_for_admin(
+            conn, token=token, admin_user_id="U_ADMIN",
+            required_admin_user_id="U_ADMIN",
+        )
+        assert admin_draft["user_id"] == "U1"
+
+        started = apply_meal_photo_review_action(
+            conn, event_id="CROSS-START", user_id="U1", admin_user_id="U_ADMIN",
+            required_admin_user_id="U_ADMIN", token=token,
+            expected_version=draft["version"], action="start",
+        )
+        sequence = (
+            ("protein_class", "medium"), ("protein_exchange", "2.5"),
+            ("vegetable_exchange", "2"), ("milk_exchange", "0"),
+            ("fruit_exchange", "0"),
+        )
+        current = started
+        for field, value in sequence:
+            current = apply_meal_photo_review_action(
+                conn, event_id=f"CROSS-{field}", user_id="U1",
+                admin_user_id="U_ADMIN", required_admin_user_id="U_ADMIN",
+                token=token, expected_version=current["draft"]["version"],
+                action="set", field=field, value=value,
+            )
+        approved = apply_meal_photo_review_action(
+            conn, event_id="CROSS-APPROVE", user_id="U1",
+            admin_user_id="U_ADMIN", required_admin_user_id="U_ADMIN",
+            token=token, expected_version=current["draft"]["version"], action="approve",
+        )
+        assert approved["draft"]["approved_by"] == "U_ADMIN"
+        assert daily_consumed_totals(
+            conn, user_id="U1", date_iso="2026-07-23"
+        )["vegetable_exchange"] == 2.0
+        assert daily_consumed_totals(
+            conn, user_id="U_ADMIN", date_iso="2026-07-23"
+        )["vegetable_exchange"] == 0.0
+
+
+def test_pending_review_list_returns_all_users_estimated_drafts_only(tmp_path):
+    with sqlite3.connect(tmp_path / "pending-review-list.db") as conn:
+        first = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="M1", payload=sample_payload()
+        )
+        _answer_all(conn, first)
+        waiting = save_meal_photo_draft(
+            conn, user_id="U2", source_message_id="M2", payload=sample_payload()
+        )
+        pending = list_pending_meal_photo_reviews(conn, limit=10)
+        assert [item["token"] for item in pending] == [first]
+        assert pending[0]["user_id"] == "U1"
+        assert waiting not in [item["token"] for item in pending]

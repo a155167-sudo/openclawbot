@@ -156,6 +156,13 @@ def ensure_meal_photo_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_meal_photo_events_token
             ON meal_photo_events(token, created_at);
+        CREATE TABLE IF NOT EXISTS meal_photo_notification_events (
+            token TEXT NOT NULL,
+            notification_kind TEXT NOT NULL,
+            delivered_at TEXT NOT NULL,
+            PRIMARY KEY(token, notification_kind),
+            FOREIGN KEY(token) REFERENCES pending_meal_photo_drafts(token)
+        );
         """
     )
     columns = {
@@ -184,7 +191,7 @@ def ensure_meal_photo_schema(conn: sqlite3.Connection) -> None:
     now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
     conn.execute(
         """INSERT INTO meal_photo_schema_versions(component,version,updated_at)
-           VALUES('meal_photo_system',3,?)
+           VALUES('meal_photo_system',4,?)
            ON CONFLICT(component) DO UPDATE SET
              version=MAX(version,excluded.version),updated_at=excluded.updated_at""",
         (now,),
@@ -320,6 +327,78 @@ def get_meal_photo_draft(
         "approved_at": row[15] or "",
         "approved_by": row[16] or "",
     }
+
+
+def get_meal_photo_draft_for_admin(
+    conn: sqlite3.Connection,
+    *,
+    token: str,
+    admin_user_id: str,
+    required_admin_user_id: str,
+) -> dict[str, Any]:
+    """由設定的管理員以不可預測token安全取得任一使用者的待審草稿。"""
+    admin_user_id = _short_text(admin_user_id, "admin_user_id", maximum=120)
+    required_admin_user_id = str(required_admin_user_id or "").strip()
+    if not required_admin_user_id or admin_user_id != required_admin_user_id:
+        raise PermissionError("管理員限定")
+    if not re.fullmatch(r"[0-9a-f]{12}", str(token or "")):
+        raise ValueError("餐點草稿token無效")
+    ensure_meal_photo_schema(conn)
+    row = conn.execute(
+        "SELECT user_id FROM pending_meal_photo_drafts WHERE token=?",
+        (token,),
+    ).fetchone()
+    if not row:
+        raise ValueError("找不到這筆餐點照片草稿")
+    return get_meal_photo_draft(conn, user_id=row[0], token=token)
+
+
+def list_pending_meal_photo_reviews(
+    conn: sqlite3.Connection, *, limit: int = 10
+) -> list[dict[str, Any]]:
+    """列出仍有效、已完成估算且尚未開始審核的跨使用者草稿。"""
+    ensure_meal_photo_schema(conn)
+    limit = max(1, min(int(limit), 10))
+    now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
+    rows = conn.execute(
+        """SELECT token,user_id FROM pending_meal_photo_drafts
+           WHERE status='estimated' AND expires_at>?
+           ORDER BY created_at ASC LIMIT ?""",
+        (now, limit),
+    ).fetchall()
+    return [
+        get_meal_photo_draft(conn, user_id=user_id, token=token)
+        for token, user_id in rows
+    ]
+
+
+def meal_photo_notification_delivered(
+    conn: sqlite3.Connection, *, token: str, notification_kind: str
+) -> bool:
+    ensure_meal_photo_schema(conn)
+    if notification_kind not in {"owner_approved", "owner_rejected"}:
+        raise ValueError("餐點通知類型無效")
+    row = conn.execute(
+        """SELECT 1 FROM meal_photo_notification_events
+           WHERE token=? AND notification_kind=?""",
+        (token, notification_kind),
+    ).fetchone()
+    return bool(row)
+
+
+def mark_meal_photo_notification_delivered(
+    conn: sqlite3.Connection, *, token: str, notification_kind: str
+) -> None:
+    ensure_meal_photo_schema(conn)
+    if notification_kind not in {"owner_approved", "owner_rejected"}:
+        raise ValueError("餐點通知類型無效")
+    now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT OR IGNORE INTO meal_photo_notification_events
+           (token,notification_kind,delivered_at) VALUES(?,?,?)""",
+        (token, notification_kind, now),
+    )
+    conn.commit()
 
 
 def clear_meal_photo_image_ref(
@@ -842,16 +921,17 @@ def apply_meal_photo_review_action(
         not required_admin_user_id
         or len(required_admin_user_id) > 120
         or admin_user_id != required_admin_user_id
-        or user_id != admin_user_id
     ):
-        raise PermissionError("管理員限定，且目前只能核准自己的餐點照片")
+        raise PermissionError("管理員限定")
     if not re.fullmatch(r"[0-9a-f]{12}", str(token or "")):
         raise ValueError("餐點草稿token無效")
     try:
         expected_version = int(expected_version)
     except (TypeError, ValueError) as exc:
         raise ValueError("餐點審核畫面版本無效") from exc
-    if expected_version < 1 or action not in {"start", "set", "cancel_review", "approve"}:
+    if expected_version < 1 or action not in {
+        "start", "set", "cancel_review", "reject", "approve"
+    }:
         raise ValueError("餐點審核操作不支援")
     if action != "set":
         field = ""
@@ -942,6 +1022,15 @@ def apply_meal_photo_review_action(
             review = {}
             status = "estimated"
             result = {"kind": "review_cancelled", "version": next_version}
+        elif action == "reject":
+            if status not in {"reviewing", "review_ready"}:
+                raise ValueError("這筆餐點照片目前不能退回")
+            review = {"rejected_by": admin_user_id, "rejected_at": now}
+            status = "rejected"
+            result = {
+                "kind": "rejected", "version": next_version,
+                "rejected_by": admin_user_id, "rejected_at": now,
+            }
         else:
             if status != "review_ready" or next_meal_photo_review_step({"review": review}) != "complete":
                 raise ValueError("正式份量尚未選完")

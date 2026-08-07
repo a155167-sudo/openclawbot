@@ -9,7 +9,7 @@ import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 
 NUTRIENT_KEYS = (
@@ -1231,6 +1231,7 @@ def apply_nutrition_text_edit(
     product_name: str = "",
     field: str = "",
     value: Any = None,
+    corrections: Sequence[tuple[str, Any]] | None = None,
 ) -> dict[str, Any]:
     message_id = str(message_id or "").strip()
     if not message_id or len(message_id) > 255:
@@ -1279,23 +1280,46 @@ def apply_nutrition_text_edit(
         if status not in {"pending", "awaiting_identity"}:
             raise ValueError("這筆營養紀錄已處理")
         payload = json.loads(payload_json)
+        changes: list[dict[str, Any]] = []
         if input_type == "name":
             name = str(product_name or "").strip()
             if not name or len(name) > 120:
                 raise ValueError("商品名稱不可空白或超過120字")
             payload["product_name"] = name
         elif input_type == "nutrient":
-            if status != "pending" or field not in NUTRIENT_KEYS:
+            requested = list(corrections) if corrections is not None else [(field, value)]
+            if status != "pending" or not requested:
                 raise ValueError("不支援的營養欄位或尚未補上商品名稱")
-            corrected = _number(value, field, max_value=NUTRIENT_LIMITS[field])
-            payload.setdefault("per_serving", {})[field] = corrected
+            normalized_corrections: list[tuple[str, float]] = []
+            seen: set[str] = set()
+            for requested_field, requested_value in requested:
+                requested_field = str(requested_field or "").strip()
+                if requested_field not in NUTRIENT_KEYS:
+                    raise ValueError("不支援的營養欄位或尚未補上商品名稱")
+                if requested_field in seen:
+                    raise ValueError("同一營養欄位不可重複修改")
+                seen.add(requested_field)
+                normalized_corrections.append((
+                    requested_field,
+                    _number(
+                        requested_value,
+                        requested_field,
+                        max_value=NUTRIENT_LIMITS[requested_field],
+                    ),
+                ))
             package_amount = float(payload.get("package_amount") or 0)
             servings = float(payload.get("servings_per_package") or 0)
             unit = str(payload.get("package_unit") or "").lower()
             base_amount = package_amount * 1000 if unit in {"kg", "l"} else package_amount
-            if unit in {"g", "ml", "kg", "l"} and base_amount > 0 and servings > 0:
-                serving_amount = base_amount / servings
-                payload.setdefault("per_100", {})[field] = round(corrected * 100 / serving_amount, 4)
+            serving_amount = base_amount / servings if base_amount > 0 and servings > 0 else 0
+            for corrected_field, corrected in normalized_corrections:
+                old_value = float((payload.get("per_serving") or {}).get(corrected_field) or 0)
+                payload.setdefault("per_serving", {})[corrected_field] = corrected
+                if unit in {"g", "ml", "kg", "l"} and serving_amount > 0:
+                    payload.setdefault("per_100", {})[corrected_field] = round(
+                        corrected * 100 / serving_amount, 4
+                    )
+                changes.append({"field": corrected_field, "old": old_value, "new": corrected})
         else:
             raise ValueError("不支援的營養輸入狀態")
         label = normalize_label_payload(payload)
@@ -1318,7 +1342,10 @@ def apply_nutrition_text_edit(
             (message_id, user_id, token, datetime.now().astimezone().isoformat(timespec="seconds")),
         )
         conn.commit()
-        return {"token": token, "label": label, "replayed": False}
+        result = {"token": token, "label": label, "replayed": False}
+        if input_type == "nutrient":
+            result["changes"] = changes
+        return result
     except Exception:
         if conn.in_transaction:
             conn.rollback()
@@ -1807,8 +1834,6 @@ def insert_approved_meal_photo_log(
         raise ValueError("餐點照片token無效")
     if not user_id or len(user_id) > 120 or not reviewer or len(reviewer) > 120:
         raise ValueError("餐點照片核准身分無效")
-    if reviewer != user_id:
-        raise PermissionError("目前只允許管理員核准自己的餐點照片")
     approved_at = utcish_now()
     values = {
         key: round(_number(exact_exchange.get(key), key, max_value=100), 4)

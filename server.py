@@ -77,6 +77,10 @@ from meal_photo_system import (
     daily_pending_meal_photo_count,
     ensure_meal_photo_schema,
     get_meal_photo_draft,
+    get_meal_photo_draft_for_admin,
+    list_pending_meal_photo_reviews,
+    mark_meal_photo_notification_delivered,
+    meal_photo_notification_delivered,
     meal_photo_step_options,
     next_meal_photo_step,
     normalize_meal_photo_payload,
@@ -273,7 +277,8 @@ pending_subscription_state = {}
 ADMIN_ONLY_EXACT_COMMANDS = {
     "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成", "#發送明日提醒",
     "#測試週報", "#測試晚報", "#生24", "#生48", "#延餐清單", "#待核訂單",
-    "#清空熱量", "#刪除檔案", "#重置", "重置本週", "檢查數據", "#待審營養份量"
+    "#清空熱量", "#刪除檔案", "#重置", "重置本週", "檢查數據", "#待審營養份量",
+    "#待審餐點"
 }
 ADMIN_ONLY_PREFIXES = (
     "@靜音 ", "@解除靜音 ", "#喚醒AI ", "#上傳點數\n", "#核准延餐 ", "#拒絕延餐 ",
@@ -7028,15 +7033,58 @@ _NUTRITION_CORRECTION_FIELDS = {
 }
 
 
-def parse_nutrition_correction_command(text):
-    match = re.fullmatch(
-        r"修正營養\s+(熱量|蛋白質|飽和脂肪|反式脂肪|脂肪|膽固醇|碳水化合物|碳水|膳食纖維|纖維|糖|鈉)\s+([0-9]+(?:\.[0-9]+)?)\s*(?:kcal|mg|g)?",
-        str(text or "").strip(),
-        flags=re.IGNORECASE,
+def parse_nutrition_corrections(text):
+    """解析一則訊息中的多個營養修正；回傳(有效修正, 無法解析片段)。"""
+    raw = re.sub(r"^修正營養\s*", "", str(text or "").strip()).strip()
+    if not raw:
+        return [], []
+    labels = sorted(_NUTRITION_CORRECTION_FIELDS, key=len, reverse=True)
+    pattern = re.compile(
+        rf"({'|'.join(map(re.escape, labels))})\s*(?:[:：=]\s*)?"
+        r"([0-9]+(?:\.[0-9]+)?)\s*(kcal|mg|g|大卡|毫克|公克)?",
+        re.IGNORECASE,
     )
-    if not match:
+    expected_units = {
+        "calories_kcal": ({"kcal", "大卡"}, "kcal"),
+        "sodium_mg": ({"mg", "毫克"}, "mg"),
+        "cholesterol_mg": ({"mg", "毫克"}, "mg"),
+    }
+    corrections = []
+    consumed = []
+    seen = set()
+    errors = []
+    for match in pattern.finditer(raw):
+        label = match.group(1)
+        field = _NUTRITION_CORRECTION_FIELDS[label]
+        consumed.append((match.start(), match.end()))
+        unit = str(match.group(3) or "").lower()
+        allowed_units, display_unit = expected_units.get(
+            field, ({"g", "公克"}, "g")
+        )
+        if unit and unit not in allowed_units:
+            errors.append(f"{label}單位應為 {display_unit}")
+            continue
+        if field in seen:
+            errors.append(f"{label}重複輸入")
+            continue
+        seen.add(field)
+        corrections.append((field, float(match.group(2))))
+    residual_chars = list(raw)
+    for start, end in consumed:
+        residual_chars[start:end] = " " * (end - start)
+    residual = "".join(residual_chars)
+    for fragment in re.split(r"[、，,；;。\n]+", residual):
+        fragment = fragment.strip(" \t:：=")
+        if fragment:
+            errors.append(fragment)
+    return corrections, errors
+
+
+def parse_nutrition_correction_command(text):
+    corrections, errors = parse_nutrition_corrections(text)
+    if errors or len(corrections) != 1:
         return None
-    return _NUTRITION_CORRECTION_FIELDS[match.group(1)], float(match.group(2))
+    return corrections[0]
 
 
 def _nutrition_targets_from_plan_row(row):
@@ -8077,6 +8125,15 @@ def build_meal_photo_review_step_message(draft, step, version=1):
     items.append(
         QuickReplyButton(
             action=PostbackAction(
+                label="退回客戶",
+                data=f"mpr:v1:{token}:{int(version)}:reject",
+                display_text="退回這筆餐點，請客戶重新送審",
+            )
+        )
+    )
+    items.append(
+        QuickReplyButton(
+            action=PostbackAction(
                 label="取消審核",
                 data=f"mpr:v1:{token}:{int(version)}:cancel_review",
                 display_text="取消這筆審核",
@@ -8151,6 +8208,10 @@ def build_meal_photo_review_ready_bubble(draft):
                             "data": f"mpr:v1:{token}:{version}:approve",
                             "displayText": "確認加入正式份量"}},
                 {"type": "button", "style": "secondary",
+                 "action": {"type": "postback", "label": "退回客戶",
+                            "data": f"mpr:v1:{token}:{version}:reject",
+                            "displayText": "退回這筆餐點，請客戶重新送審"}},
+                {"type": "button", "style": "secondary",
                  "action": {"type": "postback", "label": "取消審核",
                             "data": f"mpr:v1:{token}:{version}:cancel_review",
                             "displayText": "取消這筆審核"}},
@@ -8205,6 +8266,131 @@ def build_meal_photo_approved_bubble(draft, result):
         },
         "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body_contents},
     }
+
+
+def build_meal_photo_admin_review_messages(draft):
+    """建立跨使用者送審通知；token只放於管理員限定postback。"""
+    from linebot.models import FlexSendMessage
+    payload = draft.get("payload") or {}
+    names = [
+        str(item.get("name") or "").strip()
+        for item in payload.get("visible_items", [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    foods = "、".join(names[:8]) or "未辨識餐點內容"
+    owner_suffix = str(draft.get("user_id") or "")[-8:] or "NA"
+    consumed_at = str(draft.get("consumed_at") or "").replace("T", " ")[:16] or "待確認"
+    header = TextSendMessage(text=(
+        "📷 新的餐點審核需求\n"
+        f"用戶 UID 末8碼：{owner_suffix}\n"
+        f"餐別：{draft.get('meal_slot') or '未指定'}\n"
+        f"時間：{consumed_at}\n"
+        f"辨識餐點：{foods}\n\n"
+        "請按下方『審核並加入』選定正式營養份量。"
+    ))
+    review_card = FlexSendMessage(
+        alt_text="新的餐點審核需求",
+        contents=build_meal_photo_estimate_bubble(draft, allow_admin_review=True),
+    )
+    return [header, review_card]
+
+
+def build_pending_meal_photo_review_message(uid):
+    configured_admin_uid = str(get_admin_notify_uid() or "").strip()
+    if not configured_admin_uid or uid != configured_admin_uid:
+        raise PermissionError("管理員限定")
+    with sqlite3.connect(DB_PATH) as conn:
+        drafts = list_pending_meal_photo_reviews(conn, limit=10)
+    if not drafts:
+        return TextSendMessage(text="✅ 目前沒有待審核的餐點照片。")
+    lines = [f"📷 待審餐點（{len(drafts)}筆，最多顯示10筆）"]
+    buttons = []
+    for index, draft in enumerate(drafts, 1):
+        owner_suffix = str(draft.get("user_id") or "")[-8:] or "NA"
+        consumed_at = str(draft.get("consumed_at") or "").replace("T", " ")[:16] or "待確認"
+        names = [
+            str(item.get("name") or "").strip()
+            for item in (draft.get("payload") or {}).get("visible_items", [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        foods = "、".join(names[:4]) or "未辨識餐點"
+        lines.append(
+            f"{index}. UID末8碼 {owner_suffix}｜{draft.get('meal_slot') or '未指定'}｜{consumed_at}\n   {foods}"
+        )
+        buttons.append(QuickReplyButton(action=PostbackAction(
+            label=f"審核 {owner_suffix}",
+            data=f"mpr:v1:{draft['token']}:{draft['version']}:start",
+            display_text=f"審核 UID末8碼 {owner_suffix} 的餐點",
+        )))
+    return TextSendMessage(
+        text="\n".join(lines),
+        quick_reply=QuickReply(items=buttons),
+    )
+
+
+def push_meal_photo_review_request(draft):
+    admin_uid = str(get_admin_notify_uid() or "").strip()
+    owner_uid = str(draft.get("user_id") or "").strip()
+    if not admin_uid or admin_uid == owner_uid:
+        return False
+    try:
+        line_bot_api.push_message(
+            admin_uid, build_meal_photo_admin_review_messages(draft), timeout=12
+        )
+        return True
+    except Exception as exc:
+        print(f"⚠️ 推播餐點審核需求失敗：{exc}")
+        return False
+
+
+def _push_meal_photo_owner_notification_once(draft, notification_kind, text):
+    owner_uid = str(draft.get("user_id") or "").strip()
+    admin_uid = str(get_admin_notify_uid() or "").strip()
+    token = str(draft.get("token") or "").strip()
+    if not owner_uid:
+        return False
+    if owner_uid == admin_uid:
+        return True
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            if meal_photo_notification_delivered(
+                conn, token=token, notification_kind=notification_kind
+            ):
+                return True
+        line_bot_api.push_message(owner_uid, TextSendMessage(text=text), timeout=12)
+        with sqlite3.connect(DB_PATH) as conn:
+            mark_meal_photo_notification_delivered(
+                conn, token=token, notification_kind=notification_kind
+            )
+        return True
+    except Exception as exc:
+        print(f"⚠️ 推播餐點結果給使用者失敗（{notification_kind}）：{exc}")
+        return False
+
+
+def push_meal_photo_return_to_owner(draft):
+    text = (
+        "↩️ 你的餐點照片已由營養師退回，尚未計入正式營養紀錄。\n"
+        "請重新拍攝清楚的完整餐點，或補充食材與份量後再次送審。"
+    )
+    return _push_meal_photo_owner_notification_once(
+        draft, "owner_rejected", text
+    )
+
+
+def push_meal_photo_approval_to_owner(draft, result):
+    exact = result.get("approved_exchange") or {}
+    estimated = result.get("estimated_nutrition") or {}
+    text = (
+        "✅ 你的餐點已由營養師核准並計入正式紀錄。\n"
+        f"主食 {float(exact.get('starch_exchange', 0) or 0):g}份｜"
+        f"蔬菜 {float(exact.get('vegetable_exchange', 0) or 0):g}份\n"
+        f"估算熱量 {float(estimated.get('calories_kcal', 0) or 0):g} kcal｜"
+        f"蛋白質 {float(estimated.get('protein_g', 0) or 0):g}g"
+    )
+    return _push_meal_photo_owner_notification_once(
+        draft, "owner_approved", text
+    )
 
 
 @handler.add(PostbackEvent)
@@ -8290,11 +8476,12 @@ def handle_meal_photo_postback(event):
         r"mpr:v1:([0-9a-f]{12}):(\d+):set:([a-z_]+):([a-z0-9_.]+)", data
     )
     review_cancel = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):cancel_review", data)
+    review_reject = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):reject", data)
     review_approve = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):approve", data)
-    if not (start or cancel or answer or remove_item or request_add or cancel_add or add_category or review_start or review_set or review_cancel or review_approve):
+    if not (start or cancel or answer or remove_item or request_add or cancel_add or add_category or review_start or review_set or review_cancel or review_reject or review_approve):
         return
     uid = event.source.user_id
-    if not (review_start or review_set or review_cancel or review_approve):
+    if not (review_start or review_set or review_cancel or review_reject or review_approve):
         matched = start or cancel or answer or remove_item or request_add or cancel_add or add_category
         assert matched is not None
         token, version = matched.group(1), int(matched.group(2))
@@ -8302,15 +8489,17 @@ def handle_meal_photo_postback(event):
     if not event_id:
         fallback = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
         event_id = "postback:" + hashlib.sha256(fallback.encode()).hexdigest()
+    applied = None
     try:
-        if review_start or review_set or review_cancel or review_approve:
-            if not ADMIN_UID or uid != ADMIN_UID:
+        if review_start or review_set or review_cancel or review_reject or review_approve:
+            configured_admin_uid = str(get_admin_notify_uid() or "").strip()
+            if not configured_admin_uid or uid != configured_admin_uid:
                 line_bot_api.reply_message(
                     event.reply_token,
                     TextSendMessage(text="⚠️ 管理員限定，無法執行餐點審核。"),
                 )
                 return
-            matched = review_start or review_set or review_cancel or review_approve
+            matched = review_start or review_set or review_cancel or review_reject or review_approve
             assert matched is not None
             token, version = matched.group(1), int(matched.group(2))
             if review_start:
@@ -8319,13 +8508,20 @@ def handle_meal_photo_postback(event):
                 action, field, value = "set", matched.group(3), matched.group(4)
             elif review_cancel:
                 action, field, value = "cancel_review", "", ""
+            elif review_reject:
+                action, field, value = "reject", "", ""
             else:
                 action, field, value = "approve", "", ""
             from meal_photo_system import apply_meal_photo_review_action, next_meal_photo_review_step
             with sqlite3.connect(DB_PATH) as conn:
+                admin_draft = get_meal_photo_draft_for_admin(
+                    conn, token=token, admin_user_id=uid,
+                    required_admin_user_id=configured_admin_uid,
+                )
+                owner_uid = admin_draft["user_id"]
                 applied = apply_meal_photo_review_action(
-                    conn, event_id=event_id, user_id=uid, admin_user_id=uid,
-                    required_admin_user_id=ADMIN_UID,
+                    conn, event_id=event_id, user_id=owner_uid, admin_user_id=uid,
+                    required_admin_user_id=configured_admin_uid,
                     token=token, expected_version=version, action=action,
                     field=field, value=value,
                 )
@@ -8352,11 +8548,30 @@ def handle_meal_photo_postback(event):
                 reply = FlexSendMessage(
                     alt_text="餐點照片估算完成，待營養師審核",
                     contents=build_meal_photo_estimate_bubble(
-                        draft, allow_admin_review=(uid == ADMIN_UID)
+                        draft, allow_admin_review=True
                     ),
+                )
+            elif kind == "rejected":
+                reply = TextSendMessage(
+                    text="↩️ 已退回客戶；這筆餐點未計入正式營養紀錄。"
                 )
             else:
                 raise ValueError("餐點審核結果無效")
+            if kind == "approved":
+                owner_notified = push_meal_photo_approval_to_owner(draft, result)
+                if not owner_notified:
+                    reply = [
+                        TextSendMessage(
+                            text="⚠️ 正式紀錄已完成，但客戶通知尚未送達；請再按一次原核准按鈕重試通知。"
+                        ),
+                        reply,
+                    ]
+            elif kind == "rejected":
+                owner_notified = push_meal_photo_return_to_owner(draft)
+                if not owner_notified:
+                    reply = TextSendMessage(
+                        text="⚠️ 已退回且未入帳，但客戶通知尚未送達；請再按一次原退回按鈕重試通知。"
+                    )
             line_bot_api.reply_message(event.reply_token, reply)
             return
         with sqlite3.connect(DB_PATH) as conn:
@@ -8429,10 +8644,14 @@ def handle_meal_photo_postback(event):
             )
         elif kind == "estimate":
             from linebot.models import FlexSendMessage
+            configured_admin_uid = str(get_admin_notify_uid() or "").strip()
+            is_admin_owner = bool(configured_admin_uid and uid == configured_admin_uid)
+            if not is_admin_owner and applied is not None and not applied.get("replayed"):
+                push_meal_photo_review_request(draft)
             reply = FlexSendMessage(
                 alt_text="餐點照片估算完成，待營養師審核",
                 contents=build_meal_photo_estimate_bubble(
-                    draft, allow_admin_review=(uid == ADMIN_UID)
+                    draft, allow_admin_review=is_admin_owner
                 ),
             )
         elif kind == "cancel":
@@ -8743,9 +8962,25 @@ def _handle_message_impl(event):
             line_bot_api.reply_message(event.reply_token, reply)
             return
 
-    if uid != ADMIN_UID and is_admin_only_command(msg):
+    admin_command_uid = (
+        str(get_admin_notify_uid() or "").strip() if msg == "#待審餐點" else ADMIN_UID
+    )
+    if uid != admin_command_uid and is_admin_only_command(msg):
         try:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⛔ 這是管理員專用指令，若需要協助請直接留言給客服喔。"))
+        except Exception:
+            processed_messages.discard(msg_id)
+            raise
+        return
+
+    if msg == "#待審餐點":
+        try:
+            reply = build_pending_meal_photo_review_message(uid)
+            line_bot_api.reply_message(event.reply_token, reply)
+        except (PermissionError, ValueError) as exc:
+            line_bot_api.reply_message(
+                event.reply_token, TextSendMessage(text=f"⚠️ {exc}")
+            )
         except Exception:
             processed_messages.discard(msg_id)
             raise
@@ -9234,16 +9469,22 @@ def _handle_message_impl(event):
     if nutrition_edit_replay:
         token, label, servings, consumed_at, consumed_time_source = nutrition_edit_replay
         from linebot.models import FlexSendMessage
+        confirmation_message = FlexSendMessage(
+            alt_text=f"請確認營養標示：{label['product_name']}",
+            contents=build_label_confirmation_bubble(
+                label, token=token, consumed_servings=servings,
+                consumed_at=consumed_at,
+                consumed_time_source=consumed_time_source,
+            ),
+        )
         line_bot_api.reply_message(
             event.reply_token,
-            FlexSendMessage(
-                alt_text=f"請確認營養標示：{label['product_name']}",
-                contents=build_label_confirmation_bubble(
-                    label, token=token, consumed_servings=servings,
-                    consumed_at=consumed_at,
-                    consumed_time_source=consumed_time_source,
+            [
+                TextSendMessage(
+                    text="✅ 修改已完成，這是重送的確認卡；營養內容不會重複更新。"
                 ),
-            ),
+                confirmation_message,
+            ],
         )
         return
 
@@ -9272,23 +9513,26 @@ def _handle_message_impl(event):
                         product_name=name_match.group(1),
                     )
                 else:
-                    correction = (
-                        parse_nutrition_correction_command(msg)
-                        or parse_nutrition_correction_command(f"修正營養 {msg}")
-                    )
-                    if not correction:
+                    corrections, parse_errors = parse_nutrition_corrections(msg)
+                    if parse_errors or not corrections:
+                        problem = "、".join(parse_errors) if parse_errors else "沒有讀到營養欄位與數字"
                         line_bot_api.reply_message(
                             event.reply_token,
-                            TextSendMessage(text="格式看不懂，請輸入例如：鈉 48、熱量 228、蛋白質 21.2；若不修改請輸入『取消修改』。"),
+                            TextSendMessage(
+                                text=(
+                                    f"⚠️ 尚未修改：無法辨識「{problem}」。\n\n"
+                                    "可一次輸入多項，例如：\n"
+                                    "熱量 204、蛋白質 16.4、鈉 48\n\n"
+                                    "也可分行輸入，支援 kcal、g、mg；若不修改請輸入『取消修改』。"
+                                )
+                            ),
                         )
                         return
-                    field, value = correction
                     edited = apply_nutrition_text_edit(
                         conn,
                         user_id=uid,
                         message_id=str(msg_id),
-                        field=field,
-                        value=value,
+                        corrections=corrections,
                     )
                 edit_committed = True
                 token = edited["token"]
@@ -9302,17 +9546,42 @@ def _handle_message_impl(event):
                 consumed_at = servings_row[1] if servings_row else ""
                 consumed_time_source = servings_row[2] if servings_row else "line_timestamp"
             from linebot.models import FlexSendMessage
-            line_bot_api.reply_message(
-                event.reply_token,
-                FlexSendMessage(
-                    alt_text=f"請確認營養標示：{label['product_name']}",
-                    contents=build_label_confirmation_bubble(
-                        label, token=token, consumed_servings=servings,
-                        consumed_at=consumed_at,
-                        consumed_time_source=consumed_time_source,
-                    ),
+            confirmation_message = FlexSendMessage(
+                alt_text=f"請確認營養標示：{label['product_name']}",
+                contents=build_label_confirmation_bubble(
+                    label, token=token, consumed_servings=servings,
+                    consumed_at=consumed_at,
+                    consumed_time_source=consumed_time_source,
                 ),
             )
+            if input_type == "nutrient":
+                field_labels = {
+                    value: key for key, value in _NUTRITION_CORRECTION_FIELDS.items()
+                    if key not in {"碳水", "纖維"}
+                }
+                field_units = {
+                    "calories_kcal": "kcal", "sodium_mg": "mg",
+                    "cholesterol_mg": "mg",
+                }
+                change_lines = []
+                for change in edited.get("changes", []):
+                    field_name = field_labels.get(change["field"], change["field"])
+                    unit = field_units.get(change["field"], "g")
+                    change_lines.append(
+                        f"{field_name}：{change['old']:g} → {change['new']:g} {unit}"
+                    )
+                if edited.get("replayed"):
+                    summary = "✅ 修改已完成，這是重送的確認卡；營養數值不會重複更新。"
+                else:
+                    summary = "\n".join([
+                        f"✅ 已更新 {len(change_lines)} 個項目",
+                        *change_lines,
+                        "其他營養數值維持不變。",
+                    ])
+                reply_payload = [TextSendMessage(text=summary), confirmation_message]
+            else:
+                reply_payload = confirmation_message
+            line_bot_api.reply_message(event.reply_token, reply_payload)
         except ValueError as exc:
             if edit_committed:
                 processed_messages.discard(str(msg_id))
