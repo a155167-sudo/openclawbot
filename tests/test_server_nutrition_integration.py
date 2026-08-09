@@ -522,6 +522,68 @@ def test_soft_delete_syncs_deleted_status_to_food_log_sheet(tmp_path, monkeypatc
     assert rows[0][26] == "deleted"
 
 
+def test_clear_daily_food_ledger_soft_deletes_today_only_and_is_replay_safe(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-clear.db")
+    today = server.tw_today().isoformat()
+    yesterday = (server.tw_today() - server.timedelta(days=1)).isoformat()
+    with sqlite3.connect(db) as conn:
+        today_log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="今日餐", meal_slot="午餐",
+            consumed_at=f"{today}T12:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 500, "protein_g": 25}, source_type="ai_text_estimate",
+        )
+        yesterday_log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="昨日餐", meal_slot="晚餐",
+            consumed_at=f"{yesterday}T18:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 600, "protein_g": 30}, source_type="ai_text_estimate",
+        )
+        server._sync_health_profile_from_ledger_conn(conn, "U1", today)
+        conn.commit()
+    result = server.clear_daily_food_ledger("U1", event_id="clear-M1")
+    replay = server.clear_daily_food_ledger("U1", event_id="clear-M1")
+    assert result["deleted_count"] == 1
+    assert replay["deleted_count"] == 1 and replay["replayed"] is True
+    assert server.get_daily_food_ledger("U1", today)["count"] == 0
+    assert server.get_daily_food_ledger("U1", yesterday)["count"] == 1
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT confirmation_status FROM food_logs WHERE log_id=?", (today_log["log_id"],)
+        ).fetchone()[0] == "deleted"
+        assert conn.execute(
+            "SELECT confirmation_status FROM food_logs WHERE log_id=?", (yesterday_log["log_id"],)
+        ).fetchone()[0] == "confirmed"
+        assert conn.execute(
+            "SELECT today_extra_cal,today_extra_pro,today_food_items FROM health_profile WHERE user_id='U1'"
+        ).fetchone() == (0, 0, "")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM nutrition_sheet_outbox WHERE entity_type='food_log' AND status='pending'"
+        ).fetchone()[0] >= 1
+
+
+def test_clear_daily_food_ledger_rolls_back_if_event_write_fails(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-clear-atomic.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="不可半清", meal_slot="午餐",
+            consumed_at=f"{today}T12:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 500, "protein_g": 25}, source_type="ai_text_estimate",
+        )
+        server._sync_health_profile_from_ledger_conn(conn, "U1", today)
+        conn.execute("""CREATE TRIGGER fail_clear_event BEFORE INSERT ON daily_food_log_events
+                        BEGIN SELECT RAISE(ABORT, 'forced clear event failure'); END""")
+        conn.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="forced clear event failure"):
+        server.clear_daily_food_ledger("U1", event_id="clear-fail")
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT confirmation_status,deleted_at,version FROM food_logs WHERE log_id=?", (log["log_id"],)
+        ).fetchone() == ("confirmed", "", 1)
+        assert conn.execute(
+            "SELECT today_extra_cal,today_extra_pro FROM health_profile WHERE user_id='U1'"
+        ).fetchone() == (500, 25)
+
+
 def test_image_magic_and_opaque_reference(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
     jpeg = b"\xff\xd8\xff" + b"x" * 100

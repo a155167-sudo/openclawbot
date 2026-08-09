@@ -656,6 +656,71 @@ def apply_daily_food_log_edit(
         return result
 
 
+def clear_daily_food_ledger(user_id: str, *, event_id: str) -> dict:
+    """原子清除台灣時區今天的逐筆帳本，並保留 soft-delete 稽核與 Sheet 同步。"""
+    user_id = str(user_id or "").strip()
+    event_id = str(event_id or "").strip()
+    if not user_id or not event_id:
+        raise ValueError("缺少清空事件識別碼")
+    today = tw_today().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute(
+            "SELECT result_json FROM daily_food_log_events WHERE event_id=? AND user_id=?",
+            (event_id, user_id),
+        ).fetchone()
+        if previous:
+            result = json.loads(previous[0])
+            result["replayed"] = True
+            conn.commit()
+            return result
+        log_ids = [row[0] for row in conn.execute(
+            """SELECT log_id FROM food_logs
+               WHERE user_id=? AND date(consumed_at, '+8 hours')=?
+                 AND confirmation_status='confirmed' AND COALESCE(deleted_at,'')=''""",
+            (user_id, today),
+        ).fetchall()]
+        now = tw_now().isoformat(timespec="seconds")
+        for log_id in log_ids:
+            conn.execute(
+                """UPDATE food_logs SET deleted_at=?,confirmation_status='deleted',
+                   version=COALESCE(version,1)+1,updated_at=? WHERE log_id=? AND user_id=?""",
+                (now, now, log_id, user_id),
+            )
+            conn.execute(
+                """INSERT INTO nutrition_sheet_outbox
+                   (outbox_id,entity_type,entity_id,status,attempts,last_error,created_at,synced_at)
+                   VALUES (?,'food_log',?,'pending',0,'',?,'')
+                   ON CONFLICT(entity_type,entity_id) DO UPDATE SET
+                     status='pending',synced_at='',resync_required=1""",
+                ("outbox_" + uuid.uuid4().hex[:20], log_id, now),
+            )
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recent_meal_logs'"
+        ).fetchone():
+            conn.execute(
+                "DELETE FROM recent_meal_logs WHERE user_id=? AND meal_date=?",
+                (user_id, today),
+            )
+        _sync_health_profile_from_ledger_conn(conn, user_id, today)
+        result = {
+            "date": today, "deleted_count": len(log_ids),
+            "replayed": False,
+        }
+        conn.execute(
+            """INSERT INTO daily_food_log_events
+               (event_id,user_id,log_id,action,result_json,created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (
+                event_id, user_id, f"day:{today}", "clear_day",
+                json.dumps(result, ensure_ascii=False, sort_keys=True), now,
+            ),
+        )
+        conn.commit()
+        return result
+
+
 def _ledger_value_text(ledger: dict, field: str, unit: str) -> str:
     known = ledger["known_totals"].get(field, 0)
     count = ledger["known_counts"].get(field, 0)
@@ -12127,11 +12192,14 @@ def _handle_message_impl(event):
         return
 
     elif msg == "#清空熱量":
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0 WHERE user_id=?", (uid,))
-            conn.commit()
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🔄 報告老闆，今日偷吃紀錄（含熱量與蛋白質）已歸零！"))
+        result = clear_daily_food_ledger(
+            uid, event_id=f"foodlog:clear:{uid}:{msg_id}"
+        )
+        count = int(result.get("deleted_count") or 0)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"🔄 今日飲食紀錄已清空（共 {count} 筆），熱量與蛋白質已重新歸零。"),
+        )
         return
 
     elif msg == "#刪除檔案":
