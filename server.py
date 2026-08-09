@@ -98,6 +98,931 @@ def tw_today():
 def tw_now():
     return datetime.now(TW_TZ)
 
+
+DAILY_FOOD_NUTRIENT_FIELDS = (
+    "calories_kcal", "protein_g", "fat_g", "carbohydrate_g",
+)
+
+
+def ensure_daily_food_ledger_schema(conn: sqlite3.Connection) -> None:
+    """為既有 food_logs 加入每日帳本編輯、版本與稽核欄位。"""
+    ensure_nutrition_schema(conn)
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(food_logs)")}
+    additions = {
+        "version": "INTEGER NOT NULL DEFAULT 1",
+        "deleted_at": "TEXT NOT NULL DEFAULT ''",
+        "nutrient_sources_json": "TEXT NOT NULL DEFAULT '{}'",
+        "original_nutrition_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
+        "operation_key": "TEXT NOT NULL DEFAULT ''",
+    }
+    for column, definition in additions.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE food_logs ADD COLUMN {column} {definition}")
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recent_meal_logs'"
+    ).fetchone():
+        recent_columns = {row[1] for row in conn.execute("PRAGMA table_info(recent_meal_logs)")}
+        if "food_log_id" not in recent_columns:
+            conn.execute("ALTER TABLE recent_meal_logs ADD COLUMN food_log_id TEXT DEFAULT ''")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS daily_food_log_events (
+            event_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            log_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            result_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS daily_food_edit_states (
+            user_id TEXT PRIMARY KEY,
+            log_id TEXT NOT NULL,
+            expected_version INTEGER NOT NULL,
+            input_type TEXT NOT NULL,
+            field TEXT NOT NULL DEFAULT '',
+            pending_value REAL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS daily_food_ledger_migrations (
+            user_id TEXT NOT NULL,
+            ledger_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, ledger_date)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_food_operation_key
+            ON food_logs(operation_key) WHERE operation_key<>'';
+        CREATE INDEX IF NOT EXISTS idx_daily_food_logs_user_date
+            ON food_logs(user_id, consumed_at, confirmation_status, deleted_at);
+        """
+    )
+
+
+def _ledger_number(value, *, allow_none=True):
+    if value is None and allow_none:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("營養數值格式不正確") from exc
+    if number != number or number in (float("inf"), float("-inf")) or number < 0:
+        raise ValueError("營養數值必須是非負有限數字")
+    return round(number, 4)
+
+
+def _normalize_ledger_nutrition(nutrition: dict) -> dict:
+    raw = nutrition or {}
+    result = {}
+    for field in DAILY_FOOD_NUTRIENT_FIELDS:
+        if field in raw:
+            result[field] = _ledger_number(raw.get(field))
+    return result
+
+
+def create_daily_food_log(
+    conn: sqlite3.Connection, *, user_id: str, product_name: str,
+    meal_slot: str, consumed_at: str, servings: float,
+    nutrition: dict, source_type: str, operation_key: str = "",
+) -> dict:
+    """建立可編輯逐筆飲食紀錄；營養快照保留未知 None。"""
+    if not conn.in_transaction:
+        ensure_daily_food_ledger_schema(conn)
+    operation_key = str(operation_key or "").strip()[:180]
+    if operation_key:
+        existing_log = conn.execute(
+            """SELECT fl.log_id,fl.food_id,fc.product_name,fl.meal_slot,fl.consumed_at,
+                      fl.consumed_servings,fl.nutrition_snapshot_json,fl.version
+               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, str(user_id or "").strip()),
+        ).fetchone()
+        if existing_log:
+            return {
+                "log_id": existing_log[0], "food_id": existing_log[1],
+                "product_name": existing_log[2], "meal_slot": existing_log[3] or "",
+                "consumed_at": existing_log[4], "servings": float(existing_log[5] or 0),
+                "nutrition": json.loads(existing_log[6] or "{}"),
+                "version": int(existing_log[7] or 1), "replayed": True,
+            }
+    user_id = str(user_id or "").strip()
+    product_name = str(product_name or "").strip()[:120]
+    source_type = str(source_type or "user_private_food").strip()[:60]
+    meal_slot = str(meal_slot or "").strip()
+    consumed_at = str(consumed_at or tw_now().isoformat(timespec="seconds"))[:50]
+    if not user_id or not product_name:
+        raise ValueError("飲食紀錄缺少使用者或品名")
+    if meal_slot not in {"", "早餐", "午餐", "晚餐", "點心"}:
+        raise ValueError("餐別不支援")
+    servings = _ledger_number(servings, allow_none=False)
+    if servings < 0.1 or servings > 100:
+        raise ValueError("份量需介於 0.1～100 份")
+    normalized = _normalize_ledger_nutrition(nutrition)
+    if not normalized or all(value is None for value in normalized.values()):
+        raise ValueError("至少需要一項可記錄的營養資料")
+
+    fingerprint = hashlib.sha256(
+        f"ledger|{user_id}|{source_type}|{product_name}".encode("utf-8")
+    ).hexdigest()
+    food_id = "ledger_" + fingerprint[:24]
+    now = tw_now().isoformat(timespec="seconds")
+    per_serving = {
+        key: (None if value is None else round(value / servings, 4))
+        for key, value in normalized.items()
+    }
+    conn.execute(
+        """INSERT INTO food_catalog
+           (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+            package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+            exchange_json,exchange_review_status,fingerprint,original_image_ref,
+            recognition_confidence,verification_status,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(food_id) DO UPDATE SET
+             product_name=excluded.product_name,per_serving_json=excluded.per_serving_json,
+             updated_at=excluded.updated_at""",
+        (
+            food_id, product_name, "", "", source_type, user_id, "private",
+            1, "份", 1, json.dumps(per_serving, ensure_ascii=False, allow_nan=False),
+            "{}", "{}", "pending_review", fingerprint, "", 0,
+            "user_confirmed" if source_type != "ai_text_estimate" else "ai_estimated",
+            now, now,
+        ),
+    )
+    log_id = "log_" + uuid.uuid4().hex[:20]
+    sources = {
+        key: ("ai_estimate" if source_type == "ai_text_estimate" else source_type)
+        for key in normalized
+    }
+    nutrition_json = json.dumps(normalized, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    inserted = conn.execute(
+        """INSERT INTO food_logs
+           (log_id,user_id,food_id,consumed_at,meal_slot,consumed_servings,
+            consumed_amount,consumed_unit,nutrition_snapshot_json,exchange_snapshot_json,
+            approved_exchange_json,exchange_approval_id,source_image_ref,plan_id,
+            plan_link_status,confirmation_status,legacy_applied_at,created_at,updated_at,
+            version,deleted_at,nutrient_sources_json,original_nutrition_snapshot_json,
+            operation_key)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(operation_key) WHERE operation_key<>'' DO NOTHING""",
+        (
+            log_id, user_id, food_id, consumed_at, meal_slot, servings,
+            servings, "份", nutrition_json, "{}", "{}", "", "", "",
+            "no_plan", "confirmed", "not_applicable", now, now, 1, "",
+            json.dumps(sources, ensure_ascii=False, sort_keys=True), nutrition_json,
+            operation_key,
+        ),
+    )
+    if inserted.rowcount == 0 and operation_key:
+        existing_log = conn.execute(
+            """SELECT fl.log_id,fl.food_id,fc.product_name,fl.meal_slot,fl.consumed_at,
+                      fl.consumed_servings,fl.nutrition_snapshot_json,fl.version
+               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, str(user_id or "").strip()),
+        ).fetchone()
+        if existing_log:
+            return {
+                "log_id": existing_log[0], "food_id": existing_log[1],
+                "product_name": existing_log[2], "meal_slot": existing_log[3] or "",
+                "consumed_at": existing_log[4], "servings": float(existing_log[5] or 0),
+                "nutrition": json.loads(existing_log[6] or "{}"),
+                "version": int(existing_log[7] or 1), "replayed": True,
+            }
+        raise RuntimeError("飲食入帳事件識別碼衝突")
+    try:
+        conn.execute(
+            """INSERT OR IGNORE INTO nutrition_sheet_outbox
+               (outbox_id,entity_type,entity_id,status,attempts,last_error,created_at,synced_at)
+               VALUES (?,'food_log',?,'pending',0,'',?,'')""",
+            ("outbox_" + uuid.uuid4().hex[:20], log_id, now),
+        )
+    except sqlite3.OperationalError:
+        pass
+    return {
+        "log_id": log_id, "food_id": food_id, "product_name": product_name,
+        "meal_slot": meal_slot, "consumed_at": consumed_at,
+        "servings": servings, "nutrition": normalized, "version": 1,
+    }
+
+
+def migrate_current_day_legacy_totals_to_ledger(conn: sqlite3.Connection) -> int:
+    """首次部署時，把無法還原逐筆的今日舊總額保存成一筆明確的合計紀錄。"""
+    ensure_daily_food_ledger_schema(conn)
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='health_profile'"
+    ).fetchone():
+        return 0
+    today = tw_today().isoformat()
+    migrated = 0
+    profiles = conn.execute(
+        """SELECT user_id,today_extra_cal,today_extra_pro
+           FROM health_profile WHERE today_date=?""",
+        (today,),
+    ).fetchall()
+    for user_id, legacy_cal, legacy_pro in profiles:
+        if conn.execute(
+            "SELECT 1 FROM daily_food_ledger_migrations WHERE user_id=? AND ledger_date=?",
+            (user_id, today),
+        ).fetchone():
+            continue
+        rows = _daily_food_rows(conn, user_id, today)
+        ledger_cal = ledger_pro = 0.0
+        for row in rows:
+            nutrition = _ledger_item_from_row(row)["nutrition"]
+            if nutrition.get("calories_kcal") is not None:
+                ledger_cal += float(nutrition["calories_kcal"])
+            if nutrition.get("protein_g") is not None:
+                ledger_pro += float(nutrition["protein_g"])
+        cal_gap = round(float(legacy_cal or 0) - ledger_cal, 4)
+        pro_gap = round(float(legacy_pro or 0) - ledger_pro, 4)
+        carryover = {}
+        if cal_gap > 0.01:
+            carryover["calories_kcal"] = cal_gap
+        if pro_gap > 0.01:
+            carryover["protein_g"] = pro_gap
+        if carryover:
+            create_daily_food_log(
+                conn, user_id=user_id,
+                product_name="部署前合計（無逐筆明細）", meal_slot="",
+                consumed_at=f"{today}T00:00:00+08:00", servings=1,
+                nutrition=carryover, source_type="legacy_daily_carryover",
+            )
+        conn.execute(
+            """INSERT OR IGNORE INTO daily_food_ledger_migrations
+               (user_id,ledger_date,created_at) VALUES (?,?,?)""",
+            (user_id, today, tw_now().isoformat(timespec="seconds")),
+        )
+        migrated += 1
+    conn.commit()
+    return migrated
+
+
+def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> list[tuple]:
+    # Caller must ensure schema before opening any write transaction. Never run
+    # executescript here: sqlite3 would implicitly commit an active transaction.
+    return conn.execute(
+        """SELECT fl.log_id,fl.food_id,fc.product_name,fc.source_type,fl.consumed_at,
+                  fl.meal_slot,fl.consumed_servings,fl.consumed_amount,fl.consumed_unit,
+                  fl.nutrition_snapshot_json,fl.nutrient_sources_json,fl.version,
+                  fl.approved_exchange_json,fc.fingerprint,a.food_fingerprint,
+                  a.suggestion_rule_version,a.approved_exchange_hash
+           FROM food_logs fl
+           JOIN food_catalog fc ON fc.food_id=fl.food_id
+           LEFT JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
+           WHERE fl.user_id=? AND date(fl.consumed_at, '+8 hours')=?
+             AND fl.confirmation_status='confirmed' AND COALESCE(fl.deleted_at,'')=''
+           ORDER BY fl.consumed_at,fl.created_at,fl.log_id""",
+        (user_id, date_text),
+    ).fetchall()
+
+
+def _ledger_item_from_row(row) -> dict:
+    nutrition = json.loads(row[9] or "{}")
+    # 已核准餐點照片以驗證過的交換份估算；未核准/無值維持 NA。
+    if not nutrition and row[12] and row[13] and row[14] == row[13]:
+        try:
+            approved = json.loads(row[12] or "{}")
+            expected = exchange_approval_hash(row[14], row[15], approved)
+            if secrets.compare_digest(str(row[16] or ""), expected):
+                nutrition = estimate_nutrition_from_exchanges(approved)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            nutrition = {}
+    return {
+        "log_id": row[0], "food_id": row[1], "product_name": row[2],
+        "source_type": row[3], "consumed_at": row[4], "meal_slot": row[5] or "",
+        "servings": float(row[6] or 0), "consumed_amount": float(row[7] or 0),
+        "consumed_unit": row[8] or "", "nutrition": nutrition,
+        "nutrient_sources": json.loads(row[10] or "{}"), "version": int(row[11] or 1),
+    }
+
+
+def get_daily_food_ledger(user_id: str, date_text: str) -> dict:
+    date_text = str(date_text or "").strip()
+    try:
+        datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("日期格式必須是 YYYY-MM-DD") from exc
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        rows = _daily_food_rows(conn, user_id, date_text)
+        items = [_ledger_item_from_row(row) for row in rows]
+        hp = conn.execute(
+            "SELECT tdee,protein FROM health_profile WHERE user_id=?", (user_id,)
+        ).fetchone()
+    known_totals = {field: 0.0 for field in DAILY_FOOD_NUTRIENT_FIELDS}
+    unknown_fields = set()
+    known_counts = {field: 0 for field in DAILY_FOOD_NUTRIENT_FIELDS}
+    for item in items:
+        nutrition = item["nutrition"]
+        for field in DAILY_FOOD_NUTRIENT_FIELDS:
+            value = nutrition.get(field)
+            if value is None:
+                unknown_fields.add(field)
+            else:
+                known_totals[field] += float(value)
+                known_counts[field] += 1
+    totals = {
+        field: (None if field in unknown_fields or known_counts[field] == 0 else round(value, 4))
+        for field, value in known_totals.items()
+    }
+    return {
+        "date": date_text, "items": items, "count": len(items),
+        "totals": totals,
+        "known_totals": {field: round(value, 4) for field, value in known_totals.items()},
+        "known_counts": known_counts, "unknown_fields": unknown_fields,
+        "tdee": float(hp[0] or 2000) if hp else 2000.0,
+        "protein_goal": float(hp[1] or 100) if hp else 100.0,
+    }
+
+
+def _sync_health_profile_from_ledger_conn(
+    conn: sqlite3.Connection, user_id: str, date_text: str,
+) -> None:
+    if date_text != tw_today().isoformat():
+        return
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='health_profile'"
+    ).fetchone():
+        return
+    if not conn.execute("SELECT 1 FROM health_profile WHERE user_id=?", (user_id,)).fetchone():
+        return
+    items = [_ledger_item_from_row(row) for row in _daily_food_rows(conn, user_id, date_text)]
+    cal = pro = 0.0
+    names = []
+    for item in items:
+        names.append(item["product_name"])
+        nutrition = item["nutrition"]
+        if nutrition.get("calories_kcal") is not None:
+            cal += float(nutrition["calories_kcal"])
+        if nutrition.get("protein_g") is not None:
+            pro += float(nutrition["protein_g"])
+    conn.execute(
+        """UPDATE health_profile
+           SET today_extra_cal=?,today_extra_pro=?,today_food_items=?,today_date=?
+           WHERE user_id=?""",
+        (round(cal, 4), round(pro, 4), "、".join(names), date_text, user_id),
+    )
+
+
+def apply_daily_food_log_edit(
+    *, user_id: str, log_id: str, expected_version: int, event_id: str,
+    action: str, field: str = "", value=None,
+) -> dict:
+    """以 log_id+version 原子修改單筆紀錄；同 event_id 可安全重播。"""
+    event_id = str(event_id or "").strip()
+    if not event_id:
+        raise ValueError("缺少操作事件識別碼")
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute(
+            "SELECT result_json FROM daily_food_log_events WHERE event_id=? AND user_id=?",
+            (event_id, user_id),
+        ).fetchone()
+        if previous:
+            result = json.loads(previous[0])
+            result["replayed"] = True
+            conn.commit()
+            return result
+        row = conn.execute(
+            """SELECT fl.version,fl.consumed_servings,fl.nutrition_snapshot_json,
+                      fl.nutrient_sources_json,fl.consumed_at,fc.product_name,
+                      fl.food_id,fc.source_type
+               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+               WHERE fl.log_id=? AND fl.user_id=? AND fl.confirmation_status='confirmed'
+                 AND COALESCE(fl.deleted_at,'')=''""",
+            (log_id, user_id),
+        ).fetchone()
+        if not row:
+            raise ValueError("找不到這筆飲食紀錄")
+        version, old_servings = int(row[0]), float(row[1] or 0)
+        if version != int(expected_version):
+            raise ValueError("這筆紀錄已更新，請重新開啟最新卡片")
+        nutrition = json.loads(row[2] or "{}")
+        sources = json.loads(row[3] or "{}")
+        new_servings = old_servings
+        new_name = ""
+        if action == "correct_nutrition":
+            if field not in DAILY_FOOD_NUTRIENT_FIELDS:
+                raise ValueError("不支援的營養欄位")
+            nutrition[field] = _ledger_number(value, allow_none=False)
+            sources[field] = "user_nutrition_label"
+        elif action == "patch_nutrition":
+            if not isinstance(value, dict) or not value:
+                raise ValueError("缺少營養修正資料")
+            for nutrient_field, nutrient_value in value.items():
+                if nutrient_field not in DAILY_FOOD_NUTRIENT_FIELDS:
+                    raise ValueError("不支援的營養欄位")
+                nutrition[nutrient_field] = _ledger_number(nutrient_value)
+                sources[nutrient_field] = "user_portion_adjustment"
+        elif action == "set_servings":
+            new_servings = _ledger_number(value, allow_none=False)
+            if new_servings < 0.1 or new_servings > 100 or old_servings <= 0:
+                raise ValueError("份量需介於 0.1～100 份")
+            ratio = new_servings / old_servings
+            nutrition = {
+                key: (None if nutrient is None else round(float(nutrient) * ratio, 4))
+                for key, nutrient in nutrition.items()
+            }
+        elif action == "set_meal_slot":
+            if str(value) not in {"早餐", "午餐", "晚餐", "點心"}:
+                raise ValueError("餐別不支援")
+        elif action in {"rename", "replace_item"}:
+            replacement = value if isinstance(value, dict) else {"name": value}
+            new_name = " ".join(str(replacement.get("name") or "").split())[:80]
+            if not new_name:
+                raise ValueError("品項名稱不能空白")
+            if action == "replace_item":
+                replacement_nutrition = _normalize_ledger_nutrition(replacement.get("nutrition") or {})
+                if not replacement_nutrition or all(v is None for v in replacement_nutrition.values()):
+                    raise ValueError("新品項缺少營養資料")
+                nutrition = {field_name: replacement_nutrition.get(field_name) for field_name in DAILY_FOOD_NUTRIENT_FIELDS}
+                sources = {
+                    field_name: "user_item_replacement"
+                    for field_name, nutrient_value in nutrition.items() if nutrient_value is not None
+                }
+        elif action == "delete":
+            pass
+        else:
+            raise ValueError("不支援的飲食紀錄操作")
+        new_version = version + 1
+        now = tw_now().isoformat(timespec="seconds")
+        result_name = row[5]
+        if action == "delete":
+            conn.execute(
+                """UPDATE food_logs SET deleted_at=?,confirmation_status='deleted',
+                   version=?,updated_at=? WHERE log_id=?""",
+                (now, new_version, now, log_id),
+            )
+        elif action == "set_meal_slot":
+            conn.execute(
+                "UPDATE food_logs SET meal_slot=?,version=?,updated_at=? WHERE log_id=?",
+                (str(value), new_version, now, log_id),
+            )
+        elif action in {"rename", "replace_item"}:
+            fingerprint = hashlib.sha256(
+                f"renamed|{user_id}|{new_name}".encode("utf-8")
+            ).hexdigest()
+            renamed_food_id = "food_" + fingerprint[:24]
+            per_serving = {
+                key: (None if nutrient is None else round(float(nutrient) / old_servings, 4))
+                for key, nutrient in nutrition.items()
+            }
+            conn.execute(
+                """INSERT INTO food_catalog
+                   (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                    package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                    exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                    recognition_confidence,verification_status,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(food_id) DO UPDATE SET updated_at=excluded.updated_at""",
+                (
+                    renamed_food_id, new_name, "", "", "user_private_food", user_id, "private",
+                    1, "份", 1, json.dumps(per_serving, ensure_ascii=False, allow_nan=False),
+                    "{}", "{}", "pending_review", fingerprint, "", 1,
+                    "user_confirmed", now, now,
+                ),
+            )
+            conn.execute(
+                """UPDATE food_logs SET food_id=?,nutrition_snapshot_json=?,
+                   nutrient_sources_json=?,version=?,updated_at=? WHERE log_id=?""",
+                (
+                    renamed_food_id,
+                    json.dumps(nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                    json.dumps(sources, ensure_ascii=False, sort_keys=True),
+                    new_version, now, log_id,
+                ),
+            )
+            result_name = new_name
+        else:
+            conn.execute(
+                """UPDATE food_logs SET consumed_servings=?,consumed_amount=?,
+                   nutrition_snapshot_json=?,nutrient_sources_json=?,version=?,updated_at=?
+                   WHERE log_id=?""",
+                (
+                    new_servings, new_servings,
+                    json.dumps(nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                    json.dumps(sources, ensure_ascii=False, sort_keys=True),
+                    new_version, now, log_id,
+                ),
+            )
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recent_meal_logs'"
+        ).fetchone():
+            if action == "patch_nutrition":
+                conn.execute(
+                    """UPDATE recent_meal_logs SET current_cal=?,current_pro=?,updated_at=?
+                       WHERE user_id=? AND food_log_id=?""",
+                    (nutrition.get("calories_kcal"), nutrition.get("protein_g"), now, user_id, log_id),
+                )
+            elif action == "replace_item":
+                conn.execute(
+                    """UPDATE recent_meal_logs SET meal_name=?,base_cal=?,base_pro=?,
+                       current_cal=?,current_pro=?,source_text='改品項',updated_at=?
+                       WHERE user_id=? AND food_log_id=?""",
+                    (
+                        new_name, nutrition.get("calories_kcal"), nutrition.get("protein_g"),
+                        nutrition.get("calories_kcal"), nutrition.get("protein_g"), now,
+                        user_id, log_id,
+                    ),
+                )
+        date_text = conn.execute(
+            "SELECT date(?, '+8 hours')", (str(row[4] or ""),)
+        ).fetchone()[0]
+        _sync_health_profile_from_ledger_conn(conn, user_id, date_text)
+        result = {
+            "log_id": log_id, "product_name": result_name, "version": new_version,
+            "servings": new_servings, "nutrition": nutrition,
+            "action": action, "date": date_text, "replayed": False,
+        }
+        conn.execute(
+            """INSERT INTO daily_food_log_events
+               (event_id,user_id,log_id,action,result_json,created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (
+                event_id, user_id, log_id, action,
+                json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False), now,
+            ),
+        )
+        try:
+            conn.execute(
+                """INSERT INTO nutrition_sheet_outbox
+                   (outbox_id,entity_type,entity_id,status,attempts,last_error,created_at,synced_at)
+                   VALUES (?,'food_log',?,'pending',0,'',?,'')
+                   ON CONFLICT(entity_type,entity_id) DO UPDATE SET status='pending',synced_at=''""",
+                ("outbox_" + uuid.uuid4().hex[:20], log_id, now),
+            )
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
+        return result
+
+
+def _ledger_value_text(ledger: dict, field: str, unit: str) -> str:
+    known = ledger["known_totals"].get(field, 0)
+    count = ledger["known_counts"].get(field, 0)
+    if count == 0:
+        return "NA"
+    text = f"{known:g} {unit}"
+    if field in ledger["unknown_fields"]:
+        text += "＋部分未知"
+    return text
+
+
+def _daily_food_summary_bubble(ledger: dict, day_ref: str) -> dict:
+    is_today = ledger["date"] == tw_today().isoformat()
+    title = "今日飲食總結" if is_today else "昨日飲食總結"
+    cal_text = _ledger_value_text(ledger, "calories_kcal", "kcal")
+    pro_text = _ledger_value_text(ledger, "protein_g", "g")
+    carb_text = _ledger_value_text(ledger, "carbohydrate_g", "g")
+    fat_text = _ledger_value_text(ledger, "fat_g", "g")
+    known_cal = ledger["known_totals"]["calories_kcal"]
+    remaining = max(0, ledger["tdee"] - known_cal)
+    if "calories_kcal" in ledger["unknown_fields"]:
+        target_text = f"🎯 目標：{ledger['tdee']:g} kcal｜剩餘 NA（部分熱量未知）"
+    else:
+        target_text = f"🎯 目標：{ledger['tdee']:g} kcal｜剩餘 {remaining:g} kcal"
+    return {
+        "type": "bubble", "size": "mega",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#0F766E", "contents": [
+            {"type": "text", "text": f"📅 {title}", "color": "#FFFFFF", "weight": "bold", "size": "lg"},
+            {"type": "text", "text": ledger["date"], "color": "#CCFBF1", "size": "xs", "margin": "xs"},
+        ]},
+        "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "text", "text": f"共記錄 {ledger['count']} 項", "size": "sm", "weight": "bold"},
+            {"type": "text", "text": f"🔥 熱量：{cal_text}", "size": "sm", "wrap": True},
+            {"type": "text", "text": target_text, "size": "xs", "color": "#555555", "wrap": True},
+            {"type": "text", "text": f"🥩 蛋白質：{pro_text}", "size": "sm", "wrap": True},
+            {"type": "text", "text": f"🍚 碳水：{carb_text}", "size": "sm", "wrap": True},
+            {"type": "text", "text": f"🥑 脂肪：{fat_text}", "size": "sm", "wrap": True},
+            {"type": "text", "text": "NA 代表紀錄未提供，未當成 0。", "size": "xs", "color": "#B45309", "wrap": True},
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "contents": [
+            {"type": "button", "style": "secondary", "height": "sm", "action": {
+                "type": "postback", "label": "切換今天／昨天",
+                "data": f"foodlog:v1:day:{'yesterday' if day_ref == 'today' else 'today'}:page:0",
+                "displayText": "查看另一日飲食紀錄",
+            }}
+        ]},
+    }
+
+
+def _daily_food_item_bubble(item: dict) -> dict:
+    nutrition = item["nutrition"]
+    def val(field, unit):
+        raw = nutrition.get(field)
+        return "NA" if raw is None else f"{float(raw):g} {unit}"
+    source_labels = {
+        "ai_text_estimate": "AI 預估", "user_private_food": "我的食品",
+        "planned_meal": "排餐確認", "frequent_food": "常吃食品",
+        "user_correction": "使用者修正", "user_meal_photo": "餐點照片",
+        "menu_csv": "一日樂食菜單", "legacy_daily_carryover": "部署前合計",
+    }
+    consumed_at = str(item["consumed_at"] or "")
+    try:
+        parsed_time = datetime.fromisoformat(consumed_at.replace("Z", "+00:00"))
+        time_text = (
+            parsed_time.astimezone(TW_TZ).strftime("%H:%M")
+            if parsed_time.tzinfo else parsed_time.strftime("%H:%M")
+        )
+    except ValueError:
+        time_text = consumed_at[11:16] if len(consumed_at) >= 16 else "時間未記錄"
+    log_id, version = item["log_id"], item["version"]
+    if item["source_type"] == "legacy_daily_carryover":
+        footer_contents = [{
+            "type": "button", "style": "secondary", "height": "sm",
+            "action": {"type": "message", "label": "重新查看", "text": "飲食紀錄"},
+        }]
+    else:
+        footer_contents = [
+            {"type": "button", "style": "primary", "color": "#0F766E", "height": "sm", "action": {
+                "type": "postback", "label": "調整份量",
+                "data": f"foodlog:v1:{log_id}:{version}:portion:start", "displayText": "調整這筆飲食份量",
+            }},
+            {"type": "button", "style": "secondary", "height": "sm", "action": {
+                "type": "postback", "label": "修正營養",
+                "data": f"foodlog:v1:{log_id}:{version}:nutrition:start", "displayText": "修正這筆飲食營養",
+            }},
+            {"type": "button", "style": "secondary", "height": "sm", "action": {
+                "type": "postback", "label": "更多操作",
+                "data": f"foodlog:v1:{log_id}:{version}:more", "displayText": "更多飲食紀錄操作",
+            }},
+        ]
+    return {
+        "type": "bubble", "size": "kilo",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#ECFDF5", "contents": [
+            {"type": "text", "text": item["product_name"][:60], "weight": "bold", "size": "md", "wrap": True, "color": "#065F46"},
+            {"type": "text", "text": f"{time_text}｜{item['meal_slot'] or '未分類'}", "size": "xs", "color": "#555555", "margin": "xs"},
+        ]},
+        "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": [
+            {"type": "text", "text": f"份量：{item['servings']:g} 份", "size": "sm"},
+            {"type": "text", "text": f"🔥 {val('calories_kcal', 'kcal')}", "size": "sm"},
+            {"type": "text", "text": f"🥩 {val('protein_g', 'g')}", "size": "sm"},
+            {"type": "text", "text": f"🍚 {val('carbohydrate_g', 'g')}｜🥑 {val('fat_g', 'g')}", "size": "xs", "wrap": True},
+            {"type": "text", "text": f"來源：{source_labels.get(item['source_type'], item['source_type'] or '未標示')}", "size": "xs", "color": "#777777", "wrap": True},
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": footer_contents},
+    }
+
+
+def build_daily_food_ledger_flex(user_id: str, day_ref: str, page: int = 0):
+    from linebot.models import FlexSendMessage
+    day_ref = str(day_ref or "today")
+    if day_ref == "today":
+        target = tw_today()
+    elif day_ref == "yesterday":
+        target = tw_today() - timedelta(days=1)
+    else:
+        raise ValueError("只支援今天或昨天")
+    page = max(0, min(int(page or 0), 1000))
+    ledger = get_daily_food_ledger(user_id, target.isoformat())
+    start = page * 10
+    page_items = ledger["items"][start:start + 10]
+    bubbles = [_daily_food_summary_bubble(ledger, day_ref)]
+    bubbles.extend(_daily_food_item_bubble(item) for item in page_items)
+    if start + 10 < len(ledger["items"]):
+        bubbles.append({
+            "type": "bubble", "size": "kilo",
+            "body": {"type": "box", "layout": "vertical", "contents": [
+                {"type": "text", "text": "還有更多飲食紀錄", "weight": "bold", "wrap": True},
+            ]},
+            "footer": {"type": "box", "layout": "vertical", "contents": [
+                {"type": "button", "style": "primary", "color": "#0F766E", "action": {
+                    "type": "postback", "label": "下一頁",
+                    "data": f"foodlog:v1:day:{day_ref}:page:{page + 1}",
+                    "displayText": "查看下一頁飲食紀錄",
+                }}
+            ]},
+        })
+    elif page > 0:
+        bubbles.append({
+            "type": "bubble", "size": "kilo",
+            "body": {"type": "box", "layout": "vertical", "contents": [
+                {"type": "text", "text": "已到最後一頁", "weight": "bold"},
+            ]},
+            "footer": {"type": "box", "layout": "vertical", "contents": [
+                {"type": "button", "style": "secondary", "action": {
+                    "type": "postback", "label": "上一頁",
+                    "data": f"foodlog:v1:day:{day_ref}:page:{page - 1}",
+                    "displayText": "查看上一頁飲食紀錄",
+                }}
+            ]},
+        })
+    return FlexSendMessage(
+        alt_text=f"{target.strftime('%m/%d')} 飲食紀錄",
+        contents={"type": "carousel", "contents": bubbles},
+    )
+
+
+def build_daily_food_date_picker_flex():
+    from linebot.models import FlexSendMessage
+    bubble = {
+        "type": "bubble", "size": "kilo",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#0F766E", "contents": [
+            {"type": "text", "text": "🍽️ 我的飲食紀錄", "color": "#FFFFFF", "weight": "bold", "size": "lg"},
+        ]},
+        "body": {"type": "box", "layout": "vertical", "contents": [
+            {"type": "text", "text": "想查看哪一天？", "size": "sm", "wrap": True},
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "button", "style": "primary", "color": "#0F766E", "action": {
+                "type": "postback", "label": "今天的紀錄", "data": "foodlog:v1:day:today:page:0", "displayText": "查看今天飲食紀錄",
+            }},
+            {"type": "button", "style": "secondary", "action": {
+                "type": "postback", "label": "昨天的紀錄", "data": "foodlog:v1:day:yesterday:page:0", "displayText": "查看昨天飲食紀錄",
+            }},
+        ]},
+    }
+    return FlexSendMessage(alt_text="選擇今天或昨天的飲食紀錄", contents=bubble)
+
+
+def set_daily_food_edit_state(
+    user_id: str, log_id: str, expected_version: int, input_type: str,
+    *, field: str = "", pending_value=None, payload: dict | None = None,
+) -> None:
+    now = tw_now()
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        conn.execute(
+            """INSERT INTO daily_food_edit_states
+               (user_id,log_id,expected_version,input_type,field,pending_value,
+                payload_json,created_at,expires_at)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 log_id=excluded.log_id,expected_version=excluded.expected_version,
+                 input_type=excluded.input_type,field=excluded.field,
+                 pending_value=excluded.pending_value,payload_json=excluded.payload_json,
+                 created_at=excluded.created_at,expires_at=excluded.expires_at""",
+            (
+                user_id, log_id, int(expected_version), input_type, field,
+                pending_value, json.dumps(payload or {}, ensure_ascii=False),
+                now.isoformat(timespec="seconds"),
+                (now + timedelta(minutes=10)).isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+
+
+def get_daily_food_edit_state(user_id: str) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        row = conn.execute(
+            """SELECT log_id,expected_version,input_type,field,pending_value,
+                      payload_json,expires_at
+               FROM daily_food_edit_states WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if str(row[6] or "") < tw_now().isoformat(timespec="seconds"):
+            conn.execute("DELETE FROM daily_food_edit_states WHERE user_id=?", (user_id,))
+            conn.commit()
+            return None
+    return {
+        "log_id": row[0], "expected_version": int(row[1]), "input_type": row[2],
+        "field": row[3] or "", "pending_value": row[4],
+        "payload": json.loads(row[5] or "{}"),
+    }
+
+
+def clear_daily_food_edit_state(user_id: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        conn.execute("DELETE FROM daily_food_edit_states WHERE user_id=?", (user_id,))
+        conn.commit()
+
+
+def _daily_food_log_brief(user_id: str, log_id: str) -> dict:
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        row = conn.execute(
+            """SELECT fc.product_name,fl.nutrition_snapshot_json,fl.consumed_servings,
+                      fl.version,fl.consumed_at
+               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+               WHERE fl.user_id=? AND fl.log_id=? AND fl.confirmation_status='confirmed'
+                 AND COALESCE(fl.deleted_at,'')=''""",
+            (user_id, log_id),
+        ).fetchone()
+    if not row:
+        raise ValueError("找不到這筆飲食紀錄")
+    return {
+        "product_name": row[0], "nutrition": json.loads(row[1] or "{}"),
+        "servings": float(row[2] or 0), "version": int(row[3] or 1),
+        "date": str(row[4] or "")[:10],
+    }
+
+
+def build_daily_food_nutrition_confirmation_flex(
+    *, user_id: str, log_id: str, expected_version: int, field: str, value: float,
+):
+    from linebot.models import FlexSendMessage
+    brief = _daily_food_log_brief(user_id, log_id)
+    if brief["version"] != int(expected_version):
+        raise ValueError("這筆紀錄已更新，請重新開啟最新卡片")
+    labels = {
+        "calories_kcal": ("熱量", "kcal"), "protein_g": ("蛋白質", "g"),
+        "fat_g": ("脂肪", "g"), "carbohydrate_g": ("碳水", "g"),
+    }
+    label, unit = labels[field]
+    old = brief["nutrition"].get(field)
+    old_text = "NA" if old is None else f"{float(old):g} {unit}"
+    value_text = f"{float(value):g} {unit}"
+    bubble = {
+        "type": "bubble", "size": "kilo",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#FF6B35", "contents": [
+            {"type": "text", "text": "📝 確認修正營養", "color": "#FFFFFF", "weight": "bold", "size": "lg"},
+        ]},
+        "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "text", "text": brief["product_name"], "weight": "bold", "wrap": True},
+            {"type": "text", "text": f"{label}：{old_text} → {value_text}", "size": "sm", "wrap": True},
+            {"type": "text", "text": "只修改這個欄位，其他營養數值不會跟著改。", "size": "xs", "color": "#555555", "wrap": True},
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "button", "style": "primary", "color": "#0F766E", "action": {
+                "type": "postback", "label": "只修正這次",
+                "data": f"foodlog:v1:{log_id}:{expected_version}:nutrition:apply:{field}:{float(value):g}:once",
+                "displayText": f"確認把{label}改成 {value_text}",
+            }},
+            {"type": "button", "style": "secondary", "action": {
+                "type": "postback", "label": "修正並存成我的食品",
+                "data": f"foodlog:v1:{log_id}:{expected_version}:nutrition:apply:{field}:{float(value):g}:save",
+                "displayText": "修正並儲存成我的食品",
+            }},
+        ]},
+    }
+    return FlexSendMessage(alt_text=f"確認修正 {brief['product_name']} {label}", contents=bubble)
+
+
+def save_daily_log_as_private_food(user_id: str, log_id: str, private_name: str) -> dict:
+    private_name = " ".join(str(private_name or "").split())[:80]
+    if not private_name:
+        raise ValueError("我的食品名稱不能空白")
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        row = conn.execute(
+            """SELECT fl.nutrition_snapshot_json,fl.consumed_servings
+               FROM food_logs fl WHERE fl.user_id=? AND fl.log_id=?
+                 AND fl.confirmation_status='confirmed' AND COALESCE(fl.deleted_at,'')=''""",
+            (user_id, log_id),
+        ).fetchone()
+        if not row:
+            raise ValueError("找不到這筆飲食紀錄")
+        nutrition = json.loads(row[0] or "{}")
+        servings = float(row[1] or 1)
+        per_serving = {
+            key: (None if value is None else round(float(value) / servings, 4))
+            for key, value in nutrition.items()
+        }
+        fingerprint = hashlib.sha256(
+            f"private|{user_id}|{private_name}".encode("utf-8")
+        ).hexdigest()
+        food_id = "food_" + fingerprint[:24]
+        now = tw_now().isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO food_catalog
+               (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+                package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+                exchange_json,exchange_review_status,fingerprint,original_image_ref,
+                recognition_confidence,verification_status,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(food_id) DO UPDATE SET
+                 per_serving_json=excluded.per_serving_json,updated_at=excluded.updated_at""",
+            (
+                food_id, private_name, "", "", "user_private_food", user_id, "private",
+                1, "份", 1, json.dumps(per_serving, ensure_ascii=False, allow_nan=False),
+                "{}", "{}", "pending_review", fingerprint, "", 1,
+                "user_confirmed", now, now,
+            ),
+        )
+        conn.commit()
+    return {"food_id": food_id, "product_name": private_name, "per_serving": per_serving}
+
+
+def build_daily_food_edit_success_flex(result: dict, *, saved_name: str = ""):
+    from linebot.models import FlexSendMessage
+    nutrition = result.get("nutrition") or {}
+    date_ref = "today" if result.get("date") == tw_today().isoformat() else "yesterday"
+    body = [
+        {"type": "text", "text": result.get("product_name") or "飲食紀錄", "weight": "bold", "wrap": True},
+        {"type": "text", "text": f"份量：{float(result.get('servings') or 0):g} 份", "size": "sm"},
+        {"type": "text", "text": f"🔥 {nutrition.get('calories_kcal', 'NA')} kcal｜🥩 {nutrition.get('protein_g', 'NA')} g", "size": "sm", "wrap": True},
+    ]
+    if saved_name:
+        body.append({"type": "text", "text": f"已儲存為我的食品：{saved_name}", "size": "xs", "color": "#0F766E", "wrap": True})
+    bubble = {
+        "type": "bubble", "size": "kilo",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": "#DCFCE7", "contents": [
+            {"type": "text", "text": "✅ 飲食紀錄已更新", "color": "#166534", "weight": "bold", "size": "lg"},
+        ]},
+        "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body},
+        "footer": {"type": "box", "layout": "vertical", "contents": [
+            {"type": "button", "style": "primary", "color": "#0F766E", "action": {
+                "type": "postback", "label": "查看最新紀錄",
+                "data": f"foodlog:v1:day:{date_ref}:page:0", "displayText": "查看最新飲食紀錄",
+            }}
+        ]},
+    }
+    return FlexSendMessage(alt_text="飲食紀錄已更新", contents=bubble)
+
+
 def normalize_date_str(date_str):
     """將各式日期格式 (2026-3-5, 2026/03/05 等) 統一轉為 2026/03/05"""
     if not date_str: return ""
@@ -1730,8 +2655,13 @@ def init_db():
             current_pro INTEGER,
             meal_date TEXT,
             source_text TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            food_log_id TEXT DEFAULT ''
         )''')
+        try:
+            c.execute("ALTER TABLE recent_meal_logs ADD COLUMN food_log_id TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
         c.execute('''CREATE TABLE IF NOT EXISTS deferred_meals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
@@ -1878,6 +2808,8 @@ def init_db():
                 pass
         # 營養辨識、客製化計畫與完整飲食紀錄資料表（只新增，不覆寫既有資料）
         ensure_nutrition_schema(conn)
+        ensure_daily_food_ledger_schema(conn)
+        migrate_current_day_legacy_totals_to_ledger(conn)
         # Jason 每日健康回報與23:30日報冪等推送狀態。
         ensure_daily_health_schema(conn)
         # 無營養標示餐點照片的持久草稿與按鈕確認狀態。
@@ -3502,17 +4434,27 @@ def add_frequent_food_to_today(user_id: str, meal_name: str):
 
         today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein_goal = hp
         today = tw_today().isoformat()
-        if today_date != today:
-            today_extra_cal, today_extra_pro, today_food_items = 0, 0, ""
-        new_extra_cal = (today_extra_cal or 0) + (cal or 0)
-        new_extra_pro = (today_extra_pro or 0) + (pro or 0)
-        new_food_items = f"{today_food_items}、{meal_name}".strip("、") if today_food_items else meal_name
+        if cal is None and pro is None:
+            return None, "這筆常吃食物沒有營養資料，請先補充後再加入。"
+        meal_hour = tw_now().hour
+        meal_slot = "早餐" if meal_hour < 11 else ("午餐" if meal_hour < 15 else ("晚餐" if meal_hour < 21 else "點心"))
+        daily_log = create_daily_food_log(
+            conn, user_id=user_id, product_name=meal_name, meal_slot=meal_slot,
+            consumed_at=tw_now().isoformat(timespec="seconds"), servings=1,
+            nutrition={"calories_kcal": cal, "protein_g": pro},
+            source_type="frequent_food",
+        )
+        _sync_health_profile_from_ledger_conn(conn, user_id, today)
+        c.execute(
+            "SELECT today_extra_cal,today_extra_pro,today_food_items FROM health_profile WHERE user_id=?",
+            (user_id,),
+        )
+        projected = c.fetchone() or (0, 0, "")
+        new_extra_cal, new_extra_pro, new_food_items = projected[0] or 0, projected[1] or 0, projected[2] or ""
 
-        c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=?, today_date=? WHERE user_id=?",
-                  (new_extra_cal, new_extra_pro, new_food_items, today, user_id))
         c.execute("""
-            INSERT INTO recent_meal_logs (user_id, meal_name, base_cal, base_pro, current_cal, current_pro, meal_date, source_text, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO recent_meal_logs (user_id, meal_name, base_cal, base_pro, current_cal, current_pro, meal_date, source_text, updated_at, food_log_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 meal_name=excluded.meal_name,
                 base_cal=excluded.base_cal,
@@ -3521,8 +4463,9 @@ def add_frequent_food_to_today(user_id: str, meal_name: str):
                 current_pro=excluded.current_pro,
                 meal_date=excluded.meal_date,
                 source_text=excluded.source_text,
-                updated_at=excluded.updated_at
-        """, (user_id, meal_name, cal, pro, cal, pro, today, "常吃直接加入", tw_now().isoformat()))
+                updated_at=excluded.updated_at,
+                food_log_id=excluded.food_log_id
+        """, (user_id, meal_name, cal, pro, cal, pro, today, "常吃直接加入", tw_now().isoformat(), daily_log["log_id"]))
         conn.commit()
 
     # 💡 離開 with 區塊後再呼叫其他函數，避免資料庫鎖定
@@ -3577,52 +4520,49 @@ def build_add_workout_entry_flex():
 
 
 def replace_recent_meal_with_name(user_id: str, meal_name: str):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT meal_name, current_cal, current_pro, meal_date FROM recent_meal_logs WHERE user_id=?", (user_id,))
-    rec = c.fetchone()
-    if not rec:
-        conn.close()
-        return None, "目前沒有最近一筆可修改的記錄。"
-    old_name, old_cal, old_pro, meal_date = rec
-    if meal_date != tw_today().isoformat():
-        conn.close()
-        return None, "最近一筆不是今天的，先重新記錄一餐再修正。"
-
-    new_cal = new_pro = None
-    c.execute("SELECT last_cal, last_pro FROM frequent_foods WHERE user_id=? AND meal_name=?", (user_id, meal_name))
-    ff = c.fetchone()
-    if ff:
-        new_cal, new_pro = ff
-    else:
-        dish = next((d for d in MAIN_DISHES if d['name'] == meal_name), None)
-        if dish:
-            new_cal, new_pro = dish.get('cal'), dish.get('pro')
-    if new_cal is None and new_pro is None:
-        conn.close()
-        return None, "找不到這個品項的營養資料，先從常吃清單挑選，或直接重新記錄一餐。"
-
-    c.execute("SELECT today_extra_cal, today_extra_pro, today_food_items, tdee, protein FROM health_profile WHERE user_id=?", (user_id,))
-    hp = c.fetchone()
-    if not hp:
-        conn.close()
-        return None, "找不到你的健康資料。"
-    today_extra_cal, today_extra_pro, today_food_items, tdee, protein_goal = hp
-    new_total_cal = max(0, (today_extra_cal or 0) - (old_cal or 0) + (new_cal or 0))
-    new_total_pro = max(0, (today_extra_pro or 0) - (old_pro or 0) + (new_pro or 0))
-
-    items = [x.strip() for x in (today_food_items or '').split('、') if x.strip()]
-    for i in range(len(items)-1, -1, -1):
-        if items[i] == old_name:
-            items[i] = meal_name
-            break
-    new_food_items = '、'.join(items)
-
-    c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=? WHERE user_id=?", (new_total_cal, new_total_pro, new_food_items, user_id))
-    c.execute("UPDATE recent_meal_logs SET meal_name=?, base_cal=?, base_pro=?, current_cal=?, current_pro=?, source_text=?, updated_at=? WHERE user_id=?", (meal_name, new_cal, new_pro, new_cal, new_pro, '改品項', tw_now().isoformat(), user_id))
-    conn.commit(); conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        rec = conn.execute(
+            """SELECT r.meal_name,r.meal_date,r.food_log_id,fl.version
+               FROM recent_meal_logs r LEFT JOIN food_logs fl
+                 ON fl.log_id=r.food_log_id AND fl.user_id=r.user_id
+               WHERE r.user_id=?""", (user_id,),
+        ).fetchone()
+        if not rec:
+            return None, "目前沒有最近一筆可修改的記錄。"
+        if rec[1] != tw_today().isoformat():
+            return None, "最近一筆不是今天的，先重新記錄一餐再修正。"
+        if not rec[2] or rec[3] is None:
+            return None, "這是舊版未綁定逐筆帳本的紀錄，請先重新記錄一餐再修改。"
+        ff = conn.execute(
+            "SELECT last_cal,last_pro FROM frequent_foods WHERE user_id=? AND meal_name=?",
+            (user_id, meal_name),
+        ).fetchone()
+        new_cal, new_pro = ff if ff else (None, None)
+        if not ff:
+            dish = next((d for d in MAIN_DISHES if d['name'] == meal_name), None)
+            if dish:
+                new_cal, new_pro = dish.get('cal'), dish.get('pro')
+        if new_cal is None and new_pro is None:
+            return None, "找不到這個品項的營養資料，請從常吃清單挑選或重新記錄。"
+        log_id, version = rec[2], int(rec[3])
+    result = apply_daily_food_log_edit(
+        user_id=user_id, log_id=log_id, expected_version=version,
+        event_id=f"legacy-replace:{user_id}:{log_id}:{version}:{meal_name}",
+        action="replace_item", value={
+            "name": meal_name,
+            "nutrition": {"calories_kcal": new_cal, "protein_g": new_pro},
+        },
+    )
+    with sqlite3.connect(DB_PATH) as conn:
+        hp = conn.execute(
+            "SELECT today_extra_cal,today_extra_pro,tdee,protein FROM health_profile WHERE user_id=?",
+            (user_id,),
+        ).fetchone() or (0, 0, 2000, 100)
+        conn.commit()
     upsert_frequent_food(user_id, meal_name, new_cal, new_pro)
-    flex = build_meal_log_flex(meal_name, new_cal, new_pro, new_total_cal, tdee or 2000, new_total_pro, protein_goal or 100)
-    return flex, f"已把最近一筆改成：{meal_name}"
+    flex = build_meal_log_flex(meal_name, new_cal, new_pro, hp[0], hp[2] or 2000, hp[1], hp[3] or 100)
+    return flex, f"已把最近一筆改成：{result['product_name']}"
 
 
 def mark_planned_meal_as_eaten(user_id: str, meal_slot: str):
@@ -3663,19 +4603,24 @@ def mark_planned_meal_as_eaten(user_id: str, meal_slot: str):
                 return None, "找不到你的健康資料。"
 
             today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein_goal = hp
-            if today_date != today:
-                today_extra_cal, today_extra_pro, today_food_items = 0, 0, ""
-            new_extra_cal = (today_extra_cal or 0) + (cal or 0)
-            new_extra_pro = (today_extra_pro or 0) + (pro or 0)
-            new_food_items = f"{today_food_items}、{meal_name}".strip("、") if today_food_items else meal_name
-
-            c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=?, today_date=? WHERE user_id=?",
-                      (new_extra_cal, new_extra_pro, new_food_items, today, user_id))
+            daily_log = create_daily_food_log(
+                conn, user_id=user_id, product_name=meal_name, meal_slot=meal_slot,
+                consumed_at=tw_now().isoformat(timespec="seconds"), servings=1,
+                nutrition={"calories_kcal": cal, "protein_g": pro},
+                source_type="planned_meal",
+            )
+            _sync_health_profile_from_ledger_conn(conn, user_id, today)
+            c.execute(
+                "SELECT today_extra_cal,today_extra_pro,today_food_items FROM health_profile WHERE user_id=?",
+                (user_id,),
+            )
+            projected = c.fetchone() or (0, 0, "")
+            new_extra_cal, new_extra_pro, new_food_items = projected[0] or 0, projected[1] or 0, projected[2] or ""
             c.execute("INSERT OR REPLACE INTO planned_meal_checks (user_id, meal_date, meal_slot, meal_name, cal, pro, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                       (user_id, today, meal_slot, meal_name, cal, pro, tw_now().isoformat()))
             c.execute("""
-                INSERT INTO recent_meal_logs (user_id, meal_name, base_cal, base_pro, current_cal, current_pro, meal_date, source_text, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO recent_meal_logs (user_id, meal_name, base_cal, base_pro, current_cal, current_pro, meal_date, source_text, updated_at, food_log_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     meal_name=excluded.meal_name,
                     base_cal=excluded.base_cal,
@@ -3684,8 +4629,9 @@ def mark_planned_meal_as_eaten(user_id: str, meal_slot: str):
                     current_pro=excluded.current_pro,
                     meal_date=excluded.meal_date,
                     source_text=excluded.source_text,
-                    updated_at=excluded.updated_at
-            """, (user_id, meal_name, cal, pro, cal, pro, today, f"{meal_slot}已吃", tw_now().isoformat()))
+                    updated_at=excluded.updated_at,
+                    food_log_id=excluded.food_log_id
+            """, (user_id, meal_name, cal, pro, cal, pro, today, f"{meal_slot}已吃", tw_now().isoformat(), daily_log["log_id"]))
             conn.commit()
     except Exception as e:
         return None, f"發生錯誤：{str(e)}"
@@ -3868,52 +4814,48 @@ def build_portion_adjust_flex():
 
 def apply_portion_adjustment(user_id: str, action: str):
     rules = {
-        "少量": (0.7, 0.7),
-        "正常": (1.0, 1.0),
-        "大份": (1.3, 1.3),
-        "少飯": (0.85, 0.95),
-        "加飯": (1.15, 1.05),
-        "去醬": (0.9, 1.0),
+        "少量": (0.7, 0.7), "正常": (1.0, 1.0), "大份": (1.3, 1.3),
+        "少飯": (0.85, 0.95), "加飯": (1.15, 1.05), "去醬": (0.9, 1.0),
     }
     if action not in rules:
         return None, "不支援的修正選項"
-
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT meal_name, base_cal, base_pro, current_cal, current_pro, meal_date FROM recent_meal_logs WHERE user_id=?", (user_id,))
-    rec = c.fetchone()
-    if not rec:
-        conn.close()
-        return None, "目前沒有最近一筆可修正的記錄。"
-
-    meal_name, base_cal, base_pro, current_cal, current_pro, meal_date = rec
-    if meal_date != tw_today().isoformat():
-        conn.close()
-        return None, "最近一筆記錄不是今天的，先重新記錄一餐再修正。"
-
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        rec = conn.execute(
+            """SELECT r.meal_name,r.base_cal,r.base_pro,r.meal_date,r.food_log_id,
+                      fl.version,h.tdee,h.protein
+               FROM recent_meal_logs r
+               LEFT JOIN food_logs fl ON fl.log_id=r.food_log_id AND fl.user_id=r.user_id
+               LEFT JOIN health_profile h ON h.user_id=r.user_id
+               WHERE r.user_id=?""", (user_id,),
+        ).fetchone()
+        if not rec:
+            return None, "目前沒有最近一筆可修正的記錄。"
+        meal_name, base_cal, base_pro, meal_date, log_id, version, tdee, protein_goal = rec
+        if meal_date != tw_today().isoformat():
+            return None, "最近一筆記錄不是今天的，先重新記錄一餐再修正。"
+        if not log_id or version is None:
+            return None, "這是舊版未綁定逐筆帳本的紀錄，請先重新記錄一餐再修改。"
     cal_mul, pro_mul = rules[action]
     new_cal = int(round((base_cal or 0) * cal_mul)) if base_cal is not None else None
     new_pro = int(round((base_pro or 0) * pro_mul)) if base_pro is not None else None
-
-    delta_cal = (new_cal or 0) - (current_cal or 0)
-    delta_pro = (new_pro or 0) - (current_pro or 0)
-
-    c.execute("SELECT today_extra_cal, today_extra_pro, tdee, protein FROM health_profile WHERE user_id=?", (user_id,))
-    hp = c.fetchone()
-    if not hp:
-        conn.close()
-        return None, "找不到你的健康資料。"
-
-    today_extra_cal, today_extra_pro, tdee, protein_goal = hp
-    today_extra_cal = max(0, (today_extra_cal or 0) + delta_cal)
-    today_extra_pro = max(0, (today_extra_pro or 0) + delta_pro)
-
-    c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=? WHERE user_id=?", (today_extra_cal, today_extra_pro, user_id))
-    c.execute("UPDATE recent_meal_logs SET current_cal=?, current_pro=?, updated_at=? WHERE user_id=?", (new_cal, new_pro, tw_now().isoformat(), user_id))
-    conn.commit()
-    conn.close()
-
-    flex = build_meal_log_flex(meal_name, new_cal, new_pro, today_extra_cal, tdee or 2000, today_extra_pro, protein_goal or 100)
-    return flex, f"已將「{meal_name}」調整為{action}。"
+    patch_values = {}
+    if new_cal is not None:
+        patch_values["calories_kcal"] = new_cal
+    if new_pro is not None:
+        patch_values["protein_g"] = new_pro
+    result = apply_daily_food_log_edit(
+        user_id=user_id, log_id=log_id, expected_version=int(version),
+        event_id=f"legacy-portion:{user_id}:{log_id}:{version}:{action}",
+        action="patch_nutrition", value=patch_values,
+    )
+    with sqlite3.connect(DB_PATH) as conn:
+        hp = conn.execute(
+            "SELECT today_extra_cal,today_extra_pro FROM health_profile WHERE user_id=?", (user_id,)
+        ).fetchone() or (0, 0)
+        conn.commit()
+    flex = build_meal_log_flex(meal_name, new_cal, new_pro, hp[0], tdee or 2000, hp[1], protein_goal or 100)
+    return flex, f"已將「{result['product_name']}」調整為{action}。"
 
 
 BADGE_LEVELS = [
@@ -4849,7 +5791,7 @@ def parse_log_nutrition_fallback(ans: str, user_msg: str = ""):
     return None
 
 
-def get_ai_response_with_memory(user_id, user_msg):
+def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     
     # 抓取客人資料
@@ -5025,12 +5967,28 @@ def get_ai_response_with_memory(user_id, user_msg):
 
             # 至少要有品項，且熱量/蛋白至少有一個抓到，才視為有效記錄
             if logged_name and (logged_cal is not None or logged_pro is not None):
-                new_extra_cal = extra_cal + (logged_cal or 0)
-                new_extra_pro = extra_pro + (logged_pro or 0)
-                new_food_items = f"{food_items}、{logged_name}".strip("、") if food_items else logged_name
-                
-                c.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=? WHERE user_id=?", 
-                          (new_extra_cal, new_extra_pro, new_food_items, user_id))
+                meal_hour = tw_now().hour
+                meal_slot = "早餐" if meal_hour < 11 else ("午餐" if meal_hour < 15 else ("晚餐" if meal_hour < 21 else "點心"))
+                daily_log = create_daily_food_log(
+                    conn, user_id=user_id, product_name=logged_name,
+                    meal_slot=meal_slot, consumed_at=tw_now().isoformat(timespec="seconds"),
+                    servings=1,
+                    nutrition={"calories_kcal": logged_cal, "protein_g": logged_pro},
+                    source_type="ai_text_estimate", operation_key=operation_key,
+                )
+                if daily_log.get("replayed"):
+                    logged_name = daily_log["product_name"]
+                    logged_cal = daily_log["nutrition"].get("calories_kcal")
+                    logged_pro = daily_log["nutrition"].get("protein_g")
+                _sync_health_profile_from_ledger_conn(conn, user_id, tw_today().isoformat())
+                c.execute(
+                    "SELECT today_extra_cal,today_extra_pro,today_food_items FROM health_profile WHERE user_id=?",
+                    (user_id,),
+                )
+                projected = c.fetchone() or (0, 0, "")
+                new_extra_cal, new_extra_pro, new_food_items = (
+                    projected[0] or 0, projected[1] or 0, projected[2] or "",
+                )
                 conn.commit()
                 
                 # 若有 tag，清掉；fallback 純文字則保留原文只是不再用文字回覆
@@ -5039,8 +5997,8 @@ def get_ai_response_with_memory(user_id, user_msg):
                 # 存最近一筆，供 Task 3 份量修正使用
                 try:
                     c.execute("""
-                        INSERT INTO recent_meal_logs (user_id, meal_name, base_cal, base_pro, current_cal, current_pro, meal_date, source_text, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO recent_meal_logs (user_id, meal_name, base_cal, base_pro, current_cal, current_pro, meal_date, source_text, updated_at, food_log_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(user_id) DO UPDATE SET
                             meal_name=excluded.meal_name,
                             base_cal=excluded.base_cal,
@@ -5049,8 +6007,9 @@ def get_ai_response_with_memory(user_id, user_msg):
                             current_pro=excluded.current_pro,
                             meal_date=excluded.meal_date,
                             source_text=excluded.source_text,
-                            updated_at=excluded.updated_at
-                    """, (user_id, logged_name, logged_cal, logged_pro, logged_cal, logged_pro, tw_today().isoformat(), user_msg, tw_now().isoformat()))
+                            updated_at=excluded.updated_at,
+                            food_log_id=excluded.food_log_id
+                    """, (user_id, logged_name, logged_cal, logged_pro, logged_cal, logged_pro, tw_today().isoformat(), user_msg, tw_now().isoformat(), daily_log["log_id"]))
                     conn.commit()
                 except Exception as _se:
                     print(f'⚠️ 最近一筆記錄保存失敗: {_se}')
@@ -6600,10 +7559,9 @@ nutrition_sheet_sync_lock = threading.Lock()
 
 
 def _upsert_raw_sheet_row(ws, entity_id, row_values):
-    try:
-        cell = ws.find(entity_id, in_column=1)
-    except gspread.exceptions.CellNotFound:
-        cell = None
+    # Current gspread returns None when find() has no match. Do not catch a
+    # removed CellNotFound class, and let real API/network errors propagate.
+    cell = ws.find(entity_id, in_column=1)
     if cell:
         end = gspread.utils.rowcol_to_a1(cell.row, len(row_values))
         ws.update(values=[row_values], range_name=f"A{cell.row}:{end}", value_input_option="RAW")
@@ -6871,26 +7829,33 @@ def apply_confirmed_nutrition_to_legacy_dashboard(user_id, result):
     cal = float(nutrition.get("calories_kcal", 0) or 0)
     pro = float(nutrition.get("protein_g", 0) or 0)
     with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         applied = conn.execute("SELECT legacy_applied_at FROM food_logs WHERE log_id=? AND user_id=?", (log_id, user_id)).fetchone()
         if not applied or applied[0]:
             conn.commit()
             return None
-        row = conn.execute("SELECT today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein FROM health_profile WHERE user_id=?", (user_id,)).fetchone()
+        row = conn.execute("SELECT tdee,protein FROM health_profile WHERE user_id=?", (user_id,)).fetchone()
         if not row:
             conn.execute("UPDATE food_logs SET legacy_applied_at='no_profile' WHERE log_id=?", (log_id,))
             conn.commit()
             return None
-        old_cal, old_pro, items, today_date, tdee, protein_goal = row
-        if today_date != tw_today().isoformat():
-            old_cal, old_pro, items = 0, 0, ""
-        new_cal = round(float(old_cal or 0) + cal, 1)
-        new_pro = round(float(old_pro or 0) + pro, 1)
-        name = result["food"]["product_name"]
-        new_items = f"{items}、{name}".strip("、") if items else name
+        tdee, protein_goal = row
         applied_at = tw_now().isoformat(timespec="seconds")
-        conn.execute("UPDATE health_profile SET today_extra_cal=?, today_extra_pro=?, today_food_items=?, today_date=? WHERE user_id=?", (new_cal, new_pro, new_items, tw_today().isoformat(), user_id))
-        conn.execute("UPDATE food_logs SET legacy_applied_at=? WHERE log_id=?", (applied_at, log_id))
+        nutrition_json = json.dumps(nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        conn.execute(
+            """UPDATE food_logs
+               SET legacy_applied_at=?,nutrition_snapshot_json=CASE
+                   WHEN nutrition_snapshot_json IN ('','{}') THEN ? ELSE nutrition_snapshot_json END
+               WHERE log_id=?""",
+            (applied_at, nutrition_json, log_id),
+        )
+        _sync_health_profile_from_ledger_conn(conn, user_id, tw_today().isoformat())
+        projected = conn.execute(
+            "SELECT today_extra_cal,today_extra_pro FROM health_profile WHERE user_id=?", (user_id,)
+        ).fetchone() or (0, 0)
+        new_cal, new_pro = projected[0] or 0, projected[1] or 0
         conn.commit()
     upsert_frequent_food(user_id, result["food"]["product_name"], round(cal), round(pro))
     exchange_text = format_exchange_summary(result["log"].get("exchange") or {})
@@ -8491,6 +9456,165 @@ def handle_meal_photo_postback(event):
     data = str(getattr(event.postback, "data", "") or "")
     uid = event.source.user_id
 
+    # ── foodlog:v1 每日飲食帳本 ──
+    ledger_day = re.fullmatch(r"foodlog:v1:day:(today|yesterday):page:(\d{1,3})", data)
+    ledger_item = re.fullmatch(
+        r"foodlog:v1:(log_[a-f0-9]{16,32}):(\d+):(portion:start|portion:custom|nutrition:start|more|rename:start|delete:ask|delete:confirm)",
+        data,
+    )
+    ledger_portion = re.fullmatch(
+        r"foodlog:v1:(log_[a-f0-9]{16,32}):(\d+):portion:set:([0-9.]+)", data
+    )
+    ledger_nutrition_field = re.fullmatch(
+        r"foodlog:v1:(log_[a-f0-9]{16,32}):(\d+):nutrition:field:(calories_kcal|protein_g|fat_g|carbohydrate_g)",
+        data,
+    )
+    ledger_nutrition_apply = re.fullmatch(
+        r"foodlog:v1:(log_[a-f0-9]{16,32}):(\d+):nutrition:apply:"
+        r"(calories_kcal|protein_g|fat_g|carbohydrate_g):([0-9.]+):(once|save)",
+        data,
+    )
+    ledger_slot = re.fullmatch(
+        r"foodlog:v1:(log_[a-f0-9]{16,32}):(\d+):slot:(早餐|午餐|晚餐|點心)", data
+    )
+    if ledger_day or ledger_item or ledger_portion or ledger_nutrition_field or ledger_nutrition_apply or ledger_slot:
+        try:
+            if ledger_day:
+                reply = build_daily_food_ledger_flex(
+                    uid, ledger_day.group(1), page=int(ledger_day.group(2))
+                )
+            else:
+                matched = ledger_item or ledger_portion or ledger_nutrition_field or ledger_nutrition_apply or ledger_slot
+                assert matched is not None
+                log_id, version = matched.group(1), int(matched.group(2))
+                event_key = str(getattr(event, "webhook_event_id", "") or "").strip()
+                if not event_key:
+                    fallback = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
+                    event_key = "foodlog:" + hashlib.sha256(fallback.encode()).hexdigest()
+                if ledger_item:
+                    action = ledger_item.group(3)
+                    brief = _daily_food_log_brief(uid, log_id)
+                    if brief["version"] != version:
+                        raise ValueError("這筆紀錄已更新，請重新開啟最新卡片")
+                    if action == "portion:start":
+                        items = [
+                            QuickReplyButton(action=PostbackAction(
+                                label=f"{sv}份", data=f"foodlog:v1:{log_id}:{version}:portion:set:{sv}",
+                                display_text=f"調整為 {sv} 份",
+                            ))
+                            for sv in ("0.5", "0.75", "1", "1.5", "2")
+                        ]
+                        items.append(QuickReplyButton(action=PostbackAction(
+                            label="自訂", data=f"foodlog:v1:{log_id}:{version}:portion:custom",
+                            display_text="自訂飲食份量",
+                        )))
+                        reply = TextSendMessage(
+                            text=f"目前「{brief['product_name']}」是 {brief['servings']:g} 份，請選擇新份量：",
+                            quick_reply=QuickReply(items=items),
+                        )
+                    elif action == "portion:custom":
+                        set_daily_food_edit_state(uid, log_id, version, "portion_value")
+                        reply = TextSendMessage(text="請輸入新的份數，例如：1.25")
+                    elif action == "nutrition:start":
+                        fields = [
+                            ("熱量", "calories_kcal"), ("蛋白質", "protein_g"),
+                            ("脂肪", "fat_g"), ("碳水", "carbohydrate_g"),
+                        ]
+                        reply = TextSendMessage(
+                            text=f"要修正「{brief['product_name']}」哪一項？",
+                            quick_reply=QuickReply(items=[
+                                QuickReplyButton(action=PostbackAction(
+                                    label=label,
+                                    data=f"foodlog:v1:{log_id}:{version}:nutrition:field:{field}",
+                                    display_text=f"修正{label}",
+                                )) for label, field in fields
+                            ]),
+                        )
+                    elif action == "more":
+                        options = [
+                            QuickReplyButton(action=PostbackAction(
+                                label=slot, data=f"foodlog:v1:{log_id}:{version}:slot:{slot}",
+                                display_text=f"改成{slot}",
+                            )) for slot in ("早餐", "午餐", "晚餐", "點心")
+                        ] + [
+                            QuickReplyButton(action=PostbackAction(
+                                label="修改品項", data=f"foodlog:v1:{log_id}:{version}:rename:start",
+                                display_text="修改這筆品項名稱",
+                            )),
+                            QuickReplyButton(action=PostbackAction(
+                                label="刪除紀錄", data=f"foodlog:v1:{log_id}:{version}:delete:ask",
+                                display_text="刪除這筆飲食紀錄",
+                            )),
+                        ]
+                        reply = TextSendMessage(
+                            text=f"「{brief['product_name']}」更多操作：",
+                            quick_reply=QuickReply(items=options),
+                        )
+                    elif action == "rename:start":
+                        set_daily_food_edit_state(uid, log_id, version, "rename")
+                        reply = TextSendMessage(text="請輸入新的品項名稱；這次只修改這一筆紀錄。")
+                    elif action == "delete:ask":
+                        reply = TextSendMessage(
+                            text=f"確定刪除「{brief['product_name']}」嗎？刪除後會重新計算當日總額。",
+                            quick_reply=QuickReply(items=[
+                                QuickReplyButton(action=PostbackAction(
+                                    label="確認刪除", data=f"foodlog:v1:{log_id}:{version}:delete:confirm",
+                                    display_text="確認刪除這筆飲食紀錄",
+                                )),
+                            ]),
+                        )
+                    else:
+                        result = apply_daily_food_log_edit(
+                            user_id=uid, log_id=log_id, expected_version=version,
+                            event_id=event_key, action="delete",
+                        )
+                        reply = build_daily_food_edit_success_flex(result)
+                elif ledger_portion:
+                    result = apply_daily_food_log_edit(
+                        user_id=uid, log_id=log_id, expected_version=version,
+                        event_id=event_key, action="set_servings", value=float(ledger_portion.group(3)),
+                    )
+                    reply = build_daily_food_edit_success_flex(result)
+                elif ledger_nutrition_field:
+                    field = ledger_nutrition_field.group(3)
+                    set_daily_food_edit_state(uid, log_id, version, "nutrition_value", field=field)
+                    label = {"calories_kcal": "熱量 kcal", "protein_g": "蛋白質 g", "fat_g": "脂肪 g", "carbohydrate_g": "碳水 g"}[field]
+                    reply = TextSendMessage(text=f"請輸入正確的{label}數值，例如：230")
+                elif ledger_nutrition_apply:
+                    field, new_value, mode = (
+                        ledger_nutrition_apply.group(3), float(ledger_nutrition_apply.group(4)),
+                        ledger_nutrition_apply.group(5),
+                    )
+                    result = apply_daily_food_log_edit(
+                        user_id=uid, log_id=log_id, expected_version=version,
+                        event_id=event_key, action="correct_nutrition", field=field, value=new_value,
+                    )
+                    if mode == "save":
+                        set_daily_food_edit_state(
+                            uid, log_id, result["version"], "save_private_name",
+                            payload={"result": result},
+                        )
+                        reply = TextSendMessage(
+                            text="營養已修正。請輸入容易辨識的私人食品名稱，例如：早餐店A火腿蛋吐司"
+                        )
+                    else:
+                        clear_daily_food_edit_state(uid)
+                        reply = build_daily_food_edit_success_flex(result)
+                else:
+                    assert ledger_slot is not None
+                    result = apply_daily_food_log_edit(
+                        user_id=uid, log_id=log_id, expected_version=version,
+                        event_id=event_key, action="set_meal_slot", value=ledger_slot.group(3),
+                    )
+                    reply = build_daily_food_edit_success_flex(result)
+            line_bot_api.reply_message(event.reply_token, reply)
+        except ValueError as exc:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"⚠️ {exc}\n請重新開啟最新的飲食紀錄卡。"),
+            )
+        return
+
     notification_retry = re.fullmatch(
         r"mprn:v1:([0-9a-f]{12}):(approved|rejected)", data
     )
@@ -8575,6 +9699,8 @@ def handle_meal_photo_postback(event):
                         conn, user_id=uid, food_id=food_id,
                         consumed_servings=sv, meal_slot=slot,
                     )
+                    _sync_health_profile_from_ledger_conn(conn, uid, tw_today().isoformat())
+                    conn.commit()
                 cal = result["nutrition"].get("calories_kcal")
                 cal_text = f"{cal:.0f} kcal" if cal else "NA"
                 reply = TextSendMessage(
@@ -9047,6 +10173,73 @@ def _handle_message_impl(event):
     processed_messages.add(msg_id)
 
     msg, uid = event.message.text.strip(), event.source.user_id
+
+    # 飲食帳本編輯的文字輸入（營養數值、修改品項、私人食品名稱）優先於 AI 對話。
+    ledger_state = get_daily_food_edit_state(uid)
+    if ledger_state:
+        clear_after_reply = False
+        try:
+            if msg in {"取消", "取消修改", "取消修正"}:
+                reply = TextSendMessage(text="已取消修改飲食紀錄。")
+                clear_after_reply = True
+            elif ledger_state["input_type"] == "nutrition_value":
+                clean_value = re.sub(r"(?:kcal|大卡|卡|公克|克|g)$", "", msg.strip(), flags=re.I).strip()
+                value = _ledger_number(clean_value, allow_none=False)
+                reply = build_daily_food_nutrition_confirmation_flex(
+                    user_id=uid, log_id=ledger_state["log_id"],
+                    expected_version=ledger_state["expected_version"],
+                    field=ledger_state["field"], value=float(value),
+                )
+            elif ledger_state["input_type"] == "portion_value":
+                clean_value = re.sub(r"(?:份)$", "", msg.strip()).strip()
+                value = _ledger_number(clean_value, allow_none=False)
+                result = apply_daily_food_log_edit(
+                    user_id=uid, log_id=ledger_state["log_id"],
+                    expected_version=ledger_state["expected_version"],
+                    event_id=f"foodlog:text:{msg_id}", action="set_servings", value=value,
+                )
+                set_daily_food_edit_state(
+                    uid, ledger_state["log_id"], result["version"], "completed",
+                    payload={"result": result},
+                )
+                clear_after_reply = True
+                reply = build_daily_food_edit_success_flex(result)
+            elif ledger_state["input_type"] == "rename":
+                result = apply_daily_food_log_edit(
+                    user_id=uid, log_id=ledger_state["log_id"],
+                    expected_version=ledger_state["expected_version"],
+                    event_id=f"foodlog:text:{msg_id}", action="rename", value=msg,
+                )
+                set_daily_food_edit_state(
+                    uid, ledger_state["log_id"], result["version"], "completed",
+                    payload={"result": result},
+                )
+                clear_after_reply = True
+                reply = build_daily_food_edit_success_flex(result)
+            elif ledger_state["input_type"] == "save_private_name":
+                saved = save_daily_log_as_private_food(uid, ledger_state["log_id"], msg)
+                result = ledger_state["payload"].get("result") or _daily_food_log_brief(uid, ledger_state["log_id"])
+                set_daily_food_edit_state(
+                    uid, ledger_state["log_id"], int(result.get("version") or ledger_state["expected_version"]),
+                    "completed", payload={"result": result, "saved_name": saved["product_name"]},
+                )
+                clear_after_reply = True
+                reply = build_daily_food_edit_success_flex(result, saved_name=saved["product_name"])
+            elif ledger_state["input_type"] == "completed":
+                result = ledger_state["payload"].get("result") or _daily_food_log_brief(uid, ledger_state["log_id"])
+                clear_after_reply = True
+                reply = build_daily_food_edit_success_flex(
+                    result, saved_name=ledger_state["payload"].get("saved_name", "")
+                )
+            else:
+                reply = TextSendMessage(text="這次修改已失效，請重新開啟飲食紀錄卡。")
+                clear_after_reply = True
+        except ValueError as exc:
+            reply = TextSendMessage(text=f"⚠️ {exc}\n可重新輸入，或輸入「取消修改」。")
+        line_bot_api.reply_message(event.reply_token, reply)
+        if clear_after_reply:
+            clear_daily_food_edit_state(uid)
+        return
 
     # 處理「新增食材」等待狀態；使用既有草稿表與版本鎖，不直接拼SQL修改payload。
     with sqlite3.connect(DB_PATH) as conn:
@@ -10393,9 +11586,13 @@ def _handle_message_impl(event):
         summary += "\n💪 課表是活的，若有調整需求隨時告訴教練！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=summary))
         return
-    # 📊 儀表板觸發
-    # 📊 首頁儀表板觸發 (最乾淨的單一訊息雙卡輪播)
-    if msg in ["首頁", "儀表板", "我的狀態", "今日進度", "飲食紀錄", "dashboard", "Dashboard"]:
+    # 🍽️ 飲食紀錄先選今天／昨天，再顯示每日總結與逐筆輪播。
+    if msg == "飲食紀錄":
+        line_bot_api.reply_message(event.reply_token, build_daily_food_date_picker_flex())
+        return
+
+    # 📊 首頁儀表板觸發
+    if msg in ["首頁", "儀表板", "我的狀態", "今日進度", "dashboard", "Dashboard"]:
         flex_msg = build_dashboard_flex(uid)
         if flex_msg:
             line_bot_api.reply_message(event.reply_token, flex_msg)
@@ -11013,7 +12210,9 @@ def _handle_message_impl(event):
     allow, q_msg = check_permission_and_quota(uid)
     if not allow: return
     else:
-        ai_text, meal_flex = get_ai_response_with_memory(uid, msg)
+        ai_text, meal_flex = get_ai_response_with_memory(
+            uid, msg, operation_key=f"line-ai:{uid}:{msg_id}"
+        )
         if meal_flex:
             line_bot_api.reply_message(event.reply_token, meal_flex)
         else:

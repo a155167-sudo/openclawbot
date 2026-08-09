@@ -84,6 +84,444 @@ def test_fallback_parses_multiline_meal_reply_when_hidden_tag_is_missing():
     }
 
 
+def _daily_ledger_db(tmp_path, monkeypatch, name="daily-ledger.db"):
+    db = tmp_path / name
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        server.ensure_daily_food_ledger_schema(conn)
+        conn.execute("""CREATE TABLE health_profile (
+            user_id TEXT PRIMARY KEY, today_extra_cal REAL, today_extra_pro REAL,
+            today_food_items TEXT, today_date TEXT, tdee REAL, protein REAL)""")
+        conn.execute(
+            "INSERT INTO health_profile VALUES ('U1',0,0,'',?,2000,100)",
+            (server.tw_today().isoformat(),),
+        )
+        conn.commit()
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    return db
+
+
+def test_daily_food_ledger_separates_today_and_yesterday_and_keeps_unknown_na(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch)
+    today = server.tw_today()
+    yesterday = today - server.timedelta(days=1)
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U1", product_name="火腿蛋吐司", meal_slot="早餐",
+            consumed_at=f"{today.isoformat()}T08:30:00+08:00", servings=1,
+            nutrition={"calories_kcal": 208, "protein_g": None},
+            source_type="ai_text_estimate",
+        )
+        server.create_daily_food_log(
+            conn, user_id="U1", product_name="昨日優格", meal_slot="點心",
+            consumed_at=f"{yesterday.isoformat()}T15:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 62, "protein_g": 4},
+            source_type="user_private_food",
+        )
+        conn.commit()
+
+    today_ledger = server.get_daily_food_ledger("U1", today.isoformat())
+    yesterday_ledger = server.get_daily_food_ledger("U1", yesterday.isoformat())
+    assert [row["product_name"] for row in today_ledger["items"]] == ["火腿蛋吐司"]
+    assert [row["product_name"] for row in yesterday_ledger["items"]] == ["昨日優格"]
+    assert today_ledger["totals"]["calories_kcal"] == 208
+    assert today_ledger["totals"]["protein_g"] is None
+    assert today_ledger["unknown_fields"] == {"protein_g", "fat_g", "carbohydrate_g"}
+
+    flex = server.build_daily_food_ledger_flex("U1", "today", page=0)
+    payload = flex.as_json_dict()
+    rendered = json.dumps(payload, ensure_ascii=False)
+    assert "今日飲食總結" in rendered
+    assert "火腿蛋吐司" in rendered
+    assert "NA" in rendered
+    assert "調整份量" in rendered
+    assert "修正營養" in rendered
+
+
+def test_daily_food_nutrition_correction_is_field_only_idempotent_and_recalculates_today(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-correction.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="火腿蛋吐司", meal_slot="早餐",
+            consumed_at=f"{today}T08:30:00+08:00", servings=1,
+            nutrition={"calories_kcal": 208, "protein_g": 12, "fat_g": 7, "carbohydrate_g": 27},
+            source_type="ai_text_estimate",
+        )
+        conn.commit()
+
+    first = server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log["log_id"], expected_version=1,
+        event_id="event-correct-1", action="correct_nutrition",
+        field="calories_kcal", value=230,
+    )
+    replay = server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log["log_id"], expected_version=1,
+        event_id="event-correct-1", action="correct_nutrition",
+        field="calories_kcal", value=230,
+    )
+    assert first["version"] == 2
+    assert replay["replayed"] is True
+    assert replay["version"] == 2
+    assert first["nutrition"] == {
+        "calories_kcal": 230.0, "protein_g": 12,
+        "fat_g": 7, "carbohydrate_g": 27,
+    }
+    with sqlite3.connect(db) as conn:
+        hp = conn.execute(
+            "SELECT today_extra_cal,today_extra_pro,today_food_items FROM health_profile WHERE user_id='U1'"
+        ).fetchone()
+        version = conn.execute("SELECT version FROM food_logs WHERE log_id=?", (log["log_id"],)).fetchone()[0]
+    assert hp == (230.0, 12.0, "火腿蛋吐司")
+    assert version == 2
+    with pytest.raises(ValueError, match="已更新"):
+        server.apply_daily_food_log_edit(
+            user_id="U1", log_id=log["log_id"], expected_version=1,
+            event_id="event-stale", action="correct_nutrition",
+            field="calories_kcal", value=240,
+        )
+
+
+def test_daily_food_portion_adjustment_scales_all_known_nutrients(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-portion.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="火腿蛋吐司", meal_slot="早餐",
+            consumed_at=f"{today}T08:30:00+08:00", servings=1,
+            nutrition={"calories_kcal": 230, "protein_g": 12, "fat_g": 8, "carbohydrate_g": 28},
+            source_type="user_correction",
+        )
+        conn.commit()
+
+    result = server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log["log_id"], expected_version=1,
+        event_id="event-portion-1", action="set_servings", value=0.5,
+    )
+    assert result["servings"] == 0.5
+    assert result["nutrition"] == {
+        "calories_kcal": 115.0, "protein_g": 6.0,
+        "fat_g": 4.0, "carbohydrate_g": 14.0,
+    }
+
+
+def test_daily_food_carousel_never_exceeds_line_limit_and_keeps_page_context(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-pages.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        for idx in range(11):
+            server.create_daily_food_log(
+                conn, user_id="U1", product_name=f"食品{idx + 1}", meal_slot="點心",
+                consumed_at=f"{today}T{8 + idx:02d}:00:00+08:00", servings=1,
+                nutrition={"calories_kcal": 100 + idx, "protein_g": 5},
+                source_type="user_private_food",
+            )
+        conn.commit()
+
+    flex = server.build_daily_food_ledger_flex("U1", "today", page=0)
+    payload = flex.as_json_dict()
+    bubbles = payload["contents"]["contents"]
+    assert len(bubbles) == 12
+    rendered = json.dumps(payload, ensure_ascii=False)
+    assert "foodlog:v1:day:today:page:1" in rendered
+
+
+def test_daily_food_line_nutrition_flow_requires_confirmation_and_applies_field_only(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-line-flow.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="火腿蛋吐司", meal_slot="早餐",
+            consumed_at=f"{today}T08:30:00+08:00", servings=1,
+            nutrition={"calories_kcal": 208, "protein_g": 12},
+            source_type="ai_text_estimate",
+        )
+        conn.commit()
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
+
+    field_event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"foodlog:v1:{log['log_id']}:1:nutrition:field:calories_kcal"),
+        source=SimpleNamespace(user_id="U1"), reply_token="field", webhook_event_id="FIELD-1",
+        timestamp=1784740620000,
+    )
+    server.handle_meal_photo_postback(field_event)
+    assert "請輸入正確的熱量" in replies[-1].text
+    server.processed_messages.clear()
+    server._handle_message_impl(_text_event("FOODLOG-NUM-1", "230", user_id="U1"))
+    confirmation = json.dumps(replies[-1].as_json_dict(), ensure_ascii=False)
+    assert "208 kcal → 230 kcal" in confirmation
+    assert f"foodlog:v1:{log['log_id']}:1:nutrition:apply:calories_kcal:230:once" in confirmation
+
+    apply_event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"foodlog:v1:{log['log_id']}:1:nutrition:apply:calories_kcal:230:once"),
+        source=SimpleNamespace(user_id="U1"), reply_token="apply", webhook_event_id="APPLY-1",
+        timestamp=1784740620001,
+    )
+    server.handle_meal_photo_postback(apply_event)
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT nutrition_snapshot_json,version FROM food_logs WHERE log_id=?", (log["log_id"],)
+        ).fetchone()
+    nutrition = json.loads(row[0])
+    assert nutrition["calories_kcal"] == 230
+    assert nutrition["protein_g"] == 12
+    assert row[1] == 2
+
+
+def test_daily_food_rename_slot_and_soft_delete_are_versioned(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-more.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="吐司", meal_slot="早餐",
+            consumed_at=f"{today}T08:30:00+08:00", servings=1,
+            nutrition={"calories_kcal": 200, "protein_g": 10},
+            source_type="ai_text_estimate",
+        )
+        conn.commit()
+    renamed = server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log["log_id"], expected_version=1,
+        event_id="rename-1", action="rename", value="早餐店A火腿蛋吐司",
+    )
+    assert renamed["product_name"] == "早餐店A火腿蛋吐司"
+    slotted = server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log["log_id"], expected_version=2,
+        event_id="slot-1", action="set_meal_slot", value="點心",
+    )
+    assert slotted["version"] == 3
+    deleted = server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log["log_id"], expected_version=3,
+        event_id="delete-1", action="delete",
+    )
+    assert deleted["version"] == 4
+    assert server.get_daily_food_ledger("U1", today)["items"] == []
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT deleted_at,version FROM food_logs WHERE log_id=?", (log["log_id"],)
+        ).fetchone()
+    assert row[0]
+    assert row[1] == 4
+
+
+def test_food_record_command_opens_today_yesterday_picker(tmp_path, monkeypatch):
+    _daily_ledger_db(tmp_path, monkeypatch, "daily-picker.db")
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
+    server.processed_messages.clear()
+    server._handle_message_impl(_text_event("FOODLOG-PICKER-1", "飲食紀錄", user_id="U1"))
+    rendered = json.dumps(replies[-1].as_json_dict(), ensure_ascii=False)
+    assert "今天的紀錄" in rendered
+    assert "昨天的紀錄" in rendered
+    assert "foodlog:v1:day:today:page:0" in rendered
+    assert "foodlog:v1:day:yesterday:page:0" in rendered
+
+
+def test_legacy_today_totals_are_carried_once_without_inventing_item_details(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-migration.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U1", product_name="已知逐筆", meal_slot="早餐",
+            consumed_at=f"{today}T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 200, "protein_g": 10},
+            source_type="user_private_food",
+        )
+        conn.execute(
+            "UPDATE health_profile SET today_extra_cal=611,today_extra_pro=30,today_date=? WHERE user_id='U1'",
+            (today,),
+        )
+        conn.commit()
+        assert server.migrate_current_day_legacy_totals_to_ledger(conn) == 1
+        assert server.migrate_current_day_legacy_totals_to_ledger(conn) == 0
+    ledger = server.get_daily_food_ledger("U1", today)
+    assert [item["product_name"] for item in ledger["items"]] == [
+        "部署前合計（無逐筆明細）", "已知逐筆"
+    ]
+    assert ledger["known_totals"]["calories_kcal"] == 611
+    assert ledger["known_totals"]["protein_g"] == 30
+    rendered = json.dumps(server.build_daily_food_ledger_flex("U1", "today").as_json_dict(), ensure_ascii=False)
+    assert "部署前合計" in rendered
+    assert "無逐筆明細" in rendered
+
+
+def test_daily_food_card_converts_utc_timestamp_to_taipei_time(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-timezone.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U1", product_name="時區測試", meal_slot="早餐",
+            consumed_at=f"{today}T00:30:00+00:00", servings=1,
+            nutrition={"calories_kcal": 100}, source_type="user_private_food",
+        )
+        conn.commit()
+    rendered = json.dumps(server.build_daily_food_ledger_flex("U1", "today").as_json_dict(), ensure_ascii=False)
+    assert "08:30｜早餐" in rendered
+
+
+def test_text_edit_replays_confirmation_after_line_reply_failure_without_double_mutation(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-reply-replay.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="豆漿", meal_slot="早餐",
+            consumed_at=f"{today}T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 200, "protein_g": 10},
+            source_type="user_private_food",
+        )
+        conn.commit()
+    server.set_daily_food_edit_state("U1", log["log_id"], 1, "portion_value")
+    event = _text_event("FOODLOG-REPLAY-1", "0.5", user_id="U1")
+    calls = []
+
+    def flaky_reply(_token, message):
+        calls.append(message)
+        if len(calls) == 1:
+            raise RuntimeError("simulated LINE reply failure")
+
+    monkeypatch.setattr(server.line_bot_api, "reply_message", flaky_reply)
+    server.processed_messages.clear()
+    with pytest.raises(RuntimeError, match="simulated"):
+        server.handle_message(event)
+    assert server.get_daily_food_edit_state("U1")["input_type"] == "completed"
+
+    server.handle_message(event)
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT consumed_servings,nutrition_snapshot_json,version FROM food_logs WHERE log_id=?",
+            (log["log_id"],),
+        ).fetchone()
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM daily_food_log_events WHERE log_id=?", (log["log_id"],)
+        ).fetchone()[0]
+    assert row[0] == 0.5
+    assert json.loads(row[1])["calories_kcal"] == 100
+    assert row[2] == 2
+    assert event_count == 1
+    assert len(calls) == 2
+    assert server.get_daily_food_edit_state("U1") is None
+
+
+def test_daily_food_edit_rolls_back_when_event_insert_fails(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-atomicity.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="原子餐", meal_slot="早餐",
+            consumed_at=f"{today}T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 200, "protein_g": 10}, source_type="user_private_food",
+        )
+        server._sync_health_profile_from_ledger_conn(conn, "U1", today)
+        conn.execute("""CREATE TRIGGER fail_daily_event BEFORE INSERT ON daily_food_log_events
+                        BEGIN SELECT RAISE(ABORT, 'forced event failure'); END""")
+        conn.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="forced event failure"):
+        server.apply_daily_food_log_edit(
+            user_id="U1", log_id=log["log_id"], expected_version=1,
+            event_id="atomic-fail", action="set_servings", value=2,
+        )
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT consumed_servings,nutrition_snapshot_json,version FROM food_logs WHERE log_id=?",
+            (log["log_id"],),
+        ).fetchone()
+        hp = conn.execute(
+            "SELECT today_extra_cal,today_extra_pro FROM health_profile WHERE user_id='U1'"
+        ).fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM daily_food_log_events").fetchone()[0] == 0
+    assert row[0] == 1
+    assert json.loads(row[1])["calories_kcal"] == 200
+    assert row[2] == 1
+    assert hp == (200, 10)
+
+
+def test_create_daily_food_log_operation_key_prevents_duplicate_rows(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-operation-key.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        first = server.create_daily_food_log(
+            conn, user_id="U1", product_name="重送餐", meal_slot="午餐",
+            consumed_at=f"{today}T12:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 300}, source_type="ai_text_estimate",
+            operation_key="line-ai:U1:M1",
+        )
+        conn.commit()
+        second = server.create_daily_food_log(
+            conn, user_id="U1", product_name="重送餐", meal_slot="午餐",
+            consumed_at=f"{today}T12:01:00+08:00", servings=1,
+            nutrition={"calories_kcal": 300}, source_type="ai_text_estimate",
+            operation_key="line-ai:U1:M1",
+        )
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+    assert second["log_id"] == first["log_id"]
+    assert second["replayed"] is True
+
+
+def test_legacy_recent_adjustments_update_the_linked_ledger_log(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-legacy-edit.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        conn.execute("""CREATE TABLE recent_meal_logs (
+            user_id TEXT PRIMARY KEY,meal_name TEXT,base_cal REAL,base_pro REAL,
+            current_cal REAL,current_pro REAL,meal_date TEXT,source_text TEXT,
+            updated_at TEXT,food_log_id TEXT DEFAULT '')""")
+        conn.execute("""CREATE TABLE frequent_foods (
+            user_id TEXT,meal_name TEXT,last_cal REAL,last_pro REAL,use_count INTEGER DEFAULT 1,
+            last_used TEXT,PRIMARY KEY(user_id,meal_name))""")
+        log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="原餐", meal_slot="午餐",
+            consumed_at=f"{today}T12:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 200, "protein_g": 10}, source_type="ai_text_estimate",
+        )
+        server._sync_health_profile_from_ledger_conn(conn, "U1", today)
+        conn.execute(
+            "INSERT INTO recent_meal_logs VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("U1", "原餐", 200, 10, 200, 10, today, "AI", server.tw_now().isoformat(), log["log_id"]),
+        )
+        conn.execute(
+            "INSERT INTO frequent_foods VALUES (?,?,?,?,?,?)",
+            ("U1", "新餐", 300, 20, 1, server.tw_now().isoformat()),
+        )
+        conn.commit()
+    server.apply_portion_adjustment("U1", "少量")
+    ledger = server.get_daily_food_ledger("U1", today)
+    assert ledger["items"][0]["nutrition"]["calories_kcal"] == 140
+    assert ledger["items"][0]["nutrition"]["protein_g"] == 7
+    server.replace_recent_meal_with_name("U1", "新餐")
+    ledger = server.get_daily_food_ledger("U1", today)
+    assert ledger["items"][0]["product_name"] == "新餐"
+    assert ledger["items"][0]["nutrition"]["calories_kcal"] == 300
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT today_extra_cal,today_extra_pro FROM health_profile WHERE user_id='U1'"
+        ).fetchone() == (300, 20)
+
+
+def test_soft_delete_syncs_deleted_status_to_food_log_sheet(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-delete-sheet.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        log = server.create_daily_food_log(
+            conn, user_id="U1", product_name="刪除餐", meal_slot="晚餐",
+            consumed_at=f"{today}T18:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 500}, source_type="user_private_food",
+        )
+        conn.commit()
+    server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log["log_id"], expected_version=1,
+        event_id="delete-sheet", action="delete",
+    )
+    rows = []
+    class Sheet:
+        def find(self, *_args, **_kwargs):
+            return None
+        def append_row(self, values, **_kwargs):
+            rows.append(values)
+    monkeypatch.setattr(server, "_nutrition_ws", lambda _title: Sheet())
+    server._sync_food_log_outbox(log["log_id"])
+    assert rows[0][26] == "deleted"
+
+
 def test_image_magic_and_opaque_reference(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
     jpeg = b"\xff\xd8\xff" + b"x" * 100
