@@ -60,6 +60,30 @@ def plan_row(**overrides):
     return row
 
 
+def test_fallback_parses_multiline_meal_reply_when_hidden_tag_is_missing():
+    answer = """好的，酪梨的熱量我來估算一下！
+- 📝 品項：酪梨 90g
+- 🔥 本次熱量：約 144 大卡
+- 🥩 本次蛋白：未知
+- 🔥 今日熱量結算：611 大卡
+- 🥩 今日蛋白結算：11.5 克
+
+*(此為一般預估，實際熱量依店家有異)*"""
+
+    parsed = server.parse_log_nutrition_fallback(
+        answer,
+        "我要紀錄飲食 酪梨 90g",
+    )
+
+    assert parsed == {
+        "source": "fallback",
+        "match": None,
+        "cal": 144,
+        "pro": None,
+        "name": "酪梨 90g",
+    }
+
+
 def test_image_magic_and_opaque_reference(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
     jpeg = b"\xff\xd8\xff" + b"x" * 100

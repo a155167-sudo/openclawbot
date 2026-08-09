@@ -4823,11 +4823,11 @@ def parse_log_nutrition_fallback(ans: str, user_msg: str = ""):
             name = m.group(1).strip().splitlines()[0].strip()
             break
 
-    m_cal = re.search(r'本次熱量[:：]\s*([^\\n]+)', ans, re.IGNORECASE)
+    m_cal = re.search(r'本次熱量[:：]\s*([^\r\n]+)', ans, re.IGNORECASE)
     if m_cal:
         cal = _parse_num(m_cal.group(1))
 
-    m_pro = re.search(r'本次蛋白(?:質)?[:：]\s*([^\\n]+)', ans, re.IGNORECASE)
+    m_pro = re.search(r'本次蛋白(?:質)?[:：]\s*([^\r\n]+)', ans, re.IGNORECASE)
     if m_pro:
         pro = _parse_num(m_pro.group(1))
 
