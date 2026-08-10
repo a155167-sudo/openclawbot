@@ -746,7 +746,7 @@ def _daily_food_summary_bubble(ledger: dict, day_ref: str) -> dict:
     else:
         target_text = f"🎯 目標：{ledger['tdee']:g} kcal｜剩餘 {remaining:g} kcal"
     return {
-        "type": "bubble", "size": "mega",
+        "type": "bubble", "size": "kilo",
         "header": {"type": "box", "layout": "vertical", "backgroundColor": "#0F766E", "contents": [
             {"type": "text", "text": f"📅 {title}", "color": "#FFFFFF", "weight": "bold", "size": "lg"},
             {"type": "text", "text": ledger["date"], "color": "#CCFBF1", "size": "xs", "margin": "xs"},

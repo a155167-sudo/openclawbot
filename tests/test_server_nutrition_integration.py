@@ -222,6 +222,7 @@ def test_daily_food_carousel_never_exceeds_line_limit_and_keeps_page_context(tmp
     payload = flex.as_json_dict()
     bubbles = payload["contents"]["contents"]
     assert len(bubbles) == 12
+    assert {bubble.get("size") for bubble in bubbles} == {"kilo"}
     rendered = json.dumps(payload, ensure_ascii=False)
     assert "foodlog:v1:day:today:page:1" in rendered
 
