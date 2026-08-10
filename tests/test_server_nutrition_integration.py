@@ -3035,6 +3035,8 @@ def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
     db = tmp_path / "search-relog.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    fixed_now = server.datetime(2026, 8, 10, 0, 5, tzinfo=server.TW_TZ)
+    monkeypatch.setattr(server, "tw_now", lambda: fixed_now)
     now = utcish_now()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
@@ -3051,6 +3053,14 @@ def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
                        'approved','fp_chicken','',0,'user_confirmed',?,?)""",
             (fid, now, now),
         )
+        conn.execute(
+            """CREATE TABLE health_profile (
+                 user_id TEXT PRIMARY KEY,today_extra_cal REAL DEFAULT 0,
+                 today_extra_pro REAL DEFAULT 0,today_food_items TEXT DEFAULT '',
+                 today_date TEXT DEFAULT '',tdee REAL DEFAULT 2000,protein REAL DEFAULT 100
+               )"""
+        )
+        conn.execute("INSERT INTO health_profile VALUES ('U1',0,0,'','',2000,100)")
     replies = []
     monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
 
@@ -3091,16 +3101,30 @@ def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
         timestamp=1784740620000,
     )
     server.handle_meal_photo_postback(meal_event)
-    assert "✅ 已記錄" in replies[-1].text
-    assert "舒肥雞胸" in replies[-1].text
-    assert "1.5" in replies[-1].text
-    assert "180" in replies[-1].text
+    assert replies[-1].type == "flex"
+    payload = json.loads(replies[-1].as_json_string())
+    card_text = json.dumps(payload, ensure_ascii=False)
+    assert "✅ 記錄成功" in card_text
+    assert "舒肥雞胸 1.5份（午餐）" in card_text
+    assert "180.0 kcal" in card_text
+    assert "37.5 g" in card_text
+    assert "今日熱量累積" in card_text and "/ 2000" in card_text
+    assert "今日蛋白累積" in card_text and "/ 100" in card_text
+    assert "再記一餐" in card_text and "看今日進度" in card_text
+    assert "foodlog:v1:" in card_text and ":more" in card_text
+    server.handle_meal_photo_postback(meal_event)
+    assert replies[-1].type == "flex"
+    replay_text = json.dumps(json.loads(replies[-1].as_json_string()), ensure_ascii=False)
+    assert replay_text == card_text
     with sqlite3.connect(db) as conn:
-        row = conn.execute(
-            "SELECT consumed_servings,meal_slot FROM food_logs WHERE user_id='U1'"
-        ).fetchone()
+        rows = conn.execute(
+            "SELECT consumed_servings,meal_slot,consumed_at FROM food_logs WHERE user_id='U1'"
+        ).fetchall()
+        assert len(rows) == 1
+        row = rows[0]
         assert row[0] == 1.5
         assert row[1] == "午餐"
+        assert row[2] == "2026-08-10T00:05:00+08:00"
 
 
 def test_search_my_food_natural_language_alias_returns_private_library(tmp_path, monkeypatch):

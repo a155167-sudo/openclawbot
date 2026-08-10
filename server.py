@@ -5678,7 +5678,10 @@ def build_sport_carousel_flex(user_id: str):
 
     carousel = {"type": "carousel", "contents": [yesterday_bubble, today_bubble, tomorrow_bubble]}
     return FlexSendMessage(alt_text="📅 運動專區", contents=carousel)
-def build_meal_log_flex(logged_name, logged_cal, logged_pro, new_cal, tdee, new_pro, protein_goal, exchange_text="", exchange_review_status="pending_review"):
+def build_meal_log_flex(
+    logged_name, logged_cal, logged_pro, new_cal, tdee, new_pro, protein_goal,
+    exchange_text="", exchange_review_status="pending_review", *, log_id="", version=0,
+):
     """Task 2：記錄成功回饋卡"""
     cal_pct  = min(100, round(new_cal / tdee * 100)) if tdee > 0 else 0
     pro_pct  = min(100, round(new_pro / protein_goal * 100)) if protein_goal > 0 else 0
@@ -5694,6 +5697,14 @@ def build_meal_log_flex(logged_name, logged_cal, logged_pro, new_cal, tdee, new_
 
     cal_text  = f"{logged_cal} kcal" if logged_cal is not None else "未知"
     pro_text  = f"{logged_pro} g"    if logged_pro is not None else "未知"
+    if log_id and int(version or 0) > 0:
+        edit_action = {
+            "type": "postback", "label": "🍚 修正內容",
+            "data": f"foodlog:v1:{log_id}:{int(version)}:more",
+            "displayText": "修正這筆飲食紀錄",
+        }
+    else:
+        edit_action = {"type": "message", "label": "🍚 修正內容", "text": "修正內容"}
 
     bubble = {
         "type": "bubble",
@@ -5747,7 +5758,7 @@ def build_meal_log_flex(logged_name, logged_cal, logged_pro, new_cal, tdee, new_
                     {"type":"button","action":{"type":"message","label":"🍽️ 推薦晚餐","text":"推薦晚餐"},"style":"secondary","flex":1,"height":"sm"},
                 ]},
                 {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","action":{"type":"message","label":"🍚 修正內容","text":"修正內容"},"style":"secondary","flex":1,"height":"sm"},
+                    {"type":"button","action":edit_action,"style":"secondary","flex":1,"height":"sm"},
                     {"type":"button","action":{"type":"message","label":"📊 看今日進度","text":"首頁"},"style":"secondary","flex":1,"height":"sm"},
                 ]},
             ]
@@ -9759,18 +9770,85 @@ def handle_meal_photo_postback(event):
                 assert relog_meal is not None
                 sv = float(matched.group(2))
                 slot = matched.group(3)
+                event_ref = str(getattr(event, "webhook_event_id", "") or "").strip()
+                if not event_ref:
+                    event_ref = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
+                durable_event_id = "quick-relog:" + hashlib.sha256(
+                    event_ref.encode("utf-8")
+                ).hexdigest()
                 with sqlite3.connect(DB_PATH) as conn:
-                    result = quick_log_from_catalog(
-                        conn, user_id=uid, food_id=food_id,
-                        consumed_servings=sv, meal_slot=slot,
-                    )
-                    _sync_health_profile_from_ledger_conn(conn, uid, tw_today().isoformat())
+                    ensure_daily_food_ledger_schema(conn)
+                    conn.execute("BEGIN IMMEDIATE")
+                    previous = conn.execute(
+                        """SELECT result_json FROM daily_food_log_events
+                           WHERE event_id=? AND user_id=? AND action='quick_relog'""",
+                        (durable_event_id, uid),
+                    ).fetchone()
+                    if previous:
+                        card_state = json.loads(previous[0])
+                    else:
+                        result = quick_log_from_catalog(
+                            conn, user_id=uid, food_id=food_id,
+                            consumed_servings=sv, meal_slot=slot,
+                            consumed_at=tw_now().isoformat(timespec="seconds"),
+                            manage_transaction=False,
+                        )
+                        today = tw_today().isoformat()
+                        _sync_health_profile_from_ledger_conn(conn, uid, today)
+                        version_row = conn.execute(
+                            "SELECT version FROM food_logs WHERE log_id=? AND user_id=?",
+                            (result["log_id"], uid),
+                        ).fetchone()
+                        log_version = int(version_row[0] or 1) if version_row else 1
+                        try:
+                            hp = conn.execute(
+                                """SELECT today_extra_cal,today_extra_pro,tdee,protein
+                                   FROM health_profile WHERE user_id=?""",
+                                (uid,),
+                            ).fetchone()
+                        except sqlite3.OperationalError:
+                            hp = None
+                        if hp:
+                            daily_cal, daily_pro, tdee, protein_goal = hp
+                        else:
+                            rows = _daily_food_rows(conn, uid, today)
+                            daily_cal = daily_pro = 0.0
+                            for row in rows:
+                                snapshot = _ledger_item_from_row(row)["nutrition"]
+                                daily_cal += float(snapshot.get("calories_kcal") or 0)
+                                daily_pro += float(snapshot.get("protein_g") or 0)
+                            tdee, protein_goal = 2000, 100
+                        nutrition = result.get("nutrition") or {}
+                        card_state = {
+                            "logged_name": (
+                                f"{result['product_name']} {result['consumed_servings']:g}份"
+                                f"（{result['meal_slot']}）"
+                            ),
+                            "logged_cal": nutrition.get("calories_kcal"),
+                            "logged_pro": nutrition.get("protein_g"),
+                            "daily_cal": round(float(daily_cal or 0), 1),
+                            "daily_pro": round(float(daily_pro or 0), 1),
+                            "tdee": float(tdee or 2000),
+                            "protein_goal": float(protein_goal or 100),
+                            "log_id": result["log_id"], "version": log_version,
+                        }
+                        conn.execute(
+                            """INSERT INTO daily_food_log_events
+                               (event_id,user_id,log_id,action,result_json,created_at)
+                               VALUES (?,?,?,?,?,?)""",
+                            (
+                                durable_event_id, uid, result["log_id"], "quick_relog",
+                                json.dumps(card_state, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                                tw_now().isoformat(timespec="seconds"),
+                            ),
+                        )
                     conn.commit()
-                cal = result["nutrition"].get("calories_kcal")
-                cal_text = f"{cal:.0f} kcal" if cal else "NA"
-                reply = TextSendMessage(
-                    text=f"✅ 已記錄 {result['product_name']} {result['consumed_servings']}份"
-                         f"（{result['meal_slot']}）\n熱量：{cal_text}"
+                reply = build_meal_log_flex(
+                    card_state["logged_name"], card_state.get("logged_cal"),
+                    card_state.get("logged_pro"), card_state["daily_cal"],
+                    card_state["tdee"], card_state["daily_pro"],
+                    card_state["protein_goal"], log_id=card_state["log_id"],
+                    version=card_state["version"],
                 )
             line_bot_api.reply_message(event.reply_token, reply)
         except (ValueError, PermissionError) as exc:
