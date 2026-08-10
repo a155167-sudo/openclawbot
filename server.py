@@ -25,6 +25,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextSendMessage, TextMessage, ImageMessage, QuickReply,
     QuickReplyButton, MessageAction, PostbackAction, PostbackEvent,
+    CameraAction, CameraRollAction,
 )
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -132,6 +133,13 @@ def ensure_daily_food_ledger_schema(conn: sqlite3.Connection) -> None:
             log_id TEXT NOT NULL,
             action TEXT NOT NULL,
             result_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ai_food_log_replay_snapshots (
+            operation_key TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            log_id TEXT NOT NULL,
+            flex_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS daily_food_edit_states (
@@ -435,8 +443,9 @@ def get_daily_food_ledger(user_id: str, date_text: str) -> dict:
 
 def _sync_health_profile_from_ledger_conn(
     conn: sqlite3.Connection, user_id: str, date_text: str,
+    *, current_date: str = "",
 ) -> None:
-    if date_text != tw_today().isoformat():
+    if date_text != (current_date or tw_today().isoformat()):
         return
     if not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='health_profile'"
@@ -5867,8 +5876,179 @@ def parse_log_nutrition_fallback(ans: str, user_msg: str = ""):
     return None
 
 
+def should_ai_create_food_log(user_msg):
+    """Only the explicit fallback confirmation may let the legacy AI write a food log."""
+    return bool(re.match(
+        r"^請用一般估算記錄\s+\S+", str(user_msg or "").strip()
+    ))
+
+
+def ai_estimate_meal_slot(user_msg):
+    match = re.match(
+        r"^請用一般估算記錄\s+(早餐|午餐|晚餐|點心)\s+",
+        str(user_msg or "").strip(),
+    )
+    return match.group(1) if match else ""
+
+
+def load_ai_estimate_replay(user_id, operation_key):
+    operation_key = str(operation_key or "").strip()[:180]
+    user_id = str(user_id or "").strip()
+    if not operation_key or not user_id:
+        return None
+    def _flex_from_payload(payload):
+        if not isinstance(payload, dict) or payload.get("type") != "flex":
+            raise ValueError("invalid replay flex")
+        from linebot.models import FlexSendMessage
+        return FlexSendMessage(
+            alt_text=payload["altText"], contents=payload["contents"]
+        )
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        row = conn.execute(
+            """SELECT result_json FROM daily_food_log_events
+               WHERE event_id=? AND user_id=? AND action='ai_estimate_log'""",
+            (operation_key, user_id),
+        ).fetchone()
+        if row:
+            try:
+                state = json.loads(row[0] or "{}")
+                payload = state["flex"]
+                return _flex_from_payload(payload)
+            except (KeyError, TypeError, ValueError, AttributeError, json.JSONDecodeError):
+                pass
+        snapshot = conn.execute(
+            """SELECT log_id,flex_json FROM ai_food_log_replay_snapshots
+               WHERE operation_key=? AND user_id=?""",
+            (operation_key, user_id),
+        ).fetchone()
+        if snapshot:
+            try:
+                payload = json.loads(snapshot[1] or "{}")
+                replay = _flex_from_payload(payload)
+                state_json = json.dumps(
+                    {"kind": "ai_estimate_log", "flex": payload},
+                    ensure_ascii=False, separators=(",", ":"),
+                )
+                conn.execute(
+                    """INSERT INTO daily_food_log_events
+                       (event_id,user_id,log_id,action,result_json,created_at)
+                       VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(event_id) DO UPDATE SET
+                         user_id=excluded.user_id,log_id=excluded.log_id,
+                         action=excluded.action,result_json=excluded.result_json,
+                         created_at=excluded.created_at""",
+                    (operation_key, user_id, snapshot[0], "ai_estimate_log", state_json,
+                     tw_now().isoformat(timespec="seconds")),
+                )
+                conn.commit()
+                return replay
+            except (KeyError, TypeError, ValueError, AttributeError, json.JSONDecodeError):
+                pass
+        log_row = conn.execute(
+            """SELECT fl.log_id,fl.version,fl.nutrition_snapshot_json,fc.product_name
+               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+               WHERE fl.operation_key=? AND fl.user_id=?
+                 AND fl.confirmation_status='confirmed' AND COALESCE(fl.deleted_at,'')=''""",
+            (operation_key, user_id),
+        ).fetchone()
+        if not log_row:
+            return None
+        nutrition = json.loads(log_row[2] or "{}")
+        hp = conn.execute(
+            """SELECT today_extra_cal,tdee,today_extra_pro,protein
+               FROM health_profile WHERE user_id=?""", (user_id,)
+        ).fetchone() or (0, 2000, 0, 100)
+        replay = build_meal_log_flex(
+            log_row[3], nutrition.get("calories_kcal"), nutrition.get("protein_g"),
+            hp[0] or 0, hp[1] or 2000, hp[2] or 0, hp[3] or 100,
+            log_id=log_row[0], version=int(log_row[1] or 1),
+        )
+        replay_state = json.dumps(
+            {"kind": "ai_estimate_log", "flex": json.loads(replay.as_json_string())},
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        conn.execute(
+            """INSERT INTO daily_food_log_events
+               (event_id,user_id,log_id,action,result_json,created_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(event_id) DO UPDATE SET
+                 user_id=excluded.user_id,log_id=excluded.log_id,
+                 action=excluded.action,result_json=excluded.result_json,
+                 created_at=excluded.created_at""",
+            (operation_key, user_id, log_row[0], "ai_estimate_log", replay_state,
+             tw_now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return replay
+
+
+def claim_ai_estimate_request(user_id, operation_key, lease_seconds=120):
+    operation_key = str(operation_key or "").strip()[:180]
+    user_id = str(user_id or "").strip()
+    if not operation_key or not user_id:
+        return "invalid"
+    now = tw_now()
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT user_id,action,created_at FROM daily_food_log_events WHERE event_id=?",
+            (operation_key,),
+        ).fetchone()
+        if row:
+            if row[0] != user_id:
+                conn.rollback()
+                return "blocked"
+            if row[1] == "ai_estimate_log":
+                conn.commit()
+                return "complete"
+            if row[1] == "ai_estimate_pending":
+                conn.commit()
+                return "pending"
+        conn.execute(
+            """INSERT INTO daily_food_log_events
+               (event_id,user_id,log_id,action,result_json,created_at)
+               VALUES (?,?,'','ai_estimate_pending','{}',?)
+               ON CONFLICT(event_id) DO UPDATE SET
+                 user_id=excluded.user_id,log_id='',action='ai_estimate_pending',
+                 result_json='{}',created_at=excluded.created_at""",
+            (operation_key, user_id, now.isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return "claimed"
+
+
+def fail_ai_estimate_request(user_id, operation_key, *, refund_quota):
+    user_id = str(user_id or "").strip()
+    operation_key = str(operation_key or "")[:180]
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """DELETE FROM daily_food_log_events
+               WHERE event_id=? AND user_id=? AND action='ai_estimate_pending'""",
+            (operation_key, user_id),
+        )
+        if refund_quota:
+            conn.execute(
+                """UPDATE usage
+                   SET remaining_chat_quota=MIN(
+                       COALESCE(daily_chat_limit,remaining_chat_quota+1),
+                       remaining_chat_quota+1
+                   )
+                   WHERE user_id=?""",
+                (user_id,),
+            )
+        conn.commit()
+
+
+def release_ai_estimate_claim(user_id, operation_key):
+    fail_ai_estimate_request(user_id, operation_key, refund_quota=False)
+
+
 def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    ensure_daily_food_ledger_schema(conn)
     
     # 抓取客人資料
     c.execute("SELECT summary_text, tdee, active_days, protein, user_level, race_date FROM health_profile WHERE user_id=?", (user_id,))
@@ -5979,7 +6159,7 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
 
 【核心守則（嚴格遵守）】
 1. 若顧客輸入的食物存在於本店資料庫 / 菜單，必須 100% 使用資料庫數值，不可改寫、補值或猜測。
-2. 無論是什麼食物，都要立即用最合理的估算值記錄，不要先問。若是外食或模糊品項，直接給合理範圍中間值並記錄，回覆中說明是估算即可。
+2. 一般食物問句只回答，不可寫入正式紀錄；只有訊息以「請用一般估算記錄」開頭時，才估算並記錄。
 3. 若顧客明確表示是外部食物，或該食物不存在於本店資料庫，可用常識估算，但：
    - 不可給假精準到個位數的數字
    - 應優先給範圍
@@ -5989,9 +6169,7 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
    - 例：『乳清蛋白 30g』→ 可以記蛋白質 30，但熱量必須 UNKNOWN
 5. 若資訊不足，不要硬結算；先問清楚。
 6. 若顧客描述份量（半份、兩顆、一半飯），應以單份數值做數學換算。
-7. 只要用戶提到任何食物，就直接記錄。哪怕資訊不完整，也用最合理的估算值，不要反問。
-   - 一律加上 LOG_NUTRITION，用合理估算值，未知的用 UNKNOWN
-   - 回覆一句友善確認即可，不需要列清單詢問
+7. 只有顧客已明確點選「使用一般估算」，訊息以「請用一般估算記錄」開頭時，才可加 LOG_NUTRITION 並正式記錄。
 8. 若顧客提到範圍值（例如 300~400 卡、約 25-30g 蛋白），不要直接擇一寫入正式紀錄；先回覆為估算，除非顧客明確指定要記哪個值。
 9. 若顧客訊息同時包含多個食物，但每個食物資訊不足，先拆開詢問最關鍵缺口，不要把多樣食物合併成單一筆紀錄。
 
@@ -6008,10 +6186,9 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
   *(此為一般預估，實際熱量依店家有異)*
 
 【隱藏 tag 規則 - 非常重要，必須嚴格遵守】
-- 只要用戶提到任何食物，不管確不確定，都必須在回覆最末尾加上這個 tag（不要顯示給用戶）：
+- 只有當用戶訊息以「請用一般估算記錄」開頭，才可在回覆最末尾加：
   [LOG_NUTRITION: CAL=數字或UNKNOWN, PRO=數字或UNKNOWN, NAME=品項名稱]
-- 範例：用戶說「我吃了滷肉飯」→ 回覆末尾加 [LOG_NUTRITION: CAL=650, PRO=25, NAME=滷肉飯]
-- 不管是問句、估算、還是確認，只要提到食物就加。沒有例外。
+- 一般食物問句、營養查詢或確認問題禁止加 LOG_NUTRITION，也禁止當成正式飲食紀錄。
   【🚨 自助改單最高指令 🚨】
     如果顧客明確要求「把A天的某餐，換成B天的某餐」（例如：把週一午餐換成週三晚餐）：
     請在回覆的最結尾加上隱藏標籤：[SWAP_MEAL: 週一_午餐, 週三_晚餐]
@@ -6035,7 +6212,7 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
     meal_log_flex = None
     parsed_tag = parse_log_nutrition_tag(ans) or parse_log_nutrition_fallback(ans, user_msg)
     
-    if parsed_tag:
+    if parsed_tag and should_ai_create_food_log(user_msg):
         try:
             logged_cal = parsed_tag["cal"]
             logged_pro = parsed_tag["pro"]
@@ -6043,8 +6220,10 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
 
             # 至少要有品項，且熱量/蛋白至少有一個抓到，才視為有效記錄
             if logged_name and (logged_cal is not None or logged_pro is not None):
-                meal_hour = tw_now().hour
-                meal_slot = "早餐" if meal_hour < 11 else ("午餐" if meal_hour < 15 else ("晚餐" if meal_hour < 21 else "點心"))
+                meal_slot = ai_estimate_meal_slot(user_msg)
+                if not meal_slot:
+                    meal_hour = tw_now().hour
+                    meal_slot = "早餐" if meal_hour < 11 else ("午餐" if meal_hour < 15 else ("晚餐" if meal_hour < 21 else "點心"))
                 daily_log = create_daily_food_log(
                     conn, user_id=user_id, product_name=logged_name,
                     meal_slot=meal_slot, consumed_at=tw_now().isoformat(timespec="seconds"),
@@ -6056,6 +6235,8 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
                     logged_name = daily_log["product_name"]
                     logged_cal = daily_log["nutrition"].get("calories_kcal")
                     logged_pro = daily_log["nutrition"].get("protein_g")
+                logged_cal = float(logged_cal) if logged_cal is not None else None
+                logged_pro = float(logged_pro) if logged_pro is not None else None
                 _sync_health_profile_from_ledger_conn(conn, user_id, tw_today().isoformat())
                 c.execute(
                     "SELECT today_extra_cal,today_extra_pro,today_food_items FROM health_profile WHERE user_id=?",
@@ -6065,10 +6246,8 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
                 new_extra_cal, new_extra_pro, new_food_items = (
                     projected[0] or 0, projected[1] or 0, projected[2] or "",
                 )
-                conn.commit()
                 
-                # 若有 tag，清掉；fallback 純文字則保留原文只是不再用文字回覆
-                ans = re.sub(r'\[LOG_NUTRITION:.*?\]', '', ans, flags=re.IGNORECASE).strip()
+                # 隱藏 tag 會在此區塊後統一移除。
 
                 # 存最近一筆，供 Task 3 份量修正使用
                 try:
@@ -6086,25 +6265,89 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
                             updated_at=excluded.updated_at,
                             food_log_id=excluded.food_log_id
                     """, (user_id, logged_name, logged_cal, logged_pro, logged_cal, logged_pro, tw_today().isoformat(), user_msg, tw_now().isoformat(), daily_log["log_id"]))
-                    conn.commit()
                 except Exception as _se:
                     print(f'⚠️ 最近一筆記錄保存失敗: {_se}')
-
-                # 🌟 修復與防呆：自動加入常吃清單 (過濾掉超長名字的組合餐)
-                if len(logged_name) <= 15:
-                    upsert_frequent_food(user_id, logged_name, logged_cal, logged_pro)
+                    raise
 
                 # Task 2: 組記錄成功回饋卡
                 try:
+                    version_row = c.execute(
+                        "SELECT version FROM food_logs WHERE log_id=? AND user_id=?",
+                        (daily_log["log_id"], user_id),
+                    ).fetchone()
+                    log_version = int(version_row[0] or 1) if version_row else 1
                     meal_log_flex = build_meal_log_flex(
                         logged_name, logged_cal, logged_pro,
-                        new_extra_cal, tdee_val, new_extra_pro, protein_val
+                        new_extra_cal, tdee_val, new_extra_pro, protein_val,
+                        log_id=daily_log["log_id"], version=log_version,
                     )
                 except Exception as _fe:
                     print(f'⚠️ 回饋卡組建失敗: {_fe}')
+                    from linebot.models import FlexSendMessage
+                    meal_log_flex = FlexSendMessage(
+                        alt_text=f"✅ 已記錄：{logged_name}",
+                        contents={
+                            "type": "bubble", "size": "kilo",
+                            "body": {"type": "box", "layout": "vertical", "contents": [
+                                {"type": "text", "text": "✅ 記錄成功", "weight": "bold", "size": "xl"},
+                                {"type": "text", "text": logged_name, "wrap": True, "margin": "md"},
+                                {"type": "text", "text": f"熱量 {logged_cal if logged_cal is not None else '未知'} kcal／蛋白質 {logged_pro if logged_pro is not None else '未知'} g", "wrap": True, "size": "sm", "margin": "sm"},
+                            ]},
+                            "footer": {"type": "box", "layout": "vertical", "contents": [
+                                {"type": "button", "style": "primary", "action": {
+                                    "type": "postback", "label": "修正內容",
+                                    "data": f"foodlog:v1:{daily_log['log_id']}:{int(daily_log.get('version') or 1)}:more",
+                                    "displayText": "修正這筆飲食紀錄",
+                                }}
+                            ]},
+                        },
+                    )
+
+                if meal_log_flex is not None and operation_key:
+                    flex_payload = json.loads(meal_log_flex.as_json_string())
+                    replay_state = json.dumps(
+                        {
+                            "kind": "ai_estimate_log",
+                            "flex": flex_payload,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    created_at = tw_now().isoformat(timespec="seconds")
+                    c.execute(
+                        """INSERT OR IGNORE INTO ai_food_log_replay_snapshots
+                           (operation_key,user_id,log_id,flex_json,created_at)
+                           VALUES (?,?,?,?,?)""",
+                        (
+                            str(operation_key)[:180], user_id, daily_log["log_id"],
+                            json.dumps(flex_payload, ensure_ascii=False, separators=(",", ":")),
+                            created_at,
+                        ),
+                    )
+                    c.execute(
+                        """INSERT INTO daily_food_log_events
+                           (event_id,user_id,log_id,action,result_json,created_at)
+                           VALUES (?,?,?,?,?,?)
+                           ON CONFLICT(event_id) DO UPDATE SET
+                             user_id=excluded.user_id,log_id=excluded.log_id,
+                             action=excluded.action,result_json=excluded.result_json,
+                             created_at=excluded.created_at""",
+                        (
+                            str(operation_key)[:180], user_id, daily_log["log_id"],
+                            "ai_estimate_log", replay_state, created_at,
+                        ),
+                    )
+                conn.commit()
+
+                # 核心 ledger 與 replay state 已提交後才執行非核心 mirror。
+                if not daily_log.get("replayed") and len(logged_name) <= 15:
+                    try:
+                        upsert_frequent_food(user_id, logged_name, logged_cal, logged_pro)
+                    except Exception as _ff:
+                        print(f"⚠️ 常吃清單同步失敗: {_ff}")
                 
                 # 寫入 Google Sheet
-                if daily_rec and daily_rec[2] and gc:
+                if not daily_log.get("replayed") and daily_rec and daily_rec[2] and gc:
                     try:
                         sheet = gc.open_by_url(SHEET_URL)
                         now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
@@ -6117,7 +6360,14 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
                     except Exception:
                         pass
         except Exception as e:
+            conn.rollback()
+            meal_log_flex = None
             print(f"❌ 標籤解析存入失敗: {e}")
+
+    # 防止模型未遵守提示詞時，把隱藏記錄標籤顯示給一般問句使用者。
+    ans = re.sub(
+        r'\[LOG_NUTRITION:.*?\]', '', str(ans or ''), flags=re.IGNORECASE
+    ).strip()
 
     match_swap = re.search(r'\[SWAP_MEAL:\s*(.+?)_(.+?),\s*(.+?)_(.+?)\]', ans)
     if match_swap:
@@ -7967,6 +8217,179 @@ def current_meal_slot(now=None):
     return "點心"
 
 
+def parse_natural_food_log_intent(text):
+    """Parse an explicit single-food logging request without asking an LLM."""
+    message = " ".join(str(text or "").strip().split())
+    if not message:
+        return None
+    if re.search(r"[?？]", message):
+        return None
+    question_probe = re.sub(r"[。.!！\s]+$", "", message)
+    if re.search(
+        r"(?:會胖|多少|幾卡|幾大卡|嗎)$", question_probe
+    ):
+        return None
+    meal_slot = ""
+    body = ""
+    meal_match = re.match(
+        r"^(早餐|午餐|晚餐|點心)\s*(?:吃(?:了)?|喝(?:了)?)\s*(.+)$", message
+    )
+    if meal_match:
+        meal_slot, body = meal_match.group(1), meal_match.group(2)
+    else:
+        suffix_intent = re.match(
+            r"^(.+?)(?:吃了|喝了)[：:\s]*"
+            r"(\d+(?:\.\d+)?|一|二|兩|半)\s*"
+            r"(c\.?c\.?|ml|毫升|g|克|公克|份|瓶|包)$",
+            message,
+            re.IGNORECASE,
+        )
+        if suffix_intent:
+            body = (
+                f"{suffix_intent.group(1).strip()} "
+                f"{suffix_intent.group(2)}{suffix_intent.group(3)}"
+            )
+        intent_patterns = (
+            r"^(?:我要)?(?:紀錄|記錄)(?:一下)?(?:飲食[：:\s]*|[：:\s]+)(.+)$",
+            r"^幫我(?:紀錄|記錄|記)(?:一下)?我(?:今天)?(?:吃了|喝了)[：:\s]*(.+)$",
+            r"^幫我(?:紀錄|記錄|記)(?:一下)?(?:飲食[：:\s]*|[：:\s]*)(.+)$",
+            r"^我(?:今天)?(?:吃了|喝了)[：:\s]*(.+)$",
+        )
+        if not body:
+            for pattern in intent_patterns:
+                matched = re.match(pattern, message)
+                if matched:
+                    body = matched.group(1)
+                    break
+    body = body.strip(" ：:，,。.!！")
+    if not body:
+        return None
+    if re.fullmatch(r"(?:嗎|嗎[?？]|什麼|什麼[?？]|要記什麼[?？]?)", body):
+        return None
+    slot_match = re.match(r"^(早餐|午餐|晚餐|點心)[：:\s]*(.+)$", body)
+    if slot_match:
+        meal_slot, body = slot_match.group(1), slot_match.group(2).strip()
+
+    amount = None
+    unit = ""
+    amount_match = re.match(
+        r"^(.+?)\s*(\d+(?:\.\d+)?|一|二|兩|半)\s*"
+        r"(c\.?c\.?|ml|毫升|g|克|公克|份|瓶|包)$",
+        body,
+        re.IGNORECASE,
+    )
+    if amount_match:
+        body = amount_match.group(1).strip(" ：:，,")
+        raw_amount = amount_match.group(2)
+        amount = {"一": 1.0, "二": 2.0, "兩": 2.0, "半": 0.5}.get(
+            raw_amount, float(raw_amount) if re.fullmatch(r"\d+(?:\.\d+)?", raw_amount) else None
+        )
+        raw_unit = amount_match.group(3).lower().replace(".", "")
+        unit = {
+            "cc": "ml", "ml": "ml", "毫升": "ml",
+            "g": "g", "克": "g", "公克": "g",
+            "份": "serving", "瓶": "package", "包": "package",
+        }[raw_unit]
+    else:
+        amount_match = re.match(
+            r"^(\d+(?:\.\d+)?|一|二|兩|半)\s*"
+            r"(c\.?c\.?|ml|毫升|g|克|公克|份|瓶|包)\s*(.+)$",
+            body,
+            re.IGNORECASE,
+        )
+        if amount_match:
+            raw_amount = amount_match.group(1)
+            amount = {"一": 1.0, "二": 2.0, "兩": 2.0, "半": 0.5}.get(
+                raw_amount,
+                float(raw_amount)
+                if re.fullmatch(r"\d+(?:\.\d+)?", raw_amount)
+                else None,
+            )
+            raw_unit = amount_match.group(2).lower().replace(".", "")
+            unit = {
+                "cc": "ml", "ml": "ml", "毫升": "ml",
+                "g": "g", "克": "g", "公克": "g",
+                "份": "serving", "瓶": "package", "包": "package",
+            }[raw_unit]
+            body = amount_match.group(3).strip(" ：:，,")
+    food_name = " ".join(body.split()).strip()
+    if not food_name or len(food_name) > 160:
+        return None
+    return {
+        "food_name": food_name, "amount": amount,
+        "unit": unit, "meal_slot": meal_slot,
+    }
+
+
+def _natural_food_candidates(conn, user_id, food_name):
+    query_key = re.sub(r"[ \t\r\n]+", "", str(food_name or ""))
+    exact_rows = conn.execute(
+        """SELECT food_id,product_name,brand,barcode,source_type,owner_user_id,
+                  package_amount,package_unit,servings_per_package,
+                  per_serving_json,exchange_json,exchange_review_status,
+                  created_at,updated_at
+           FROM food_catalog
+           WHERE (owner_user_id=? OR visibility='public')
+             AND lower(replace(replace(replace(replace(
+                   product_name, ' ', ''), char(9), ''), char(10), ''), char(13), ''))=lower(?)
+           ORDER BY CASE WHEN owner_user_id=? THEN 0 ELSE 1 END, updated_at DESC""",
+        (user_id, query_key, user_id),
+    ).fetchall()
+    exact = []
+    for row in exact_rows:
+        exact.append({
+            "food_id": row[0], "product_name": row[1],
+            "brand": row[2] or "", "barcode": row[3] or "",
+            "source_type": row[4], "owner_user_id": row[5],
+            "package_amount": float(row[6] or 0),
+            "package_unit": row[7] or "",
+            "servings_per_package": float(row[8] or 1),
+            "per_serving": json.loads(row[9] or "{}"),
+            "exchange": json.loads(row[10] or "{}"),
+            "exchange_review_status": row[11] or "",
+            "created_at": row[12] or "", "updated_at": row[13] or "",
+            "last_consumed_at": None, "use_count": 0,
+        })
+    if exact:
+        return exact, "exact"
+    candidates = search_food_catalog(
+        conn, user_id=user_id, query=food_name, limit=20
+    )
+    candidates.sort(key=lambda item: item["owner_user_id"] != user_id)
+    return candidates, "fuzzy"
+
+
+def _validate_natural_food_amount(amount, unit):
+    amount = float(amount)
+    maximum = 100.0 if unit in {"serving", "package"} else 100000.0
+    if not 0.1 <= amount <= maximum:
+        unit_label = _natural_unit_label(unit) or "份量"
+        raise ValueError(f"{unit_label}需介於 0.1～{maximum:g}")
+    return amount
+
+
+def _natural_food_servings(item, amount, unit):
+    if amount is None:
+        return None
+    amount = _validate_natural_food_amount(amount, unit)
+    if unit == "serving":
+        return amount
+    servings_per_package = float(item.get("servings_per_package") or 1)
+    if unit == "package":
+        return amount * servings_per_package
+    package_amount = float(item.get("package_amount") or 0)
+    package_unit = str(item.get("package_unit") or "").strip().lower().replace(".", "")
+    package_unit = {
+        "cc": "ml", "毫升": "ml", "公克": "g", "克": "g",
+    }.get(package_unit, package_unit)
+    if unit not in {"ml", "g"} or unit != package_unit or package_amount <= 0:
+        raise ValueError(
+            f"「{item['product_name']}」以{item.get('package_unit') or '份'}記錄，"
+            f"無法直接換算這個單位"
+        )
+    return amount / package_amount * servings_per_package
+
+
 def resolve_nutrition_consumed_at(parsed, *, received_at):
     """Only promote a high-confidence, plausible photo watermark to event time."""
     fallback = received_at
@@ -9113,7 +9536,7 @@ def build_meal_photo_step_message(token, step, version=1):
     )
 
 
-def build_food_search_result_bubble(item):
+def build_food_search_result_bubble(item, *, action_data="", action_label="快速記錄"):
     """食物搜尋結果的單張Flex bubble。"""
     name = item["product_name"]
     brand = item.get("brand") or ""
@@ -9174,12 +9597,243 @@ def build_food_search_result_bubble(item):
             "type": "box", "layout": "vertical", "spacing": "sm",
             "contents": [
                 {"type": "button", "style": "primary", "color": "#0F766E", "height": "sm",
-                 "action": {"type": "postback", "label": "快速記錄",
-                            "data": f"relog:v1:{food_id}:start",
+                 "action": {"type": "postback", "label": action_label,
+                            "data": action_data or f"relog:v1:{food_id}:start",
                             "displayText": f"記錄：{name[:20]}"}},
             ],
         },
     }
+
+
+def build_food_servings_picker(food_id, product_name="", meal_slot=""):
+    def _serving_action_data(serving):
+        if meal_slot in {"早餐", "午餐", "晚餐", "點心"}:
+            return f"nlfood:v1:{food_id}:servings:{serving}:meal:{meal_slot}"
+        return f"relog:v1:{food_id}:servings:{serving}"
+
+    items = [
+        QuickReplyButton(action=PostbackAction(
+            label=f"{sv}份", data=_serving_action_data(sv),
+            display_text=f"{sv}份",
+        ))
+        for sv in ("0.5", "1", "1.5", "2", "2.5", "3")
+    ]
+    items.append(QuickReplyButton(action=PostbackAction(
+        label="取消", data=f"relog:v1:{food_id}:servings:cancel",
+        display_text="取消快速記錄",
+    )))
+    prefix = f"已找到「{product_name}」。" if product_name else ""
+    return TextSendMessage(
+        text=f"{prefix}請選擇份量：", quick_reply=QuickReply(items=items)
+    )
+
+
+def _quick_log_catalog_card_once(
+    *, user_id, food_id, meal_slot, event_ref, servings=None,
+    amount=None, amount_unit="", display_quantity="",
+):
+    """Atomically quick-log one catalog food and replay the same success card."""
+    durable_event_id = "quick-relog:" + hashlib.sha256(
+        str(event_ref or "").encode("utf-8")
+    ).hexdigest()
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_nutrition_schema(conn)
+        ensure_daily_food_ledger_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute(
+            """SELECT result_json FROM daily_food_log_events
+               WHERE event_id=? AND user_id=? AND action='quick_relog'""",
+            (durable_event_id, user_id),
+        ).fetchone()
+        if previous:
+            card_state = json.loads(previous[0])
+        else:
+            logged_at = tw_now()
+            resolved_servings = servings
+            if amount is not None:
+                conn.row_factory = sqlite3.Row
+                catalog_row = conn.execute(
+                    """SELECT food_id,product_name,owner_user_id,visibility,
+                              package_amount,package_unit,servings_per_package
+                       FROM food_catalog
+                       WHERE food_id=? AND (owner_user_id=? OR visibility='public')""",
+                    (food_id, user_id),
+                ).fetchone()
+                if catalog_row is None:
+                    raise PermissionError("找不到可使用的食品資料")
+                resolved_servings = _natural_food_servings(
+                    dict(catalog_row), amount, amount_unit
+                )
+            if resolved_servings is None:
+                raise ValueError("缺少可記錄的食品份量")
+            result = quick_log_from_catalog(
+                conn, user_id=user_id, food_id=food_id,
+                consumed_servings=float(resolved_servings), meal_slot=meal_slot,
+                consumed_at=logged_at.isoformat(timespec="seconds"),
+                manage_transaction=False,
+            )
+            today = logged_at.date().isoformat()
+            _sync_health_profile_from_ledger_conn(
+                conn, user_id, today, current_date=today
+            )
+            version_row = conn.execute(
+                "SELECT version FROM food_logs WHERE log_id=? AND user_id=?",
+                (result["log_id"], user_id),
+            ).fetchone()
+            log_version = int(version_row[0] or 1) if version_row else 1
+            try:
+                hp = conn.execute(
+                    """SELECT today_extra_cal,today_extra_pro,tdee,protein
+                       FROM health_profile WHERE user_id=?""",
+                    (user_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                hp = None
+            if hp:
+                daily_cal, daily_pro, tdee, protein_goal = hp
+            else:
+                rows = _daily_food_rows(conn, user_id, today)
+                daily_cal = daily_pro = 0.0
+                for row in rows:
+                    snapshot = _ledger_item_from_row(row)["nutrition"]
+                    daily_cal += float(snapshot.get("calories_kcal") or 0)
+                    daily_pro += float(snapshot.get("protein_g") or 0)
+                tdee, protein_goal = 2000, 100
+            nutrition = result.get("nutrition") or {}
+            quantity = str(display_quantity or "").strip()
+            if not quantity:
+                quantity = f"{result['consumed_servings']:g}份"
+            card_state = {
+                "logged_name": f"{result['product_name']} {quantity}（{result['meal_slot']}）",
+                "logged_cal": round(float(nutrition["calories_kcal"]), 1)
+                if nutrition.get("calories_kcal") is not None else None,
+                "logged_pro": round(float(nutrition["protein_g"]), 1)
+                if nutrition.get("protein_g") is not None else None,
+                "daily_cal": round(float(daily_cal or 0), 1),
+                "daily_pro": round(float(daily_pro or 0), 1),
+                "tdee": float(tdee or 2000),
+                "protein_goal": float(protein_goal or 100),
+                "log_id": result["log_id"], "version": log_version,
+            }
+            conn.execute(
+                """INSERT INTO daily_food_log_events
+                   (event_id,user_id,log_id,action,result_json,created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (
+                    durable_event_id, user_id, result["log_id"], "quick_relog",
+                    json.dumps(card_state, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                    logged_at.isoformat(timespec="seconds"),
+                ),
+            )
+        conn.commit()
+    return build_meal_log_flex(
+        card_state["logged_name"], card_state.get("logged_cal"),
+        card_state.get("logged_pro"), card_state["daily_cal"],
+        card_state["tdee"], card_state["daily_pro"],
+        card_state["protein_goal"], log_id=card_state["log_id"],
+        version=card_state["version"],
+    )
+
+
+def _natural_unit_label(unit):
+    return {
+        "ml": "ml", "g": "g", "serving": "份", "package": "個包裝",
+    }.get(unit, "")
+
+
+def build_natural_food_log_reply(*, user_id, message_id, event, request):
+    """Resolve one explicit food-log request without invoking the LLM."""
+    try:
+        if request["amount"] is not None:
+            _validate_natural_food_amount(request["amount"], request["unit"])
+        with sqlite3.connect(DB_PATH) as conn:
+            ensure_nutrition_schema(conn)
+            candidates, match_kind = _natural_food_candidates(
+                conn, user_id, request["food_name"]
+            )
+        if request["amount"] is not None and candidates:
+            compatible = []
+            for item in candidates:
+                try:
+                    _natural_food_servings(item, request["amount"], request["unit"])
+                except ValueError:
+                    continue
+                compatible.append(item)
+            if compatible:
+                candidates = compatible
+        if match_kind == "exact" and candidates:
+            private_candidates = [
+                item for item in candidates if item["owner_user_id"] == user_id
+            ]
+            if private_candidates:
+                candidates = private_candidates
+        if len(candidates) == 1 and match_kind == "exact":
+            item = candidates[0]
+            slot = request["meal_slot"] or current_meal_slot()
+            if request["amount"] is None:
+                return build_food_servings_picker(
+                    item["food_id"], item["product_name"], meal_slot=slot
+                )
+            quantity = f"{request['amount']:g}{_natural_unit_label(request['unit'])}"
+            event_ref = str(getattr(event, "webhook_event_id", "") or "").strip()
+            if not event_ref:
+                event_ref = f"natural-food:{user_id}:{message_id}"
+            return _quick_log_catalog_card_once(
+                user_id=user_id, food_id=item["food_id"],
+                amount=request["amount"], amount_unit=request["unit"],
+                meal_slot=slot, event_ref=event_ref, display_quantity=quantity,
+            )
+        if candidates:
+            from linebot.models import FlexSendMessage
+            slot = request["meal_slot"] or current_meal_slot()
+            action_amount = request["amount"]
+            bubbles = []
+            for item in candidates[:11]:
+                action_data = (
+                    f"nlfood:v1:{item['food_id']}:servings:start:meal:{slot}"
+                )
+                action_label = "選擇份量"
+                if action_amount is not None:
+                    action_data = (
+                        f"nlfood:v1:{item['food_id']}:amount:{action_amount:g}:"
+                        f"{request['unit']}:meal:{slot}"
+                    )
+                    action_label = (
+                        f"記錄 {action_amount:g}{_natural_unit_label(request['unit'])}"
+                    )
+                bubbles.append(build_food_search_result_bubble(
+                    item, action_data=action_data, action_label=action_label
+                ))
+            return FlexSendMessage(
+                alt_text=f"請選擇要記錄的{request['food_name']}",
+                contents={"type": "carousel", "contents": bubbles},
+            )
+        query = request["food_name"]
+        fallback_slot = request["meal_slot"] or current_meal_slot()
+        amount_text = ""
+        if request["amount"] is not None:
+            amount_text = (
+                f" {request['amount']:g}{_natural_unit_label(request['unit'])}"
+            )
+        return TextSendMessage(
+            text=(
+                f"🔍 食品庫找不到「{query}」。\n"
+                "我不會用 UNKNOWN 假裝已記錄，請選擇下一步："
+            ),
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=MessageAction(
+                    label="瀏覽我的食物", text="搜尋我的食物"
+                )),
+                QuickReplyButton(action=CameraAction(label="拍營養標示")),
+                QuickReplyButton(action=CameraRollAction(label="從相簿選擇")),
+                QuickReplyButton(action=MessageAction(
+                    label="使用一般估算",
+                    text=f"請用一般估算記錄 {fallback_slot} {query}{amount_text}"
+                )),
+            ]),
+        )
+    except (ValueError, PermissionError) as exc:
+        return TextSendMessage(text=f"⚠️ 尚未記錄：{exc}")
 
 
 def build_meal_photo_review_step_message(draft, step, version=1):
@@ -9532,6 +10186,72 @@ def handle_meal_photo_postback(event):
     data = str(getattr(event.postback, "data", "") or "")
     uid = event.source.user_id
 
+    # ── nlfood:v1 自然語句候選食品選擇 ──
+    natural_serving_choice = re.fullmatch(
+        r"nlfood:v1:([a-z0-9_]{8,40}):servings:"
+        r"(start|[0-9]+(?:\.[0-9]+)?):meal:(早餐|午餐|晚餐|點心)",
+        data,
+    )
+    if natural_serving_choice:
+        food_id = natural_serving_choice.group(1)
+        serving_choice = natural_serving_choice.group(2)
+        slot = natural_serving_choice.group(3)
+        try:
+            if serving_choice == "start":
+                with sqlite3.connect(DB_PATH) as conn:
+                    row = conn.execute(
+                        """SELECT product_name FROM food_catalog
+                           WHERE food_id=? AND (owner_user_id=? OR visibility='public')""",
+                        (food_id, uid),
+                    ).fetchone()
+                if row is None:
+                    raise PermissionError("找不到可使用的食品資料")
+                reply = build_food_servings_picker(
+                    food_id, row[0], meal_slot=slot
+                )
+            else:
+                servings = _validate_natural_food_amount(
+                    float(serving_choice), "serving"
+                )
+                event_ref = str(
+                    getattr(event, "webhook_event_id", "") or ""
+                ).strip()
+                if not event_ref:
+                    event_ref = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
+                reply = _quick_log_catalog_card_once(
+                    user_id=uid, food_id=food_id, servings=servings,
+                    meal_slot=slot, event_ref=event_ref,
+                    display_quantity=f"{servings:g}份",
+                )
+        except (ValueError, PermissionError) as exc:
+            reply = TextSendMessage(text=f"⚠️ 尚未記錄：{exc}")
+        line_bot_api.reply_message(event.reply_token, reply)
+        return
+
+    natural_choice = re.fullmatch(
+        r"nlfood:v1:([a-z0-9_]{8,40}):amount:([0-9]+(?:\.[0-9]+)?):"
+        r"(ml|g|serving|package):meal:(早餐|午餐|晚餐|點心)",
+        data,
+    )
+    if natural_choice:
+        food_id = natural_choice.group(1)
+        amount = float(natural_choice.group(2))
+        unit = natural_choice.group(3)
+        slot = natural_choice.group(4)
+        try:
+            event_ref = str(getattr(event, "webhook_event_id", "") or "").strip()
+            if not event_ref:
+                event_ref = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
+            reply = _quick_log_catalog_card_once(
+                user_id=uid, food_id=food_id, amount=amount, amount_unit=unit,
+                meal_slot=slot, event_ref=event_ref,
+                display_quantity=f"{amount:g}{_natural_unit_label(unit)}",
+            )
+        except (ValueError, PermissionError) as exc:
+            reply = TextSendMessage(text=f"⚠️ 尚未記錄：{exc}")
+        line_bot_api.reply_message(event.reply_token, reply)
+        return
+
     # ── foodlog:v1 每日飲食帳本 ──
     ledger_day = re.fullmatch(r"foodlog:v1:day:(today|yesterday):page:(\d{1,3})", data)
     ledger_item = re.fullmatch(
@@ -9741,17 +10461,7 @@ def handle_meal_photo_postback(event):
         food_id = matched.group(1)
         try:
             if relog_start:
-                items = []
-                for sv in ("0.5", "1", "1.5", "2", "2.5", "3"):
-                    items.append(QuickReplyButton(action=PostbackAction(
-                        label=f"{sv}份", data=f"relog:v1:{food_id}:servings:{sv}",
-                        display_text=f"{sv}份",
-                    )))
-                items.append(QuickReplyButton(action=PostbackAction(
-                    label="取消", data=f"relog:v1:{food_id}:servings:cancel",
-                    display_text="取消快速記錄",
-                )))
-                reply = TextSendMessage(text="請選擇份量：", quick_reply=QuickReply(items=items))
+                reply = build_food_servings_picker(food_id)
             elif relog_cancel:
                 reply = TextSendMessage(text="✅ 已取消快速記錄。")
             elif relog_servings:
@@ -9773,82 +10483,9 @@ def handle_meal_photo_postback(event):
                 event_ref = str(getattr(event, "webhook_event_id", "") or "").strip()
                 if not event_ref:
                     event_ref = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
-                durable_event_id = "quick-relog:" + hashlib.sha256(
-                    event_ref.encode("utf-8")
-                ).hexdigest()
-                with sqlite3.connect(DB_PATH) as conn:
-                    ensure_daily_food_ledger_schema(conn)
-                    conn.execute("BEGIN IMMEDIATE")
-                    previous = conn.execute(
-                        """SELECT result_json FROM daily_food_log_events
-                           WHERE event_id=? AND user_id=? AND action='quick_relog'""",
-                        (durable_event_id, uid),
-                    ).fetchone()
-                    if previous:
-                        card_state = json.loads(previous[0])
-                    else:
-                        result = quick_log_from_catalog(
-                            conn, user_id=uid, food_id=food_id,
-                            consumed_servings=sv, meal_slot=slot,
-                            consumed_at=tw_now().isoformat(timespec="seconds"),
-                            manage_transaction=False,
-                        )
-                        today = tw_today().isoformat()
-                        _sync_health_profile_from_ledger_conn(conn, uid, today)
-                        version_row = conn.execute(
-                            "SELECT version FROM food_logs WHERE log_id=? AND user_id=?",
-                            (result["log_id"], uid),
-                        ).fetchone()
-                        log_version = int(version_row[0] or 1) if version_row else 1
-                        try:
-                            hp = conn.execute(
-                                """SELECT today_extra_cal,today_extra_pro,tdee,protein
-                                   FROM health_profile WHERE user_id=?""",
-                                (uid,),
-                            ).fetchone()
-                        except sqlite3.OperationalError:
-                            hp = None
-                        if hp:
-                            daily_cal, daily_pro, tdee, protein_goal = hp
-                        else:
-                            rows = _daily_food_rows(conn, uid, today)
-                            daily_cal = daily_pro = 0.0
-                            for row in rows:
-                                snapshot = _ledger_item_from_row(row)["nutrition"]
-                                daily_cal += float(snapshot.get("calories_kcal") or 0)
-                                daily_pro += float(snapshot.get("protein_g") or 0)
-                            tdee, protein_goal = 2000, 100
-                        nutrition = result.get("nutrition") or {}
-                        card_state = {
-                            "logged_name": (
-                                f"{result['product_name']} {result['consumed_servings']:g}份"
-                                f"（{result['meal_slot']}）"
-                            ),
-                            "logged_cal": nutrition.get("calories_kcal"),
-                            "logged_pro": nutrition.get("protein_g"),
-                            "daily_cal": round(float(daily_cal or 0), 1),
-                            "daily_pro": round(float(daily_pro or 0), 1),
-                            "tdee": float(tdee or 2000),
-                            "protein_goal": float(protein_goal or 100),
-                            "log_id": result["log_id"], "version": log_version,
-                        }
-                        conn.execute(
-                            """INSERT INTO daily_food_log_events
-                               (event_id,user_id,log_id,action,result_json,created_at)
-                               VALUES (?,?,?,?,?,?)""",
-                            (
-                                durable_event_id, uid, result["log_id"], "quick_relog",
-                                json.dumps(card_state, ensure_ascii=False, sort_keys=True, allow_nan=False),
-                                tw_now().isoformat(timespec="seconds"),
-                            ),
-                        )
-                    conn.commit()
-                reply = build_meal_log_flex(
-                    card_state["logged_name"], card_state.get("logged_cal"),
-                    card_state.get("logged_pro"), card_state["daily_cal"],
-                    card_state["tdee"], card_state["daily_pro"],
-                    card_state["protein_goal"], log_id=card_state["log_id"],
-                    version=card_state["version"],
+                reply = _quick_log_catalog_card_once(
+                    user_id=uid, food_id=food_id, servings=sv, meal_slot=slot,
+                    event_ref=event_ref,
                 )
             line_bot_api.reply_message(event.reply_token, reply)
         except (ValueError, PermissionError) as exc:
@@ -10532,6 +11169,18 @@ def _handle_message_impl(event):
             line_bot_api.reply_message(event.reply_token, reply)
         except Exception:
             # 資料已由持久化 combo_log_events 冪等保護；允許 LINE 安全重送回覆。
+            processed_messages.discard(msg_id)
+            raise
+        return
+
+    natural_log = parse_natural_food_log_intent(msg)
+    if natural_log:
+        try:
+            reply = build_natural_food_log_reply(
+                user_id=uid, message_id=msg_id, event=event, request=natural_log
+            )
+            line_bot_api.reply_message(event.reply_token, reply)
+        except Exception:
             processed_messages.discard(msg_id)
             raise
         return
@@ -12353,12 +13002,56 @@ def _handle_message_impl(event):
             )
         return # 處理完畢，直接返回
      # 🟢 顧客一般對話 (串接 AI) 🟢
-    allow, q_msg = check_permission_and_quota(uid)
-    if not allow: return
+    ai_operation_key = f"line-ai:{uid}:{msg_id}"
+    is_ai_estimate = should_ai_create_food_log(msg)
+    claim_status = ""
+    if is_ai_estimate:
+        replay_flex = load_ai_estimate_replay(uid, ai_operation_key)
+        if replay_flex is not None:
+            try:
+                line_bot_api.reply_message(event.reply_token, replay_flex)
+            except Exception:
+                processed_messages.discard(msg_id)
+                raise
+            return
+        claim_status = claim_ai_estimate_request(uid, ai_operation_key)
+        if claim_status in {"pending", "complete", "blocked"}:
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="⏳ 這筆飲食紀錄正在處理，請稍候；完成後重送會直接顯示成功卡。"),
+                )
+            except Exception:
+                processed_messages.discard(msg_id)
+                raise
+            return
+    try:
+        allow, q_msg = check_permission_and_quota(uid)
+    except Exception:
+        if claim_status == "claimed":
+            fail_ai_estimate_request(
+                uid, ai_operation_key, refund_quota=False
+            )
+        raise
+    if not allow:
+        if claim_status == "claimed":
+            release_ai_estimate_claim(uid, ai_operation_key)
+        return
     else:
-        ai_text, meal_flex = get_ai_response_with_memory(
-            uid, msg, operation_key=f"line-ai:{uid}:{msg_id}"
-        )
+        try:
+            ai_text, meal_flex = get_ai_response_with_memory(
+                uid, msg, operation_key=ai_operation_key
+            )
+        except Exception:
+            if is_ai_estimate:
+                fail_ai_estimate_request(
+                    uid, ai_operation_key, refund_quota=True
+                )
+            raise
+        if is_ai_estimate and meal_flex is None:
+            fail_ai_estimate_request(
+                uid, ai_operation_key, refund_quota=True
+            )
         if meal_flex:
             line_bot_api.reply_message(event.reply_token, meal_flex)
         else:

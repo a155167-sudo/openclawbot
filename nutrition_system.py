@@ -772,6 +772,11 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_food_catalog_owner_fingerprint
             ON food_catalog(owner_user_id, fingerprint, source_type);
         CREATE INDEX IF NOT EXISTS idx_food_catalog_owner ON food_catalog(owner_user_id);
+        CREATE INDEX IF NOT EXISTS idx_food_catalog_normalized_name
+            ON food_catalog(
+                lower(replace(replace(replace(replace(
+                    product_name, ' ', ''), char(9), ''), char(10), ''), char(13), ''))
+            );
         CREATE INDEX IF NOT EXISTS idx_food_logs_user_time ON food_logs(user_id, consumed_at);
         CREATE INDEX IF NOT EXISTS idx_plan_user_effective ON nutrition_plans(user_id, effective_from);
         CREATE INDEX IF NOT EXISTS idx_food_exchange_approvals_food
@@ -1976,7 +1981,7 @@ def quick_log_from_catalog(
         servings = float(consumed_servings)
     except (TypeError, ValueError) as exc:
         raise ValueError("份量數值無效") from exc
-    if servings <= 0 or servings > 100:
+    if servings < 0.1 or servings > 100:
         raise ValueError("份量需介於0.1~100")
     meal_slot = str(meal_slot or "").strip()
     if meal_slot not in {"早餐", "午餐", "晚餐", "點心", ""}:
@@ -2071,14 +2076,16 @@ def search_food_catalog(
         return []
     limit = max(1, min(int(limit or 8), 20))
     if query:
-        pattern = f"%{query}%"
+        escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped_query}%"
         rows = conn.execute(
             """SELECT food_id,product_name,brand,barcode,source_type,owner_user_id,
                       package_amount,package_unit,servings_per_package,
                       per_serving_json,exchange_json,exchange_review_status,
                       created_at,updated_at
                FROM food_catalog
-               WHERE (owner_user_id=? OR visibility='public') AND product_name LIKE ?
+               WHERE (owner_user_id=? OR visibility='public')
+                 AND product_name LIKE ? ESCAPE '\\'
                ORDER BY updated_at DESC
                LIMIT ?""",
             (user_id, pattern, limit),
