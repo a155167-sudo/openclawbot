@@ -452,6 +452,35 @@ def test_daily_food_summary_is_scoped_sorted_and_counts_pending_reviews():
     assert summary["pending_reviews"] == 1
 
 
+def test_daily_food_summary_converts_offsets_to_taipei_time_and_date():
+    conn = sqlite3.connect(":memory:")
+    ensure_nutrition_schema(conn)
+    timestamps = (
+        "2026-08-10T02:43:00+00:00",  # 台北 10:43
+        "2026-08-10T18:30:00+00:00",  # 台北隔日 02:30
+        "2026-08-10T09:00:00+08:00",  # 台北 09:00
+        "2026-08-10T10:00:00",        # 舊 naive 資料視為台北 10:00
+        "2026-08-10T03:00:00+00:00",  # 台北 11:00
+        "2026-08-10T23:30:00",        # 舊 naive 資料仍屬台北 8/10
+    )
+    for consumed_at in timestamps:
+        token = save_pending_label(
+            conn, user_id="U_TEST", payload=SOY_MILK_PAYLOAD,
+            consumed_at=consumed_at,
+        )
+        confirm_pending_label(conn, token=token, user_id="U_TEST")
+
+    august_10 = daily_food_summary(conn, user_id="U_TEST", date_iso="2026-08-10")
+    august_11 = daily_food_summary(conn, user_id="U_TEST", date_iso="2026-08-11")
+
+    assert [item["time"] for item in august_10["foods"]] == [
+        "09:00", "10:00", "10:43", "11:00", "23:30",
+    ]
+    assert [item["time"] for item in august_11["foods"]] == ["02:30"]
+    assert august_10["totals"]["calories_kcal"] == pytest.approx(190.2 * 5)
+    assert august_11["totals"]["calories_kcal"] == pytest.approx(190.2)
+
+
 def test_approving_exchange_suggestion_preserves_suggestion_and_creates_applied_snapshot():
     conn = sqlite3.connect(":memory:")
     ensure_nutrition_schema(conn)

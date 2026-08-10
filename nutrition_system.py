@@ -8,8 +8,18 @@ import math
 import secrets
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
+
+
+_TAIPEI_LOCAL_CONSUMED_AT_SQL = """
+CASE
+  WHEN upper(substr(l.consumed_at, -1)) = 'Z'
+    OR substr(l.consumed_at, 12) GLOB '*[-+][0-9][0-9]:[0-9][0-9]'
+  THEN datetime(l.consumed_at, '+8 hours')
+  ELSE datetime(l.consumed_at)
+END
+""".strip()
 
 
 NUTRIENT_KEYS = (
@@ -2366,7 +2376,7 @@ def daily_consumed_totals(
     conn: sqlite3.Connection, *, user_id: str, date_iso: str, meal_slot: str = ""
 ) -> dict[str, float]:
     totals = {key: 0.0 for key in (*NUTRIENT_KEYS, *EXCHANGE_KEYS)}
-    sql = """
+    sql = f"""
         SELECT l.nutrition_snapshot_json,l.approved_exchange_json,l.exchange_approval_id,
                l.consumed_servings,
                a.food_fingerprint,a.suggestion_rule_version,a.approved_exchange_json,
@@ -2374,7 +2384,8 @@ def daily_consumed_totals(
         FROM food_logs l
         JOIN food_catalog f ON f.food_id=l.food_id
         LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
-        WHERE l.user_id=? AND date(l.consumed_at, '+8 hours')=? AND l.confirmation_status='confirmed'
+        WHERE l.user_id=? AND date({_TAIPEI_LOCAL_CONSUMED_AT_SQL})=?
+          AND l.confirmation_status='confirmed'
     """
     params: list[Any] = [user_id, date_iso]
     if meal_slot:
@@ -2417,7 +2428,7 @@ def daily_food_summary(
 ) -> dict[str, Any]:
     """Return confirmed food details plus verified totals for one local consumption date."""
     rows = conn.execute(
-        """
+        f"""
         SELECT l.consumed_at,f.product_name,l.nutrition_snapshot_json,
                l.exchange_approval_id,a.food_fingerprint,a.suggestion_rule_version,
                a.approved_exchange_json,a.approved_exchange_hash,f.fingerprint,
@@ -2425,9 +2436,9 @@ def daily_food_summary(
         FROM food_logs l
         JOIN food_catalog f ON f.food_id=l.food_id
         LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
-        WHERE l.user_id=? AND substr(l.consumed_at,1,10)=?
+        WHERE l.user_id=? AND date({_TAIPEI_LOCAL_CONSUMED_AT_SQL})=?
           AND l.confirmation_status='confirmed'
-        ORDER BY l.consumed_at,l.log_id
+        ORDER BY {_TAIPEI_LOCAL_CONSUMED_AT_SQL},l.log_id
         """,
         (user_id, date_iso),
     ).fetchall()
@@ -2440,7 +2451,12 @@ def daily_food_summary(
     ) in rows:
         nutrition = json.loads(nutrition_json or "{}")
         try:
-            consumed_time = datetime.fromisoformat(str(consumed_at)).strftime("%H:%M")
+            consumed_dt = datetime.fromisoformat(str(consumed_at))
+            if consumed_dt.tzinfo is None:
+                consumed_dt = consumed_dt.replace(tzinfo=timezone(timedelta(hours=8)))
+            else:
+                consumed_dt = consumed_dt.astimezone(timezone(timedelta(hours=8)))
+            consumed_time = consumed_dt.strftime("%H:%M")
         except ValueError:
             consumed_time = str(consumed_at)[11:16] if len(str(consumed_at)) >= 16 else "--:--"
         foods.append(

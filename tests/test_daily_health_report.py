@@ -202,10 +202,9 @@ def test_format_complete_daily_health_report_with_plan_progress():
     assert "🏃跑步 10.0km" in report
     assert "09:05 無糖豆漿｜228 kcal｜蛋白質21.2g" in report
     assert "熱量748 kcal｜蛋白質63.2g" in report
-    assert "主食：4／6｜尚缺2" in report
-    assert "蛋白質食物：10／13｜尚缺3" in report
-    assert "蔬菜：5／5｜✅達標" in report
-    assert "1筆交換份尚待審核" in report
+    assert "🥣 營養份量" not in report
+    assert "主食：4／6｜尚缺2" not in report
+    assert "交換份尚待審核" not in report
     assert len(report) <= 5000
 
 
@@ -237,7 +236,8 @@ def test_format_report_uses_na_without_guessing_missing_health_or_plan():
 
     assert "體重：NA｜飲水：NA" in report
     assert "今日無已確認飲食紀錄" in report
-    assert "營養計畫：尚未建立或無法取得" in report
+    assert "🥣 營養份量" not in report
+    assert "營養計畫：尚未建立或無法取得" not in report
     assert "今日運動：NA" in report
 
 

@@ -285,28 +285,6 @@ def _fmt_number(value: Any) -> str:
     return str(int(number)) if number.is_integer() else f"{number:.1f}".rstrip("0").rstrip(".")
 
 
-def _protein_total(values: Mapping[str, Any]) -> float:
-    if "protein_total_exchange" in values:
-        return float(values.get("protein_total_exchange") or 0)
-    return sum(
-        float(values.get(key) or 0)
-        for key in (
-            "protein_low_exchange", "protein_medium_exchange", "protein_high_exchange"
-        )
-    )
-
-
-def _progress_line(label: str, actual: float, target: float) -> str:
-    remaining = target - actual
-    if remaining > 0.0001:
-        status = f"尚缺{_fmt_number(remaining)}"
-    elif actual - target > 0.0001:
-        status = f"超出{_fmt_number(actual - target)}"
-    else:
-        status = "✅達標"
-    return f"{label}：{_fmt_number(actual)}／{_fmt_number(target)}｜{status}"
-
-
 def summarize_intervals_activities(activities: list[Mapping[str, Any]]) -> dict[str, Any]:
     type_labels = {
         "Run": "🏃跑步", "Ride": "🚴騎車", "VirtualRide": "🚴室內騎",
@@ -404,28 +382,7 @@ def format_daily_health_report(
             f"熱量{_fmt_number(totals.get('calories_kcal'))} kcal｜蛋白質{_fmt_number(totals.get('protein_g'))}g",
             f"脂肪{_fmt_number(totals.get('fat_g'))}g｜碳水{_fmt_number(totals.get('carbohydrate_g'))}g",
             f"纖維{_fmt_number(totals.get('fiber_g'))}g｜鈉{_fmt_number(totals.get('sodium_mg'))}mg",
-            "",
-            "🥣 營養份量",
         ]
     )
-    if target:
-        progress = (
-            ("主食", float(totals.get("starch_exchange") or 0), float(target.get("starch_exchange") or 0)),
-            ("蛋白質食物", _protein_total(totals), _protein_total(target)),
-            ("蔬菜", float(totals.get("vegetable_exchange") or 0), float(target.get("vegetable_exchange") or 0)),
-            ("水果", float(totals.get("fruit_exchange") or 0), float(target.get("fruit_exchange") or 0)),
-            ("奶類", float(totals.get("milk_exchange") or 0), float(target.get("milk_exchange") or 0)),
-        )
-        lines.extend(_progress_line(*row) for row in progress)
-    else:
-        lines.append("營養計畫：尚未建立或無法取得")
-
-    if pending_reviews:
-        lines.extend(
-            [
-                "",
-                f"⚠️ {int(pending_reviews)}筆交換份尚待審核，未計入正式份量達成率。",
-            ]
-        )
     lines.extend(["", "資料截止：23:30；晚於此時間補記可輸入「今日健康日報」重新整理。"])
     return "\n".join(lines)[:5000]

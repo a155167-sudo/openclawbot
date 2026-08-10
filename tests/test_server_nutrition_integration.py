@@ -2145,8 +2145,9 @@ def test_build_jason_daily_health_report_uses_db_plan_and_intervals(tmp_path, mo
 
     assert "2026/07/22 一日健康日報" in report
     assert "今日無已確認飲食紀錄" in report
-    assert "主食：0／6｜尚缺6" in report
-    assert "蛋白質食物：0／13｜尚缺13" in report
+    assert "🥣 營養份量" not in report
+    assert "主食：0／6｜尚缺6" not in report
+    assert "蛋白質食物：0／13｜尚缺13" not in report
     assert "今日運動：無活動紀錄" in report
     assert "休息日" not in report
     with pytest.raises(PermissionError):
