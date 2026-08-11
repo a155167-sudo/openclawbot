@@ -5876,6 +5876,46 @@ def parse_log_nutrition_fallback(ans: str, user_msg: str = ""):
     return None
 
 
+def parse_ai_estimate_range_fallback(ans: str, user_msg: str):
+    """Turn an explicitly confirmed AI range into one deterministic midpoint record."""
+    if not should_ai_create_food_log(user_msg):
+        return None
+
+    def _midpoint(pattern):
+        match = re.search(pattern, str(ans or ""), re.IGNORECASE)
+        if not match:
+            return None
+        low = float(match.group(1))
+        high = float(match.group(2) or low)
+        if low <= 0 or high < low:
+            return None
+        return int((low + high) / 2 + 0.5)
+
+    range_separator = r"(?:[~～\-–—]|到|至)"
+    cal = _midpoint(
+        rf"(?:本次)?熱量\s*(?:[:：]\s*)?(?:約\s*)?"
+        rf"(\d+(?:\.\d+)?)\s*{range_separator}?\s*"
+        rf"(\d+(?:\.\d+)?)?\s*(?:大卡|卡|kcal)"
+    )
+    pro = _midpoint(
+        rf"(?:本次)?蛋白(?:質)?\s*(?:[:：]\s*)?(?:約\s*)?"
+        rf"(\d+(?:\.\d+)?)\s*{range_separator}?\s*"
+        rf"(\d+(?:\.\d+)?)?\s*(?:克|g)"
+    )
+    if cal is None and pro is None:
+        return None
+    name = re.sub(
+        r"^請用一般估算記錄\s+(?:(?:早餐|午餐|晚餐|點心)\s+)?",
+        "", str(user_msg or "").strip(),
+    ).strip(" ：:，,。.!！")
+    if not name:
+        return None
+    return {
+        "source": "range_fallback", "match": None,
+        "cal": cal, "pro": pro, "name": name,
+    }
+
+
 def should_ai_create_food_log(user_msg):
     """Only the explicit fallback confirmation may let the legacy AI write a food log."""
     return bool(re.match(
@@ -6170,7 +6210,7 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
 5. 若資訊不足，不要硬結算；先問清楚。
 6. 若顧客描述份量（半份、兩顆、一半飯），應以單份數值做數學換算。
 7. 只有顧客已明確點選「使用一般估算」，訊息以「請用一般估算記錄」開頭時，才可加 LOG_NUTRITION 並正式記錄。
-8. 若顧客提到範圍值（例如 300~400 卡、約 25-30g 蛋白），不要直接擇一寫入正式紀錄；先回覆為估算，除非顧客明確指定要記哪個值。
+8. 一般詢問若出現範圍值（例如 300~400 卡、約 25-30g 蛋白），不要寫入正式紀錄。但若訊息以「請用一般估算記錄」開頭，代表顧客已按下確認按鈕：必須取範圍中間值、四捨五入成單一合理估算值，立即加入 LOG_NUTRITION 並正式記錄，不可再反問要記哪個值。
 9. 若顧客訊息同時包含多個食物，但每個食物資訊不足，先拆開詢問最關鍵缺口，不要把多樣食物合併成單一筆紀錄。
 
 【回覆格式】
@@ -6210,7 +6250,11 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
         return ("⚠️ AI 助理暫時忙碌中，請稍後再試；若持續發生請聯繫客服。", None)
         
     meal_log_flex = None
-    parsed_tag = parse_log_nutrition_tag(ans) or parse_log_nutrition_fallback(ans, user_msg)
+    parsed_tag = (
+        parse_log_nutrition_tag(ans)
+        or parse_log_nutrition_fallback(ans, user_msg)
+        or parse_ai_estimate_range_fallback(ans, user_msg)
+    )
     
     if parsed_tag and should_ai_create_food_log(user_msg):
         try:
@@ -6338,6 +6382,13 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
                         ),
                     )
                 conn.commit()
+
+                if parsed_tag.get("source") == "range_fallback":
+                    ans = (
+                        f"✅ 已用一般估算記錄：{logged_name}\n"
+                        f"🔥 熱量 {logged_cal if logged_cal is not None else '未知'} 大卡｜"
+                        f"🥩 蛋白質 {logged_pro if logged_pro is not None else '未知'} 克"
+                    )
 
                 # 核心 ledger 與 replay state 已提交後才執行非核心 mirror。
                 if not daily_log.get("replayed") and len(logged_name) <= 15:
@@ -9751,6 +9802,7 @@ def build_natural_food_log_reply(*, user_id, message_id, event, request):
             candidates, match_kind = _natural_food_candidates(
                 conn, user_id, request["food_name"]
             )
+        unit_mismatch = False
         if request["amount"] is not None and candidates:
             compatible = []
             for item in candidates:
@@ -9761,6 +9813,9 @@ def build_natural_food_log_reply(*, user_id, message_id, event, request):
                 compatible.append(item)
             if compatible:
                 candidates = compatible
+            else:
+                unit_mismatch = True
+                candidates = []
         if match_kind == "exact" and candidates:
             private_candidates = [
                 item for item in candidates if item["owner_user_id"] == user_id
@@ -9815,11 +9870,18 @@ def build_natural_food_log_reply(*, user_id, message_id, event, request):
             amount_text = (
                 f" {request['amount']:g}{_natural_unit_label(request['unit'])}"
             )
-        return TextSendMessage(
-            text=(
+        if unit_mismatch:
+            response_text = (
+                f"⚠️ 尚未記錄：「{query}」的食品庫單位無法直接換算"
+                f"{amount_text.strip()}。\n請改選一般估算，或建立相同單位的食品資料："
+            )
+        else:
+            response_text = (
                 f"🔍 食品庫找不到「{query}」。\n"
                 "我不會用 UNKNOWN 假裝已記錄，請選擇下一步："
-            ),
+            )
+        return TextSendMessage(
+            text=response_text,
             quick_reply=QuickReply(items=[
                 QuickReplyButton(action=MessageAction(
                     label="瀏覽我的食物", text="搜尋我的食物"

@@ -200,6 +200,51 @@ def test_ai_estimate_log_preserves_meal_and_builds_versioned_edit_card(
     assert rolled_back == (0, 0, 0)
 
 
+def test_ai_estimate_button_records_midpoint_when_model_returns_only_ranges(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "ai-estimate-range.db"
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    server.init_db()
+    content = """茶葉蛋 2 顆的營養估算：
+- 熱量：約 150～200 大卡
+- 蛋白質：約 14～18 克
+
+請問要記哪個熱量值？"""
+    fake_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
+    monkeypatch.setattr(
+        server,
+        "client",
+        SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **_kwargs: fake_response
+        ))),
+    )
+    monkeypatch.setattr(server, "gc", None)
+
+    answer, card = server.get_ai_response_with_memory(
+        "U-AI-RANGE",
+        "請用一般估算記錄 午餐 茶葉蛋 2顆",
+        "AI-ESTIMATE-RANGE-1",
+    )
+
+    assert card is not None
+    assert "✅ 已記錄" in card.alt_text
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            """SELECT fc.product_name,fl.meal_slot,fl.nutrition_snapshot_json
+               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+               WHERE fl.user_id='U-AI-RANGE'"""
+        ).fetchone()
+    assert row[:2] == ("茶葉蛋 2顆", "午餐")
+    nutrition = json.loads(row[2])
+    assert nutrition["calories_kcal"] == 175
+    assert nutrition["protein_g"] == 16
+    assert "請問要記哪個熱量值" not in answer
+
+
 def test_ai_estimate_claim_is_durable_and_exclusive(tmp_path, monkeypatch):
     db = tmp_path / "ai-estimate-claim.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
@@ -420,6 +465,46 @@ def test_fallback_parses_multiline_meal_reply_when_hidden_tag_is_missing():
         "pro": None,
         "name": "酪梨 90g",
     }
+
+
+def test_natural_food_unit_mismatch_offers_executable_ai_estimate(tmp_path, monkeypatch):
+    db = tmp_path / "natural-unit-mismatch.db"
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    server.init_db()
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        conn.execute(
+            """INSERT INTO food_catalog
+               (food_id,product_name,fingerprint,source_type,owner_user_id,visibility,
+                package_amount,package_unit,servings_per_package,per_serving_json,
+                created_at,updated_at)
+               VALUES ('AVOCADO-SERVING','酪梨','fixture-avocado-serving',
+                       'manual','system','public',1,'份',1,
+                       '{\"calories_kcal\":160,\"protein_g\":2}',?,?)""",
+            (server.tw_now().isoformat(), server.tw_now().isoformat()),
+        )
+        conn.commit()
+
+    reply = server.build_natural_food_log_reply(
+        user_id="U-MISMATCH", message_id="M-MISMATCH",
+        event=SimpleNamespace(webhook_event_id="E-MISMATCH"),
+        request={
+            "food_name": "酪梨", "amount": 100.0,
+            "unit": "g", "meal_slot": "午餐",
+        },
+    )
+
+    assert "無法直接換算" in reply.text
+    actions = [
+        getattr(button.action, "text", None)
+        for button in reply.quick_reply.items
+    ]
+    assert "請用一般估算記錄 午餐 酪梨 100g" in actions
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM food_logs WHERE user_id='U-MISMATCH'"
+        ).fetchone()[0] == 0
 
 
 def _daily_ledger_db(tmp_path, monkeypatch, name="daily-ledger.db"):
