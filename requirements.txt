@@ -9,4 +9,5 @@ google-auth-oauthlib
 google-auth-httplib2
 apscheduler
 tzdata
+Pillow
 garminconnect[workout]

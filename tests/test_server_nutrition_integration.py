@@ -2580,6 +2580,7 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
         token = save_meal_photo_draft(
             conn, user_id="U_CUSTOMER", source_message_id="M_CUSTOMER",
             payload=meal_photo_payload(),
+            source_image_ref="nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg",
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
@@ -2599,6 +2600,14 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
             push_message=lambda target, message, **_kwargs: pushes.append((target, message)),
         ),
     )
+    monkeypatch.setattr(
+        server,
+        "build_meal_photo_image_url",
+        lambda _draft, *, preview=False, now=None: (
+            "https://example.test/meal-photo-image/token.jpg?preview="
+            + ("1" if preview else "0")
+        ),
+    )
     event = SimpleNamespace(
         postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
         source=SimpleNamespace(user_id="U_CUSTOMER"), reply_token="reply-customer-final",
@@ -2609,14 +2618,209 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
 
     customer_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
     assert "審核並加入" not in customer_text
-    assert len(pushes) == 1 and pushes[0][0] == "U_ADMIN"
-    admin_payload = pushes[0][1]
+    assert len(pushes) == 2
+    assert all(target == "U_ADMIN" for target, _message in pushes)
+    image_message = pushes[0][1]
+    assert isinstance(image_message, server.ImageSendMessage)
+    assert str(image_message.original_content_url).endswith("preview=0")
+    assert str(image_message.preview_image_url).endswith("preview=1")
+    admin_payload = pushes[1][1]
     assert isinstance(admin_payload, list)
+    assert len(admin_payload) == 2
     admin_text = json.dumps(
         [json.loads(str(message)) for message in admin_payload], ensure_ascii=False
     )
     assert "新的餐點審核需求" in admin_text
     assert f"mpr:v1:{token}:8:start" in admin_text
+
+
+def test_meal_photo_review_photo_failure_falls_back_to_text_and_card(monkeypatch):
+    draft = {
+        "token": "abcdef123456",
+        "user_id": "U_CUSTOMER",
+        "source_image_ref": "nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg",
+        "payload": meal_photo_payload(),
+        "meal_slot": "午餐",
+        "consumed_at": "2026-08-15T12:00:00+08:00",
+        "version": 8,
+        "estimate": {},
+    }
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    monkeypatch.setattr(
+        server,
+        "build_meal_photo_estimate_bubble",
+        lambda _draft, allow_admin_review=False: {"type": "bubble", "body": {"type": "box", "layout": "vertical", "contents": []}},
+    )
+    monkeypatch.setattr(
+        server,
+        "build_meal_photo_image_url",
+        lambda _draft, *, preview=False, now=None: (
+            "https://example.test/meal-photo-image/token.jpg?preview="
+            + ("1" if preview else "0")
+        ),
+    )
+    pushes = []
+
+    def push_message(target, messages, **_kwargs):
+        pushes.append((target, messages))
+        if len(pushes) == 1:
+            raise RuntimeError("LINE image fetch failed")
+
+    monkeypatch.setattr(server, "line_bot_api", SimpleNamespace(push_message=push_message))
+
+    assert server.push_meal_photo_review_request(draft) is True
+    assert len(pushes) == 2
+    assert isinstance(pushes[0][1], server.ImageSendMessage)
+    assert len(pushes[1][1]) == 2
+    assert not isinstance(pushes[1][1][0], server.ImageSendMessage)
+
+
+def test_meal_photo_review_message_build_failure_never_escapes(monkeypatch):
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    monkeypatch.setattr(
+        server,
+        "build_meal_photo_admin_review_messages",
+        lambda _draft: (_ for _ in ()).throw(ValueError("bad draft")),
+    )
+    monkeypatch.setattr(
+        server,
+        "line_bot_api",
+        SimpleNamespace(push_message=lambda *_args, **_kwargs: pytest.fail("must not push")),
+    )
+    assert server.push_meal_photo_review_request({"user_id": "U_CUSTOMER"}) is False
+
+
+def test_meal_photo_image_url_rejects_weak_secret_and_non_https(monkeypatch):
+    draft = {
+        "token": "abcdef123456",
+        "source_image_ref": "nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg",
+        "expires_at": datetime.fromtimestamp(1_800_001_200, timezone.utc).isoformat(),
+    }
+    monkeypatch.setattr(server, "MEAL_PHOTO_IMAGE_SECRET", "weak-secret")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://example.test")
+    with pytest.raises(RuntimeError):
+        server.build_meal_photo_image_url(draft, now=1_800_000_000)
+
+    monkeypatch.setattr(server, "MEAL_PHOTO_IMAGE_SECRET", "s" * 32)
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "http://example.test/private")
+    with pytest.raises(ValueError):
+        server.build_meal_photo_image_url(draft, now=1_800_000_000)
+
+
+def test_meal_photo_image_url_is_signed_expiring_and_bound_to_variant(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-image-url.db"
+    image_root = tmp_path / "nutrition_images"
+    image_root.mkdir()
+    image_path = image_root / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff" + b"x" * 200)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "MEAL_PHOTO_IMAGE_SECRET", "s" * 32)
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://example.test")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn,
+            user_id="U_CUSTOMER",
+            source_message_id="M_IMAGE",
+            payload=meal_photo_payload(),
+            source_image_ref="nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg",
+        )
+        conn.execute(
+            """UPDATE pending_meal_photo_drafts SET status='estimated',expires_at=?
+               WHERE token=?""",
+            (datetime.fromtimestamp(1_800_001_200, timezone.utc).isoformat(), token),
+        )
+        conn.commit()
+        draft = get_meal_photo_draft(conn, user_id="U_CUSTOMER", token=token)
+
+    url = server.build_meal_photo_image_url(draft, preview=True, now=1_800_000_000)
+    from urllib.parse import parse_qs, urlparse
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    assert parsed.path == f"/meal-photo-image/{token}.jpg"
+    assert query["preview"] == ["1"]
+    assert int(query["expires"][0]) == 1_800_000_600
+
+    resolved = server._authorize_meal_photo_image_request(
+        token=token,
+        extension="jpg",
+        expires=int(query["expires"][0]),
+        signature=query["sig"][0],
+        preview=True,
+        now=1_800_000_001,
+    )
+    assert resolved == str(image_path)
+    with pytest.raises(server.HTTPException) as tampered:
+        server._authorize_meal_photo_image_request(
+            token=token,
+            extension="jpg",
+            expires=int(query["expires"][0]),
+            signature=query["sig"][0],
+            preview=False,
+            now=1_800_000_001,
+        )
+    assert tampered.value.status_code == 403
+    with pytest.raises(server.HTTPException) as expired:
+        server._authorize_meal_photo_image_request(
+            token=token,
+            extension="jpg",
+            expires=int(query["expires"][0]),
+            signature=query["sig"][0],
+            preview=True,
+            now=1_800_000_601,
+        )
+    assert expired.value.status_code == 410
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET status='approved' WHERE token=?",
+            (token,),
+        )
+        conn.commit()
+    with pytest.raises(server.HTTPException) as approved:
+        server._authorize_meal_photo_image_request(
+            token=token,
+            extension="jpg",
+            expires=int(query["expires"][0]),
+            signature=query["sig"][0],
+            preview=True,
+            now=1_800_000_001,
+        )
+    assert approved.value.status_code == 410
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET status='estimated',expires_at=? WHERE token=?",
+            (datetime.fromtimestamp(1_800_000_000, timezone.utc).isoformat(), token),
+        )
+        conn.commit()
+    with pytest.raises(server.HTTPException) as draft_expired:
+        server._authorize_meal_photo_image_request(
+            token=token,
+            extension="jpg",
+            expires=int(query["expires"][0]),
+            signature=query["sig"][0],
+            preview=True,
+            now=1_800_000_001,
+        )
+    assert draft_expired.value.status_code == 410
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET status='cancelled' WHERE token=?",
+            (token,),
+        )
+        conn.commit()
+    with pytest.raises(server.HTTPException) as cancelled:
+        server._authorize_meal_photo_image_request(
+            token=token,
+            extension="jpg",
+            expires=int(query["expires"][0]),
+            signature=query["sig"][0],
+            preview=True,
+            now=1_800_000_001,
+        )
+    assert cancelled.value.status_code == 410
 
 
 def test_owner_notification_retries_after_failure_and_then_deduplicates(tmp_path, monkeypatch):

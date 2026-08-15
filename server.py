@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import os
 import json
 import sqlite3
@@ -14,6 +15,7 @@ import re
 import requests
 import threading
 import uuid
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 # Google & Web 相關套件
@@ -25,13 +27,13 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextSendMessage, TextMessage, ImageMessage, QuickReply,
     QuickReplyButton, MessageAction, PostbackAction, PostbackEvent,
-    CameraAction, CameraRollAction,
+    CameraAction, CameraRollAction, ImageSendMessage,
 )
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from contextlib import asynccontextmanager, closing
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from nutrition_system import (
     apply_nutrition_text_edit,
@@ -1251,6 +1253,13 @@ LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("MAPS_API_KEY")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "#GEN_CODES")
+_railway_public_domain = str(os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip()
+PUBLIC_BASE_URL = str(
+    os.environ.get("PUBLIC_BASE_URL")
+    or (f"https://{_railway_public_domain}" if _railway_public_domain else "")
+    or "https://openclawbot-production-36ed.up.railway.app"
+).rstrip("/")
+MEAL_PHOTO_IMAGE_SECRET = str(os.environ.get("MEAL_PHOTO_IMAGE_SECRET") or "")
 DB_DIR = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
 DB_PATH = os.path.join(DB_DIR, "user_quota.db")
 os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
@@ -8934,6 +8943,152 @@ def _nutrition_image_path(image_ref):
     return path if os.path.dirname(path) == root else None
 
 
+MEAL_PHOTO_IMAGE_URL_TTL_SECONDS = 10 * 60
+MEAL_PHOTO_MAX_PREVIEW_PIXELS = 25_000_000
+
+
+def _meal_photo_image_signature(token, extension, expires, preview):
+    secret = MEAL_PHOTO_IMAGE_SECRET.encode("utf-8")
+    if len(secret) < 32:
+        raise RuntimeError("餐點照片網址簽章密鑰未設定")
+    payload = f"v1\n{token}\n{extension}\n{int(expires)}\n{1 if preview else 0}".encode("utf-8")
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+def build_meal_photo_image_url(draft, *, preview=False, now=None):
+    """建立只在短時間內有效、且綁定原圖/預覽版本的餐點照片網址。"""
+    token = str(draft.get("token") or "")
+    image_ref = str(draft.get("source_image_ref") or "")
+    if not re.fullmatch(r"[0-9a-f]{12}", token):
+        raise ValueError("餐點照片 token 無效")
+    match = re.fullmatch(r"nutrition-image:[0-9a-f]{32}\.(jpg|png|webp)", image_ref)
+    if not match:
+        raise ValueError("餐點照片參照無效")
+    base = urlsplit(PUBLIC_BASE_URL)
+    if (
+        base.scheme != "https" or not base.hostname or base.username or base.password
+        or base.path not in {"", "/"} or base.query or base.fragment
+    ):
+        raise ValueError("餐點照片公開網址必須是純 HTTPS 網域")
+    source_extension = match.group(1)
+    output_extension = "jpg" if preview or source_extension == "webp" else source_extension
+    issued_at = int(datetime.now(TW_TZ).timestamp() if now is None else now)
+    try:
+        draft_expires = int(datetime.fromisoformat(str(draft.get("expires_at") or "")).timestamp())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("餐點照片草稿期限無效") from exc
+    expires = min(issued_at + MEAL_PHOTO_IMAGE_URL_TTL_SECONDS, draft_expires)
+    if expires <= issued_at:
+        raise ValueError("餐點照片草稿已過期")
+    signature = _meal_photo_image_signature(token, output_extension, expires, preview)
+    return (
+        f"{PUBLIC_BASE_URL.rstrip('/')}/meal-photo-image/{token}.{output_extension}"
+        f"?expires={expires}&sig={signature}&preview={1 if preview else 0}"
+    )
+
+
+def _authorize_meal_photo_image_request(
+    *, token, extension, expires, signature, preview=False, now=None
+):
+    current = int(datetime.now(TW_TZ).timestamp() if now is None else now)
+    if not re.fullmatch(r"[0-9a-f]{12}", str(token or "")):
+        raise HTTPException(status_code=404, detail="image not found")
+    if extension not in {"jpg", "png"}:
+        raise HTTPException(status_code=404, detail="image not found")
+    try:
+        expires = int(expires)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=403, detail="invalid image signature") from exc
+    if expires < current:
+        raise HTTPException(status_code=410, detail="image URL expired")
+    if expires > current + MEAL_PHOTO_IMAGE_URL_TTL_SECONDS + 60:
+        raise HTTPException(status_code=403, detail="invalid image expiry")
+    expected = _meal_photo_image_signature(token, extension, expires, bool(preview))
+    if not hmac.compare_digest(expected, str(signature or "")):
+        raise HTTPException(status_code=403, detail="invalid image signature")
+
+    with sqlite3.connect(DB_PATH, timeout=5) as conn:
+        row = conn.execute(
+            """SELECT source_image_ref,status,expires_at FROM pending_meal_photo_drafts
+               WHERE token=?""",
+            (token,),
+        ).fetchone()
+    allowed_statuses = {"estimated", "reviewing", "review_ready"}
+    if not row or row[1] not in allowed_statuses:
+        raise HTTPException(status_code=410 if row else 404, detail="image unavailable")
+    try:
+        draft_expires = datetime.fromisoformat(str(row[2] or ""))
+        draft_expires_timestamp = int(draft_expires.timestamp())
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=410, detail="image unavailable") from exc
+    if draft_expires_timestamp < current or expires > draft_expires_timestamp:
+        raise HTTPException(status_code=410, detail="image URL expired")
+    image_ref = str(row[0] or "")
+    match = re.fullmatch(r"nutrition-image:[0-9a-f]{32}\.(jpg|png|webp)", image_ref)
+    if not match:
+        raise HTTPException(status_code=404, detail="image not found")
+    source_extension = match.group(1)
+    expected_extension = "jpg" if preview or source_extension == "webp" else source_extension
+    if extension != expected_extension:
+        raise HTTPException(status_code=404, detail="image not found")
+    path = _nutrition_image_path(image_ref)
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="image not found")
+    return path
+
+
+def _meal_photo_preview_response(path):
+    """產生符合 LINE preview 1MB 限制的 JPEG，不另留永久衍生檔。"""
+    from io import BytesIO
+    from PIL import Image
+
+    try:
+        with Image.open(path) as image:
+            if image.width * image.height > MEAL_PHOTO_MAX_PREVIEW_PIXELS:
+                raise ValueError("餐點照片像素超過預覽上限")
+            image.thumbnail((1200, 1200))
+            if image.mode != "RGB":
+                background = Image.new("RGB", image.size, "white")
+                if "A" in image.getbands():
+                    background.paste(image, mask=image.getchannel("A"))
+                else:
+                    background.paste(image)
+                image = background
+            for quality in (85, 75, 65, 55, 45):
+                output = BytesIO()
+                image.save(output, format="JPEG", quality=quality, optimize=True)
+                data = output.getvalue()
+                if len(data) <= 950 * 1024:
+                    return Response(
+                        content=data,
+                        media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"},
+                    )
+    except Exception as exc:
+        print(f"⚠️ 產生餐點照片預覽失敗：{exc}")
+        raise HTTPException(status_code=404, detail="image unavailable") from exc
+    raise HTTPException(status_code=413, detail="image preview too large")
+
+
+@app.get("/meal-photo-image/{token}.{extension}")
+def get_meal_photo_image(token: str, extension: str, expires: int, sig: str, preview: bool = False):
+    path = _authorize_meal_photo_image_request(
+        token=token,
+        extension=extension,
+        expires=expires,
+        signature=sig,
+        preview=preview,
+    )
+    if preview or path.lower().endswith(".webp"):
+        return _meal_photo_preview_response(path)
+    media_type = "image/jpeg" if extension == "jpg" else "image/png"
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"},
+    )
+
+
 def _store_nutrition_image(image_bytes, extension, image_ref=""):
     root = os.path.join(DB_DIR, "nutrition_images")
     os.makedirs(root, mode=0o700, exist_ok=True)
@@ -10082,7 +10237,16 @@ def build_meal_photo_admin_review_messages(draft):
         alt_text="新的餐點審核需求",
         contents=build_meal_photo_estimate_bubble(draft, allow_admin_review=True),
     )
-    return [header, review_card]
+    messages = []
+    if draft.get("source_image_ref"):
+        try:
+            messages.append(ImageSendMessage(
+                original_content_url=build_meal_photo_image_url(draft, preview=False),
+                preview_image_url=build_meal_photo_image_url(draft, preview=True),
+            ))
+        except (RuntimeError, ValueError) as exc:
+            print(f"⚠️ 餐點審核通知無法附上原始照片：{exc}")
+    return [*messages, header, review_card]
 
 
 def build_pending_meal_photo_review_message(uid):
@@ -10130,12 +10294,24 @@ def push_meal_photo_review_request(draft):
     if not admin_uid or admin_uid == owner_uid:
         return False
     try:
-        line_bot_api.push_message(
-            admin_uid, build_meal_photo_admin_review_messages(draft), timeout=12
-        )
+        messages = build_meal_photo_admin_review_messages(draft)
+    except Exception as exc:
+        print(f"⚠️ 建立餐點審核通知失敗：{exc}")
+        return False
+
+    main_messages = messages
+    if messages and isinstance(messages[0], ImageSendMessage):
+        main_messages = messages[1:]
+        try:
+            # 圖片是 best effort；timeout 時不重送，避免 LINE 已接受卻造成重複照片。
+            line_bot_api.push_message(admin_uid, messages[0], timeout=12)
+        except Exception as exc:
+            print(f"⚠️ 原始餐點照片推播失敗，繼續送文字審核通知：{exc}")
+    try:
+        line_bot_api.push_message(admin_uid, main_messages, timeout=12)
         return True
     except Exception as exc:
-        print(f"⚠️ 推播餐點審核需求失敗：{exc}")
+        print(f"⚠️ 推播餐點文字審核通知失敗：{exc}")
         return False
 
 
