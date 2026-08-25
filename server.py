@@ -6569,6 +6569,7 @@ def calculate_delivery_quote(target_address: str):
     if not target_address:
         return {
             "success": False,
+            "delivery_available": None,
             "address": "",
             "distance_text": "",
             "distance_meters": 0,
@@ -6585,6 +6586,7 @@ def calculate_delivery_quote(target_address: str):
     if not success:
         return {
             "success": False,
+            "delivery_available": None,
             "address": target_address,
             "distance_text": "",
             "distance_meters": 0,
@@ -6598,39 +6600,43 @@ def calculate_delivery_quote(target_address: str):
         }
 
     hub_match = None
-    for hub in HUBS:
-        h_succ, h_d_txt, h_d_m, h_t_txt = get_distance(hub["address"], target_address, mode="walking")
-        if h_succ and h_d_m <= 1000:
-            hub_match = hub["name"]
-            break
-
-    if hub_match:
+    if dist_meters <= 1000:
         delivery_fee = 20
-        delivery_fee_text = f"20 元（{hub_match} 周邊順風車特惠）"
-        delivery_zone = "HUB"
+        delivery_zone = "KM_0_1"
+        delivery_available = True
+    elif dist_meters <= 1500:
+        delivery_fee = 25
+        delivery_zone = "KM_1_1_5"
+        delivery_available = True
+    elif dist_meters <= 2000:
+        delivery_fee = 30
+        delivery_zone = "KM_1_5_2"
+        delivery_available = True
+    elif dist_meters <= 2500:
+        delivery_fee = 40
+        delivery_zone = "KM_2_2_5"
+        delivery_available = True
+    elif dist_meters <= 3000:
+        delivery_fee = 50
+        delivery_zone = "KM_2_5_3"
+        delivery_available = True
     else:
-        if dist_meters <= 2000:
-            delivery_fee = 0
-            delivery_fee_text = "0 元（2 公里內免運）"
-            delivery_zone = "NEAR"
-        elif dist_meters <= 4000:
-            delivery_fee = 40
-            delivery_fee_text = "40 元"
-            delivery_zone = "MID"
-        elif dist_meters <= 6000:
-            delivery_fee = 80
-            delivery_fee_text = "80 元"
-            delivery_zone = "FAR"
-        else:
-            delivery_fee = 150
-            delivery_fee_text = "150 元起（超出自家車隊範圍，建議再人工確認）"
-            delivery_zone = "OUTSIDE"
+        delivery_fee = 0
+        delivery_zone = "UNAVAILABLE"
+        delivery_available = False
+
+    delivery_fee_text = (
+        f"{delivery_fee} 元"
+        if delivery_available
+        else "超過 3 公里，暫不提供外送"
+    )
 
     route_group = infer_route_group(target_address)
     carpool_hint = f"若同配送日有 {route_group} 同路客戶，可再套用順風車折扣。" if route_group != "OTHER" else "若有同區域併單，可再人工調整順風車折扣。"
 
     return {
         "success": True,
+        "delivery_available": delivery_available,
         "address": target_address,
         "distance_text": dist_text,
         "distance_meters": dist_meters,
@@ -6832,14 +6838,15 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
     if not address:
         address = saved_address or ""
 
-    quote = calculate_delivery_quote(address) if address and pickup_method == "外送" else {"success": False, "delivery_fee": 0, "distance_text": "", "duration_text": "", "delivery_fee_text": "自取無外送費" if pickup_method == "自取" else "未提供地址", "route_group": "OTHER", "delivery_zone": "未分類", "carpool_hint": ""}
+    quote = calculate_delivery_quote(address) if address and pickup_method == "外送" else {"success": False, "delivery_available": True if pickup_method == "自取" else None, "delivery_fee": 0, "distance_text": "", "duration_text": "", "delivery_fee_text": "自取無外送費" if pickup_method == "自取" else "未提供地址", "route_group": "OTHER", "delivery_zone": "未分類", "carpool_hint": ""}
     if pickup_method == "外送" and address and not quote.get("success"):
         # Google Maps 偶爾會因地址格式/API 狀態查不到；估價流程不要卡死，先讓用戶看到餐費，外送費交由客服確認。
         quote["delivery_fee_text"] = "已收到地址，但地圖暫時無法判讀，外送費需客服確認"
         quote["distance_text"] = quote.get("distance_text") or "已填地址，距離需客服確認"
         quote["duration_text"] = quote.get("duration_text") or ""
         quote["route_group"] = quote.get("route_group") or infer_route_group(address)
-    delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") and pickup_method == "外送" else 0
+    delivery_available = quote.get("delivery_available") if pickup_method == "外送" else True
+    delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") and delivery_available is not False and pickup_method == "外送" else 0
     if delivery_count is None:
         delivery_count = meal_count if pickup_method == "外送" else 0
     meal_low_total = meal_count * SUBSCRIPTION_MEAL_LOW
@@ -6857,6 +6864,7 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
         "meal_count": meal_count,
         "delivery_count": delivery_count,
         "delivery_fee": delivery_fee,
+        "delivery_available": delivery_available,
         "meal_low_total": meal_low_total,
         "meal_high_total": meal_high_total,
         "delivery_total": delivery_total,
@@ -6889,6 +6897,16 @@ def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> 
     pickup_method = est.get("pickup_method") or "外送"
     days = est.get("days_per_week")
     meals_per_day = est.get("meals_per_day")
+    if pickup_method == "外送" and est.get("delivery_available") is False:
+        distance_text = q.get("distance_text") or "超過 3 公里"
+        duration_text = f" / {q.get('duration_text')}" if q.get("duration_text") else ""
+        return (
+            "🚫 此地址暫不提供外送\n\n"
+            f"📍 地址：{address}\n"
+            f"📏 距離：{distance_text}{duration_text}\n\n"
+            "目前外送範圍為門市 3 公里內。\n"
+            "你可以重新選擇自取，或找客服確認其他方式。"
+        )
     distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("📏 距離：自取不需測距" if pickup_method == "自取" else f"📏 距離：{q.get('distance_text') or '已填地址，距離需客服確認'}")
     delivery_text = q.get("delivery_fee_text") or ("自取無外送費" if pickup_method == "自取" else "尚未提供地址，外送費需人工確認")
     manual_review_note = format_delivery_manual_review_note(q) if pickup_method == "外送" else ""
@@ -6937,6 +6955,34 @@ def build_subscription_estimate_flex(uid: str, est: dict):
     meals_per_day = est.get("meals_per_day")
     address = est.get("address") or "尚未提供"
     q = est.get("quote", {})
+    if pickup_method == "外送" and est.get("delivery_available") is False:
+        bubble = {
+            "type": "bubble",
+            "size": "mega",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "paddingAll": "20px",
+                "backgroundColor": "#FFF5F2",
+                "contents": [
+                    {"type": "text", "text": "🚫 此地址暫不提供外送", "weight": "bold", "size": "xl", "color": "#9F2D20", "wrap": True},
+                    {"type": "text", "text": f"地址：{address}", "size": "sm", "color": "#4B352F", "wrap": True, "margin": "lg"},
+                    {"type": "text", "text": f"距離：{q.get('distance_text') or '超過 3 公里'} / {q.get('duration_text') or '時間未提供'}", "size": "sm", "color": "#4B352F", "wrap": True, "margin": "sm"},
+                    {"type": "separator", "margin": "lg", "color": "#E8C9C3"},
+                    {"type": "text", "text": "目前外送範圍為門市 3 公里內。你可以重新選擇自取，或找客服確認其他方式。", "size": "sm", "color": "#6B433A", "wrap": True, "margin": "lg"},
+                ],
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {"type": "button", "style": "primary", "color": "#2E8B57", "action": {"type": "message", "label": "重新選擇取餐方式", "text": "開始包月估價"}},
+                    {"type": "button", "style": "link", "action": {"type": "message", "label": "找客服", "text": "找客服"}},
+                ],
+            },
+        }
+        return FlexSendMessage(alt_text="此地址暫不提供外送", contents=bubble)
     summary = f"每週 {days} 天 × 每天 {meals_per_day} 餐｜本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐" if days and meals_per_day else f"共 {est['meal_count']} 餐"
     distance_text = f"{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("自取不需測距" if pickup_method == "自取" else (q.get("distance_text") or "已填地址，距離需客服確認"))
     manual_review_note = format_delivery_manual_review_note(q) if pickup_method == "外送" else ""
@@ -12227,7 +12273,15 @@ def _handle_message_impl(event):
 
         quote = calculate_delivery_quote(target_address)
 
-        if quote.get("success"):
+        if quote.get("success") and quote.get("delivery_available") is False:
+            reply_text = (
+                "🚫 此地址暫不提供外送\n\n"
+                f"📍 目的地：{target_address}\n"
+                f"📏 距本店距離：{quote.get('distance_text')}\n\n"
+                "目前外送範圍為門市 3 公里內。\n"
+                "你可以改選自取，或找客服確認其他方式。"
+            )
+        elif quote.get("success"):
             reply_text = (
                 f"🛵 一日樂食 外送試算結果\n"
                 f"📍 目的地：{target_address}\n"
@@ -12280,6 +12334,12 @@ def _handle_message_impl(event):
                 "範例：\n估價 24餐 台北市松山區南京東路四段133巷4弄5號\n"
                 "或：\n訂購 24餐 台北市松山區南京東路四段133巷4弄5號"
             )))
+            return
+        if est.get("delivery_available") is False:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=format_subscription_estimate(est, include_order_hint=False)),
+            )
             return
         if parsed_order["action"] == "估價":
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=format_subscription_estimate(est, include_order_hint=True)))

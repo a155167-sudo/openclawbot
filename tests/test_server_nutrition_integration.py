@@ -41,6 +41,90 @@ class FakeWorksheet:
         return self._records
 
 
+@pytest.mark.parametrize(
+    ("distance_meters", "expected_fee"),
+    [
+        (0, 20),
+        (1, 20),
+        (1000, 20),
+        (1001, 25),
+        (1500, 25),
+        (1501, 30),
+        (2000, 30),
+        (2001, 40),
+        (2500, 40),
+        (2501, 50),
+        (3000, 50),
+    ],
+)
+def test_delivery_quote_uses_new_distance_fee_boundaries(
+    monkeypatch, distance_meters, expected_fee,
+):
+    monkeypatch.setattr(
+        server,
+        "get_distance",
+        lambda *_args, **_kwargs: (
+            True, f"{distance_meters / 1000:g} 公里", distance_meters, "5 分鐘"
+        ),
+    )
+
+    quote = server.calculate_delivery_quote("台北市測試路1號")
+
+    assert quote["success"] is True
+    assert quote["delivery_available"] is True
+    assert quote["delivery_fee"] == expected_fee
+    assert quote["delivery_fee_text"] == f"{expected_fee} 元"
+
+
+def test_delivery_quote_rejects_addresses_over_three_kilometers(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_distance",
+        lambda *_args, **_kwargs: (True, "3.1 公里", 3001, "12 分鐘"),
+    )
+
+    quote = server.calculate_delivery_quote("台北市測試路1號")
+
+    assert quote["success"] is True
+    assert quote["delivery_available"] is False
+    assert quote["delivery_fee"] == 0
+    assert quote["delivery_fee_text"] == "超過 3 公里，暫不提供外送"
+
+
+def test_over_three_kilometers_estimate_card_cannot_open_subscription_form(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "calculate_delivery_quote",
+        lambda _address: {
+            "success": True,
+            "delivery_available": False,
+            "address": _address,
+            "distance_text": "3.1 公里",
+            "distance_meters": 3100,
+            "duration_text": "12 分鐘",
+            "delivery_fee": 0,
+            "delivery_fee_text": "超過 3 公里，暫不提供外送",
+            "hub_name": "",
+            "route_group": "EAST",
+            "delivery_zone": "UNAVAILABLE",
+            "carpool_hint": "",
+        },
+    )
+    est = server.calculate_subscription_estimate(
+        "U1", 24, "台北市測試路1號", delivery_count=12,
+        pickup_method="外送", days_per_week=3, meals_per_day=2,
+    )
+
+    flex = server.build_subscription_estimate_flex("U1", est)
+    payload = json.loads(flex.as_json_string())
+    rendered = json.dumps(payload, ensure_ascii=False)
+
+    assert est["delivery_available"] is False
+    assert "此地址暫不提供外送" in rendered
+    assert "可以，建立包月資料" not in rendered
+    assert server.get_subscription_form_link("U1") not in rendered
+
+
 def plan_row(**overrides):
     row = {
         "plan_id": "plan_default",
@@ -1772,6 +1856,83 @@ def _text_event(message_id, text, user_id="U_EDIT"):
         source=SimpleNamespace(user_id=user_id),
         reply_token=f"reply-{message_id}",
     )
+
+
+def test_distance_command_over_three_kilometers_explains_delivery_rejection(monkeypatch):
+    replies = []
+    server.processed_messages.clear()
+    monkeypatch.setattr(
+        server,
+        "calculate_delivery_quote",
+        lambda _address: {
+            "success": True,
+            "delivery_available": False,
+            "distance_text": "3.1 公里",
+            "duration_text": "12 分鐘",
+            "delivery_fee": 0,
+            "delivery_fee_text": "超過 3 公里，暫不提供外送",
+            "route_group": "EAST",
+            "delivery_zone": "UNAVAILABLE",
+            "carpool_hint": "",
+        },
+    )
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message",
+        lambda _token, message: replies.append(message.text),
+    )
+
+    server._handle_message_impl(
+        _text_event("DELIVERY-DISTANCE-BLOCK", "測距 台北市測試路1號", "U1")
+    )
+
+    assert len(replies) == 1
+    assert "此地址暫不提供外送" in replies[0]
+    assert "目前外送範圍為門市 3 公里內" in replies[0]
+    assert "想了解包月方案" not in replies[0]
+
+
+def test_legacy_subscription_order_over_three_kilometers_is_not_created(monkeypatch):
+    replies = []
+    created = []
+    server.processed_messages.clear()
+    monkeypatch.setattr(server, "get_customer_profile_for_order", lambda _uid: None)
+    monkeypatch.setattr(
+        server,
+        "calculate_delivery_quote",
+        lambda _address: {
+            "success": True,
+            "delivery_available": False,
+            "address": _address,
+            "distance_text": "3.1 公里",
+            "distance_meters": 3100,
+            "duration_text": "12 分鐘",
+            "delivery_fee": 0,
+            "delivery_fee_text": "超過 3 公里，暫不提供外送",
+            "hub_name": "",
+            "route_group": "EAST",
+            "delivery_zone": "UNAVAILABLE",
+            "carpool_hint": "",
+        },
+    )
+    monkeypatch.setattr(
+        server, "create_subscription_order",
+        lambda *_args, **_kwargs: created.append(True) or 999,
+    )
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message",
+        lambda _token, message: replies.append(message.text),
+    )
+
+    server._handle_message_impl(
+        _text_event(
+            "DELIVERY-LEGACY-BLOCK", "訂購 24餐 台北市測試路1號", "U1"
+        )
+    )
+
+    assert created == []
+    assert len(replies) == 1
+    assert "此地址暫不提供外送" in replies[0]
+    assert "建立包月資料" not in replies[0]
 
 
 def test_text_handler_completes_missing_product_name(tmp_path, monkeypatch):
