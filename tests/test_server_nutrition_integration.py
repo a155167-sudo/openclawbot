@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import sqlite3
@@ -5,6 +6,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -1933,6 +1935,295 @@ def test_legacy_subscription_order_over_three_kilometers_is_not_created(monkeypa
     assert len(replies) == 1
     assert "此地址暫不提供外送" in replies[0]
     assert "建立包月資料" not in replies[0]
+
+
+def test_form_data_rejects_over_three_kilometer_delivery_before_pending_order(monkeypatch):
+    created = []
+    pushed = []
+
+    async def request_json():
+        return {
+            "UID": "U_FORM_BLOCK",
+            "稱呼": "測試客戶",
+            "本期取餐方式": "外送",
+            "本期外送地址": "台北市測試路1號",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "calculate_delivery_quote",
+        lambda _address: {
+            "success": True,
+            "delivery_available": False,
+            "address": _address,
+            "distance_text": "3.1 公里",
+            "distance_meters": 3100,
+            "duration_text": "12 分鐘",
+            "delivery_fee": 0,
+            "delivery_fee_text": "超過 3 公里，暫不提供外送",
+            "delivery_zone": "UNAVAILABLE",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "create_pending_subscription_form_order",
+        lambda _snapshot: created.append(True) or 987,
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "push_message",
+        lambda uid, message: pushed.append((uid, message.text)),
+    )
+
+    result = asyncio.run(
+        server.receive_form_data(
+            cast(Any, SimpleNamespace(json=request_json)),
+            cast(Any, SimpleNamespace()),
+        )
+    )
+
+    assert result == {
+        "status": "rejected",
+        "reason": "delivery_out_of_range",
+        "distance": "3.1 公里",
+    }
+    assert created == []
+    assert pushed == [
+        (
+            "U_FORM_BLOCK",
+            "🚫 此地址暫不提供外送\n\n"
+            "📍 台北市測試路1號\n"
+            "📏 距本店距離：3.1 公里\n\n"
+            "目前外送範圍為門市 3 公里內。\n"
+            "這次沒有建立包月訂單，請改選自取或找客服協助。",
+        )
+    ]
+
+
+def test_rejected_estimate_state_cannot_request_subscription_form_link(monkeypatch):
+    uid = "U_FORM_LINK_BLOCK"
+    replies = []
+    server.processed_messages.clear()
+    server.pending_subscription_state[uid] = {
+        "step": "estimated",
+        "estimate": {
+            "pickup_method": "外送",
+            "delivery_available": False,
+            "address": "台北市測試路1號",
+            "quote": {"distance_text": "3.1 公里"},
+        },
+    }
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message.text),
+    )
+
+    try:
+        server._handle_message_impl(
+            _text_event("DELIVERY-FORM-LINK-BLOCK", "我要填寫包月資料", uid)
+        )
+    finally:
+        server.pending_subscription_state.pop(uid, None)
+
+    assert len(replies) == 1
+    assert "此地址暫不提供外送" in replies[0]
+    assert "這次不會提供包月表單連結" in replies[0]
+    assert server.get_subscription_form_link(uid) not in replies[0]
+
+
+def test_rejected_estimate_state_cannot_use_alternate_form_command(monkeypatch):
+    uid = "U_ALT_FORM_LINK_BLOCK"
+    replies = []
+    server.processed_messages.clear()
+    server.pending_subscription_state[uid] = {
+        "step": "estimated",
+        "estimate": {
+            "pickup_method": "外送",
+            "delivery_available": False,
+            "address": "台北市測試路1號",
+            "quote": {"distance_text": "3.1 公里"},
+        },
+    }
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message.text),
+    )
+
+    try:
+        server._handle_message_impl(
+            _text_event("DELIVERY-ALT-FORM-BLOCK", "填寫體質表單", uid)
+        )
+    finally:
+        server.pending_subscription_state.pop(uid, None)
+
+    assert len(replies) == 1
+    assert "此地址暫不提供外送" in replies[0]
+    assert server.get_subscription_form_link(uid) not in replies[0]
+
+
+def test_package_intro_reset_cannot_clear_delivery_form_block(monkeypatch):
+    uid = "U_RESET_FORM_LINK_BLOCK"
+    replies = []
+    server.processed_messages.clear()
+    server.pending_subscription_state[uid] = {
+        "step": "estimated",
+        "estimate": {
+            "pickup_method": "外送",
+            "delivery_available": False,
+            "address": "台北市測試路1號",
+            "quote": {"distance_text": "3.1 公里"},
+        },
+    }
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message),
+    )
+
+    try:
+        server._handle_message_impl(
+            _text_event("DELIVERY-PACKAGE-RESET", "包月方案", uid)
+        )
+        server._handle_message_impl(
+            _text_event("DELIVERY-PACKAGE-AFTER-RESET", "我要填寫包月資料", uid)
+        )
+    finally:
+        server.pending_subscription_state.pop(uid, None)
+        blocked_users = getattr(server, "subscription_delivery_blocked_users", set())
+        blocked_users.discard(uid)
+
+    assert len(replies) == 2
+    second_text = replies[1].text
+    assert "此地址暫不提供外送" in second_text
+    assert server.get_subscription_form_link(uid) not in second_text
+
+
+def test_selecting_self_pickup_clears_delivery_form_block(monkeypatch):
+    uid = "U_SELF_PICKUP_UNBLOCK"
+    replies = []
+    server.processed_messages.clear()
+    server.subscription_delivery_blocked_users.add(uid)
+    server.pending_subscription_state[uid] = {"step": "pickup", "days_per_week": 3}
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message),
+    )
+
+    try:
+        server._handle_message_impl(
+            _text_event("DELIVERY-SELF-PICKUP", "包月取餐 自取", uid)
+        )
+        unblocked_after_selection = uid not in server.subscription_delivery_blocked_users
+        server._handle_message_impl(
+            _text_event("DELIVERY-SELF-PICKUP-FORM", "我要填寫包月資料", uid)
+        )
+    finally:
+        server.pending_subscription_state.pop(uid, None)
+        server.subscription_delivery_blocked_users.discard(uid)
+
+    assert unblocked_after_selection is True
+    assert server.get_subscription_form_link(uid) in replies[1].text
+
+
+def test_map_lookup_manual_review_clears_delivery_form_block(monkeypatch):
+    uid = "U_MAP_REVIEW_UNBLOCK"
+    replies = []
+    server.processed_messages.clear()
+    server.subscription_delivery_blocked_users.add(uid)
+    server.pending_subscription_state[uid] = {
+        "step": "delivery_address",
+        "days_per_week": 3,
+        "pickup_method": "外送",
+    }
+    monkeypatch.setattr(
+        server,
+        "calculate_subscription_estimate",
+        lambda *_args, **_kwargs: {
+            "delivery_available": None,
+            "pickup_method": "外送",
+            "address": "台北市待確認路1號",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "build_subscription_estimate_flex",
+        lambda _uid, _est: server.TextSendMessage(text="地圖待客服確認"),
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message),
+    )
+
+    try:
+        server._handle_message_impl(
+            _text_event("DELIVERY-MAP-REVIEW", "台北市待確認路1號", uid)
+        )
+        unblocked_after_lookup = uid not in server.subscription_delivery_blocked_users
+        server._handle_message_impl(
+            _text_event("DELIVERY-MAP-REVIEW-FORM", "我要填寫包月資料", uid)
+        )
+    finally:
+        server.pending_subscription_state.pop(uid, None)
+        server.subscription_delivery_blocked_users.discard(uid)
+
+    assert unblocked_after_lookup is True
+    assert server.get_subscription_form_link(uid) in replies[1].text
+
+
+def _seed_vip_redemption_db(path, code):
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE subscription_orders (id INTEGER PRIMARY KEY, vip_code TEXT, user_id TEXT, formalized_at TEXT)"
+        )
+        conn.execute("INSERT INTO vips VALUES (?, 24, 31, 20, 0)", (code,))
+
+
+def test_vip_redemption_does_not_expose_form_link_for_blocked_delivery(tmp_path, monkeypatch):
+    uid = "U_BLOCKED_VIP"
+    code = "#VIP24-BLOCK1"
+    db = tmp_path / "blocked-vip.db"
+    _seed_vip_redemption_db(db, code)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    server.subscription_delivery_blocked_users.add(uid)
+
+    try:
+        expiry, message = server.redeem_code(uid, code)
+        with sqlite3.connect(db) as conn:
+            usage = conn.execute(
+                "SELECT remaining_meals, status FROM usage WHERE user_id=?", (uid,)
+            ).fetchone()
+    finally:
+        server.subscription_delivery_blocked_users.discard(uid)
+
+    assert expiry
+    assert usage == (24, "vip")
+    assert "兌換成功" in message
+    assert "此地址暫不提供外送" in message
+    assert server.get_subscription_form_link(uid) not in message
+
+
+def test_vip_redemption_still_exposes_form_link_when_not_delivery_blocked(tmp_path, monkeypatch):
+    uid = "U_ALLOWED_VIP"
+    code = "#VIP24-ALLOW1"
+    db = tmp_path / "allowed-vip.db"
+    _seed_vip_redemption_db(db, code)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    server.subscription_delivery_blocked_users.discard(uid)
+
+    expiry, message = server.redeem_code(uid, code)
+
+    assert expiry
+    assert server.get_subscription_form_link(uid) in message
 
 
 def test_text_handler_completes_missing_product_name(tmp_path, monkeypatch):

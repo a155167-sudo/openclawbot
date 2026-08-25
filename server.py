@@ -1283,6 +1283,48 @@ with sqlite3.connect(DB_PATH) as conn:
 COACH_UIDS = ["Uefd72ca53a9a6ac39781fe673c398530","U9540c22cea2d6e0b1df8edbd9e3ebc41"]
 pending_image_date = {}
 pending_subscription_state = {}
+subscription_delivery_blocked_users = set()
+
+
+def update_subscription_delivery_block(uid, delivery_available):
+    if delivery_available is False:
+        subscription_delivery_blocked_users.add(uid)
+    else:
+        subscription_delivery_blocked_users.discard(uid)
+
+
+def get_subscription_delivery_block_context(uid):
+    state = pending_subscription_state.get(uid) or {}
+    stored_estimate = state.get("estimate")
+    estimate = stored_estimate if isinstance(stored_estimate, dict) else state
+    if estimate.get("delivery_available") is False:
+        subscription_delivery_blocked_users.add(uid)
+        return {
+            "address": estimate.get("address") or "先前輸入的外送地址",
+            "distance_text": (estimate.get("quote") or {}).get("distance_text") or "超過 3 公里",
+        }
+    if uid in subscription_delivery_blocked_users:
+        return {"address": "先前輸入的外送地址", "distance_text": "超過 3 公里"}
+    return None
+
+
+def build_subscription_form_blocked_text(uid):
+    blocked = get_subscription_delivery_block_context(uid)
+    if not blocked:
+        return ""
+    return (
+        "🚫 此地址暫不提供外送\n\n"
+        f"📍 {blocked['address']}\n"
+        f"📏 距本店距離：{blocked['distance_text']}\n\n"
+        "目前外送範圍為門市 3 公里內，這次不會提供包月表單連結。\n"
+        "請回覆「開始包月估價」並改選自取，或輸入「找客服」。"
+    )
+
+
+def clear_pending_subscription_state(uid):
+    get_subscription_delivery_block_context(uid)
+    pending_subscription_state.pop(uid, None)
+
 
 ADMIN_ONLY_EXACT_COMMANDS = {
     "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成", "#發送明日提醒",
@@ -2952,6 +2994,27 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "delivery_zone": "SELF_PICKUP" if not is_delivery else "未分類",
             "carpool_hint": "",
         }
+        update_subscription_delivery_block(
+            user_id,
+            delivery_info.get("delivery_available") if is_delivery else True,
+        )
+        if is_delivery and delivery_info.get("delivery_available") is False:
+            rejection_text = (
+                "🚫 此地址暫不提供外送\n\n"
+                f"📍 {address}\n"
+                f"📏 距本店距離：{delivery_info.get('distance_text', '超過 3 公里')}\n\n"
+                "目前外送範圍為門市 3 公里內。\n"
+                "這次沒有建立包月訂單，請改選自取或找客服協助。"
+            )
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(text=rejection_text))
+            except Exception as push_error:
+                print(f"⚠️ 推播超距表單拒絕通知失敗 uid={user_id[:8]}...: {push_error}")
+            return {
+                "status": "rejected",
+                "reason": "delivery_out_of_range",
+                "distance": delivery_info.get("distance_text", ""),
+            }
         weight, height, age, gender = float(get_val("體重") or 70), float(get_val("身高") or 170), float(get_val("年齡") or 30), get_val("性別")
         # 🔥 身高防呆：如果客人填 1.76 公尺，自動轉成 176 公分
         if height < 3.0:
@@ -7398,7 +7461,13 @@ def redeem_code(uid, code):
             "您先前填寫的包月資料已由客服付款確認後轉正式，\n"
             "不需要再填一次表單，接下來可直接使用專屬菜單與 AI 營養管理。"
         )
-    link = f"https://docs.google.com/forms/d/e/1FAIpQLSfblmRmSc669n_C7JU1wja0g4KrEGs1oRQwdq6cfNCC8b1DFA/viewform?usp=pp_url&entry.1461831832={uid}"
+    blocked_text = build_subscription_form_blocked_text(uid)
+    if blocked_text:
+        return exp, (
+            "🎉 兌換成功，包月會員權限與餐數已啟用！\n\n"
+            f"{blocked_text}"
+        )
+    link = get_subscription_form_link(uid)
     return exp, f"🎉 兌換成功！\n您的專屬排餐表單：\n{link}"
 
 # ==========================================
@@ -12087,12 +12156,12 @@ def _handle_message_impl(event):
     # 放在靜音 / VIP 權限檢查之前，確保一定會觸發
     # ======================================================
     if msg in ["了解包月方案", "包月方案", "我要包月", "如何訂購"]:
-        pending_subscription_state.pop(uid, None)
+        clear_pending_subscription_state(uid)
         line_bot_api.reply_message(event.reply_token, build_subscription_intro_flex(uid))
         return
 
     if msg in ["我的方案", "包月狀態", "查看狀態"]:
-        pending_subscription_state.pop(uid, None)
+        clear_pending_subscription_state(uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=(
                 "你目前尚未啟用包月方案。\n"
@@ -12108,12 +12177,12 @@ def _handle_message_impl(event):
         return
 
     if msg == "先不用":
-        pending_subscription_state.pop(uid, None)
+        clear_pending_subscription_state(uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="沒問題～有需要時可以再從圖文選單查看「包月方案」。"))
         return
 
     if msg in ["碳循環", "碳循環排餐", "啟用碳循環", "我要碳循環", "碳循環菜單"]:
-        pending_subscription_state.pop(uid, None)
+        clear_pending_subscription_state(uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
             "碳循環排餐目前正在調整中，暫時先不開放自動排餐。\n"
             "如果你有運動日、減脂或訓練需求，可以先找客服協助安排。"
@@ -12212,6 +12281,7 @@ def _handle_message_impl(event):
             )))
             return
         if pickup_method == "自取":
+            update_subscription_delivery_block(uid, True)
             pending_subscription_state[uid] = {"step": "self_pickup_meals", "days_per_week": days, "pickup_method": "自取"}
             line_bot_api.reply_message(
                 event.reply_token,
@@ -12241,7 +12311,7 @@ def _handle_message_impl(event):
         return
 
     if msg in ["找客服", "客服", "聯絡客服"]:
-        pending_subscription_state.pop(uid, None)
+        clear_pending_subscription_state(uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="可以，請直接在這裡留言你的需求，客服會協助確認餐數、外送/自取、金額與付款方式。"))
         return
 
@@ -12257,6 +12327,7 @@ def _handle_message_impl(event):
         delivery_count = days * SUBSCRIPTION_PERIOD_WEEKS
         address_text = msg.replace("#測距 ", "").replace("測距 ", "").strip()
         est = calculate_subscription_estimate(uid, meal_count, address_text, delivery_count=delivery_count, pickup_method="外送", days_per_week=days, meals_per_day=meals_per_day)
+        update_subscription_delivery_block(uid, est.get("delivery_available"))
         pending_subscription_state[uid] = {"step": "estimated", "estimate": est}
         line_bot_api.reply_message(event.reply_token, build_subscription_estimate_flex(uid, est))
         return
@@ -12272,6 +12343,7 @@ def _handle_message_impl(event):
             return
 
         quote = calculate_delivery_quote(target_address)
+        update_subscription_delivery_block(uid, quote.get("delivery_available"))
 
         if quote.get("success") and quote.get("delivery_available") is False:
             reply_text = (
@@ -12303,6 +12375,10 @@ def _handle_message_impl(event):
         return
 
     if msg == "我要填寫包月資料":
+        blocked_text = build_subscription_form_blocked_text(uid)
+        if blocked_text:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=blocked_text))
+            return
         reply_text = (
             "太好了！接下來請填寫包月資料表。\n\n"
             "這份資料會用來計算 TDEE、蛋白質目標、飲食禁忌與配餐方向。\n"
@@ -12328,6 +12404,7 @@ def _handle_message_impl(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=parsed_order["error"]))
             return
         est = calculate_subscription_estimate(uid, parsed_order["meal_count"], parsed_order.get("address", ""))
+        update_subscription_delivery_block(uid, est.get("delivery_available"))
         if not est.get("address"):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
                 "請提供完整外送地址，才能估運費與送出訂單喔！\n\n"
@@ -12886,6 +12963,10 @@ def _handle_message_impl(event):
         return
     # 🔥 LINE 圖文選單攔截區
     if msg == "填寫體質表單":
+        blocked_text = build_subscription_form_blocked_text(uid)
+        if blocked_text:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=blocked_text))
+            return
         form_link = get_subscription_form_link(uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📝 請點擊下方專屬連結，填寫您的體質評估 / 包月資料表單：\n\n{form_link}\n\n(系統已為您自動帶入 LINE 帳號，請直接填寫即可喔！)"))
         return
