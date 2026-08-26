@@ -6565,6 +6565,32 @@ def check_permission_and_quota(user_id):
             return True, f"(剩{m}餐 | 諮詢:{q-1})"
         return False, f"(剩{m}餐 | 諮詢:0)"
 
+
+def get_subscription_menu_access(user_id):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        usage = conn.execute(
+            "SELECT remaining_meals, status, expiry_date FROM usage WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        menu = conn.execute(
+            "SELECT summary_text FROM health_profile WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+
+    if not usage or usage[1] != "vip":
+        return "inactive", None, 0, ""
+
+    remaining_meals = int(usage[0] or 0)
+    expiry_date = str(usage[2] or "")
+    if not expiry_date or tw_today().isoformat() > expiry_date:
+        return "expired", None, remaining_meals, expiry_date
+    if remaining_meals <= 0:
+        return "empty", None, remaining_meals, expiry_date
+    if not menu or not menu[0]:
+        return "missing_menu", None, remaining_meals, expiry_date
+    return "active", menu[0], remaining_meals, expiry_date
+
+
 def send_tomorrow_reminders():
     tomorrow = tw_today() + timedelta(days=1)
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
@@ -12978,13 +13004,35 @@ def _handle_message_impl(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
     elif msg in ["查看菜單", "包月菜單", "查看包月菜單"]:
-        # ✅ 安全連線
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("SELECT summary_text FROM health_profile WHERE user_id=?", (uid,))
-            hp = c.fetchone()
-            
-        reply_text = f"🍽️ 這是為您量身打造的專屬菜單：\n\n{hp[0]}\n\n(若想更換菜色或加購單品，可以直接打字告訴我喔！)" if hp and hp[0] else "您好像還沒填寫體質評估表單喔！請點擊選單來建立專屬檔案吧！📝"
+        access, menu_text, remaining_meals, expiry_date = get_subscription_menu_access(uid)
+        if access == "expired":
+            reply_text = (
+                "⏰ 你的包月方案已到期。\n\n"
+                "先前的菜單屬於上一期方案，目前已封存，不再顯示。\n"
+                "請回覆「包月方案」重新估價續約，或輸入「找客服」協助處理。"
+            )
+        elif access == "empty":
+            reply_text = (
+                "🍱 你的包月餐數已使用完畢。\n\n"
+                "先前的菜單已封存，不再顯示。\n"
+                "請回覆「包月方案」重新估價續約，或輸入「找客服」協助處理。"
+            )
+        elif access == "inactive":
+            reply_text = (
+                "目前沒有有效的包月方案，因此不會顯示過去的菜單。\n\n"
+                "請回覆「包月方案」了解方案，或輸入「找客服」。"
+            )
+        elif access == "missing_menu":
+            reply_text = (
+                "你的包月方案仍有效，但目前找不到本期菜單內容。\n"
+                "請輸入「找客服」，我們會協助確認。"
+            )
+        else:
+            reply_text = (
+                f"🍽️ 這是為你量身打造的本期專屬菜單（還剩 {remaining_meals} 餐，到期日 {expiry_date}）：\n\n"
+                f"{menu_text}\n\n"
+                "(若想更換菜色或加購單品，可以直接打字告訴我喔！)"
+            )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
     elif msg == "我要紀錄飲食":

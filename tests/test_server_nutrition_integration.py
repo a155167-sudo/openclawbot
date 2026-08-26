@@ -2226,6 +2226,90 @@ def test_vip_redemption_still_exposes_form_link_when_not_delivery_blocked(tmp_pa
     assert server.get_subscription_form_link(uid) in message
 
 
+def _seed_subscription_menu_db(path, uid, summary_text, remaining_meals=None, expiry_date=None):
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE health_profile (user_id TEXT PRIMARY KEY, summary_text TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO health_profile (user_id, summary_text) VALUES (?, ?)",
+            (uid, summary_text),
+        )
+        if remaining_meals is not None:
+            conn.execute(
+                "INSERT INTO usage VALUES (?, 20, ?, ?, 'vip', ?, 20)",
+                (uid, remaining_meals, server.tw_today().isoformat(), expiry_date),
+            )
+
+
+def _run_subscription_menu_command(uid, message_id, monkeypatch):
+    replies = []
+    server.processed_messages.clear()
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message.text),
+    )
+    server._handle_message_impl(
+        _text_event(message_id, "查看包月菜單", uid)
+    )
+    return replies[0]
+
+
+def test_expired_subscription_cannot_view_stale_menu(tmp_path, monkeypatch):
+    uid = "U_EXPIRED_MENU"
+    db = tmp_path / "expired-menu.db"
+    expired = (server.tw_today() - server.timedelta(days=1)).isoformat()
+    _seed_subscription_menu_db(db, uid, "不應顯示的舊菜單", 12, expired)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    reply = _run_subscription_menu_command(uid, "EXPIRED-MENU", monkeypatch)
+
+    assert "包月方案已到期" in reply
+    assert "不應顯示的舊菜單" not in reply
+
+
+def test_subscription_with_no_remaining_meals_cannot_view_stale_menu(tmp_path, monkeypatch):
+    uid = "U_EMPTY_MENU"
+    db = tmp_path / "empty-menu.db"
+    valid_until = (server.tw_today() + server.timedelta(days=7)).isoformat()
+    _seed_subscription_menu_db(db, uid, "不應顯示的舊菜單", 0, valid_until)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    reply = _run_subscription_menu_command(uid, "EMPTY-MENU", monkeypatch)
+
+    assert "包月餐數已使用完畢" in reply
+    assert "不應顯示的舊菜單" not in reply
+
+
+def test_user_without_active_subscription_cannot_view_stale_menu(tmp_path, monkeypatch):
+    uid = "U_NO_PLAN_MENU"
+    db = tmp_path / "no-plan-menu.db"
+    _seed_subscription_menu_db(db, uid, "不應顯示的舊菜單")
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    reply = _run_subscription_menu_command(uid, "NO-PLAN-MENU", monkeypatch)
+
+    assert "目前沒有有效的包月方案" in reply
+    assert "不應顯示的舊菜單" not in reply
+
+
+def test_active_subscription_with_remaining_meals_can_view_menu(tmp_path, monkeypatch):
+    uid = "U_ACTIVE_MENU"
+    db = tmp_path / "active-menu.db"
+    valid_until = (server.tw_today() + server.timedelta(days=7)).isoformat()
+    _seed_subscription_menu_db(db, uid, "本期有效菜單內容", 12, valid_until)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    reply = _run_subscription_menu_command(uid, "ACTIVE-MENU", monkeypatch)
+
+    assert "本期有效菜單內容" in reply
+    assert "還剩 12 餐" in reply
+
+
 def test_text_handler_completes_missing_product_name(tmp_path, monkeypatch):
     db = tmp_path / "edit-name.db"
     partial = {**valid_label(), "product_name": "", "brand": ""}
