@@ -25,6 +25,8 @@ When `APP_ENV` is `staging` or `production`, startup fails unless these environm
 - `GOOGLE_CREDENTIALS`
 - `MEAL_PHOTO_IMAGE_SECRET`
 - `ADMIN_SECRET`
+- `FORM_WEBHOOK_SECRET`
+- `SURVEY_WEBHOOK_SECRET`
 - `PUBLIC_BASE_URL` or Railway-provided `RAILWAY_PUBLIC_DOMAIN`
 - `SPREADSHEET_ID`
 - `ADMIN_UID`
@@ -45,6 +47,24 @@ When `APP_ENV` is `staging` or `production`, startup fails unless these environm
 | Health check | staging `/health` | production `/health` |
 
 A Google Form link update alone is insufficient: each Form requires its own Apps Script `onFormSubmit` trigger and destination.
+
+Each Apps Script request must also send the matching environment secret without
+placing it in the form payload:
+
+```javascript
+UrlFetchApp.fetch(destinationUrl, {
+  method: "post",
+  contentType: "application/json",
+  headers: {
+    "X-Webhook-Secret": PropertiesService.getScriptProperties()
+      .getProperty("WEBHOOK_SECRET")
+  },
+  payload: JSON.stringify(payload)
+});
+```
+
+Store `WEBHOOK_SECRET` in Apps Script **Script Properties**. Use separate values
+for subscription/survey and for staging/production.
 
 ## Release workflow
 

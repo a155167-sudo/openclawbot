@@ -100,6 +100,18 @@ ADMIN_UID = APP_SETTINGS.admin_uid
 COACH_UIDS = list(APP_SETTINGS.coach_uids)
 LIFF_ID = APP_SETTINGS.liff_id
 SPREADSHEET_ID = APP_SETTINGS.spreadsheet_id
+FORM_WEBHOOK_SECRET = APP_SETTINGS.form_webhook_secret
+SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
+
+
+def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
+    """Reject forged form callbacks when this environment configures a secret."""
+    if not expected_secret:
+        return
+    supplied_secret = str(request.headers.get("X-Webhook-Secret") or "")
+    if not hmac.compare_digest(supplied_secret, expected_secret):
+        print(f"⚠️ 拒絕未授權的 webhook：{setting_name}")
+        raise HTTPException(status_code=401, detail="Unauthorized webhook")
 
 # --- 1. 時區與基本工具設定 ---
 TW_TZ = ZoneInfo("Asia/Taipei")
@@ -2981,6 +2993,7 @@ sync_menu_to_food_catalog()  # 同步菜單到 food_catalog
 # ==========================================
 @app.post("/form-data")
 async def receive_form_data(request: Request, background_tasks: BackgroundTasks):
+    require_webhook_secret(request, FORM_WEBHOOK_SECRET, "FORM_WEBHOOK_SECRET")
     try:
         data = await request.json()
         print(f"📦 [表單測試] 收到 Google 傳來的大禮包：{data}")
@@ -3625,6 +3638,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
 # ==========================================
 @app.post("/survey-data")
 async def receive_survey_data(request: Request):
+    require_webhook_secret(request, SURVEY_WEBHOOK_SECRET, "SURVEY_WEBHOOK_SECRET")
     try:
         data = await request.json()
         print(f"📝 [問卷測試] 收到問卷資料：{data}")

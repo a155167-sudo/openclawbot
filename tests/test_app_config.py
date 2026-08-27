@@ -19,6 +19,8 @@ def isolated_environment(app_env="staging"):
         "GOOGLE_CREDENTIALS": "{}",
         "MEAL_PHOTO_IMAGE_SECRET": "x" * 32,
         "ADMIN_SECRET": f"{app_env}-admin-secret",
+        "FORM_WEBHOOK_SECRET": "f" * 32,
+        "SURVEY_WEBHOOK_SECRET": "s" * 32,
         "ADMIN_UID": "U" + "1" * 32,
         "COACH_UIDS": "U" + "1" * 32,
         "LIFF_ID": f"{app_env}-liff",
@@ -56,6 +58,8 @@ def test_staging_environment_can_isolate_account_resources():
             "GOOGLE_CREDENTIALS": "{}",
             "MEAL_PHOTO_IMAGE_SECRET": "x" * 32,
             "ADMIN_SECRET": "staging-admin-secret",
+            "FORM_WEBHOOK_SECRET": "f" * 32,
+            "SURVEY_WEBHOOK_SECRET": "s" * 32,
             "ADMIN_UID": "U" + "1" * 32,
             "COACH_UIDS": "U" + "1" * 32 + ", U" + "2" * 32,
             "LIFF_ID": "staging-liff",
@@ -91,6 +95,7 @@ def test_production_defaults_scheduler_to_enabled():
         "ADMIN_SECRET",
         "COACH_UIDS",
         "DATA_DIR",
+        "FORM_WEBHOOK_SECRET",
         "GOOGLE_CREDENTIALS",
         "LIFF_ID",
         "LINE_CHANNEL_ACCESS_TOKEN",
@@ -100,6 +105,7 @@ def test_production_defaults_scheduler_to_enabled():
         "PUBLIC_BASE_URL",
         "SPREADSHEET_ID",
         "SUBSCRIPTION_FORM_URL_TEMPLATE",
+        "SURVEY_WEBHOOK_SECRET",
         "SURVEY_FORM_URL_TEMPLATE",
     ],
 )
@@ -166,4 +172,13 @@ def test_public_base_url_must_be_https_origin_without_path():
     environ["PUBLIC_BASE_URL"] = "https://production.example/wrong-path"
 
     with pytest.raises(ValueError, match="PUBLIC_BASE_URL"):
+        load_settings(environ)
+
+
+@pytest.mark.parametrize("name", ["FORM_WEBHOOK_SECRET", "SURVEY_WEBHOOK_SECRET"])
+def test_named_environment_rejects_short_webhook_secret(name):
+    environ = isolated_environment()
+    environ[name] = "too-short"
+
+    with pytest.raises(ValueError, match=name):
         load_settings(environ)

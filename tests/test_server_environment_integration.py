@@ -3,11 +3,54 @@ from dataclasses import replace
 import os
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("OPENAI_API_KEY", "dummy")
 os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
 os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy")
 
 import server
+
+
+class HeaderRequest:
+    def __init__(self, secret=None):
+        self.headers = {}
+        if secret is not None:
+            self.headers["X-Webhook-Secret"] = secret
+
+
+def test_webhook_secret_is_required_when_configured():
+    server.require_webhook_secret(
+        HeaderRequest("correct"), "correct", "FORM_WEBHOOK_SECRET"
+    )
+
+    for supplied in (None, "wrong"):
+        with pytest.raises(server.HTTPException) as exc:
+            server.require_webhook_secret(
+                HeaderRequest(supplied), "correct", "FORM_WEBHOOK_SECRET"
+            )
+        assert exc.value.status_code == 401
+
+
+def test_webhook_secret_remains_optional_in_legacy_mode():
+    server.require_webhook_secret(HeaderRequest(), "", "FORM_WEBHOOK_SECRET")
+
+
+def test_form_endpoints_reject_before_reading_body(monkeypatch):
+    monkeypatch.setattr(server, "FORM_WEBHOOK_SECRET", "f" * 32)
+    monkeypatch.setattr(server, "SURVEY_WEBHOOK_SECRET", "s" * 32)
+
+    with pytest.raises(server.HTTPException) as form_exc:
+        asyncio.run(
+            server.receive_form_data(
+                HeaderRequest(), server.BackgroundTasks()
+            )
+        )
+    assert form_exc.value.status_code == 401
+
+    with pytest.raises(server.HTTPException) as survey_exc:
+        asyncio.run(server.receive_survey_data(HeaderRequest()))
+    assert survey_exc.value.status_code == 401
 
 
 def test_server_source_contains_no_direct_legacy_account_resource_ids():

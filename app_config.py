@@ -84,6 +84,8 @@ class AppSettings:
     coach_uids: tuple[str, ...]
     liff_id: str
     spreadsheet_id: str
+    form_webhook_secret: str
+    survey_webhook_secret: str
     subscription_form_url_template: str
     survey_form_url_template: str
 
@@ -106,6 +108,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
             "ADMIN_SECRET",
             "COACH_UIDS",
             "DATA_DIR",
+            "FORM_WEBHOOK_SECRET",
             "GOOGLE_CREDENTIALS",
             "LIFF_ID",
             "LINE_CHANNEL_ACCESS_TOKEN",
@@ -114,6 +117,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
             "OPENAI_API_KEY",
             "SPREADSHEET_ID",
             "SUBSCRIPTION_FORM_URL_TEMPLATE",
+            "SURVEY_WEBHOOK_SECRET",
             "SURVEY_FORM_URL_TEMPLATE",
         )
         missing = [
@@ -167,6 +171,15 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         or (f"https://{railway_domain}" if railway_domain else "")
         or "https://openclawbot-production-36ed.up.railway.app"
     )
+    form_webhook_secret = str(environ.get("FORM_WEBHOOK_SECRET") or "")
+    survey_webhook_secret = str(environ.get("SURVEY_WEBHOOK_SECRET") or "")
+    if app_env != "legacy":
+        for name, secret in (
+            ("FORM_WEBHOOK_SECRET", form_webhook_secret),
+            ("SURVEY_WEBHOOK_SECRET", survey_webhook_secret),
+        ):
+            if len(secret.encode("utf-8")) < 32:
+                raise ValueError(f"{name} 必須至少 32 bytes")
 
     return AppSettings(
         app_env=app_env,
@@ -179,6 +192,8 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         spreadsheet_id=str(
             environ.get("SPREADSHEET_ID") or LEGACY_SPREADSHEET_ID
         ).strip(),
+        form_webhook_secret=form_webhook_secret,
+        survey_webhook_secret=survey_webhook_secret,
         subscription_form_url_template=subscription_template,
         survey_form_url_template=survey_template,
     )

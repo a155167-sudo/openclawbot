@@ -10,3 +10,4 @@ nutrition_images/
 !.env.example
 google_key.json
 *service-account*.json
+*service_account*.json
