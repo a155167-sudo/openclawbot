@@ -1,0 +1,23 @@
+# Railway production variables — never commit real secret values.
+APP_ENV=production
+ENABLE_SCHEDULER=true
+DATA_DIR=/app/data
+PUBLIC_BASE_URL=https://YOUR-PRODUCTION-DOMAIN
+
+LINE_CHANNEL_ACCESS_TOKEN=<production LINE Messaging API token>
+LINE_CHANNEL_SECRET=<production LINE channel secret>
+OPENAI_API_KEY=<secret>
+GOOGLE_CREDENTIALS=<service account JSON>
+GOOGLE_MAPS_API_KEY=<secret>
+MEAL_PHOTO_IMAGE_SECRET=<at least 32 random bytes>
+ADMIN_SECRET=<secret admin command value>
+
+SPREADSHEET_ID=<production Google Sheet ID>
+ADMIN_UID=<production provider Jason UID>
+COACH_UIDS=<comma-separated production coach UIDs>
+LIFF_ID=<production LIFF ID>
+SUBSCRIPTION_FORM_URL_TEMPLATE=https://docs.google.com/forms/d/e/PRODUCTION_FORM_ID/viewform?usp=pp_url&entry.UID_FIELD={uid}
+SURVEY_FORM_URL_TEMPLATE=https://docs.google.com/forms/d/e/PRODUCTION_SURVEY_ID/viewform?usp=pp_url&entry.UID_FIELD={uid}
+
+INTERVALS_ATHLETE_ID=<production athlete ID>
+INTERVALS_API_KEY=<secret>

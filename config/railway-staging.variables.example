@@ -1,0 +1,24 @@
+# Railway staging variables — never commit real secret values.
+APP_ENV=staging
+ENABLE_SCHEDULER=false
+DATA_DIR=/app/data
+PUBLIC_BASE_URL=https://YOUR-STAGING-DOMAIN
+
+LINE_CHANNEL_ACCESS_TOKEN=<staging LINE Messaging API token>
+LINE_CHANNEL_SECRET=<staging LINE channel secret>
+OPENAI_API_KEY=<secret>
+GOOGLE_CREDENTIALS=<service account JSON>
+GOOGLE_MAPS_API_KEY=<secret>
+MEAL_PHOTO_IMAGE_SECRET=<at least 32 random bytes>
+ADMIN_SECRET=<secret admin command value>
+
+SPREADSHEET_ID=<staging Google Sheet ID>
+ADMIN_UID=<staging provider Jason UID>
+COACH_UIDS=<comma-separated staging coach UIDs>
+LIFF_ID=<staging LIFF ID>
+SUBSCRIPTION_FORM_URL_TEMPLATE=https://docs.google.com/forms/d/e/STAGING_FORM_ID/viewform?usp=pp_url&entry.UID_FIELD={uid}
+SURVEY_FORM_URL_TEMPLATE=https://docs.google.com/forms/d/e/STAGING_SURVEY_ID/viewform?usp=pp_url&entry.UID_FIELD={uid}
+
+# Optional Garmin/Intervals integration for staging.
+INTERVALS_ATHLETE_ID=
+INTERVALS_API_KEY=

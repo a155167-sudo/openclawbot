@@ -35,6 +35,7 @@ from contextlib import asynccontextmanager, closing
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
+from app_config import load_settings
 from nutrition_system import (
     apply_nutrition_text_edit,
     approve_food_exchange_suggestion,
@@ -91,6 +92,14 @@ from meal_photo_system import (
     normalize_meal_photo_payload,
     save_meal_photo_draft,
 )
+
+APP_SETTINGS = load_settings(os.environ)
+APP_ENV = APP_SETTINGS.app_env
+ENABLE_SCHEDULER = APP_SETTINGS.enable_scheduler
+ADMIN_UID = APP_SETTINGS.admin_uid
+COACH_UIDS = list(APP_SETTINGS.coach_uids)
+LIFF_ID = APP_SETTINGS.liff_id
+SPREADSHEET_ID = APP_SETTINGS.spreadsheet_id
 
 # --- 1. 時區與基本工具設定 ---
 TW_TZ = ZoneInfo("Asia/Taipei")
@@ -1135,7 +1144,7 @@ try:
         print("💡 使用檔案 google_key.json")
     
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key("1webSlOkY0OwpY-9_HxxNKowLMoChGaWNlIpUVyJluiQ")
+    sh = gc.open_by_key(SPREADSHEET_ID)
     sheet_main = sh.worksheet("Master_API_View")
     sheet_log = sh.worksheet("raw_logs")
 
@@ -1253,14 +1262,14 @@ LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("MAPS_API_KEY")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "#GEN_CODES")
-_railway_public_domain = str(os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip()
-PUBLIC_BASE_URL = str(
-    os.environ.get("PUBLIC_BASE_URL")
-    or (f"https://{_railway_public_domain}" if _railway_public_domain else "")
-    or "https://openclawbot-production-36ed.up.railway.app"
-).rstrip("/")
+PUBLIC_BASE_URL = APP_SETTINGS.public_base_url
 MEAL_PHOTO_IMAGE_SECRET = str(os.environ.get("MEAL_PHOTO_IMAGE_SECRET") or "")
-DB_DIR = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
+_configured_data_dir = APP_SETTINGS.data_dir
+DB_DIR = (
+    _configured_data_dir
+    if os.path.isabs(_configured_data_dir)
+    else os.path.join(os.getcwd(), _configured_data_dir)
+)
 DB_PATH = os.path.join(DB_DIR, "user_quota.db")
 os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
 try:
@@ -1280,7 +1289,6 @@ with sqlite3.connect(DB_PATH) as conn:
         # 如果欄位已經存在，會跳出 OperationalError，這很正常，我們直接忽略
         pass
 # ==========================================    
-COACH_UIDS = ["Uefd72ca53a9a6ac39781fe673c398530","U9540c22cea2d6e0b1df8edbd9e3ebc41"]
 pending_image_date = {}
 pending_subscription_state = {}
 subscription_delivery_blocked_users = set()
@@ -1367,18 +1375,12 @@ def sync_customer_sheet(uid, name, status, remaining_meals, expiry_date, tdee):
     except Exception as _e:
         print(f"⚠️ sync_customer_sheet 失敗: {_e}")
 
-# 🔥 Google 試算表設定 🔥
-SPREADSHEET_ID = "1webSlOkY0OwpY-9_HxxNKowLMoChGaWNlIpUVyJluiQ"
-
-# Google 試算表設定 (網址公開安全，靠 service_account 保護)
-SPREADSHEET_ID = "1webSlOkY0OwpY-9_HxxNKowLMoChGaWNlIpUVyJluiQ"
+# Google 試算表設定（正式／測試環境由 SPREADSHEET_ID 隔離）
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
 
 # ==========================================
 # 🔑 功能一：老闆 LINE UID（靜音指令專用）
 # ==========================================
-ADMIN_UID = "Uefd72ca53a9a6ac39781fe673c398530"
-
 def get_admin_notify_uid():
     """回傳管理通知目的地；僅通知用途可在讀取失敗時使用預設值。"""
     try:
@@ -1627,6 +1629,11 @@ def register_nutrition_cleanup_job(scheduler):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not ENABLE_SCHEDULER:
+        print(f"⏸️ 自動定時器未啟動（APP_ENV={APP_ENV}）")
+        yield
+        return
+
     # 伺服器啟動時，喚醒隱形店長
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
     
@@ -1651,10 +1658,11 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     print("✅ 全自動定時器已啟動！系統進入無人駕駛模式 ON！")
     
-    yield
-    
-    # 伺服器關閉時，讓店長下班
-    scheduler.shutdown()
+    try:
+        yield
+    finally:
+        # 伺服器關閉時，讓店長下班
+        scheduler.shutdown()
 
 # 正式建立啟用了定時器的 FastAPI 應用程式
 app = FastAPI(lifespan=lifespan)
@@ -2208,7 +2216,7 @@ def find_training_assignment_for_date(user_id: str, target_date) -> dict:
 # 2. 戰情室網頁畫面 (HTML)
 @app.get("/coach-dashboard", response_class=HTMLResponse)
 async def coach_dashboard():
-    return """
+    dashboard_html = """
     <!DOCTYPE html>
     <html lang="zh-TW">
     <head>
@@ -2584,7 +2592,7 @@ async def coach_dashboard():
             // --- 7. 乾淨的啟動函數 ---
             async function init() {
                 try {
-                    await liff.init({ liffId: "2009824277-W3lYtSjF" });
+                    await liff.init({ liffId: "__LIFF_ID__" });
                     if (!liff.isLoggedIn()) { liff.login(); return; }
                     
                     const profile = await liff.getProfile();
@@ -2609,6 +2617,7 @@ async def coach_dashboard():
     </body>
     </html>
     """
+    return dashboard_html.replace("__LIFF_ID__", LIFF_ID)
 # 喚醒 Google 虛擬助理 (🔥 卸下裝甲，回歸純淨版)
 try:
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -6777,7 +6786,11 @@ def calculate_delivery_quote(target_address: str):
 
 
 def get_subscription_form_link(uid: str) -> str:
-    return f"https://docs.google.com/forms/d/e/1FAIpQLSfblmRmSc669n_C7JU1wja0g4KrEGs1oRQwdq6cfNCC8b1DFA/viewform?usp=pp_url&entry.1461831832={uid}"
+    return APP_SETTINGS.subscription_form_url(uid)
+
+
+def get_survey_form_link(uid: str) -> str:
+    return APP_SETTINGS.survey_form_url(uid)
 
 
 def get_customer_profile_for_order(uid: str):
@@ -12595,11 +12608,8 @@ def _handle_message_impl(event):
     # ─────────────────────────────────────────────────────────────────────────
     # 🌟 Phase 3：教練彙總介面 — #教練 指令（LIFF 升級版）
     # ─────────────────────────────────────────────────────────────────────────
-    COACH_UIDS = ["Uefd72ca53a9a6ac39781fe673c398530","U9540c22cea2d6e0b1df8edbd9e3ebc41"]
-
     if msg == "#教練" and uid in COACH_UIDS:
-        # 這裡放入你剛剛拿到的 LIFF URL
-        liff_url = "https://liff.line.me/2009824277-W3lYtSjF"
+        liff_url = f"https://liff.line.me/{LIFF_ID}"
         
         from linebot.models import FlexSendMessage
         bubble = {
@@ -13066,8 +13076,7 @@ def _handle_message_impl(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📝 請點擊下方專屬連結，填寫您的體質評估 / 包月資料表單：\n\n{form_link}\n\n(系統已為您自動帶入 LINE 帳號，請直接填寫即可喔！)"))
         return
     elif msg == "填寫滿意度問卷":
-        # 👉 老闆注意：請把下面這串網址，換成您剛剛在 Google 表單產生的那串「最後面有 {uid} 的黃金連結」！
-        survey_link = f"https://docs.google.com/forms/d/e/1FAIpQLScF6Va_sdq6KMaKFd8BUVB2x5SyLji3JqX28-Z7h-tuLnpB-Q/viewform?usp=pp_url&entry.1048958109={uid}"
+        survey_link = get_survey_form_link(uid)
         
         reply_text = f"🎁 感謝您對一日樂食的支持！\n請點擊下方專屬連結填寫滿意度調查 (約1分鐘)。\n\n完成填寫後，系統將自動發送【1 點集點卡點數】給您喔！👇\n\n{survey_link}"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
