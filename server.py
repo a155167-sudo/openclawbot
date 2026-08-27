@@ -2747,6 +2747,20 @@ def sync_menu_to_food_catalog():
 # ==========================================
 # 3. 資料庫初始化 (🔥 升級版：支援點數網址與發放紀錄)
 # ==========================================
+def ensure_subscription_menu_entitlement_schema(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscription_menu_entitlements (
+            user_id TEXT PRIMARY KEY,
+            order_id INTEGER NOT NULL,
+            vip_code TEXT DEFAULT '',
+            status TEXT DEFAULT 'active',
+            starts_on TEXT DEFAULT '',
+            expires_on TEXT DEFAULT '',
+            created_at TEXT DEFAULT ''
+        )
+    """)
+
+
 def init_db():
     # 單一資料路徑來源：必須遵守 DATA_DIR／DB_PATH，才能安全掛載 Railway Volume。
     os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
@@ -2843,6 +2857,7 @@ def init_db():
                 c.execute(f"ALTER TABLE subscription_orders ADD COLUMN {_col} {_ddl}")
             except sqlite3.OperationalError:
                 pass
+        ensure_subscription_menu_entitlement_schema(c.connection)
         c.execute('''CREATE TABLE IF NOT EXISTS workout_checks (
             user_id TEXT,
             workout_date TEXT,
@@ -6568,6 +6583,7 @@ def check_permission_and_quota(user_id):
 
 def get_subscription_menu_access(user_id):
     with closing(sqlite3.connect(DB_PATH)) as conn:
+        ensure_subscription_menu_entitlement_schema(conn)
         usage = conn.execute(
             "SELECT remaining_meals, status, expiry_date FROM usage WHERE user_id=?",
             (user_id,),
@@ -6576,6 +6592,25 @@ def get_subscription_menu_access(user_id):
             "SELECT summary_text FROM health_profile WHERE user_id=?",
             (user_id,),
         ).fetchone()
+        has_orders_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='subscription_orders'"
+        ).fetchone()
+        current_plan = None
+        if has_orders_table:
+            current_plan = conn.execute(
+                """
+                SELECT o.id, e.expires_on
+                FROM subscription_menu_entitlements e
+                JOIN subscription_orders o
+                  ON o.id=e.order_id AND o.user_id=e.user_id
+                WHERE e.user_id=? AND e.status='active'
+                  AND e.expires_on>=?
+                  AND o.status='activated'
+                  AND COALESCE(o.formalized_at, '')<>''
+                LIMIT 1
+                """,
+                (user_id, tw_today().isoformat()),
+            ).fetchone()
 
     if not usage or usage[1] != "vip":
         return "inactive", None, 0, ""
@@ -6586,9 +6621,11 @@ def get_subscription_menu_access(user_id):
         return "expired", None, remaining_meals, expiry_date
     if remaining_meals <= 0:
         return "empty", None, remaining_meals, expiry_date
+    if not current_plan:
+        return "no_active_plan", None, remaining_meals, expiry_date
     if not menu or not menu[0]:
         return "missing_menu", None, remaining_meals, expiry_date
-    return "active", menu[0], remaining_meals, expiry_date
+    return "active", menu[0], remaining_meals, current_plan[1]
 
 
 def send_tomorrow_reminders():
@@ -7472,16 +7509,48 @@ def redeem_code(uid, code):
     c.execute("SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0", (code,))
     r = c.fetchone()
     if not r: conn.close(); return None, "❌ 無效"
-    c.execute("SELECT id, formalized_at FROM subscription_orders WHERE vip_code=? AND user_id=?", (code, uid))
-    linked_order = c.fetchone()
+    order_record = None
+    is_subscription_order_code = code.startswith("#VIPORDER-")
+    if is_subscription_order_code:
+        c.execute("SELECT id, user_id, formalized_at, status FROM subscription_orders WHERE vip_code=?", (code,))
+        order_record = c.fetchone()
+        if not order_record:
+            conn.close()
+            return None, "❌ 找不到對應的包月訂單，請聯絡客服確認開通碼。"
+    if order_record and order_record[1] != uid:
+        conn.close()
+        return None, "❌ 此開通碼不屬於目前帳號，請使用原訂購LINE帳號兌換。"
+    if order_record and (not order_record[2] or order_record[3] != "activated"):
+        conn.close()
+        return None, "⏳ 此訂單尚未完成付款確認與正式配餐，請先聯絡客服。"
+    linked_order = None
+    if order_record:
+        linked_order = (order_record[0], order_record[2], order_record[3])
     m, d, l = r; today = tw_today()
     c.execute("UPDATE vips SET is_used=1 WHERE code=?", (code,))
     c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (uid,))
     u = c.fetchone(); curr_m = u[0] if u else 0
     exp = (today + timedelta(days=d)).isoformat()
     c.execute("INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)", (uid, l, curr_m+m, today.isoformat(), 'vip', exp, l))
+    if linked_order and linked_order[1] and linked_order[2] == "activated":
+        ensure_subscription_menu_entitlement_schema(conn)
+        c.execute("""
+            INSERT INTO subscription_menu_entitlements
+                (user_id, order_id, vip_code, status, starts_on, expires_on, created_at)
+            VALUES (?, ?, ?, 'active', ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                order_id=excluded.order_id,
+                vip_code=excluded.vip_code,
+                status='active',
+                starts_on=excluded.starts_on,
+                expires_on=excluded.expires_on,
+                created_at=excluded.created_at
+        """, (
+            uid, linked_order[0], code, today.isoformat(), exp,
+            tw_now().strftime("%Y-%m-%d %H:%M:%S"),
+        ))
     conn.commit(); conn.close()
-    if linked_order and linked_order[1]:
+    if linked_order and linked_order[1] and linked_order[2] == "activated":
         return exp, (
             "🎉 兌換成功，包月會員權限已啟用！\n"
             "您先前填寫的包月資料已由客服付款確認後轉正式，\n"
@@ -13021,6 +13090,12 @@ def _handle_message_impl(event):
             reply_text = (
                 "目前沒有有效的包月方案，因此不會顯示過去的菜單。\n\n"
                 "請回覆「包月方案」了解方案，或輸入「找客服」。"
+            )
+        elif access == "no_active_plan":
+            reply_text = (
+                "你目前有VIP／餐數權限，但目前沒有本期正式配餐。\n\n"
+                "先前的菜單屬於上一期資料，因此不再顯示。\n"
+                "請回覆「包月方案」建立本期配餐，或輸入「找客服」協助確認。"
             )
         elif access == "missing_menu":
             reply_text = (

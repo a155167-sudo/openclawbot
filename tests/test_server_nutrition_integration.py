@@ -2174,7 +2174,7 @@ def test_map_lookup_manual_review_clears_delivery_form_block(monkeypatch):
     assert server.get_subscription_form_link(uid) in replies[1].text
 
 
-def _seed_vip_redemption_db(path, code):
+def _seed_vip_redemption_db(path, code, linked_uid=None):
     with sqlite3.connect(path) as conn:
         conn.execute(
             "CREATE TABLE vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER DEFAULT 0)"
@@ -2183,9 +2183,14 @@ def _seed_vip_redemption_db(path, code):
             "CREATE TABLE usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)"
         )
         conn.execute(
-            "CREATE TABLE subscription_orders (id INTEGER PRIMARY KEY, vip_code TEXT, user_id TEXT, formalized_at TEXT)"
+            "CREATE TABLE subscription_orders (id INTEGER PRIMARY KEY, vip_code TEXT, user_id TEXT, formalized_at TEXT, status TEXT, activated_at TEXT)"
         )
         conn.execute("INSERT INTO vips VALUES (?, 24, 31, 20, 0)", (code,))
+        if linked_uid:
+            conn.execute(
+                "INSERT INTO subscription_orders VALUES (1, ?, ?, '2026-08-27 10:00:00', 'activated', '2026-08-27 09:00:00')",
+                (code, linked_uid),
+            )
 
 
 def test_vip_redemption_does_not_expose_form_link_for_blocked_delivery(tmp_path, monkeypatch):
@@ -2226,13 +2231,133 @@ def test_vip_redemption_still_exposes_form_link_when_not_delivery_blocked(tmp_pa
     assert server.get_subscription_form_link(uid) in message
 
 
-def _seed_subscription_menu_db(path, uid, summary_text, remaining_meals=None, expiry_date=None):
+def test_linked_formalized_order_redemption_creates_current_menu_entitlement(tmp_path, monkeypatch):
+    uid = "U_LINKED_CURRENT_PLAN"
+    code = "#VIPORDER-LINKED"
+    db = tmp_path / "linked-current-plan.db"
+    _seed_vip_redemption_db(db, code, linked_uid=uid)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    expiry, message = server.redeem_code(uid, code)
+
+    with sqlite3.connect(db) as conn:
+        entitlement = conn.execute(
+            "SELECT order_id, status, expires_on FROM subscription_menu_entitlements WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    assert expiry
+    assert "不需要再填一次表單" in message
+    assert entitlement == (1, "active", expiry)
+
+
+def test_linked_order_code_cannot_be_consumed_by_another_user(tmp_path, monkeypatch):
+    owner_uid = "U_ORDER_OWNER"
+    wrong_uid = "U_WRONG_REDEEMER"
+    code = "#VIPORDER-OWNER-ONLY"
+    db = tmp_path / "owner-only-order-code.db"
+    _seed_vip_redemption_db(db, code, linked_uid=owner_uid)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    expiry, message = server.redeem_code(wrong_uid, code)
+
+    with sqlite3.connect(db) as conn:
+        is_used = conn.execute(
+            "SELECT is_used FROM vips WHERE code=?", (code,)
+        ).fetchone()[0]
+        wrong_usage = conn.execute(
+            "SELECT 1 FROM usage WHERE user_id=?", (wrong_uid,)
+        ).fetchone()
+    assert expiry is None
+    assert "此開通碼不屬於目前帳號" in message
+    assert is_used == 0
+    assert wrong_usage is None
+
+
+def test_linked_order_code_waits_until_order_is_activated_and_formalized(tmp_path, monkeypatch):
+    uid = "U_ORDER_NOT_READY"
+    code = "#VIPORDER-NOT-READY"
+    db = tmp_path / "not-ready-order-code.db"
+    _seed_vip_redemption_db(db, code, linked_uid=uid)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE subscription_orders SET status='pending_payment', formalized_at='' WHERE vip_code=?",
+            (code,),
+        )
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    expiry, message = server.redeem_code(uid, code)
+
+    with sqlite3.connect(db) as conn:
+        is_used = conn.execute(
+            "SELECT is_used FROM vips WHERE code=?", (code,)
+        ).fetchone()[0]
+        usage = conn.execute(
+            "SELECT 1 FROM usage WHERE user_id=?", (uid,)
+        ).fetchone()
+    assert expiry is None
+    assert "訂單尚未完成付款確認與正式配餐" in message
+    assert is_used == 0
+    assert usage is None
+
+
+def test_ordinary_vip_code_never_creates_menu_entitlement_even_if_linked(tmp_path, monkeypatch):
+    uid = "U_ORDINARY_LINKED"
+    code = "#VIP24-ORDINARY-LINKED"
+    db = tmp_path / "ordinary-linked-code.db"
+    _seed_vip_redemption_db(db, code, linked_uid=uid)
+    with sqlite3.connect(db) as conn:
+        server.ensure_subscription_menu_entitlement_schema(conn)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    expiry, message = server.redeem_code(uid, code)
+
+    with sqlite3.connect(db) as conn:
+        entitlements = conn.execute(
+            "SELECT user_id FROM subscription_menu_entitlements"
+        ).fetchall()
+    assert expiry
+    assert "兌換成功" in message
+    assert entitlements == []
+
+
+def test_unlinked_viporder_code_is_not_consumed(tmp_path, monkeypatch):
+    uid = "U_UNLINKED_VIPORDER"
+    code = "#VIPORDER-NO-ORDER"
+    db = tmp_path / "unlinked-viporder.db"
+    _seed_vip_redemption_db(db, code)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    expiry, message = server.redeem_code(uid, code)
+
+    with sqlite3.connect(db) as conn:
+        is_used = conn.execute(
+            "SELECT is_used FROM vips WHERE code=?", (code,)
+        ).fetchone()[0]
+        usage = conn.execute(
+            "SELECT 1 FROM usage WHERE user_id=?", (uid,)
+        ).fetchone()
+    assert expiry is None
+    assert "找不到對應的包月訂單" in message
+    assert is_used == 0
+    assert usage is None
+
+
+def _seed_subscription_menu_db(
+    path, uid, summary_text, remaining_meals=None, expiry_date=None,
+    formalized_order=False, current_menu_entitlement=False,
+):
     with sqlite3.connect(path) as conn:
         conn.execute(
             "CREATE TABLE health_profile (user_id TEXT PRIMARY KEY, summary_text TEXT)"
         )
         conn.execute(
             "CREATE TABLE usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE subscription_orders (id INTEGER PRIMARY KEY, user_id TEXT, status TEXT, formalized_at TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE subscription_menu_entitlements (user_id TEXT PRIMARY KEY, order_id INTEGER, status TEXT, starts_on TEXT, expires_on TEXT)"
         )
         conn.execute(
             "INSERT INTO health_profile (user_id, summary_text) VALUES (?, ?)",
@@ -2243,9 +2368,19 @@ def _seed_subscription_menu_db(path, uid, summary_text, remaining_meals=None, ex
                 "INSERT INTO usage VALUES (?, 20, ?, ?, 'vip', ?, 20)",
                 (uid, remaining_meals, server.tw_today().isoformat(), expiry_date),
             )
+        if formalized_order:
+            conn.execute(
+                "INSERT INTO subscription_orders VALUES (1, ?, 'activated', '2026-08-01 12:00:00')",
+                (uid,),
+            )
+        if current_menu_entitlement:
+            conn.execute(
+                "INSERT INTO subscription_menu_entitlements VALUES (?, 1, 'active', ?, ?)",
+                (uid, server.tw_today().isoformat(), expiry_date),
+            )
 
 
-def _run_subscription_menu_command(uid, message_id, monkeypatch):
+def _run_subscription_menu_command(uid, message_id, monkeypatch, command="查看包月菜單"):
     replies = []
     server.processed_messages.clear()
     monkeypatch.setattr(
@@ -2254,7 +2389,7 @@ def _run_subscription_menu_command(uid, message_id, monkeypatch):
         lambda _token, message: replies.append(message.text),
     )
     server._handle_message_impl(
-        _text_event(message_id, "查看包月菜單", uid)
+        _text_event(message_id, command, uid)
     )
     return replies[0]
 
@@ -2301,13 +2436,94 @@ def test_active_subscription_with_remaining_meals_can_view_menu(tmp_path, monkey
     uid = "U_ACTIVE_MENU"
     db = tmp_path / "active-menu.db"
     valid_until = (server.tw_today() + server.timedelta(days=7)).isoformat()
-    _seed_subscription_menu_db(db, uid, "本期有效菜單內容", 12, valid_until)
+    _seed_subscription_menu_db(
+        db, uid, "本期有效菜單內容", 12, valid_until,
+        formalized_order=True, current_menu_entitlement=True,
+    )
     monkeypatch.setattr(server, "DB_PATH", str(db))
 
     reply = _run_subscription_menu_command(uid, "ACTIVE-MENU", monkeypatch)
 
     assert "本期有效菜單內容" in reply
     assert "還剩 12 餐" in reply
+
+
+def test_active_menu_displays_plan_expiry_instead_of_generic_vip_expiry(tmp_path, monkeypatch):
+    uid = "U_PLAN_EXPIRY"
+    db = tmp_path / "plan-expiry.db"
+    vip_expiry = (server.tw_today() + server.timedelta(days=30)).isoformat()
+    plan_expiry = (server.tw_today() + server.timedelta(days=7)).isoformat()
+    _seed_subscription_menu_db(
+        db, uid, "本期菜單", 12, vip_expiry,
+        formalized_order=True, current_menu_entitlement=True,
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE subscription_menu_entitlements SET expires_on=? WHERE user_id=?",
+            (plan_expiry, uid),
+        )
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    reply = _run_subscription_menu_command(uid, "PLAN-EXPIRY", monkeypatch)
+
+    assert f"到期日 {plan_expiry}" in reply
+    assert f"到期日 {vip_expiry}" not in reply
+
+
+@pytest.mark.parametrize("command", ["查看菜單", "包月菜單", "查看包月菜單"])
+def test_active_vip_without_formalized_order_cannot_view_stale_menu(tmp_path, monkeypatch, command):
+    uid = "U_VIP_WITHOUT_PLAN"
+    db = tmp_path / "vip-without-plan.db"
+    valid_until = (server.tw_today() + server.timedelta(days=8)).isoformat()
+    _seed_subscription_menu_db(db, uid, "不應顯示的上一期菜單", 662, valid_until)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    reply = _run_subscription_menu_command(
+        uid, f"VIP-WITHOUT-PLAN-{command}", monkeypatch, command=command
+    )
+
+    assert "目前沒有本期正式配餐" in reply
+    assert "不應顯示的上一期菜單" not in reply
+
+
+def test_old_formalized_order_without_current_entitlement_cannot_view_stale_menu(tmp_path, monkeypatch):
+    uid = "U_OLD_FORMALIZED_PLAN"
+    db = tmp_path / "old-formalized-plan.db"
+    valid_until = (server.tw_today() + server.timedelta(days=8)).isoformat()
+    _seed_subscription_menu_db(
+        db, uid, "不應顯示的舊正式菜單", 48, valid_until,
+        formalized_order=True,
+    )
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+
+    reply = _run_subscription_menu_command(uid, "OLD-FORMALIZED-PLAN", monkeypatch)
+
+    assert "目前沒有本期正式配餐" in reply
+    assert "不應顯示的舊正式菜單" not in reply
+
+
+def test_entitlement_schema_does_not_infer_plan_from_vip_and_old_order(tmp_path):
+    db = tmp_path / "menu-entitlement-no-inference.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE usage (user_id TEXT PRIMARY KEY, remaining_meals INTEGER, status TEXT, expiry_date TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE subscription_orders (id INTEGER PRIMARY KEY, user_id TEXT, status TEXT, formalized_at TEXT, activated_at TEXT, vip_code TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO usage VALUES ('U_GENERIC_VIP', 662, 'vip', '2026-09-26')"
+        )
+        conn.execute(
+            "INSERT INTO subscription_orders VALUES (1, 'U_GENERIC_VIP', 'activated', 'done', '2026-08-27 10:00:00', '#VIPORDER-UNREDEEMED')"
+        )
+
+        server.ensure_subscription_menu_entitlement_schema(conn)
+
+        rows = conn.execute(
+            "SELECT user_id, order_id FROM subscription_menu_entitlements"
+        ).fetchall()
+    assert rows == []
 
 
 def test_text_handler_completes_missing_product_name(tmp_path, monkeypatch):
