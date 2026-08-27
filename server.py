@@ -113,6 +113,12 @@ def require_webhook_secret(request, expected_secret: str, setting_name: str) -> 
         print(f"⚠️ 拒絕未授權的 webhook：{setting_name}")
         raise HTTPException(status_code=401, detail="Unauthorized webhook")
 
+
+def require_named_environment_resource(resource_name: str, resource) -> None:
+    """Fail startup instead of silently disabling a named environment resource."""
+    if APP_ENV != "legacy" and resource is None:
+        raise RuntimeError(f"{resource_name} 在 APP_ENV={APP_ENV} 無法初始化")
+
 # --- 1. 時區與基本工具設定 ---
 TW_TZ = ZoneInfo("Asia/Taipei")
 
@@ -1250,6 +1256,8 @@ except Exception as e:
     sh = None
     sheet_main = None
     sheet_log = None
+
+require_named_environment_resource("Google Sheets", sh)
 
 # --- 下方接著寫你的 LINE Bot API 和 路由邏輯 ---
 
@@ -2604,7 +2612,7 @@ async def coach_dashboard():
             // --- 7. 乾淨的啟動函數 ---
             async function init() {
                 try {
-                    await liff.init({ liffId: "__LIFF_ID__" });
+                    await liff.init({ liffId: __LIFF_ID_JSON__ });
                     if (!liff.isLoggedIn()) { liff.login(); return; }
                     
                     const profile = await liff.getProfile();
@@ -2629,7 +2637,7 @@ async def coach_dashboard():
     </body>
     </html>
     """
-    return dashboard_html.replace("__LIFF_ID__", LIFF_ID)
+    return dashboard_html.replace("__LIFF_ID_JSON__", json.dumps(LIFF_ID))
 # 喚醒 Google 虛擬助理 (🔥 卸下裝甲，回歸純淨版)
 try:
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]

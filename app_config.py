@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from typing import Mapping
 from urllib.parse import quote, urlsplit
@@ -97,7 +98,18 @@ class AppSettings:
 
 
 def load_settings(environ: Mapping[str, str]) -> AppSettings:
-    app_env = str(environ.get("APP_ENV") or "legacy").strip().lower()
+    explicit_app_env = str(environ.get("APP_ENV") or "").strip()
+    railway_markers = (
+        "RAILWAY_ENVIRONMENT_NAME",
+        "RAILWAY_ENVIRONMENT",
+        "RAILWAY_ENVIRONMENT_ID",
+        "RAILWAY_PROJECT_ID",
+        "RAILWAY_SERVICE_ID",
+        "RAILWAY_PUBLIC_DOMAIN",
+    )
+    if not explicit_app_env and any(environ.get(name) for name in railway_markers):
+        raise ValueError("Railway 部署必須明確設定 APP_ENV=staging 或 production")
+    app_env = (explicit_app_env or "legacy").lower()
     if app_env not in _ALLOWED_APP_ENVS:
         raise ValueError(
             "APP_ENV 必須是 legacy、staging 或 production"
@@ -155,6 +167,26 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
     for coach_uid in coach_uids:
         _validate_line_uid("COACH_UIDS", coach_uid)
 
+    liff_id = str(environ.get("LIFF_ID") or LEGACY_LIFF_ID).strip()
+    if not re.fullmatch(r"[0-9]{5,}-[A-Za-z0-9_-]+", liff_id):
+        raise ValueError("LIFF_ID 格式無效")
+
+    if app_env != "legacy":
+        try:
+            google_credentials = json.loads(str(environ.get("GOOGLE_CREDENTIALS")))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("GOOGLE_CREDENTIALS 必須是有效 JSON") from exc
+        required_google_fields = {
+            "type", "project_id", "private_key_id", "private_key",
+            "client_email", "token_uri",
+        }
+        if (
+            not isinstance(google_credentials, dict)
+            or google_credentials.get("type") != "service_account"
+            or any(not google_credentials.get(name) for name in required_google_fields)
+        ):
+            raise ValueError("GOOGLE_CREDENTIALS 缺少必要的 service account 欄位")
+
     subscription_template = _form_template(
         "SUBSCRIPTION_FORM_URL_TEMPLATE",
         environ.get("SUBSCRIPTION_FORM_URL_TEMPLATE")
@@ -166,10 +198,15 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         or LEGACY_SURVEY_FORM_URL_TEMPLATE,
     )
     railway_domain = str(environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip()
-    public_base_url = _validate_public_base_url(
+    raw_public_base_url = (
         environ.get("PUBLIC_BASE_URL")
         or (f"https://{railway_domain}" if railway_domain else "")
         or "https://openclawbot-production-36ed.up.railway.app"
+    )
+    public_base_url = (
+        str(raw_public_base_url).rstrip("/")
+        if app_env == "legacy"
+        else _validate_public_base_url(raw_public_base_url)
     )
     form_webhook_secret = str(environ.get("FORM_WEBHOOK_SECRET") or "")
     survey_webhook_secret = str(environ.get("SURVEY_WEBHOOK_SECRET") or "")
@@ -188,7 +225,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         public_base_url=public_base_url,
         admin_uid=admin_uid,
         coach_uids=coach_uids,
-        liff_id=str(environ.get("LIFF_ID") or LEGACY_LIFF_ID).strip(),
+        liff_id=liff_id,
         spreadsheet_id=str(
             environ.get("SPREADSHEET_ID") or LEGACY_SPREADSHEET_ID
         ).strip(),

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app_config import load_settings
@@ -8,6 +10,17 @@ LEGACY_LIFF_ID = "2009824277-W3lYtSjF"
 LEGACY_SPREADSHEET_ID = "1webSlOkY0OwpY-9_HxxNKowLMoChGaWNlIpUVyJluiQ"
 
 
+def valid_google_credentials():
+    return json.dumps({
+        "type": "service_account",
+        "project_id": "test-project",
+        "private_key_id": "test-key-id",
+        "private_key": "test-private-key",
+        "client_email": "test@test-project.iam.gserviceaccount.com",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    })
+
+
 def isolated_environment(app_env="staging"):
     return {
         "APP_ENV": app_env,
@@ -16,14 +29,14 @@ def isolated_environment(app_env="staging"):
         "LINE_CHANNEL_ACCESS_TOKEN": f"{app_env}-token",
         "LINE_CHANNEL_SECRET": f"{app_env}-secret",
         "OPENAI_API_KEY": f"{app_env}-openai",
-        "GOOGLE_CREDENTIALS": "{}",
+        "GOOGLE_CREDENTIALS": valid_google_credentials(),
         "MEAL_PHOTO_IMAGE_SECRET": "x" * 32,
         "ADMIN_SECRET": f"{app_env}-admin-secret",
         "FORM_WEBHOOK_SECRET": "f" * 32,
         "SURVEY_WEBHOOK_SECRET": "s" * 32,
         "ADMIN_UID": "U" + "1" * 32,
         "COACH_UIDS": "U" + "1" * 32,
-        "LIFF_ID": f"{app_env}-liff",
+        "LIFF_ID": "2000000000-" + app_env + "Liff",
         "SPREADSHEET_ID": f"{app_env}-sheet",
         "SUBSCRIPTION_FORM_URL_TEMPLATE": f"https://{app_env}.example/form?uid={{uid}}",
         "SURVEY_FORM_URL_TEMPLATE": f"https://{app_env}.example/survey?uid={{uid}}",
@@ -55,14 +68,14 @@ def test_staging_environment_can_isolate_account_resources():
             "LINE_CHANNEL_ACCESS_TOKEN": "staging-token",
             "LINE_CHANNEL_SECRET": "staging-secret",
             "OPENAI_API_KEY": "staging-openai",
-            "GOOGLE_CREDENTIALS": "{}",
+            "GOOGLE_CREDENTIALS": valid_google_credentials(),
             "MEAL_PHOTO_IMAGE_SECRET": "x" * 32,
             "ADMIN_SECRET": "staging-admin-secret",
             "FORM_WEBHOOK_SECRET": "f" * 32,
             "SURVEY_WEBHOOK_SECRET": "s" * 32,
             "ADMIN_UID": "U" + "1" * 32,
             "COACH_UIDS": "U" + "1" * 32 + ", U" + "2" * 32,
-            "LIFF_ID": "staging-liff",
+            "LIFF_ID": "2000000000-stagingLiff",
             "SPREADSHEET_ID": "staging-sheet",
             "SUBSCRIPTION_FORM_URL_TEMPLATE": "https://example.test/form?uid={uid}",
             "SURVEY_FORM_URL_TEMPLATE": "https://example.test/survey?uid={uid}",
@@ -73,7 +86,7 @@ def test_staging_environment_can_isolate_account_resources():
     assert settings.enable_scheduler is False
     assert settings.admin_uid == "U" + "1" * 32
     assert settings.coach_uids == ("U" + "1" * 32, "U" + "2" * 32)
-    assert settings.liff_id == "staging-liff"
+    assert settings.liff_id == "2000000000-stagingLiff"
     assert settings.spreadsheet_id == "staging-sheet"
     assert settings.public_base_url == "https://staging.example"
     assert settings.subscription_form_url("U abc") == "https://example.test/form?uid=U%20abc"
@@ -181,4 +194,50 @@ def test_named_environment_rejects_short_webhook_secret(name):
     environ[name] = "too-short"
 
     with pytest.raises(ValueError, match=name):
+        load_settings(environ)
+
+
+def test_legacy_preserves_previous_public_base_url_acceptance():
+    settings = load_settings({"PUBLIC_BASE_URL": "http://localhost:8000/dev/"})
+
+    assert settings.public_base_url == "http://localhost:8000/dev"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "RAILWAY_ENVIRONMENT_NAME",
+        "RAILWAY_ENVIRONMENT",
+        "RAILWAY_ENVIRONMENT_ID",
+        "RAILWAY_PROJECT_ID",
+        "RAILWAY_SERVICE_ID",
+        "RAILWAY_PUBLIC_DOMAIN",
+    ],
+)
+def test_railway_deployment_requires_explicit_app_env(marker):
+    with pytest.raises(ValueError, match="APP_ENV"):
+        load_settings({marker: "railway-value"})
+
+
+def test_named_environment_rejects_malformed_google_credentials():
+    environ = isolated_environment()
+    environ["GOOGLE_CREDENTIALS"] = "not-json"
+
+    with pytest.raises(ValueError, match="GOOGLE_CREDENTIALS"):
+        load_settings(environ)
+
+
+def test_named_environment_rejects_incomplete_google_credentials():
+    environ = isolated_environment()
+    environ["GOOGLE_CREDENTIALS"] = "{}"
+
+    with pytest.raises(ValueError, match="GOOGLE_CREDENTIALS"):
+        load_settings(environ)
+
+
+def test_named_environment_rejects_javascript_liff_injection():
+    environ = isolated_environment()
+    environ["LIFF_ID"] = '\";alert(document.domain);//'
+
+    with pytest.raises(ValueError, match="LIFF_ID"):
         load_settings(environ)

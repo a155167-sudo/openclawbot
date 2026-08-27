@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+import json
 import os
 from pathlib import Path
 
@@ -90,12 +91,33 @@ def test_subscription_and_survey_links_use_environment_templates(monkeypatch):
 
 
 def test_coach_dashboard_uses_configured_liff_id(monkeypatch):
-    monkeypatch.setattr(server, "LIFF_ID", "production-liff-id")
+    monkeypatch.setattr(server, "LIFF_ID", "2000000000-productionLiff")
 
     response = asyncio.run(server.coach_dashboard())
 
-    assert 'liffId: "production-liff-id"' in response
+    assert 'liffId: "2000000000-productionLiff"' in response
     assert 'liffId: "2009824277-W3lYtSjF"' not in response
+
+
+def test_coach_dashboard_json_encodes_liff_id(monkeypatch):
+    malicious = '\";alert(document.domain);//'
+    monkeypatch.setattr(server, "LIFF_ID", malicious)
+
+    response = asyncio.run(server.coach_dashboard())
+
+    assert f"liffId: {json.dumps(malicious)}" in response
+    assert 'liffId: "";alert' not in response
+
+
+def test_named_environment_requires_google_resource(monkeypatch):
+    monkeypatch.setattr(server, "APP_ENV", "staging")
+    with pytest.raises(RuntimeError, match="Google Sheets"):
+        server.require_named_environment_resource("Google Sheets", None)
+
+
+def test_legacy_allows_optional_google_resource(monkeypatch):
+    monkeypatch.setattr(server, "APP_ENV", "legacy")
+    server.require_named_environment_resource("Google Sheets", None)
 
 
 def test_disabled_scheduler_registers_no_jobs_and_does_not_start(monkeypatch):

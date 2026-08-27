@@ -35,6 +35,12 @@ When `APP_ENV` is `staging` or `production`, startup fails unless these environm
 - `SUBSCRIPTION_FORM_URL_TEMPLATE` containing `{uid}`
 - `SURVEY_FORM_URL_TEMPLATE` containing `{uid}`
 
+If any Railway deployment metadata is present while `APP_ENV` is missing, startup
+fails closed instead of falling back to legacy resources or enabling the scheduler.
+`LIFF_ID` must match LINE's numeric-prefix format (for example,
+`2000000000-AbCdEfGh`). `GOOGLE_CREDENTIALS` must be valid service-account JSON,
+and a named environment stops at startup if its configured Sheet cannot initialize.
+
 `PUBLIC_BASE_URL` must be an HTTPS origin without a path. Form templates must use HTTPS. LINE user IDs are validated before startup.
 
 ## External endpoint mapping
@@ -78,3 +84,6 @@ for subscription/survey and for staging/production.
 ## Data policy
 
 Production starts with a fresh SQLite schema. Do not clone staging `usage`, `vips`, `subscription_orders`, `health_profile`, food logs, entitlements, or admin bindings. Official menu data is rebuilt from `menu.csv`; any other table migration requires an explicit table-by-table review.
+
+Both services mount their own Railway volume at `/app/data`. The identical path is
+inside separate containers; never attach the same volume resource to both services.
