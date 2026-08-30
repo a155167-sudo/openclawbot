@@ -6659,6 +6659,44 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
 # ==========================================
 # 6. 其他輔助函數與 Webhook (🔥 融合版：完整保留測距、VIP功能)
 # ==========================================
+def has_active_vip_access(user_id):
+    """只檢查VIP資格，不扣除每日諮詢額度。"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            row = conn.execute(
+                "SELECT remaining_meals, status, expiry_date FROM usage WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    if not row:
+        return False
+    remaining_meals, status, expiry_date = row
+    if status != "vip":
+        return False
+    if expiry_date and tw_today().isoformat() > str(expiry_date):
+        return False
+    return remaining_meals is None or int(remaining_meals) > 0
+
+
+def is_text_command_allowed_without_vip(user_id, message):
+    """非VIP僅可開通VIP；授權管理員與教練只放行各自專用指令。"""
+    if message.startswith("#VIP"):
+        return True
+    if message == "#教練" and user_id in COACH_UIDS:
+        return True
+    if not is_admin_only_command(message):
+        return False
+    if message == "#待審餐點":
+        try:
+            authorized_uid = get_bound_admin_uid_for_authorization()
+        except PermissionError:
+            return False
+    else:
+        authorized_uid = ADMIN_UID
+    return user_id == authorized_uid
+
+
 def check_permission_and_quota(user_id):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
@@ -12381,9 +12419,6 @@ def _handle_message_impl(event):
         return
 
     if msg in ["碳循環", "碳循環排餐", "啟用碳循環", "我要碳循環", "碳循環菜單"]:
-        allow, _ = check_permission_and_quota(uid)
-        if not allow:
-            return
         clear_pending_subscription_state(uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
             "碳循環排餐目前正在調整中，暫時先不開放自動排餐。\n"
@@ -13670,6 +13705,12 @@ def _handle_message_impl(event):
 def handle_message(event):
     message_id = str(event.message.id)
     try:
+        message = event.message.text.strip()
+        user_id = event.source.user_id
+        if not has_active_vip_access(user_id) and not is_text_command_allowed_without_vip(
+            user_id, message
+        ):
+            return
         return _handle_message_impl(event)
     except Exception:
         processed_messages.discard(message_id)

@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -368,6 +368,7 @@ def test_ai_estimate_quota_exception_releases_claim(tmp_path, monkeypatch):
         server, "check_permission_and_quota",
         lambda _uid: (_ for _ in ()).throw(sqlite3.OperationalError("forced quota read failure")),
     )
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     ai_calls = []
     monkeypatch.setattr(
         server, "get_ai_response_with_memory",
@@ -402,7 +403,7 @@ def test_ai_estimate_webhook_replay_precedes_quota_and_openai(tmp_path, monkeypa
             """INSERT INTO usage
                (user_id,remaining_chat_quota,remaining_meals,last_date,status,
                 expiry_date,daily_chat_limit)
-               VALUES ('U-AI-WEBHOOK',1,10,?,'active','2099-12-31',1)""",
+               VALUES ('U-AI-WEBHOOK',1,10,?,'vip','2099-12-31',1)""",
             (today,),
         )
         conn.execute(
@@ -890,6 +891,7 @@ def test_text_edit_replays_confirmation_after_line_reply_failure_without_double_
             raise RuntimeError("simulated LINE reply failure")
 
     monkeypatch.setattr(server.line_bot_api, "reply_message", flaky_reply)
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     server.processed_messages.clear()
     with pytest.raises(RuntimeError, match="simulated"):
         server.handle_message(event)
@@ -1680,7 +1682,11 @@ def test_text_failure_discards_only_failed_event_id(monkeypatch):
     completed_id = "completed-event"
     failed_id = "failed-event"
     server.processed_messages.update({completed_id, failed_id})
-    event = SimpleNamespace(message=SimpleNamespace(id=failed_id))
+    event = SimpleNamespace(
+        message=SimpleNamespace(id=failed_id, text="測試"),
+        source=SimpleNamespace(user_id="U1"),
+    )
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     monkeypatch.setattr(server, "_handle_message_impl", lambda _: (_ for _ in ()).throw(RuntimeError("temporary")))
     with pytest.raises(RuntimeError):
         server.handle_message(event)
@@ -2127,21 +2133,100 @@ def test_package_intro_reset_cannot_clear_delivery_form_block(monkeypatch):
     assert server.get_subscription_form_link(uid) not in second_text
 
 
+@pytest.mark.parametrize(
+    "message",
+    ["飲食紀錄", "我要紀錄飲食", "運費怎麼算", "⚠️ 今日調整"],
+)
+def test_non_vip_pre_gate_text_commands_are_silent(message, monkeypatch):
+    replies = []
+    server.processed_messages.clear()
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False, raising=False)
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, reply: replies.append(reply),
+    )
+
+    server.handle_message(
+        _text_event(f"NON-VIP-GLOBAL-{message}", message, "U_NON_VIP")
+    )
+
+    assert replies == []
+
+
 def test_non_vip_carbon_cycle_command_is_silent(monkeypatch):
     replies = []
     server.processed_messages.clear()
-    monkeypatch.setattr(server, "check_permission_and_quota", lambda _uid: (False, ""))
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False)
     monkeypatch.setattr(
         server.line_bot_api,
         "reply_message",
         lambda _token, message: replies.append(message),
     )
 
-    server._handle_message_impl(
+    server.handle_message(
         _text_event("NON-VIP-CARB-CYCLE", "碳循環", "U_NON_VIP")
     )
 
     assert replies == []
+
+
+def test_active_vip_access_requires_vip_status_valid_expiry_and_meals(tmp_path, monkeypatch):
+    db = tmp_path / "vip-access.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """CREATE TABLE usage (
+                user_id TEXT PRIMARY KEY,
+                remaining_meals INTEGER,
+                status TEXT,
+                expiry_date TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO usage VALUES (?, ?, ?, ?)",
+            ("U1", 12, "vip", (server.tw_today() + timedelta(days=1)).isoformat()),
+        )
+
+    assert server.has_active_vip_access("U1") is True
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE usage SET status='inactive' WHERE user_id='U1'")
+    assert server.has_active_vip_access("U1") is False
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE usage SET status='vip', remaining_meals=0 WHERE user_id='U1'")
+    assert server.has_active_vip_access("U1") is False
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE usage SET remaining_meals=12, expiry_date=? WHERE user_id='U1'",
+            ((server.tw_today() - timedelta(days=1)).isoformat(),),
+        )
+    assert server.has_active_vip_access("U1") is False
+
+
+def test_non_vip_text_allowlist_only_permits_activation_and_authorized_roles(monkeypatch):
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(server, "COACH_UIDS", ["U_COACH"])
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
+
+    assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#VIP24-ABC123") is True
+    assert server.is_text_command_allowed_without_vip("U_ADMIN", "#綁定老闆") is True
+    assert server.is_text_command_allowed_without_vip("U_COACH", "#教練") is True
+    assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#教練") is False
+    assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#綁定老闆") is False
+    assert server.is_text_command_allowed_without_vip("U_ADMIN", "碳循環") is False
+    assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "包月方案") is False
+
+
+def test_non_vip_vip_code_passes_global_text_gate(monkeypatch):
+    seen = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False)
+    monkeypatch.setattr(server, "_handle_message_impl", lambda event: seen.append(event.message.text))
+
+    server.handle_message(
+        _text_event("NON-VIP-ACTIVATION", "#VIP24-ABC123", "U_NON_VIP")
+    )
+
+    assert seen == ["#VIP24-ABC123"]
 
 
 def test_selecting_self_pickup_clears_delivery_form_block(monkeypatch):
