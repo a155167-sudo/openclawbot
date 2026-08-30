@@ -131,6 +131,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
             "SPREADSHEET_ID",
             "SUBSCRIPTION_FORM_URL_TEMPLATE",
             "SURVEY_WEBHOOK_SECRET",
+            "SURVEY_REWARD_LINK_COUNT",
             "SURVEY_FORM_URL_TEMPLATE",
         )
         missing = [

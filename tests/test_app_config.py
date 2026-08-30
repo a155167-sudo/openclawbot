@@ -34,6 +34,7 @@ def isolated_environment(app_env="staging"):
         "ADMIN_SECRET": f"{app_env}-admin-secret",
         "FORM_WEBHOOK_SECRET": "f" * 32,
         "SURVEY_WEBHOOK_SECRET": "s" * 32,
+        "SURVEY_REWARD_LINK_COUNT": "2" if app_env == "production" else "1",
         "ADMIN_UID": "U" + "1" * 32,
         "COACH_UIDS": "U" + "1" * 32,
         "LIFF_ID": "2000000000-" + app_env + "Liff",
@@ -73,6 +74,7 @@ def test_staging_environment_can_isolate_account_resources():
             "ADMIN_SECRET": "staging-admin-secret",
             "FORM_WEBHOOK_SECRET": "f" * 32,
             "SURVEY_WEBHOOK_SECRET": "s" * 32,
+            "SURVEY_REWARD_LINK_COUNT": "1",
             "ADMIN_UID": "U" + "1" * 32,
             "COACH_UIDS": "U" + "1" * 32 + ", U" + "2" * 32,
             "LIFF_ID": "2000000000-stagingLiff",
@@ -139,6 +141,7 @@ def test_invalid_survey_reward_link_count_fails_closed(value):
         "SPREADSHEET_ID",
         "SUBSCRIPTION_FORM_URL_TEMPLATE",
         "SURVEY_WEBHOOK_SECRET",
+        "SURVEY_REWARD_LINK_COUNT",
         "SURVEY_FORM_URL_TEMPLATE",
     ],
 )

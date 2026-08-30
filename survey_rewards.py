@@ -1,14 +1,47 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 
 @dataclass(frozen=True)
 class RewardReservation:
     status: str
     links: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DeliveryLease:
+    status: str
+    links: tuple[str, ...] = ()
+    token: str = ""
+
+
+def _ensure_delivery_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS survey_reward_deliveries (
+            user_id TEXT PRIMARY KEY,
+            links_json TEXT NOT NULL,
+            delivered_at TEXT,
+            lease_token TEXT,
+            lease_expires_at TEXT
+        )
+        """
+    )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(survey_reward_deliveries)")
+    }
+    if "lease_token" not in columns:
+        conn.execute("ALTER TABLE survey_reward_deliveries ADD COLUMN lease_token TEXT")
+    if "lease_expires_at" not in columns:
+        conn.execute(
+            "ALTER TABLE survey_reward_deliveries ADD COLUMN lease_expires_at TEXT"
+        )
 
 
 def build_survey_invitation_message(survey_link: str, reward_count: int) -> str:
@@ -53,9 +86,87 @@ def build_survey_reward_message(links: tuple[str, ...]) -> str:
     )
 
 
+def acquire_survey_reward_delivery(
+    db_path: str,
+    user_id: str,
+    *,
+    now: str,
+    lease_seconds: int = 60,
+) -> DeliveryLease:
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be at least 1")
+    now_dt = datetime.fromisoformat(now)
+    if now_dt.tzinfo is None:
+        raise ValueError("now must include timezone information")
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_delivery_schema(conn)
+        row = conn.execute(
+            """
+            SELECT links_json, delivered_at, lease_token, lease_expires_at
+            FROM survey_reward_deliveries
+            WHERE user_id=?
+            """,
+            (user_id,),
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return DeliveryLease(status="missing")
+        if row[1]:
+            conn.rollback()
+            return DeliveryLease(status="delivered")
+
+        expires_at = datetime.fromisoformat(row[3]) if row[3] else None
+        if row[2] and expires_at and expires_at > now_dt:
+            conn.rollback()
+            return DeliveryLease(status="in_progress")
+
+        token = secrets.token_urlsafe(24)
+        new_expiry = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        cursor = conn.execute(
+            """
+            UPDATE survey_reward_deliveries
+            SET lease_token=?, lease_expires_at=?
+            WHERE user_id=? AND delivered_at IS NULL
+            """,
+            (token, new_expiry, user_id),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return DeliveryLease(status="in_progress")
+        links = tuple(str(link) for link in json.loads(row[0]))
+        conn.commit()
+        return DeliveryLease(status="acquired", links=links, token=token)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def release_survey_reward_delivery(
+    db_path: str,
+    user_id: str,
+    token: str,
+) -> bool:
+    with sqlite3.connect(db_path, timeout=10) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE survey_reward_deliveries
+            SET lease_token=NULL, lease_expires_at=NULL
+            WHERE user_id=? AND lease_token=? AND delivered_at IS NULL
+            """,
+            (user_id, token),
+        )
+        return cursor.rowcount == 1
+
+
 def mark_survey_reward_delivered(
     db_path: str,
     user_id: str,
+    token: str,
     *,
     delivered_at: str,
 ) -> bool:
@@ -63,10 +174,10 @@ def mark_survey_reward_delivered(
         cursor = conn.execute(
             """
             UPDATE survey_reward_deliveries
-            SET delivered_at=COALESCE(delivered_at, ?)
-            WHERE user_id=?
+            SET delivered_at=?, lease_token=NULL, lease_expires_at=NULL
+            WHERE user_id=? AND lease_token=? AND delivered_at IS NULL
             """,
-            (delivered_at, user_id),
+            (delivered_at, user_id, token),
         )
         return cursor.rowcount == 1
 
@@ -85,15 +196,7 @@ def reserve_survey_reward_links(
     conn = sqlite3.connect(db_path, timeout=10)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS survey_reward_deliveries (
-                user_id TEXT PRIMARY KEY,
-                links_json TEXT NOT NULL,
-                delivered_at TEXT
-            )
-            """
-        )
+        _ensure_delivery_schema(conn)
         delivery = conn.execute(
             "SELECT links_json, delivered_at FROM survey_reward_deliveries WHERE user_id=?",
             (user_id,),

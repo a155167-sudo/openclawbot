@@ -2,9 +2,11 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 from survey_rewards import (
+    acquire_survey_reward_delivery,
     build_survey_invitation_message,
     build_survey_reward_message,
     mark_survey_reward_delivered,
+    release_survey_reward_delivery,
     reserve_survey_reward_links,
 )
 
@@ -98,6 +100,39 @@ def test_pending_delivery_reuses_the_same_reserved_links(tmp_path):
     assert used_count == 2
 
 
+def test_delivery_lease_allows_only_one_concurrent_sender(tmp_path):
+    db_path = tmp_path / "quota.db"
+    make_reward_db(db_path, ["https://reward/1", "https://reward/2"])
+    reservation = reserve_survey_reward_links(
+        str(db_path),
+        "U123",
+        claim_date="2026-08-30",
+        reward_count=2,
+    )
+
+    def acquire():
+        return acquire_survey_reward_delivery(
+            str(db_path),
+            "U123",
+            now="2026-08-30T08:30:00+00:00",
+            lease_seconds=60,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        leases = list(pool.map(lambda _: acquire(), range(2)))
+
+    assert sorted(lease.status for lease in leases) == ["acquired", "in_progress"]
+    acquired = next(lease for lease in leases if lease.status == "acquired")
+    assert acquired.links == reservation.links
+    assert acquired.token
+    assert release_survey_reward_delivery(str(db_path), "U123", acquired.token) is True
+
+    retry = acquire()
+    assert retry.status == "acquired"
+    assert retry.links == reservation.links
+    assert retry.token != acquired.token
+
+
 def test_delivered_claim_is_not_resent(tmp_path):
     db_path = tmp_path / "quota.db"
     make_reward_db(db_path, ["https://reward/1", "https://reward/2"])
@@ -108,9 +143,15 @@ def test_delivered_claim_is_not_resent(tmp_path):
         reward_count=2,
     )
 
+    lease = acquire_survey_reward_delivery(
+        str(db_path),
+        "U123",
+        now="2026-08-30T08:30:00+00:00",
+    )
     marked = mark_survey_reward_delivered(
         str(db_path),
         "U123",
+        lease.token,
         delivered_at="2026-08-30T16:30:00+08:00",
     )
     retry = reserve_survey_reward_links(
