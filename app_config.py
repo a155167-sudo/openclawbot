@@ -87,6 +87,7 @@ class AppSettings:
     spreadsheet_id: str
     form_webhook_secret: str
     survey_webhook_secret: str
+    survey_reward_link_count: int
     subscription_form_url_template: str
     survey_form_url_template: str
 
@@ -218,6 +219,14 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
             if len(secret.encode("utf-8")) < 32:
                 raise ValueError(f"{name} 必須至少 32 bytes")
 
+    raw_reward_count = str(environ.get("SURVEY_REWARD_LINK_COUNT") or "1").strip()
+    try:
+        survey_reward_link_count = int(raw_reward_count)
+    except ValueError as exc:
+        raise ValueError("SURVEY_REWARD_LINK_COUNT 必須是 1 到 10 的整數") from exc
+    if not 1 <= survey_reward_link_count <= 10:
+        raise ValueError("SURVEY_REWARD_LINK_COUNT 必須是 1 到 10 的整數")
+
     return AppSettings(
         app_env=app_env,
         enable_scheduler=enable_scheduler,
@@ -231,6 +240,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         ).strip(),
         form_webhook_secret=form_webhook_secret,
         survey_webhook_secret=survey_webhook_secret,
+        survey_reward_link_count=survey_reward_link_count,
         subscription_form_url_template=subscription_template,
         survey_form_url_template=survey_template,
     )

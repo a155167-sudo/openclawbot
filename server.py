@@ -36,6 +36,12 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from app_config import load_settings
+from survey_rewards import (
+    build_survey_invitation_message,
+    build_survey_reward_message,
+    mark_survey_reward_delivered,
+    reserve_survey_reward_links,
+)
 from nutrition_system import (
     apply_nutrition_text_edit,
     approve_food_exchange_suggestion,
@@ -102,6 +108,7 @@ LIFF_ID = APP_SETTINGS.liff_id
 SPREADSHEET_ID = APP_SETTINGS.spreadsheet_id
 FORM_WEBHOOK_SECRET = APP_SETTINGS.form_webhook_secret
 SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
+SURVEY_REWARD_LINK_COUNT = APP_SETTINGS.survey_reward_link_count
 
 
 def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
@@ -3650,50 +3657,82 @@ async def receive_survey_data(request: Request):
     try:
         data = await request.json()
         print(f"📝 [問卷測試] 收到問卷資料：{data}")
-        
+
         # 抓取表單裡的 UID
         user_id = ""
         for k, v in data.items():
             if "UID" in k.upper():
                 user_id = str(v).strip()
                 break
-                
+
         if not user_id or user_id == "UID_REPLACE_ME":
             return {"status": "ignored", "msg": "無效的 UID"}
 
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        
-        # 1. 檢查這個人是不是已經領過點數了？(防貪小便宜)
-        c.execute("SELECT claim_date FROM survey_records WHERE user_id=?", (user_id,))
-        if c.fetchone():
-            conn.close()
-            # 已經領過，不再發網址，但可以回個感謝訊息
-            try: line_bot_api.push_message(user_id, TextSendMessage(text="❤️ 感謝您再次填寫問卷！您之前已經領取過集點卡點數囉，一日樂食祝您有美好的一天！"))
-            except: pass
+        reservation = reserve_survey_reward_links(
+            DB_PATH,
+            user_id,
+            claim_date=tw_today().isoformat(),
+            reward_count=SURVEY_REWARD_LINK_COUNT,
+        )
+
+        if reservation.status == "already_claimed":
+            try:
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(
+                        text="❤️ 感謝您再次填寫問卷！您之前已經領取過集點卡點數囉，一日樂食祝您有美好的一天！"
+                    ),
+                )
+            except Exception:
+                pass
             return {"status": "already_claimed"}
 
-        # 2. 從保險箱抽出一張「還沒被使用」的點數網址
-        c.execute("SELECT link FROM reward_links WHERE is_used=0 LIMIT 1")
-        row = c.fetchone()
-        
-        if row:
-            reward_link = row[0]
-            # 標記為已使用，並記錄這個人已經領過
-            c.execute("UPDATE reward_links SET is_used=1 WHERE link=?", (reward_link,))
-            c.execute("INSERT INTO survey_records (user_id, claim_date) VALUES (?, ?)", (user_id, tw_today().isoformat()))
-            conn.commit()
-            
-            # 3. 把專屬點數網址私訊給客人
-            push_msg = f"🎉 感謝您的寶貴回饋！\n\n這是答應您的專屬獎勵，請點擊下方連結領取【一日樂食集點卡 1 點】👇\n\n{reward_link}\n\n(⚠️ 注意：此連結為專屬一次性連結，點擊後即失效，請勿轉發給他人喔！)"
-            line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
-        else:
-            # 點數發光了，通知老闆！
-            c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
-            admin_row = c.fetchone()
+        if reservation.status == "insufficient_stock":
+            try:
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(
+                        text=(
+                            "❤️ 感謝您的寶貴回饋！目前 "
+                            f"{SURVEY_REWARD_LINK_COUNT} 點獎勵連結正在補貨中，"
+                            "尚未扣除您的領取資格；請稍後再填一次，或聯絡一日樂食客服協助。"
+                        )
+                    ),
+                )
+            except Exception:
+                pass
+
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                admin_row = conn.execute(
+                    "SELECT value FROM admin_settings WHERE key='admin_id'"
+                ).fetchone()
             if admin_row:
-                line_bot_api.push_message(admin_row[0], TextSendMessage(text="🚨 老闆緊急通知：填問卷送點數的「點數網址」已經被抽光啦！請盡快上後台產生新的網址並用 #上傳點數 補貨！"))
-        
-        conn.close()
+                try:
+                    line_bot_api.push_message(
+                        admin_row[0],
+                        TextSendMessage(
+                            text=(
+                                "🚨 老闆緊急通知：滿意度問卷每人需發 "
+                                f"{SURVEY_REWARD_LINK_COUNT} 張一點連結，但目前可用庫存不足 "
+                                f"{SURVEY_REWARD_LINK_COUNT} 張。系統沒有消耗剩餘連結，"
+                                "也沒有標記客人已領取；請用 #上傳點數 補貨。"
+                            )
+                        ),
+                    )
+                except Exception:
+                    pass
+            return {"status": "reward_stock_insufficient"}
+
+        line_bot_api.push_message(
+            user_id,
+            TextSendMessage(text=build_survey_reward_message(reservation.links)),
+        )
+        if not mark_survey_reward_delivered(
+            DB_PATH,
+            user_id,
+            delivered_at=tw_now().isoformat(),
+        ):
+            raise RuntimeError("survey reward delivery record missing")
         return {"status": "success"}
     except Exception as e:
         print(f"⚠️ 問卷處理錯誤: {e}")
@@ -13099,8 +13138,11 @@ def _handle_message_impl(event):
         return
     elif msg == "填寫滿意度問卷":
         survey_link = get_survey_form_link(uid)
-        
-        reply_text = f"🎁 感謝您對一日樂食的支持！\n請點擊下方專屬連結填寫滿意度調查 (約1分鐘)。\n\n完成填寫後，系統將自動發送【1 點集點卡點數】給您喔！👇\n\n{survey_link}"
+
+        reply_text = build_survey_invitation_message(
+            survey_link,
+            SURVEY_REWARD_LINK_COUNT,
+        )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
     elif msg in ["查看菜單", "包月菜單", "查看包月菜單"]:

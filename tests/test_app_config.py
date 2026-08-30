@@ -101,6 +101,26 @@ def test_production_defaults_scheduler_to_enabled():
     assert load_settings(isolated_environment("production")).enable_scheduler is True
 
 
+def test_survey_reward_link_count_defaults_to_one_for_staging():
+    assert load_settings(isolated_environment()).survey_reward_link_count == 1
+
+
+def test_production_can_configure_two_survey_reward_links():
+    environ = isolated_environment("production")
+    environ["SURVEY_REWARD_LINK_COUNT"] = "2"
+
+    assert load_settings(environ).survey_reward_link_count == 2
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "two", "11"])
+def test_invalid_survey_reward_link_count_fails_closed(value):
+    environ = isolated_environment("production")
+    environ["SURVEY_REWARD_LINK_COUNT"] = value
+
+    with pytest.raises(ValueError, match="SURVEY_REWARD_LINK_COUNT"):
+        load_settings(environ)
+
+
 @pytest.mark.parametrize(
     "missing_name",
     [

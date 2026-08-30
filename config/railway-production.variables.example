@@ -13,6 +13,7 @@ MEAL_PHOTO_IMAGE_SECRET=<at least 32 random bytes>
 ADMIN_SECRET=<secret admin command value>
 FORM_WEBHOOK_SECRET=<at least 32 random bytes, production only>
 SURVEY_WEBHOOK_SECRET=<at least 32 random bytes, production only>
+SURVEY_REWARD_LINK_COUNT=2
 
 SPREADSHEET_ID=<production Google Sheet ID>
 ADMIN_UID=<production provider Jason UID>

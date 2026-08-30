@@ -43,6 +43,8 @@ and a named environment stops at startup if its configured Sheet cannot initiali
 
 `PUBLIC_BASE_URL` must be an HTTPS origin without a path. Form templates must use HTTPS. LINE user IDs are validated before startup.
 
+`SURVEY_REWARD_LINK_COUNT` controls how many one-point `reward_links` are reserved per completed survey. It defaults to `1`; set staging to `1` and production to `2`. Values outside `1`–`10` fail closed. Reservations are atomic: when fewer than the configured number remain, the service consumes none and does not record the respondent as claimed. Reserved links are stored in `survey_reward_deliveries` until LINE push succeeds; a retry for the same UID reuses that exact set instead of consuming additional links.
+
 ## External endpoint mapping
 
 | Integration | staging | production |
