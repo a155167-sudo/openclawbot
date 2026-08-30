@@ -1356,6 +1356,33 @@ def test_mark_planned_meal_resets_stale_dashboard_totals_before_first_log(tmp_pa
     assert values == (500.0, 40.0, "舒肥雞胸餐", today)
 
 
+def test_init_db_migrates_health_profile_status_for_existing_database(tmp_path, monkeypatch):
+    data_dir = tmp_path / "volume-status-migration"
+    data_dir.mkdir()
+    db_path = data_dir / "health.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE health_profile (
+                user_id TEXT PRIMARY KEY,
+                name TEXT,
+                tdee INTEGER,
+                protein REAL,
+                goal TEXT,
+                restrictions TEXT,
+                summary_text TEXT,
+                active_days TEXT
+            )"""
+        )
+
+    monkeypatch.setattr(server, "DB_DIR", str(data_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db_path))
+    server.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(health_profile)")}
+    assert "status" in columns
+
+
 def test_health_check_uses_configured_sqlite_schema(tmp_path, monkeypatch):
     data_dir = tmp_path / "volume"
     db_path = data_dir / "health.db"

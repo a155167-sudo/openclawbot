@@ -2963,7 +2963,8 @@ def init_db():
             UNIQUE(user_id, workout_date, workout_type)
         )''')
 
-        for col, dtype in [("today_extra_cal", "INTEGER DEFAULT 0"), 
+        for col, dtype in [("status", "TEXT DEFAULT ''"),
+                           ("today_extra_cal", "INTEGER DEFAULT 0"),
                            ("today_date", "TEXT DEFAULT ''"), 
                            ("sheet_name", "TEXT DEFAULT ''"), 
                            ("today_extra_pro", "INTEGER DEFAULT 0"), 
