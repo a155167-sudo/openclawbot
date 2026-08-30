@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
+import os
 import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,29 @@ def _ensure_delivery_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE survey_reward_deliveries ADD COLUMN lease_expires_at TEXT"
         )
+
+
+def try_acquire_survey_reward_delivery_lock(
+    db_path: str,
+    user_id: str,
+) -> int | None:
+    lock_dir = Path(db_path).resolve().parent / ".survey_reward_locks"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_name = hashlib.sha256(user_id.encode("utf-8")).hexdigest() + ".lock"
+    fd = os.open(lock_dir / lock_name, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def release_survey_reward_delivery_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def build_survey_invitation_message(survey_link: str, reward_count: int) -> str:

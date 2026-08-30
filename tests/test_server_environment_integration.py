@@ -1,6 +1,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -67,6 +68,23 @@ class BlockingLineBotApi(RecordingLineBotApi):
         self.entered.set()
         if not self.release.wait(timeout=5):
             raise TimeoutError("test did not release LINE push")
+
+
+class BlockFirstLineBotApi(RecordingLineBotApi):
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+
+    def push_message(self, user_id, message):
+        with self._lock:
+            self.pushes.append((user_id, message))
+            call_number = len(self.pushes)
+        if call_number == 1:
+            self.entered.set()
+            if not self.release.wait(timeout=5):
+                raise TimeoutError("test did not release first LINE push")
 
 
 def test_webhook_secret_is_required_when_configured():
@@ -249,6 +267,53 @@ def test_concurrent_duplicate_survey_callbacks_push_only_once(monkeypatch, tmp_p
         ).fetchone()[0]
     assert used_count == 2
     assert claim_count == 1
+
+
+def test_active_sender_blocks_takeover_after_database_lease_expiry(monkeypatch, tmp_path):
+    db_path = tmp_path / "quota.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE reward_links (link TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE survey_records (user_id TEXT PRIMARY KEY, claim_date TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE admin_settings (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO reward_links (link, is_used) VALUES (?, 0)",
+            [("https://reward/1",), ("https://reward/2",), ("https://reward/3",)],
+        )
+
+    line_api = BlockFirstLineBotApi()
+    current_time = [datetime(2026, 8, 30, 9, 0, tzinfo=timezone.utc)]
+    monkeypatch.setattr(server, "DB_PATH", str(db_path))
+    monkeypatch.setattr(server, "SURVEY_WEBHOOK_SECRET", "s" * 32)
+    monkeypatch.setattr(server, "SURVEY_REWARD_LINK_COUNT", 2)
+    monkeypatch.setattr(server, "line_bot_api", line_api)
+    monkeypatch.setattr(server, "tw_now", lambda: current_time[0])
+    payload = {"uid": "U123"}
+
+    def call_endpoint():
+        return asyncio.run(
+            server.receive_survey_data(JsonRequest(payload, "s" * 32))
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(call_endpoint)
+        assert line_api.entered.wait(timeout=5)
+        current_time[0] += timedelta(seconds=61)
+        second = pool.submit(call_endpoint)
+        try:
+            second_result = second.result(timeout=5)
+        finally:
+            line_api.release.set()
+        first_result = first.result(timeout=5)
+
+    assert first_result == {"status": "success"}
+    assert second_result == {"status": "delivery_in_progress"}
+    assert len(line_api.pushes) == 1
 
 
 def test_survey_endpoint_preserves_one_point_staging_reward(monkeypatch, tmp_path):

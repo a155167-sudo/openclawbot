@@ -42,7 +42,9 @@ from survey_rewards import (
     build_survey_reward_message,
     mark_survey_reward_delivered,
     release_survey_reward_delivery,
+    release_survey_reward_delivery_lock,
     reserve_survey_reward_links,
+    try_acquire_survey_reward_delivery_lock,
 )
 from nutrition_system import (
     apply_nutrition_text_edit,
@@ -3725,36 +3727,42 @@ async def receive_survey_data(request: Request):
                     pass
             return {"status": "reward_stock_insufficient"}
 
-        delivery = acquire_survey_reward_delivery(
-            DB_PATH,
-            user_id,
-            now=tw_now().isoformat(),
-            lease_seconds=60,
-        )
-        if delivery.status == "in_progress":
+        delivery_lock = try_acquire_survey_reward_delivery_lock(DB_PATH, user_id)
+        if delivery_lock is None:
             return {"status": "delivery_in_progress"}
-        if delivery.status == "delivered":
-            return {"status": "already_claimed"}
-        if delivery.status != "acquired":
-            raise RuntimeError("survey reward delivery record missing")
-
         try:
-            line_bot_api.push_message(
+            delivery = acquire_survey_reward_delivery(
+                DB_PATH,
                 user_id,
-                TextSendMessage(text=build_survey_reward_message(delivery.links)),
+                now=tw_now().isoformat(),
+                lease_seconds=60,
             )
-        except Exception:
-            release_survey_reward_delivery(DB_PATH, user_id, delivery.token)
-            raise
+            if delivery.status == "in_progress":
+                return {"status": "delivery_in_progress"}
+            if delivery.status == "delivered":
+                return {"status": "already_claimed"}
+            if delivery.status != "acquired":
+                raise RuntimeError("survey reward delivery record missing")
 
-        if not mark_survey_reward_delivered(
-            DB_PATH,
-            user_id,
-            delivery.token,
-            delivered_at=tw_now().isoformat(),
-        ):
-            raise RuntimeError("survey reward delivery lease lost")
-        return {"status": "success"}
+            try:
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text=build_survey_reward_message(delivery.links)),
+                )
+            except Exception:
+                release_survey_reward_delivery(DB_PATH, user_id, delivery.token)
+                raise
+
+            if not mark_survey_reward_delivered(
+                DB_PATH,
+                user_id,
+                delivery.token,
+                delivered_at=tw_now().isoformat(),
+            ):
+                raise RuntimeError("survey reward delivery lease lost")
+            return {"status": "success"}
+        finally:
+            release_survey_reward_delivery_lock(delivery_lock)
     except Exception as e:
         print(f"⚠️ 問卷處理錯誤: {e}")
         return {"status": "error"}
