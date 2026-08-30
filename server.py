@@ -12381,6 +12381,9 @@ def _handle_message_impl(event):
         return
 
     if msg in ["碳循環", "碳循環排餐", "啟用碳循環", "我要碳循環", "碳循環菜單"]:
+        allow, _ = check_permission_and_quota(uid)
+        if not allow:
+            return
         clear_pending_subscription_state(uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
             "碳循環排餐目前正在調整中，暫時先不開放自動排餐。\n"

@@ -2127,6 +2127,23 @@ def test_package_intro_reset_cannot_clear_delivery_form_block(monkeypatch):
     assert server.get_subscription_form_link(uid) not in second_text
 
 
+def test_non_vip_carbon_cycle_command_is_silent(monkeypatch):
+    replies = []
+    server.processed_messages.clear()
+    monkeypatch.setattr(server, "check_permission_and_quota", lambda _uid: (False, ""))
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message),
+    )
+
+    server._handle_message_impl(
+        _text_event("NON-VIP-CARB-CYCLE", "碳循環", "U_NON_VIP")
+    )
+
+    assert replies == []
+
+
 def test_selecting_self_pickup_clears_delivery_form_block(monkeypatch):
     uid = "U_SELF_PICKUP_UNBLOCK"
     replies = []
