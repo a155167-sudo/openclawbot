@@ -142,6 +142,7 @@ def test_survey_endpoint_awards_two_one_point_links(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "DB_PATH", str(db_path))
     monkeypatch.setattr(server, "SURVEY_WEBHOOK_SECRET", "s" * 32)
     monkeypatch.setattr(server, "SURVEY_REWARD_LINK_COUNT", 2)
+    monkeypatch.setattr(server, "SURVEY_REWARD_POINTS_PER_LINK", 1)
     monkeypatch.setattr(server, "line_bot_api", line_api)
 
     response = asyncio.run(
@@ -316,7 +317,7 @@ def test_active_sender_blocks_takeover_after_database_lease_expiry(monkeypatch, 
     assert len(line_api.pushes) == 1
 
 
-def test_survey_endpoint_preserves_one_point_staging_reward(monkeypatch, tmp_path):
+def test_survey_endpoint_sends_one_two_point_reward_link(monkeypatch, tmp_path):
     db_path = tmp_path / "quota.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -337,6 +338,7 @@ def test_survey_endpoint_preserves_one_point_staging_reward(monkeypatch, tmp_pat
     monkeypatch.setattr(server, "DB_PATH", str(db_path))
     monkeypatch.setattr(server, "SURVEY_WEBHOOK_SECRET", "s" * 32)
     monkeypatch.setattr(server, "SURVEY_REWARD_LINK_COUNT", 1)
+    monkeypatch.setattr(server, "SURVEY_REWARD_POINTS_PER_LINK", 2)
     monkeypatch.setattr(server, "line_bot_api", line_api)
 
     response = asyncio.run(
@@ -352,8 +354,8 @@ def test_survey_endpoint_preserves_one_point_staging_reward(monkeypatch, tmp_pat
         ).fetchone()[0]
     assert used_count == 1
     assert len(line_api.pushes) == 1
-    assert "集點卡 1 點" in line_api.pushes[0][1].text
-    assert "集點卡 2 點" not in line_api.pushes[0][1].text
+    assert "集點卡 2 點" in line_api.pushes[0][1].text
+    assert "集點卡 1 點" not in line_api.pushes[0][1].text
 
 
 def test_server_source_contains_no_direct_legacy_account_resource_ids():

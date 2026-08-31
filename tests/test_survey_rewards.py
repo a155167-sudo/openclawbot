@@ -211,6 +211,19 @@ def test_concurrent_claims_never_share_the_same_two_links(tmp_path):
     assert set(claimed.links) == {"https://reward/1", "https://reward/2"}
 
 
+def test_two_point_message_can_use_one_two_point_link():
+    message = build_survey_reward_message(
+        ("https://reward/1",),
+        points_per_link=2,
+    )
+
+    assert "集點卡 2 點" in message
+    assert "https://reward/1" in message
+    assert "集點卡 1 點" not in message
+    assert "第 2 點" not in message
+    assert "兩個連結都要分別點擊" not in message
+
+
 def test_two_point_message_contains_both_one_point_links():
     message = build_survey_reward_message(
         ("https://reward/1", "https://reward/2")

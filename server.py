@@ -113,6 +113,7 @@ SPREADSHEET_ID = APP_SETTINGS.spreadsheet_id
 FORM_WEBHOOK_SECRET = APP_SETTINGS.form_webhook_secret
 SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
 SURVEY_REWARD_LINK_COUNT = APP_SETTINGS.survey_reward_link_count
+SURVEY_REWARD_POINTS_PER_LINK = APP_SETTINGS.survey_reward_points_per_link
 
 
 def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
@@ -3768,7 +3769,12 @@ async def receive_survey_data(request: Request):
             try:
                 line_bot_api.push_message(
                     user_id,
-                    TextSendMessage(text=build_survey_reward_message(delivery.links)),
+                    TextSendMessage(
+                        text=build_survey_reward_message(
+                            delivery.links,
+                            points_per_link=SURVEY_REWARD_POINTS_PER_LINK,
+                        )
+                    ),
                 )
             except Exception:
                 release_survey_reward_delivery(DB_PATH, user_id, delivery.token)
@@ -13229,7 +13235,7 @@ def _handle_message_impl(event):
 
         reply_text = build_survey_invitation_message(
             survey_link,
-            SURVEY_REWARD_LINK_COUNT,
+            SURVEY_REWARD_LINK_COUNT * SURVEY_REWARD_POINTS_PER_LINK,
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return

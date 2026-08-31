@@ -34,7 +34,7 @@ def isolated_environment(app_env="staging"):
         "ADMIN_SECRET": f"{app_env}-admin-secret",
         "FORM_WEBHOOK_SECRET": "f" * 32,
         "SURVEY_WEBHOOK_SECRET": "s" * 32,
-        "SURVEY_REWARD_LINK_COUNT": "2" if app_env == "production" else "1",
+        "SURVEY_REWARD_LINK_COUNT": "1",
         "ADMIN_UID": "U" + "1" * 32,
         "COACH_UIDS": "U" + "1" * 32,
         "LIFF_ID": "2000000000-" + app_env + "Liff",
@@ -112,6 +112,26 @@ def test_production_can_configure_two_survey_reward_links():
     environ["SURVEY_REWARD_LINK_COUNT"] = "2"
 
     assert load_settings(environ).survey_reward_link_count == 2
+
+
+def test_survey_reward_points_per_link_defaults_to_two():
+    assert load_settings(isolated_environment("production")).survey_reward_points_per_link == 2
+
+
+def test_survey_reward_points_per_link_can_be_overridden():
+    environ = isolated_environment("production")
+    environ["SURVEY_REWARD_POINTS_PER_LINK"] = "3"
+
+    assert load_settings(environ).survey_reward_points_per_link == 3
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "two", "101"])
+def test_invalid_survey_reward_points_per_link_fails_closed(value):
+    environ = isolated_environment("production")
+    environ["SURVEY_REWARD_POINTS_PER_LINK"] = value
+
+    with pytest.raises(ValueError, match="SURVEY_REWARD_POINTS_PER_LINK"):
+        load_settings(environ)
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "two", "11"])

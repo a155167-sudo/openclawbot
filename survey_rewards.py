@@ -82,28 +82,39 @@ def build_survey_invitation_message(survey_link: str, reward_count: int) -> str:
     )
 
 
-def build_survey_reward_message(links: tuple[str, ...]) -> str:
+def build_survey_reward_message(
+    links: tuple[str, ...],
+    *,
+    points_per_link: int = 1,
+) -> str:
     if not links:
         raise ValueError("at least one reward link is required")
+    if points_per_link < 1:
+        raise ValueError("points_per_link must be at least 1")
 
-    point_count = len(links)
+    link_count = len(links)
+    point_count = link_count * points_per_link
     intro = (
         "🎉 感謝您的寶貴回饋！\n\n"
         f"這是答應您的專屬獎勵【一日樂食集點卡 {point_count} 點】。\n\n"
     )
-    if point_count == 1:
+    if link_count == 1:
         return (
             f"{intro}請點擊下方連結領取：\n{links[0]}\n\n"
             "⚠️ 此連結為專屬一次性連結，請勿轉發給他人。"
         )
 
     numbered_links = "\n\n".join(
-        f"第 {index} 點：\n{link}"
+        (
+            f"第 {index} 點：\n{link}"
+            if points_per_link == 1
+            else f"第 {index} 個獎勵連結：\n{link}"
+        )
         for index, link in enumerate(links, start=1)
     )
     click_instruction = (
         "兩個連結都要分別點擊"
-        if point_count == 2
+        if link_count == 2
         else "所有連結都要分別點擊"
     )
     return (
