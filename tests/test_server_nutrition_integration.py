@@ -1970,6 +1970,63 @@ def test_legacy_subscription_order_over_three_kilometers_is_not_created(monkeypa
     assert "建立包月資料" not in replies[0]
 
 
+def test_form_data_routes_delivery_quote_failure_to_manual_review(monkeypatch):
+    created = []
+    pushed = []
+
+    async def request_json():
+        return {
+            "UID": "U_FORM_MAPS_FAILURE",
+            "稱呼": "測試客戶",
+            "本期取餐方式": "外送",
+            "本期外送地址": "台北市測試路1號",
+        }
+
+    monkeypatch.setattr(
+        server,
+        "calculate_delivery_quote",
+        lambda _address: {
+            "success": False,
+            "delivery_available": None,
+            "address": _address,
+            "distance_text": "",
+            "distance_meters": 0,
+            "duration_text": "",
+            "delivery_fee": 0,
+            "delivery_fee_text": "地址查詢失敗",
+            "delivery_zone": "未分類",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "create_pending_subscription_form_order",
+        lambda _snapshot: created.append(True) or 988,
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "push_message",
+        lambda uid, message: pushed.append((uid, message.text)),
+    )
+
+    result = asyncio.run(
+        server.receive_form_data(
+            cast(Any, SimpleNamespace(json=request_json)),
+            cast(Any, SimpleNamespace()),
+        )
+    )
+
+    assert result == {
+        "status": "pending_manual_delivery_review",
+        "reason": "delivery_quote_failed",
+    }
+    assert created == []
+    assert len(pushed) == 1
+    assert pushed[0][0] == "U_FORM_MAPS_FAILURE"
+    assert "運費待客服確認" in pushed[0][1]
+    assert "不需要重新填寫表單" in pushed[0][1]
+    assert "$0" not in pushed[0][1]
+
+
 def test_form_data_rejects_over_three_kilometer_delivery_before_pending_order(monkeypatch):
     created = []
     pushed = []

@@ -3055,6 +3055,26 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             user_id,
             delivery_info.get("delivery_available") if is_delivery else True,
         )
+        if is_delivery and not delivery_info.get("success"):
+            manual_review_text = (
+                "⚠️ 包月資料已收到，但地圖系統暫時無法完成測距。\n\n"
+                f"📍 外送地址：{address}\n"
+                "🛵 運費待客服確認\n\n"
+                "這次不會以未確認的運費建立訂單；您的表單資料已保留，"
+                "客服會確認距離與最終金額，您不需要重新填寫表單。"
+            )
+            try:
+                line_bot_api.push_message(
+                    user_id, TextSendMessage(text=manual_review_text)
+                )
+            except Exception as push_error:
+                print(
+                    f"⚠️ 推播測距失敗人工確認通知失敗 uid={user_id[:8]}...: {push_error}"
+                )
+            return {
+                "status": "pending_manual_delivery_review",
+                "reason": "delivery_quote_failed",
+            }
         if is_delivery and delivery_info.get("delivery_available") is False:
             rejection_text = (
                 "🚫 此地址暫不提供外送\n\n"
