@@ -1671,6 +1671,7 @@ def test_transient_image_failure_allows_webhook_redelivery(monkeypatch):
         reply_token="reply",
     )
     server.processed_messages.discard(message_id)
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     monkeypatch.setattr(server, "cleanup_nutrition_images", lambda: None)
     monkeypatch.setattr(server.line_bot_api, "get_message_content", lambda _: (_ for _ in ()).throw(RuntimeError("temporary")))
     with pytest.raises(RuntimeError):
@@ -2209,6 +2210,38 @@ def test_non_vip_pre_gate_text_commands_are_silent(message, monkeypatch):
     )
 
     assert replies == []
+
+
+def test_non_vip_image_message_is_silent_before_processing(monkeypatch):
+    calls = []
+    message_id = "NON-VIP-IMAGE"
+    server.processed_messages.discard(message_id)
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False)
+    monkeypatch.setattr(
+        server,
+        "cleanup_nutrition_images",
+        lambda: calls.append("cleanup"),
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "get_message_content",
+        lambda _message_id: calls.append("download"),
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, _message: calls.append("reply"),
+    )
+    event = SimpleNamespace(
+        message=SimpleNamespace(id=message_id),
+        source=SimpleNamespace(user_id="U_NON_VIP"),
+        reply_token="reply-non-vip-image",
+    )
+
+    server.handle_image_message(event)
+
+    assert calls == []
+    assert message_id not in server.processed_messages
 
 
 def test_non_vip_carbon_cycle_command_is_silent(monkeypatch):
@@ -3230,6 +3263,7 @@ def test_vision_prompt_requests_observations_not_fake_food_photo_nutrients():
 
 def test_unknown_image_reply_mentions_meal_photos(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     monkeypatch.setattr(server, "cleanup_nutrition_images", lambda: None)
     monkeypatch.setattr(
         server.line_bot_api, "get_message_content",
@@ -3264,6 +3298,7 @@ def test_food_photo_image_handler_stages_durable_unknown_safe_flex(tmp_path, mon
     db = tmp_path / "meal-photo-handler.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     monkeypatch.setattr(server, "cleanup_nutrition_images", lambda: None)
     monkeypatch.setattr(
         server.line_bot_api,
