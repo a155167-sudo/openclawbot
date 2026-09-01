@@ -9742,6 +9742,8 @@ def cleanup_nutrition_images():
 def handle_image_message(event):
     """收到 Garmin 截圖 → GPT-4o Vision 解析 → 寫入 SQLite → 回覆用戶"""
     uid = event.source.user_id
+    if not has_active_vip_access(uid):
+        return
     message_id = event.message.id
     if message_id in processed_messages:
         return
