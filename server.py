@@ -102,6 +102,12 @@ from meal_photo_system import (
     normalize_meal_photo_payload,
     save_meal_photo_draft,
 )
+from vip_health_check import (
+    create_first_vip_health_check_case,
+    ensure_vip_health_check_schema,
+    get_customer_health_check_state,
+    is_vip_health_check_enabled,
+)
 
 APP_SETTINGS = load_settings(os.environ)
 APP_ENV = APP_SETTINGS.app_env
@@ -114,6 +120,7 @@ FORM_WEBHOOK_SECRET = APP_SETTINGS.form_webhook_secret
 SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
 SURVEY_REWARD_LINK_COUNT = APP_SETTINGS.survey_reward_link_count
 SURVEY_REWARD_POINTS_PER_LINK = APP_SETTINGS.survey_reward_points_per_link
+VIP_HEALTH_CHECK_ENABLED = is_vip_health_check_enabled()
 
 
 def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
@@ -2802,6 +2809,14 @@ def ensure_subscription_menu_entitlement_schema(conn):
     """)
 
 
+def get_vip_health_check_state_for_user(user_id: str):
+    """內部唯讀服務；公開路由需待 LIFF ID token 驗證完成後另行建立。"""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return None
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        return get_customer_health_check_state(conn, user_id=user_id)
+
+
 def init_db():
     # 單一資料路徑來源：必須遵守 DATA_DIR／DB_PATH，才能安全掛載 Railway Volume。
     os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
@@ -2996,6 +3011,8 @@ def init_db():
         ensure_daily_health_schema(conn)
         # 無營養標示餐點照片的持久草稿與按鈕確認狀態。
         ensure_meal_photo_schema(conn)
+        # 首次 VIP 三日健檢採獨立 additive schema；功能入口仍由 flag 控制。
+        ensure_vip_health_check_schema(conn)
 
         # --- 以上結束 ---
 
@@ -7673,51 +7690,89 @@ def generate_package_codes(t, n):
     return codes
 
 def redeem_code(uid, code):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0", (code,))
-    r = c.fetchone()
-    if not r: conn.close(); return None, "❌ 無效"
-    order_record = None
-    is_subscription_order_code = code.startswith("#VIPORDER-")
-    if is_subscription_order_code:
-        c.execute("SELECT id, user_id, formalized_at, status FROM subscription_orders WHERE vip_code=?", (code,))
-        order_record = c.fetchone()
-        if not order_record:
-            conn.close()
-            return None, "❌ 找不到對應的包月訂單，請聯絡客服確認開通碼。"
-    if order_record and order_record[1] != uid:
-        conn.close()
-        return None, "❌ 此開通碼不屬於目前帳號，請使用原訂購LINE帳號兌換。"
-    if order_record and (not order_record[2] or order_record[3] != "activated"):
-        conn.close()
-        return None, "⏳ 此訂單尚未完成付款確認與正式配餐，請先聯絡客服。"
     linked_order = None
-    if order_record:
-        linked_order = (order_record[0], order_record[2], order_record[3])
-    m, d, l = r; today = tw_today()
-    c.execute("UPDATE vips SET is_used=1 WHERE code=?", (code,))
-    c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (uid,))
-    u = c.fetchone(); curr_m = u[0] if u else 0
-    exp = (today + timedelta(days=d)).isoformat()
-    c.execute("INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)", (uid, l, curr_m+m, today.isoformat(), 'vip', exp, l))
-    if linked_order and linked_order[1] and linked_order[2] == "activated":
-        ensure_subscription_menu_entitlement_schema(conn)
-        c.execute("""
-            INSERT INTO subscription_menu_entitlements
-                (user_id, order_id, vip_code, status, starts_on, expires_on, created_at)
-            VALUES (?, ?, ?, 'active', ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                order_id=excluded.order_id,
-                vip_code=excluded.vip_code,
-                status='active',
-                starts_on=excluded.starts_on,
-                expires_on=excluded.expires_on,
-                created_at=excluded.created_at
-        """, (
-            uid, linked_order[0], code, today.isoformat(), exp,
-            tw_now().strftime("%Y-%m-%d %H:%M:%S"),
-        ))
-    conn.commit(); conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        try:
+            c = conn.cursor()
+            c.execute(
+                "SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0",
+                (code,),
+            )
+            r = c.fetchone()
+            if not r:
+                return None, "❌ 無效"
+            order_record = None
+            is_subscription_order_code = code.startswith("#VIPORDER-")
+            if is_subscription_order_code:
+                c.execute(
+                    "SELECT id, user_id, formalized_at, status FROM subscription_orders WHERE vip_code=?",
+                    (code,),
+                )
+                order_record = c.fetchone()
+                if not order_record:
+                    return None, "❌ 找不到對應的包月訂單，請聯絡客服確認開通碼。"
+            if order_record and order_record[1] != uid:
+                return None, "❌ 此開通碼不屬於目前帳號，請使用原訂購LINE帳號兌換。"
+            if order_record and (not order_record[2] or order_record[3] != "activated"):
+                return None, "⏳ 此訂單尚未完成付款確認與正式配餐，請先聯絡客服。"
+            if order_record:
+                linked_order = (order_record[0], order_record[2], order_record[3])
+            m, d, l = r
+            today = tw_today()
+            activated_at = tw_now()
+            c.execute(
+                "UPDATE vips SET is_used=1 WHERE code=? AND is_used=0",
+                (code,),
+            )
+            if c.rowcount != 1:
+                conn.rollback()
+                return None, "❌ 無效"
+            c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (uid,))
+            u = c.fetchone()
+            curr_m = u[0] if u else 0
+            exp = (today + timedelta(days=d)).isoformat()
+            c.execute(
+                "INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)",
+                (uid, l, curr_m + m, today.isoformat(), "vip", exp, l),
+            )
+            if linked_order and linked_order[1] and linked_order[2] == "activated":
+                ensure_subscription_menu_entitlement_schema(conn)
+                c.execute(
+                    """
+                    INSERT INTO subscription_menu_entitlements
+                        (user_id, order_id, vip_code, status, starts_on, expires_on, created_at)
+                    VALUES (?, ?, ?, 'active', ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        order_id=excluded.order_id,
+                        vip_code=excluded.vip_code,
+                        status='active',
+                        starts_on=excluded.starts_on,
+                        expires_on=excluded.expires_on,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        uid,
+                        linked_order[0],
+                        code,
+                        today.isoformat(),
+                        exp,
+                        tw_now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
+                )
+            if VIP_HEALTH_CHECK_ENABLED:
+                activation_id = f"vip_redemption_event:{uuid.uuid4().hex}"
+                create_first_vip_health_check_case(
+                    conn,
+                    user_id=uid,
+                    first_vip_activation_id=activation_id,
+                    activation_event_key=activation_id,
+                    activated_at=activated_at,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     if linked_order and linked_order[1] and linked_order[2] == "activated":
         return exp, (
             "🎉 兌換成功，包月會員權限已啟用！\n"

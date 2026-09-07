@@ -37,6 +37,9 @@ When `APP_ENV` is `staging` or `production`, startup fails unless these environm
 
 If any Railway deployment metadata is present while `APP_ENV` is missing, startup
 fails closed instead of falling back to legacy resources or enabling the scheduler.
+`VIP_HEALTH_CHECK_ENABLED` is separately fail-closed: an unset or unrecognised value
+keeps the feature disabled. Both checked-in Railway templates pin it to `false`; change
+it only during a reviewed rollout.
 `LIFF_ID` must match LINE's numeric-prefix format (for example,
 `2000000000-AbCdEfGh`). `GOOGLE_CREDENTIALS` must be valid service-account JSON,
 and a named environment stops at startup if its configured Sheet cannot initialize.
