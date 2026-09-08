@@ -5282,6 +5282,213 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
         assert all(r[0] == "早餐" for r in rows)
 
 
+def test_dashboard_uses_food_ledger_without_creating_placeholder_health_profile(tmp_path, monkeypatch):
+    db_dir = tmp_path / "new-vip-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U-NEW-VIP", product_name="燕麥豆漿", meal_slot="午餐",
+            consumed_at=f"{today}T12:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 287, "protein_g": 11.3},
+            source_type="official_menu",
+        )
+        server.create_daily_food_log(
+            conn, user_id="U-NEW-VIP", product_name="鮭魚食蔬", meal_slot="晚餐",
+            consumed_at=f"{today}T18:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 376, "protein_g": 24},
+            source_type="official_menu",
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT 1 FROM health_profile WHERE user_id='U-NEW-VIP'"
+        ).fetchone() is None
+
+    dashboard = server.get_dashboard_data("U-NEW-VIP")
+
+    assert dashboard is not None
+    assert dashboard["name"] == "你"
+    assert dashboard["tdee"] == 2000
+    assert dashboard["protein_goal"] == 100
+    assert dashboard["extra_cal"] == 663
+    assert dashboard["extra_pro"] == 35.3
+    assert dashboard["food_list"] == ["燕麥豆漿", "鮭魚食蔬"]
+    assert dashboard["recorded_count"] == 2
+    assert dashboard["task_logged_once"] is True
+    assert dashboard["task_two_meals"] is True
+
+    flex = server.build_dashboard_flex("U-NEW-VIP")
+    assert flex is not None
+    rendered = json.dumps(flex.as_json_dict(), ensure_ascii=False)
+    assert "燕麥豆漿" in rendered
+    assert "鮭魚食蔬" in rendered
+    assert "663" in rendered
+    assert "35.3" in rendered
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM health_profile WHERE user_id='U-NEW-VIP'"
+        ).fetchone() is None
+
+
+def test_dashboard_without_profile_keeps_delimiter_in_single_food_name(tmp_path, monkeypatch):
+    db_dir = tmp_path / "delimiter-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U-SINGLE-FOOD", product_name="雞胸、青花菜", meal_slot="早餐",
+            consumed_at=f"{today}T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 200, "protein_g": 20},
+            source_type="official_menu",
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT 1 FROM health_profile WHERE user_id='U-SINGLE-FOOD'"
+        ).fetchone() is None
+
+    dashboard = server.get_dashboard_data("U-SINGLE-FOOD")
+
+    assert dashboard is not None
+    assert dashboard["food_list"] == ["雞胸、青花菜"]
+    assert dashboard["recorded_count"] == 1
+    assert dashboard["task_two_meals"] is False
+    assert dashboard["extra_cal"] == 200
+    assert dashboard["extra_pro"] == 20
+
+    flex = server.build_dashboard_flex("U-SINGLE-FOOD")
+    assert flex is not None
+    rendered = json.dumps(flex.as_json_dict(), ensure_ascii=False)
+    assert '"text": "雞胸、青花菜"' in rendered
+    assert "今日飲食紀錄" in rendered
+    assert "今日已記錄：200.0 / 2000 kcal" in rendered
+    assert "今日已記錄：20.0 / 100 g" in rendered
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM health_profile WHERE user_id='U-SINGLE-FOOD'"
+        ).fetchone() is None
+
+
+def test_dashboard_with_profile_uses_canonical_log_names_without_delimiter_xp(tmp_path, monkeypatch):
+    db_dir = tmp_path / "profile-delimiter-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,today_extra_cal,today_extra_pro,today_food_items,today_date)
+               VALUES ('U-PROFILE','既有會員',1800,90,200,20,'雞胸、青花菜',?)""",
+            (today,),
+        )
+        server.create_daily_food_log(
+            conn, user_id="U-PROFILE", product_name="雞胸、青花菜", meal_slot="早餐",
+            consumed_at=f"{today}T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 200, "protein_g": 20},
+            source_type="official_menu",
+        )
+        conn.commit()
+
+    dashboard = server.get_dashboard_data("U-PROFILE")
+
+    assert dashboard["food_list"] == ["雞胸、青花菜"]
+    assert dashboard["recorded_count"] == 1
+    assert dashboard["task_two_meals"] is False
+    assert dashboard["extra_cal"] == 200
+    assert dashboard["extra_pro"] == 20
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COALESCE(SUM(today_xp_earned), 0) FROM achievement_daily_log WHERE user_id='U-PROFILE'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COALESCE(xp_total, 0) FROM user_achievements WHERE user_id='U-PROFILE'"
+        ).fetchone()[0] == 0
+
+
+def test_dashboard_keeps_empty_user_without_profile_hidden(tmp_path, monkeypatch):
+    db_dir = tmp_path / "empty-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+
+    assert server.get_dashboard_data("U-NO-PROFILE-NO-FOOD") is None
+
+
+def test_dashboard_uses_canonical_totals_when_profile_projection_already_contains_photo(tmp_path, monkeypatch):
+    db_dir = tmp_path / "profile-photo-projection-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,today_extra_cal,today_extra_pro,today_food_items,today_date)
+               VALUES ('U-PROJECTED-PHOTO','既有會員',1800,90,0,0,'',?)""",
+            (today,),
+        )
+        server.create_daily_food_log(
+            conn, user_id="U-PROJECTED-PHOTO", product_name="正常餐", meal_slot="午餐",
+            consumed_at=f"{today}T12:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 100, "protein_g": 10},
+            source_type="official_menu",
+        )
+        insert_approved_meal_photo_log(
+            conn, token="feedface0001", user_id="U-PROJECTED-PHOTO",
+            reviewer="U-PROJECTED-PHOTO", consumed_at=f"{today}T13:00:00+08:00",
+            meal_slot="午餐", source_image_ref="projected-photo.jpg",
+            observed_payload={
+                "visible_items": [{"name": "照片餐", "category": "protein", "confidence": 0.9}]
+            },
+            answers={},
+            exact_exchange={
+                "milk_exchange": 0, "protein_low_exchange": 1,
+                "protein_medium_exchange": 0, "protein_high_exchange": 0,
+                "starch_exchange": 0, "vegetable_exchange": 0,
+                "fruit_exchange": 0, "fat_exchange": 0,
+            },
+        )
+        server._sync_health_profile_from_ledger_conn(
+            conn, "U-PROJECTED-PHOTO", today, current_date=today
+        )
+        projected = conn.execute(
+            """SELECT today_extra_cal,today_extra_pro
+               FROM health_profile WHERE user_id='U-PROJECTED-PHOTO'"""
+        ).fetchone()
+        conn.commit()
+
+    assert projected == (155, 17)
+    dashboard = server.get_dashboard_data("U-PROJECTED-PHOTO")
+    replayed = server.get_dashboard_data("U-PROJECTED-PHOTO")
+
+    assert dashboard["extra_cal"] == 155
+    assert dashboard["extra_pro"] == 17
+    assert dashboard["food_list"] == ["正常餐", "餐點照片：照片餐"]
+    assert dashboard["recorded_count"] == 2
+    assert replayed["extra_cal"] == 155
+    assert replayed["extra_pro"] == 17
+
+
 def test_dashboard_counts_approved_meal_photo_estimates_once_including_legacy_na_snapshot(tmp_path, monkeypatch):
     db_dir = tmp_path / "photo-dashboard"
     db = db_dir / "health.db"
@@ -5368,6 +5575,52 @@ def test_dashboard_counts_approved_meal_photo_estimates_once_including_legacy_na
     replayed_dashboard = server.get_dashboard_data("U1")
     assert replayed_dashboard["extra_cal"] == 293.0
     assert replayed_dashboard["extra_pro"] == 24.0
+
+
+def test_dashboard_without_profile_excludes_deleted_confirmed_photo(tmp_path, monkeypatch):
+    db_dir = tmp_path / "deleted-photo-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U-DELETED-PHOTO", product_name="正常餐", meal_slot="午餐",
+            consumed_at=f"{today}T12:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 100, "protein_g": 10},
+            source_type="official_menu",
+        )
+        deleted = insert_approved_meal_photo_log(
+            conn, token="deadbeef0001", user_id="U-DELETED-PHOTO",
+            reviewer="U-DELETED-PHOTO", consumed_at=f"{today}T13:00:00+08:00",
+            meal_slot="午餐", source_image_ref="deleted.jpg",
+            observed_payload={
+                "visible_items": [{"name": "已刪照片", "category": "protein", "confidence": 0.9}]
+            },
+            answers={},
+            exact_exchange={
+                "milk_exchange": 0, "protein_low_exchange": 1,
+                "protein_medium_exchange": 0, "protein_high_exchange": 0,
+                "starch_exchange": 0, "vegetable_exchange": 0,
+                "fruit_exchange": 0, "fat_exchange": 0,
+            },
+        )
+        conn.execute(
+            "UPDATE food_logs SET deleted_at=? WHERE log_id=?",
+            (server.tw_now().isoformat(), deleted["log_id"]),
+        )
+        conn.commit()
+
+    dashboard = server.get_dashboard_data("U-DELETED-PHOTO")
+
+    assert dashboard["food_list"] == ["正常餐"]
+    assert dashboard["recorded_count"] == 1
+    assert dashboard["extra_cal"] == 100
+    assert dashboard["extra_pro"] == 10
+    assert dashboard["task_two_meals"] is False
 
 
 def test_dashboard_excludes_other_user_old_unconfirmed_and_non_photo_logs(tmp_path, monkeypatch):

@@ -102,6 +102,13 @@ from meal_photo_system import (
     normalize_meal_photo_payload,
     save_meal_photo_draft,
 )
+from vip_health_check import (
+    configure_vip_health_check_connection,
+    create_first_vip_health_check_case,
+    ensure_vip_health_check_schema,
+    get_customer_health_check_state,
+    is_vip_health_check_enabled,
+)
 
 APP_SETTINGS = load_settings(os.environ)
 APP_ENV = APP_SETTINGS.app_env
@@ -114,6 +121,7 @@ FORM_WEBHOOK_SECRET = APP_SETTINGS.form_webhook_secret
 SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
 SURVEY_REWARD_LINK_COUNT = APP_SETTINGS.survey_reward_link_count
 SURVEY_REWARD_POINTS_PER_LINK = APP_SETTINGS.survey_reward_points_per_link
+VIP_HEALTH_CHECK_ENABLED = is_vip_health_check_enabled()
 
 
 def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
@@ -412,7 +420,7 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
                   fl.meal_slot,fl.consumed_servings,fl.consumed_amount,fl.consumed_unit,
                   fl.nutrition_snapshot_json,fl.nutrient_sources_json,fl.version,
                   fl.approved_exchange_json,fc.fingerprint,a.food_fingerprint,
-                  a.suggestion_rule_version,a.approved_exchange_hash
+                  a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id
            FROM food_logs fl
            JOIN food_catalog fc ON fc.food_id=fl.food_id
            LEFT JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
@@ -2802,13 +2810,25 @@ def ensure_subscription_menu_entitlement_schema(conn):
     """)
 
 
+def get_vip_health_check_state_for_user(user_id: str):
+    """內部唯讀服務；公開路由需待 LIFF ID token 驗證完成後另行建立。"""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return None
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        configure_vip_health_check_connection(conn)
+        return get_customer_health_check_state(conn, user_id=user_id)
+
+
 def init_db():
     # 單一資料路徑來源：必須遵守 DATA_DIR／DB_PATH，才能安全掛載 Railway Volume。
     os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
 
+    conn = None
     try:
         # 🔗 3. 安全連線
         conn = sqlite3.connect(DB_PATH)
+        # VIP 三日健檔 schema 含跨表外鍵；必須在任何 transaction 前啟用。
+        configure_vip_health_check_connection(conn)
         c = conn.cursor()
         
         # --- 以下是您的原本表格定義 (保持不變) ---
@@ -2996,15 +3016,23 @@ def init_db():
         ensure_daily_health_schema(conn)
         # 無營養標示餐點照片的持久草稿與按鈕確認狀態。
         ensure_meal_photo_schema(conn)
+        # 首次 VIP 三日健檢採獨立 additive schema；功能入口仍由 flag 控制。
+        ensure_vip_health_check_schema(conn)
 
         # --- 以上結束 ---
 
         conn.commit()
         conn.close()
+        conn = None
         print(f"✅ 保險箱資料庫連線成功！路徑: {DB_PATH}")
 
     except Exception as e:
+        if conn is not None:
+            conn.rollback()
+            conn.close()
         print(f"❌ 啟動保險箱失敗，錯誤原因: {e}")
+        if APP_ENV != "legacy":
+            raise
 init_db()
 load_menu()  # 🔥 伺服器啟動時自動載入菜單
 sync_menu_to_food_catalog()  # 同步菜單到 food_catalog
@@ -5298,6 +5326,7 @@ def compute_achievement_snapshot(user_id: str, dashboard: dict = None) -> dict:
 def get_dashboard_data(user_id: str) -> dict:
     """取得儀表板所需資料，Phase 1 Flex Message 和 Phase 2 LIFF API 都用這個"""
     hp = None
+    ledger_names = []
     checked_slots = set()
     workout_done = False
     frequent_foods = []
@@ -5315,6 +5344,33 @@ def get_dashboard_data(user_id: str) -> dict:
                             today_food_items, today_date, sheet_name
                      FROM health_profile WHERE user_id=?""", (user_id,))
         hp = c.fetchone()
+
+        ledger_rows = _daily_food_rows(conn, user_id, today_str)
+        ledger_items = [
+            _ledger_item_from_row(row) for row in ledger_rows
+        ]
+        ordinary_ledger_items = [
+            item for row, item in zip(ledger_rows, ledger_items)
+            if item.get("source_type") != "user_meal_photo"
+            and not str(row[17] or "").strip()
+        ]
+        ledger_names = [
+            item["product_name"] for item in ordinary_ledger_items
+        ]
+        ordinary_ledger_cal = ordinary_ledger_pro = 0.0
+        for item in ordinary_ledger_items:
+            nutrition = item.get("nutrition") or {}
+            if nutrition.get("calories_kcal") is not None:
+                ordinary_ledger_cal += float(nutrition["calories_kcal"])
+            if nutrition.get("protein_g") is not None:
+                ordinary_ledger_pro += float(nutrition["protein_g"])
+
+        if not hp:
+            # 新 VIP 可能先完成 LINE 飲食紀錄、稍後才填健康表單。
+            # Dashboard 只讀 canonical food_logs 作 fallback；不要建立空的
+            # health_profile，否則舊流程可能誤判為已完成 onboarding。
+            if ledger_items:
+                hp = ("", 2000, 100, 0, 0, "", today_str, "")
         
         if hp:
             # 2. 抓今日打卡紀錄
@@ -5349,6 +5405,7 @@ def get_dashboard_data(user_id: str) -> dict:
                          ON a.approval_id=fl.exchange_approval_id AND a.food_id=fl.food_id
                        WHERE fl.user_id=? AND date(fl.consumed_at, '+8 hours')=?
                          AND fl.confirmation_status='confirmed'
+                         AND COALESCE(fl.deleted_at,'')=''
                          AND fc.source_type='user_meal_photo'
                        ORDER BY fl.consumed_at, fl.created_at""",
                     (user_id, today_str),
@@ -5375,17 +5432,14 @@ def get_dashboard_data(user_id: str) -> dict:
     if not hp:
         return None
 
-    name, tdee, protein_goal, extra_cal, extra_pro, food_items, today_date, sheet_name = hp
+    name, tdee, protein_goal, _projected_cal, _projected_pro, _projected_foods, _projected_date, sheet_name = hp
     tdee = tdee or 2000
     protein_goal = protein_goal or 100
-    extra_cal = extra_cal or 0
-    extra_pro = extra_pro or 0
 
-    if today_date != today_str:
-        extra_cal, extra_pro, food_items = 0, 0, ""
-
-    extra_cal = round(float(extra_cal) + approved_photo_cal, 4)
-    extra_pro = round(float(extra_pro) + approved_photo_pro, 4)
+    # Dashboard 的今日飲食只信任 canonical food_logs。一般餐由逐筆快照加總，
+    # 照片餐則只加入上方通過 fingerprint／approval hash 驗證的數值。
+    extra_cal = round(ordinary_ledger_cal + approved_photo_cal, 4)
+    extra_pro = round(ordinary_ledger_pro + approved_photo_pro, 4)
 
     cal_remaining = max(0, tdee - extra_cal)
     pro_remaining = max(0, protein_goal - extra_pro)
@@ -5449,7 +5503,7 @@ def get_dashboard_data(user_id: str) -> dict:
     lunch_checked = "午餐" in checked_slots
     dinner_checked = "晚餐" in checked_slots
 
-    food_list = [f.strip() for f in food_items.split("、") if f.strip()] if food_items else []
+    food_list = list(ledger_names)
     food_list.extend(approved_photo_foods)
     recorded_count = len(food_list)
     task_logged_once = (extra_cal > 0 or extra_pro > 0 or recorded_count >= 1)
@@ -5680,6 +5734,11 @@ def build_dashboard_flex(user_id: str):
     # ==========================================
     # 👈 左卡：純飲食儀表板 Bubble
     # ==========================================
+    recorded_foods = [str(item or "").strip() for item in d.get("food_list", []) if str(item or "").strip()]
+    food_summary = "、".join(item[:32] for item in recorded_foods[:3]) or "尚無紀錄"
+    if len(recorded_foods) > 3:
+        food_summary += f"，另有 {len(recorded_foods) - 3} 筆"
+
     diet_bubble = {
         "type": "bubble", "size": "mega",
         "header": {
@@ -5701,6 +5760,10 @@ def build_dashboard_flex(user_id: str):
                 {"type": "text", "text": "🥩 蛋白進度", "size": "xs", "color": "#888888", "margin": "md"},
                 {"type": "text", "text": f"今日已記錄：{d['extra_pro']} / {d['protein_goal']} g", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm"},
                 dual_progress_bar(d["pro_recorded_segment"], d["pro_planned_segment"], d["pro_remaining_segment"], "#FF6B35", "#FFD2C2"),
+                {"type": "separator", "margin": "md"},
+
+                {"type": "text", "text": "🍽️ 今日飲食紀錄", "size": "xs", "color": "#888888", "margin": "md"},
+                {"type": "text", "text": food_summary, "size": "sm", "color": "#333333", "margin": "sm", "wrap": True},
                 {"type": "separator", "margin": "lg"},
 
                 {"type": "box", "layout": "vertical", "margin": "md", "backgroundColor": "#f8f8f8", "cornerRadius": "8px", "paddingAll": "12px", "contents": [
@@ -7673,51 +7736,92 @@ def generate_package_codes(t, n):
     return codes
 
 def redeem_code(uid, code):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0", (code,))
-    r = c.fetchone()
-    if not r: conn.close(); return None, "❌ 無效"
-    order_record = None
-    is_subscription_order_code = code.startswith("#VIPORDER-")
-    if is_subscription_order_code:
-        c.execute("SELECT id, user_id, formalized_at, status FROM subscription_orders WHERE vip_code=?", (code,))
-        order_record = c.fetchone()
-        if not order_record:
-            conn.close()
-            return None, "❌ 找不到對應的包月訂單，請聯絡客服確認開通碼。"
-    if order_record and order_record[1] != uid:
-        conn.close()
-        return None, "❌ 此開通碼不屬於目前帳號，請使用原訂購LINE帳號兌換。"
-    if order_record and (not order_record[2] or order_record[3] != "activated"):
-        conn.close()
-        return None, "⏳ 此訂單尚未完成付款確認與正式配餐，請先聯絡客服。"
     linked_order = None
-    if order_record:
-        linked_order = (order_record[0], order_record[2], order_record[3])
-    m, d, l = r; today = tw_today()
-    c.execute("UPDATE vips SET is_used=1 WHERE code=?", (code,))
-    c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (uid,))
-    u = c.fetchone(); curr_m = u[0] if u else 0
-    exp = (today + timedelta(days=d)).isoformat()
-    c.execute("INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)", (uid, l, curr_m+m, today.isoformat(), 'vip', exp, l))
-    if linked_order and linked_order[1] and linked_order[2] == "activated":
-        ensure_subscription_menu_entitlement_schema(conn)
-        c.execute("""
-            INSERT INTO subscription_menu_entitlements
-                (user_id, order_id, vip_code, status, starts_on, expires_on, created_at)
-            VALUES (?, ?, ?, 'active', ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                order_id=excluded.order_id,
-                vip_code=excluded.vip_code,
-                status='active',
-                starts_on=excluded.starts_on,
-                expires_on=excluded.expires_on,
-                created_at=excluded.created_at
-        """, (
-            uid, linked_order[0], code, today.isoformat(), exp,
-            tw_now().strftime("%Y-%m-%d %H:%M:%S"),
-        ))
-    conn.commit(); conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        try:
+            if VIP_HEALTH_CHECK_ENABLED:
+                # PRAGMA 在 transaction 開始後不生效，必須先於任何兌換寫入。
+                configure_vip_health_check_connection(conn)
+            c = conn.cursor()
+            c.execute(
+                "SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0",
+                (code,),
+            )
+            r = c.fetchone()
+            if not r:
+                return None, "❌ 無效"
+            order_record = None
+            is_subscription_order_code = code.startswith("#VIPORDER-")
+            if is_subscription_order_code:
+                c.execute(
+                    "SELECT id, user_id, formalized_at, status FROM subscription_orders WHERE vip_code=?",
+                    (code,),
+                )
+                order_record = c.fetchone()
+                if not order_record:
+                    return None, "❌ 找不到對應的包月訂單，請聯絡客服確認開通碼。"
+            if order_record and order_record[1] != uid:
+                return None, "❌ 此開通碼不屬於目前帳號，請使用原訂購LINE帳號兌換。"
+            if order_record and (not order_record[2] or order_record[3] != "activated"):
+                return None, "⏳ 此訂單尚未完成付款確認與正式配餐，請先聯絡客服。"
+            if order_record:
+                linked_order = (order_record[0], order_record[2], order_record[3])
+            m, d, l = r
+            today = tw_today()
+            activated_at = tw_now()
+            c.execute(
+                "UPDATE vips SET is_used=1 WHERE code=? AND is_used=0",
+                (code,),
+            )
+            if c.rowcount != 1:
+                conn.rollback()
+                return None, "❌ 無效"
+            c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (uid,))
+            u = c.fetchone()
+            curr_m = u[0] if u else 0
+            exp = (today + timedelta(days=d)).isoformat()
+            c.execute(
+                "INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)",
+                (uid, l, curr_m + m, today.isoformat(), "vip", exp, l),
+            )
+            if linked_order and linked_order[1] and linked_order[2] == "activated":
+                ensure_subscription_menu_entitlement_schema(conn)
+                c.execute(
+                    """
+                    INSERT INTO subscription_menu_entitlements
+                        (user_id, order_id, vip_code, status, starts_on, expires_on, created_at)
+                    VALUES (?, ?, ?, 'active', ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        order_id=excluded.order_id,
+                        vip_code=excluded.vip_code,
+                        status='active',
+                        starts_on=excluded.starts_on,
+                        expires_on=excluded.expires_on,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        uid,
+                        linked_order[0],
+                        code,
+                        today.isoformat(),
+                        exp,
+                        tw_now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
+                )
+            if VIP_HEALTH_CHECK_ENABLED:
+                activation_id = f"vip_redemption_event:{uuid.uuid4().hex}"
+                create_first_vip_health_check_case(
+                    conn,
+                    user_id=uid,
+                    first_vip_activation_id=activation_id,
+                    activation_event_key=activation_id,
+                    activated_at=activated_at,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     if linked_order and linked_order[1] and linked_order[2] == "activated":
         return exp, (
             "🎉 兌換成功，包月會員權限已啟用！\n"

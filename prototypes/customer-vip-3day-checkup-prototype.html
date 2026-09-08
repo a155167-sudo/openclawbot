@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>VIP 3 日飲食健檢｜顧客端互動雛形</title>
+  <style>
+    :root{--ink:#16332a;--muted:#61736c;--green:#126b4f;--green2:#eaf5ef;--lime:#dcecc5;--cream:#faf8f0;--paper:#fffef9;--line:#dce5df;--amber:#9a6214;--amber2:#fff3db;--shadow:0 18px 45px rgba(20,53,42,.12);--radius:20px}
+    *{box-sizing:border-box} body{margin:0;background:#e8eee9;color:var(--ink);font-family:"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif;line-height:1.55}
+    button{font:inherit} button:focus-visible{outline:3px solid #f1a43b;outline-offset:2px}.app{width:min(100%,430px);min-height:100dvh;margin:auto;background:var(--cream);box-shadow:var(--shadow);position:relative;padding-bottom:24px;overflow:hidden}
+    .topbar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:10px;padding:15px 18px;background:rgba(250,248,240,.96);border-bottom:1px solid var(--line)}
+    .brand{display:flex;align-items:center;gap:10px;flex:1}.mark{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:var(--green);color:#fff;font-weight:900}.brand b{display:block;font-size:15px}.brand small{display:block;color:var(--muted);font-size:11px}.back{display:none;min-width:44px;height:44px;border:0;border-radius:13px;background:#fff;color:var(--ink);font-weight:800}
+    main{padding:18px}.screen{display:none}.screen.active{display:block}.eyebrow{font-size:11px;letter-spacing:.12em;color:var(--green);font-weight:900}.title{font-family:"Noto Serif TC","PMingLiU",serif;font-size:27px;line-height:1.25;margin:5px 0 7px}.lead{margin:0;color:var(--muted);font-size:14px}
+    .notice{margin:16px 0;padding:13px 14px;background:#fff;border:1px solid var(--line);border-radius:14px;font-size:12px;color:#51635c}.notice b{color:var(--ink)}
+    .progress-card{margin-top:18px;padding:20px;border-radius:24px;background:var(--green);color:#fff}.progress-top{display:flex;justify-content:space-between;align-items:flex-start;gap:14px}.progress-top small{display:block;color:#d7eee4}.progress-count{font-size:38px;line-height:1;font-weight:900}.progress-count span{font-size:15px;font-weight:700}.bar{height:8px;border-radius:20px;background:rgba(255,255,255,.2);overflow:hidden;margin:16px 0 12px}.bar i{display:block;height:100%;width:0;background:#f5d58c;border-radius:20px;transition:width .25s ease}.status-copy{font-size:13px;margin:0;color:#e6f3ed}
+    .state-panel{margin-top:13px;padding:12px;border:1px dashed #b9c8c0;border-radius:15px;background:#f6f5ed}.state-panel label{display:block;font-size:11px;color:var(--muted);font-weight:800;margin-bottom:8px}.states{display:flex;gap:6px;overflow:auto;padding-bottom:2px}.state{border:1px solid var(--line);background:#fff;border-radius:10px;padding:8px 10px;white-space:nowrap;min-height:44px;font-size:12px;color:var(--muted)}.state.active{background:var(--ink);border-color:var(--ink);color:#fff}
+    .section{margin-top:22px}.section-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.section h2{font-size:16px;margin:0}.section-head small{font-size:11px;color:var(--muted)}
+    .days{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:11px}.day{padding:12px 9px;border:1px solid var(--line);border-radius:15px;background:#fff}.day b{display:block;font-size:13px}.day small{display:block;color:var(--muted);font-size:11px;margin-top:3px}.day.done{background:var(--green2);border-color:#a8cbbb}.day.wait{background:#f0eee5;color:#718078}
+    .action-card{margin-top:12px;padding:17px;background:#fff;border:1px solid var(--line);border-radius:18px}.action-card h3{font-size:15px;margin:0 0 5px}.action-card p{font-size:12px;color:var(--muted);margin:0 0 13px}.btn{width:100%;min-height:48px;border:0;border-radius:13px;padding:11px 14px;font-weight:900;cursor:pointer}.primary{background:var(--green);color:#fff}.secondary{background:var(--green2);color:var(--green);border:1px solid #b9d6c8}.quiet{background:#f0eee5;color:var(--ink)}.btn+.btn{margin-top:8px}.two{display:grid;grid-template-columns:1fr 1fr;gap:8px}.two .btn+.btn{margin-top:0}
+    .route-card{display:grid;grid-template-columns:38px 1fr;gap:10px;padding:13px 0;border-top:1px solid var(--line)}.route-card:first-of-type{border-top:0}.route-num{width:34px;height:34px;border-radius:11px;background:var(--lime);display:grid;place-items:center;font-weight:900}.route-card b{font-size:13px}.route-card p{font-size:11px;margin:2px 0;color:var(--muted)}
+    .report-cover{background:var(--ink);color:#fff;margin:-18px -18px 0;padding:28px 22px 24px}.report-cover small{color:#cde3d9}.report-cover h1{font-family:"Noto Serif TC","PMingLiU",serif;font-size:29px;line-height:1.2;margin:7px 0 10px}.report-meta{display:flex;gap:16px;font-size:12px;color:#d8e7e0}.report-block{margin-top:14px;padding:17px;background:#fff;border:1px solid var(--line);border-radius:18px}.report-block .label{font-size:11px;color:var(--green);font-weight:900}.report-block h2{font-family:"Noto Serif TC","PMingLiU",serif;font-size:20px;margin:3px 0 8px}.report-block p,.report-block li{font-size:13px;color:#52645c}.report-block ul{margin:8px 0 0;padding-left:20px}.priority{background:var(--amber2);border-color:#ecd39e}.confidence{padding:12px 14px;margin-top:14px;border-radius:13px;background:#f1f2ed;font-size:11px;color:var(--muted)}
+    .coach-head{padding:18px;border-radius:22px;background:var(--green);color:#fff}.coach-head h1{font-family:"Noto Serif TC","PMingLiU",serif;font-size:26px;margin:5px 0}.coach-head p{font-size:13px;color:#d9eee5;margin:0}.weeks{margin-top:14px}.week{display:flex;gap:12px;padding:13px 0;border-bottom:1px solid var(--line)}.week strong{width:44px;height:44px;border-radius:13px;background:var(--green2);color:var(--green);display:grid;place-items:center;font-size:12px;flex:none}.week b{font-size:13px}.week p{font-size:11px;margin:2px 0;color:var(--muted)}
+    .payment-status{text-align:center;padding:28px 16px}.status-icon{width:72px;height:72px;margin:auto;border-radius:50%;display:grid;place-items:center;background:var(--amber2);color:var(--amber);font-size:32px}.payment-status h1{font-family:"Noto Serif TC","PMingLiU",serif;font-size:25px;margin:14px 0 6px}.payment-status p{font-size:13px;color:var(--muted)}.steps{text-align:left;margin:20px 0;padding:0;list-style:none;counter-reset:steps}.steps li{counter-increment:steps;padding:12px 0 12px 40px;border-bottom:1px solid var(--line);position:relative;font-size:13px}.steps li:before{content:counter(steps);position:absolute;left:0;top:10px;width:28px;height:28px;border-radius:9px;background:var(--ink);color:#fff;display:grid;place-items:center;font-weight:900}
+    .dev-note{margin-top:22px;border-top:1px solid var(--line);padding-top:16px}.dev-note summary{font-size:12px;color:var(--muted);cursor:pointer}.dev-note p,.dev-note li{font-size:11px;color:var(--muted)}code{font-family:ui-monospace,monospace;background:#ecefe9;padding:1px 4px;border-radius:4px}
+    .bottom{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:min(100%,430px);padding:12px 18px calc(12px + env(safe-area-inset-bottom));background:rgba(255,254,249,.96);border-top:1px solid var(--line);z-index:12}.toast{position:fixed;left:50%;bottom:90px;transform:translate(-50%,20px);width:min(calc(100% - 40px),390px);padding:12px 15px;background:var(--ink);color:#fff;border-radius:13px;font-size:12px;opacity:0;pointer-events:none;transition:.2s;z-index:30}.toast.show{opacity:1;transform:translate(-50%,0)}.hidden{display:none!important}
+    @media(min-width:700px){body{padding:24px 0}.app{min-height:820px;border-radius:28px}.bottom{bottom:24px;border-radius:0 0 28px 28px}}
+    @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+  </style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <button class="back" id="backToHome" aria-label="返回進度首頁">←</button>
+    <div class="brand"><span class="mark">日</span><div><b>一日樂食・VIP 健檢</b><small>此為假資料互動雛形</small></div></div>
+  </header>
+
+  <main>
+    <section class="screen active" id="homeScreen">
+      <div class="eyebrow">VIP FIRST-USE BENEFIT</div>
+      <h1 class="title">先記錄，再給你<br>真正能執行的建議</h1>
+      <p class="lead">VIP 首次開通權益包含 7 天練習期、完成 3 個有效紀錄日，以及 1 次營養師基準報告。</p>
+      <div class="notice"><b>7 天窗口已自 VIP 正式生效啟動。</b>不用另外按開始、不另發序號，也不新增第三個飲食紀錄入口。</div>
+
+      <section class="progress-card" aria-live="polite">
+        <div class="progress-top"><div><small>3 日飲食健檢進度</small><div class="progress-count"><b id="count">0</b><span>/3 個有效日</span></div></div><small id="windowText">還有 7 天</small></div>
+        <div class="bar"><i id="progressBar"></i></div>
+        <p class="status-copy" id="statusCopy">從今天開始，用原本的飲食紀錄方式即可。</p>
+      </section>
+
+      <div class="state-panel">
+        <label>雛形狀態切換（正式版不顯示）</label>
+        <div class="states">
+          <button class="state active" data-demo-state="0">0/3</button>
+          <button class="state" data-demo-state="1">1/3</button>
+          <button class="state" data-demo-state="2">2/3</button>
+          <button class="state" data-demo-state="3">3/3</button>
+          <button class="state" data-demo-state="ai">AI 整理中</button>
+          <button class="state" data-demo-state="review">營養師審核中</button>
+          <button class="state" data-demo-state="approved">報告待送達</button>
+          <button class="state" data-demo-state="delivery-failed">送達失敗</button>
+          <button class="state" data-demo-state="done">報告完成</button>
+        </div>
+      </div>
+
+      <section class="section">
+        <div class="section-head"><h2>你的 3 個有效紀錄日</h2><small>建議 2 平日＋1 假日</small></div>
+        <div class="days" id="days"></div>
+      </section>
+
+      <section class="action-card" id="nextAction">
+        <h3 id="actionTitle">完成第 1 個有效紀錄日</h3>
+        <p id="actionCopy">每天不必三餐都完美；一個有效日以至少 2 餐主要餐點，並補上飲料、點心與宵夜狀況為原則。</p>
+        <button class="btn primary" id="startCheckup">前往既有「紀錄飲食」</button>
+        <button class="btn primary hidden" id="viewReport">查看 3 日飲食基準報告</button>
+      </section>
+
+      <section class="section">
+        <div class="section-head"><h2>沿用你現在的兩個入口</h2><small>不建立新入口</small></div>
+        <div class="action-card">
+          <div class="route-card"><span class="route-num">A</span><div><b>紀錄飲食 / FOOD LOG</b><p>傳照片、文字或搜尋食品，完成後仍寫入既有 <code>food_logs</code>。</p></div></div>
+          <button class="btn secondary" id="openFoodLog">模擬開啟「紀錄飲食」</button>
+          <div class="route-card"><span class="route-num">B</span><div><b>首頁／儀表板</b><p>正式 Rich Menu 名稱待確認；既有訊息觸發詞為首頁、儀表板、我的狀態、今日進度。</p></div></div>
+          <button class="btn secondary" id="openDashboard">模擬開啟今日儀表板</button>
+        </div>
+      </section>
+
+      <section class="section" id="plannedMealCard">
+        <div class="section-head"><h2>今天的一日樂食安排</h2><small>沿用既有資料</small></div>
+        <div class="action-card">
+          <div class="route-card"><span class="route-num">午</span><div><b>雞肉低碳餐盒</b><p>520 kcal・蛋白質 38 g（假資料）</p></div></div>
+          <button class="btn quiet" id="markLunch">午餐已吃</button>
+          <div class="route-card"><span class="route-num">晚</span><div><b>鮭魚食蔬餐盒</b><p>560 kcal・蛋白質 35 g（假資料）</p></div></div>
+          <button class="btn quiet" id="markDinner">晚餐已吃</button>
+          <p style="font-size:11px;color:var(--muted);margin:12px 0 0">「午餐已吃／晚餐已吃」沿用正式 <code>source_type='planned_meal'</code> 的同一筆紀錄；健檢只讀取，不重複計算或另存一餐。</p>
+        </div>
+      </section>
+
+      <details class="dev-note"><summary>原型資料與邊界說明</summary><ul><li>所有姓名、餐點、熱量和報告內容均是假資料。</li><li>正式版以已確認且未刪除的 <code>food_logs</code> 為事實來源。</li><li>營養師判斷另存 review／suggested value，不覆蓋顧客原始熱量。</li><li>本雛形不連 LINE、不讀正式資料、不寫資料庫。</li></ul></details>
+    </section>
+
+    <section class="screen" id="reportScreen">
+      <div class="report-cover"><small>一次性 VIP 基準報告</small><h1>3 日飲食基準報告</h1><div class="report-meta"><span>3 個有效日</span><span>8 餐</span><span>完整度 84%</span></div></div>
+      <div class="report-block"><span class="label">01・保留</span><h2>你做得好的地方</h2><p>主要餐點都有明確蛋白質來源，而且含糖飲料頻率不高。這是可以持續保留的基礎。</p></div>
+      <div class="report-block priority"><span class="label">02・先調整一件事</span><h2>優先調整建議</h2><p>早餐有 2 天缺少明確蛋白質。先從早餐補上一份無糖豆漿、蛋或無糖優格，不需要同時改掉所有餐。</p></div>
+      <div class="report-block"><span class="label">03・執行</span><h2>接下來 7 天行動</h2><ul><li>任選 5 天，早餐加入 1 份蛋白質。</li><li>原本飲食照常記錄，不必重開新頁面。</li><li>第 7 天回看完成率，不追求每餐滿分。</li></ul></div>
+      <div class="confidence">資料限制：其中一餐醬汁份量不確定；未拍到的食物不能視為沒有吃。報告內容為假資料示範。</div>
+      <section class="section"><h2>接下來你可以</h2><div class="action-card"><button class="btn quiet" id="selfPractice">先自己執行 7 天</button><button class="btn primary" id="viewCoaching">查看 4 週營養師陪跑</button></div></section>
+    </section>
+
+    <section class="screen" id="coachingScreen">
+      <div class="coach-head"><div class="eyebrow" style="color:#cde8dc">OPTIONAL ADD-ON</div><h1>4 週營養師陪跑</h1><p>基準報告已包含在首次 VIP 權益；這是需要真正營養師持續看紀錄、追蹤調整的額外服務。</p></div>
+      <section class="weeks">
+        <div class="week"><strong>W1</strong><div><b>確認可執行目標</b><p>依基準報告設定一件最優先的飲食行動。</p></div></div>
+        <div class="week"><strong>W2</strong><div><b>檢查卡點</b><p>根據既有紀錄調整，不要求另填一套飲食日誌。</p></div></div>
+        <div class="week"><strong>W3</strong><div><b>外食與情境修正</b><p>把建議改成顧客平日真正做得到的版本。</p></div></div>
+        <div class="week"><strong>W4</strong><div><b>回顧與維持方案</b><p>整理有效策略，留下後續可自行執行的方式。</p></div></div>
+      </section>
+      <div class="notice"><b>付款方式：人工匯款。</b>不串自動金流；提出申請後由客服提供正式匯款資訊，確認後直接開通同一 LINE 帳號，不另發序號。</div>
+      <button class="btn primary" id="requestTransfer">索取人工匯款資訊</button>
+      <button class="btn quiet" id="keepSelfPractice">先自己執行</button>
+    </section>
+
+    <section class="screen" id="paymentScreen">
+      <div class="payment-status"><div class="status-icon">⌛</div><h1>等待客服確認</h1><p>你的 4 週陪跑申請已建立。這是雛形，不會真的送出資料或顯示銀行帳號。</p>
+        <ol class="steps"><li><b>客服傳送正式匯款資訊</b><br><span>僅在正式 LINE 對話中提供。</span></li><li><b>顧客完成人工匯款</b><br><span>不經自動金流或付款 webhook。</span></li><li><b>客服人工核對</b><br><span>確認後開通原本 LINE 帳號。</span></li></ol>
+        <button class="btn primary" id="paymentDone">模擬客服已確認</button>
+      </div>
+    </section>
+
+    <section class="screen" id="coachingActiveScreen">
+      <div class="payment-status"><div class="status-icon" style="background:var(--green2);color:var(--green)">✓</div><h1>4 週陪跑已開通</h1><p>客服已人工確認款項，服務直接綁定原本的 LINE 帳號；沒有新序號，也沒有第二個飲食入口。</p>
+        <ol class="steps"><li><b>第 1 週：確認行動目標</b><br><span>由真正營養師依基準報告確認。</span></li><li><b>沿用原飲食紀錄</b><br><span>營養師持續查看同一份 food_logs，不要求重複填寫。</span></li><li><b>第 4 週：回顧與維持</b><br><span>整理可持續執行的方式。</span></li></ol>
+        <button class="btn primary" id="activeBackHome">回到健檢首頁</button>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</div>
+<script>
+  const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+  let state='0', screen='home';
+  const stateData={
+    '0':{count:0,width:0,window:'還有 7 天',status:'7 天窗口已自 VIP 正式生效啟動，使用原本的飲食紀錄方式即可。',title:'完成第 1 個有效紀錄日',copy:'每天不必三餐都完美；一個有效日以至少 2 餐主要餐點，並補上飲料、點心與宵夜狀況為原則。'},
+    '1':{count:1,width:33,window:'還有 5 天',status:'已完成第 1 個有效日，照原本方式再記 2 天。',title:'下一步：再完成 2 個有效日',copy:'建議下一個紀錄日選平日，至少留下 2 餐主要餐點。',bottom:'開啟紀錄飲食'},
+    '2':{count:2,width:67,window:'還有 3 天',status:'只差 1 個有效日，建議補一個和平日不同的假日。',title:'最後一步：完成第 3 天',copy:'若有飲料、點心或宵夜也一起補上，營養師比較能看見完整情境。',bottom:'前往今日儀表板'},
+    '3':{count:3,width:100,window:'已完成紀錄',status:'3 個有效日完成，系統準備整理給營養師。',title:'你的紀錄已完成',copy:'接下來由 AI 整理已確認紀錄；不會重新估算 planned meal。',bottom:'查看處理進度'},
+    ai:{count:3,width:100,window:'處理中',status:'AI 整理中：正在彙整已確認紀錄與資料限制。',title:'AI 正在整理',copy:'此階段只彙整 food_logs；不直接產生最終醫療或營養判斷。',bottom:'查看處理進度'},
+    review:{count:3,width:100,window:'審核中',status:'營養師審核中：確認觀察、限制與可執行建議。',title:'已交給營養師審核',copy:'營養師的 review 與 suggested value 應另存，不覆蓋原始紀錄。',bottom:'查看處理進度'},
+    approved:{count:3,width:100,window:'待送達',status:'報告已由營養師核准，正在等待獨立 LINE 投遞。',title:'報告已核准，尚未視為送達',copy:'核准快照不再重算；投遞使用唯一 delivery key。'},
+    'delivery-failed':{count:3,width:100,window:'等待重送',status:'LINE 送達失敗；系統會重送同一份核准報告，不會重新產生。',title:'報告暫時未送達',copy:'保留原核准版本並安全重試，顧客不需重新完成 3 日紀錄。'},
+    done:{count:3,width:100,window:'報告完成',status:'你的首次 VIP 基準報告已完成。',title:'3 日飲食基準報告已完成',copy:'先看一件做得好的地方、一件優先調整與接下來 7 天行動。',bottom:'查看基準報告'}
+  };
+  function showToast(text){const t=$('#toast');t.textContent=text;t.classList.add('show');clearTimeout(showToast.timer);showToast.timer=setTimeout(()=>t.classList.remove('show'),2200)}
+  function renderDays(count){$('#days').innerHTML=[0,1,2].map((_,i)=>{const done=i<count;return `<div class="day ${done?'done':'wait'}"><b>${done?'已完成':'待完成'}・第 ${i+1} 天</b><small>${done?(i===0?'平日・3 餐':i===1?'平日・2 餐':'假日・3 餐'):'至少 2 餐'}</small></div>`}).join('')}
+  function renderState(next){state=String(next);const d=stateData[state];$('#count').textContent=d.count;$('#progressBar').style.width=d.width+'%';$('#windowText').textContent=d.window;$('#statusCopy').textContent=d.status;$('#actionTitle').textContent=d.title;$('#actionCopy').textContent=d.copy;renderDays(d.count);$$('.state').forEach(b=>b.classList.toggle('active',b.dataset.demoState===state));$('#startCheckup').classList.toggle('hidden',state!=='0');$('#viewReport').classList.toggle('hidden',state!=='done')}
+  function openScreen(name){screen=name;$$('.screen').forEach(s=>s.classList.remove('active'));$('#'+name+'Screen').classList.add('active');$('#backToHome').style.display=name==='home'?'none':'block';window.scrollTo(0,0)}
+  $$('.state').forEach(b=>b.addEventListener('click',()=>renderState(b.dataset.demoState)));
+  $('#startCheckup').addEventListener('click',()=>showToast('正式版沿用既有指令：飲食紀錄'));
+  $('#viewReport').addEventListener('click',()=>openScreen('report'));
+  $('#viewCoaching').addEventListener('click',()=>openScreen('coaching'));
+  $('#requestTransfer').addEventListener('click',()=>openScreen('payment'));
+  $('#backToHome').addEventListener('click',()=>openScreen('home'));
+  $('#openFoodLog').addEventListener('click',()=>showToast('正式版送出既有指令：飲食紀錄'));
+  $('#openDashboard').addEventListener('click',()=>showToast('正式版送出既有指令：首頁／儀表板'));
+  $('#markLunch').addEventListener('click',e=>{e.currentTarget.textContent='✓ 午餐已確認（模擬）';e.currentTarget.disabled=true;showToast("沿用 planned_meal，不建立第二筆")});
+  $('#markDinner').addEventListener('click',e=>{e.currentTarget.textContent='✓ 晚餐已確認（模擬）';e.currentTarget.disabled=true;showToast("沿用 planned_meal，不建立第二筆")});
+  $('#selfPractice').addEventListener('click',()=>{openScreen('home');showToast('已保留 7 天自行執行目標（模擬）')});
+  $('#keepSelfPractice').addEventListener('click',()=>{openScreen('report');showToast('你可以先自行執行，不影響原 VIP 權益')});
+  $('#paymentDone').addEventListener('click',()=>openScreen('coachingActive'));
+  $('#activeBackHome').addEventListener('click',()=>openScreen('home'));
+  renderState('0');
+</script>
+</body>
+</html>
