@@ -419,7 +419,7 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
                   fl.meal_slot,fl.consumed_servings,fl.consumed_amount,fl.consumed_unit,
                   fl.nutrition_snapshot_json,fl.nutrient_sources_json,fl.version,
                   fl.approved_exchange_json,fc.fingerprint,a.food_fingerprint,
-                  a.suggestion_rule_version,a.approved_exchange_hash
+                  a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id
            FROM food_logs fl
            JOIN food_catalog fc ON fc.food_id=fl.food_id
            LEFT JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
@@ -5315,6 +5315,7 @@ def compute_achievement_snapshot(user_id: str, dashboard: dict = None) -> dict:
 def get_dashboard_data(user_id: str) -> dict:
     """取得儀表板所需資料，Phase 1 Flex Message 和 Phase 2 LIFF API 都用這個"""
     hp = None
+    ledger_names = []
     checked_slots = set()
     workout_done = False
     frequent_foods = []
@@ -5332,6 +5333,33 @@ def get_dashboard_data(user_id: str) -> dict:
                             today_food_items, today_date, sheet_name
                      FROM health_profile WHERE user_id=?""", (user_id,))
         hp = c.fetchone()
+
+        ledger_rows = _daily_food_rows(conn, user_id, today_str)
+        ledger_items = [
+            _ledger_item_from_row(row) for row in ledger_rows
+        ]
+        ordinary_ledger_items = [
+            item for row, item in zip(ledger_rows, ledger_items)
+            if item.get("source_type") != "user_meal_photo"
+            and not str(row[17] or "").strip()
+        ]
+        ledger_names = [
+            item["product_name"] for item in ordinary_ledger_items
+        ]
+        ordinary_ledger_cal = ordinary_ledger_pro = 0.0
+        for item in ordinary_ledger_items:
+            nutrition = item.get("nutrition") or {}
+            if nutrition.get("calories_kcal") is not None:
+                ordinary_ledger_cal += float(nutrition["calories_kcal"])
+            if nutrition.get("protein_g") is not None:
+                ordinary_ledger_pro += float(nutrition["protein_g"])
+
+        if not hp:
+            # 新 VIP 可能先完成 LINE 飲食紀錄、稍後才填健康表單。
+            # Dashboard 只讀 canonical food_logs 作 fallback；不要建立空的
+            # health_profile，否則舊流程可能誤判為已完成 onboarding。
+            if ledger_items:
+                hp = ("", 2000, 100, 0, 0, "", today_str, "")
         
         if hp:
             # 2. 抓今日打卡紀錄
@@ -5366,6 +5394,7 @@ def get_dashboard_data(user_id: str) -> dict:
                          ON a.approval_id=fl.exchange_approval_id AND a.food_id=fl.food_id
                        WHERE fl.user_id=? AND date(fl.consumed_at, '+8 hours')=?
                          AND fl.confirmation_status='confirmed'
+                         AND COALESCE(fl.deleted_at,'')=''
                          AND fc.source_type='user_meal_photo'
                        ORDER BY fl.consumed_at, fl.created_at""",
                     (user_id, today_str),
@@ -5392,17 +5421,14 @@ def get_dashboard_data(user_id: str) -> dict:
     if not hp:
         return None
 
-    name, tdee, protein_goal, extra_cal, extra_pro, food_items, today_date, sheet_name = hp
+    name, tdee, protein_goal, _projected_cal, _projected_pro, _projected_foods, _projected_date, sheet_name = hp
     tdee = tdee or 2000
     protein_goal = protein_goal or 100
-    extra_cal = extra_cal or 0
-    extra_pro = extra_pro or 0
 
-    if today_date != today_str:
-        extra_cal, extra_pro, food_items = 0, 0, ""
-
-    extra_cal = round(float(extra_cal) + approved_photo_cal, 4)
-    extra_pro = round(float(extra_pro) + approved_photo_pro, 4)
+    # Dashboard 的今日飲食只信任 canonical food_logs。一般餐由逐筆快照加總，
+    # 照片餐則只加入上方通過 fingerprint／approval hash 驗證的數值。
+    extra_cal = round(ordinary_ledger_cal + approved_photo_cal, 4)
+    extra_pro = round(ordinary_ledger_pro + approved_photo_pro, 4)
 
     cal_remaining = max(0, tdee - extra_cal)
     pro_remaining = max(0, protein_goal - extra_pro)
@@ -5466,7 +5492,7 @@ def get_dashboard_data(user_id: str) -> dict:
     lunch_checked = "午餐" in checked_slots
     dinner_checked = "晚餐" in checked_slots
 
-    food_list = [f.strip() for f in food_items.split("、") if f.strip()] if food_items else []
+    food_list = list(ledger_names)
     food_list.extend(approved_photo_foods)
     recorded_count = len(food_list)
     task_logged_once = (extra_cal > 0 or extra_pro > 0 or recorded_count >= 1)
@@ -5697,6 +5723,11 @@ def build_dashboard_flex(user_id: str):
     # ==========================================
     # 👈 左卡：純飲食儀表板 Bubble
     # ==========================================
+    recorded_foods = [str(item or "").strip() for item in d.get("food_list", []) if str(item or "").strip()]
+    food_summary = "、".join(item[:32] for item in recorded_foods[:3]) or "尚無紀錄"
+    if len(recorded_foods) > 3:
+        food_summary += f"，另有 {len(recorded_foods) - 3} 筆"
+
     diet_bubble = {
         "type": "bubble", "size": "mega",
         "header": {
@@ -5718,6 +5749,10 @@ def build_dashboard_flex(user_id: str):
                 {"type": "text", "text": "🥩 蛋白進度", "size": "xs", "color": "#888888", "margin": "md"},
                 {"type": "text", "text": f"今日已記錄：{d['extra_pro']} / {d['protein_goal']} g", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm"},
                 dual_progress_bar(d["pro_recorded_segment"], d["pro_planned_segment"], d["pro_remaining_segment"], "#FF6B35", "#FFD2C2"),
+                {"type": "separator", "margin": "md"},
+
+                {"type": "text", "text": "🍽️ 今日飲食紀錄", "size": "xs", "color": "#888888", "margin": "md"},
+                {"type": "text", "text": food_summary, "size": "sm", "color": "#333333", "margin": "sm", "wrap": True},
                 {"type": "separator", "margin": "lg"},
 
                 {"type": "box", "layout": "vertical", "margin": "md", "backgroundColor": "#f8f8f8", "cornerRadius": "8px", "paddingAll": "12px", "contents": [
