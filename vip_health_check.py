@@ -22,6 +22,33 @@ FEATURE_FLAG = "VIP_HEALTH_CHECK_ENABLED"
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
+def require_vip_health_check_connection(
+    conn: sqlite3.Connection,
+) -> sqlite3.Connection:
+    """Fail closed unless SQLite is actively enforcing foreign keys."""
+    enabled = conn.execute("PRAGMA foreign_keys").fetchone()
+    if not enabled or int(enabled[0]) != 1:
+        raise sqlite3.IntegrityError(
+            "VIP health-check connection requires PRAGMA foreign_keys=ON"
+        )
+    return conn
+
+
+def configure_vip_health_check_connection(
+    conn: sqlite3.Connection,
+) -> sqlite3.Connection:
+    """Enable and verify FK enforcement before the caller starts a transaction."""
+    enabled = conn.execute("PRAGMA foreign_keys").fetchone()
+    if enabled and int(enabled[0]) == 1:
+        return conn
+    if conn.in_transaction:
+        raise sqlite3.IntegrityError(
+            "cannot enable PRAGMA foreign_keys inside an active transaction"
+        )
+    conn.execute("PRAGMA foreign_keys=ON")
+    return require_vip_health_check_connection(conn)
+
+
 def is_vip_health_check_enabled(environment: Mapping[str, str] | None = None) -> bool:
     """只有明確 truthy 值才啟用；未設定時一律關閉。"""
     source = os.environ if environment is None else environment
@@ -45,15 +72,261 @@ def _execute_sql_script_without_implicit_commit(
 
 def ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
     """以不提交 caller transaction 的 SAVEPOINT 執行 failure-atomic migration。"""
+    configure_vip_health_check_connection(conn)
     savepoint = "vip_health_check_schema_" + uuid.uuid4().hex
+    previous_deferred = int(conn.execute("PRAGMA defer_foreign_keys").fetchone()[0])
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
         _ensure_vip_health_check_schema(conn)
     except Exception:
         conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        conn.execute(f"PRAGMA defer_foreign_keys={previous_deferred}")
         raise
     conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    conn.execute(f"PRAGMA defer_foreign_keys={previous_deferred}")
+
+
+def _rebuild_legacy_reports_table(
+    conn: sqlite3.Connection, report_columns: set[str]
+) -> None:
+    """Rebuild legacy reports with real FKs without exposing partial schema/data."""
+    def normalize_schema_sql(sql: str) -> str:
+        """Canonicalize SQL syntax while preserving every quoted literal byte."""
+        text = str(sql or "")
+        literals: list[str] = []
+        pieces: list[str] = []
+        index = 0
+        while index < len(text):
+            opener = text[index]
+            if opener not in {"'", '"', "`", "["}:
+                if not opener.isspace():
+                    pieces.append(opener.lower())
+                index += 1
+                continue
+
+            closer = "]" if opener == "[" else opener
+            start = index
+            index += 1
+            while index < len(text):
+                if text[index] != closer:
+                    index += 1
+                    continue
+                if closer != "]" and index + 1 < len(text) and text[index + 1] == closer:
+                    index += 2
+                    continue
+                index += 1
+                break
+            marker = f"\x00literal{len(literals)}\x00"
+            literals.append(text[start:index])
+            pieces.append(marker)
+
+        normalized = "".join(pieces)
+        for literal_index, literal in enumerate(literals):
+            normalized = normalized.replace(f"\x00literal{literal_index}\x00", literal)
+        return normalized
+
+    def allowed_schema_sql_variants(canonical: str) -> set[str]:
+        variants = {canonical}
+        for prefix in ("createtrigger", "createuniqueindex", "createindex"):
+            if canonical.startswith(prefix):
+                variants.add(prefix + "ifnotexists" + canonical[len(prefix) :])
+                break
+        return variants
+
+    expected_schema_objects = {
+        "vip_health_check_reports": {
+            "vip_health_check_reports_no_update": (
+                "trigger",
+                normalize_schema_sql(
+                    """CREATE TRIGGER vip_health_check_reports_no_update
+                    BEFORE UPDATE ON vip_health_check_reports
+                    BEGIN
+                        SELECT RAISE(ABORT, 'published health-check reports are immutable');
+                    END"""
+                ),
+            ),
+            "vip_health_check_reports_no_delete": (
+                "trigger",
+                normalize_schema_sql(
+                    """CREATE TRIGGER vip_health_check_reports_no_delete
+                    BEFORE DELETE ON vip_health_check_reports
+                    BEGIN
+                        SELECT RAISE(ABORT, 'published health-check reports are immutable');
+                    END"""
+                ),
+            ),
+            "idx_vip_health_check_reports_review": (
+                "index",
+                normalize_schema_sql(
+                    """CREATE UNIQUE INDEX idx_vip_health_check_reports_review
+                    ON vip_health_check_reports(review_id) WHERE review_id<>''"""
+                ),
+            ),
+        },
+        "vip_health_check_deliveries": {
+            "idx_vip_health_check_deliveries_status": (
+                "index",
+                normalize_schema_sql(
+                    """CREATE INDEX idx_vip_health_check_deliveries_status
+                    ON vip_health_check_deliveries(status, created_at)"""
+                ),
+            ),
+        },
+    }
+    for table_name, expected_objects in expected_schema_objects.items():
+        objects = conn.execute(
+            """SELECT type,name,sql FROM sqlite_master
+               WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL""",
+            (table_name,),
+        ).fetchall()
+        unknown = [
+            (object_type, name)
+            for object_type, name, sql in objects
+            if name not in expected_objects
+            or object_type != expected_objects[name][0]
+            or normalize_schema_sql(sql)
+            not in allowed_schema_sql_variants(expected_objects[name][1])
+        ]
+        if unknown:
+            raise sqlite3.IntegrityError(
+                f"unsupported custom schema objects on {table_name}: {unknown!r}"
+            )
+
+    if "review_id" in report_columns:
+        review_join = """ON review.status='approved' AND (
+                 (report.review_id<>''
+                  AND review.review_id=report.review_id
+                  AND review.case_id=report.case_id
+                  AND review.review_version=report.report_version)
+                 OR
+                 (report.review_id=''
+                  AND review.case_id=report.case_id
+                  AND review.review_version=report.report_version)
+               )"""
+    else:
+        review_join = """ON review.case_id=report.case_id
+              AND review.review_version=report.report_version
+              AND review.status='approved'"""
+
+    unresolved = conn.execute(
+        f"""SELECT report.report_id, COUNT(review.review_id)
+           FROM vip_health_check_reports AS report
+           LEFT JOIN vip_health_check_reviews AS review
+             {review_join}
+           GROUP BY report.report_id
+           HAVING COUNT(review.review_id)<>1
+           LIMIT 1"""
+    ).fetchone()
+    if unresolved:
+        raise sqlite3.IntegrityError(
+            "legacy VIP health-check report has no unique approved review: "
+            f"{unresolved[0]}"
+        )
+
+    suffix = uuid.uuid4().hex
+    replacement = "vip_health_check_reports_rebuild_" + suffix
+    delivery_backup = "vip_health_check_deliveries_rebuild_" + suffix
+    conn.execute(
+        f"CREATE TABLE {delivery_backup} AS SELECT * FROM vip_health_check_deliveries"
+    )
+    conn.execute("DROP TABLE vip_health_check_deliveries")
+    conn.execute(
+        f"""CREATE TABLE {replacement} (
+            report_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            review_id TEXT NOT NULL UNIQUE,
+            report_kind TEXT NOT NULL DEFAULT 'baseline_3day',
+            report_version INTEGER NOT NULL,
+            report_json TEXT NOT NULL,
+            source_manifest_hash TEXT NOT NULL,
+            published_by TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            UNIQUE(case_id, report_kind, report_version),
+            FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id),
+            FOREIGN KEY(review_id) REFERENCES vip_health_check_reviews(review_id),
+            FOREIGN KEY(case_id, review_id)
+                REFERENCES vip_health_check_reviews(case_id, review_id)
+        )"""
+    )
+    conn.execute(
+        f"""INSERT INTO {replacement}
+               (report_id,case_id,review_id,report_kind,report_version,report_json,
+                source_manifest_hash,published_by,published_at)
+           SELECT report.report_id,report.case_id,review.review_id,report.report_kind,
+                  report.report_version,report.report_json,report.source_manifest_hash,
+                  report.published_by,report.published_at
+           FROM vip_health_check_reports AS report
+           JOIN vip_health_check_reviews AS review
+             {review_join}"""
+    )
+    conn.execute("DROP TABLE vip_health_check_reports")
+    conn.execute(f"ALTER TABLE {replacement} RENAME TO vip_health_check_reports")
+    _execute_sql_script_without_implicit_commit(
+        conn,
+        """
+        CREATE TRIGGER vip_health_check_reports_no_update
+        BEFORE UPDATE ON vip_health_check_reports
+        BEGIN
+            SELECT RAISE(ABORT, 'published health-check reports are immutable');
+        END;
+        CREATE TRIGGER vip_health_check_reports_no_delete
+        BEFORE DELETE ON vip_health_check_reports
+        BEGIN
+            SELECT RAISE(ABORT, 'published health-check reports are immutable');
+        END;
+        """,
+    )
+    conn.execute(
+        """CREATE TABLE vip_health_check_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            delivery_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','failed','delivered')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            delivered_at TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id)
+        )"""
+    )
+    conn.execute(
+        f"""INSERT INTO vip_health_check_deliveries
+               (delivery_id,report_id,user_id,delivery_key,status,attempts,last_error,
+                created_at,delivered_at)
+           SELECT delivery_id,report_id,user_id,delivery_key,status,attempts,last_error,
+                  created_at,delivered_at
+           FROM {delivery_backup}"""
+    )
+    conn.execute(f"DROP TABLE {delivery_backup}")
+    conn.execute(
+        """CREATE INDEX idx_vip_health_check_deliveries_status
+           ON vip_health_check_deliveries(status, created_at)"""
+    )
+
+
+def _verify_vip_health_check_foreign_keys(conn: sqlite3.Connection) -> None:
+    """Reject historical VIP orphan rows even if they were written with FK checks off."""
+    tables = (
+        "vip_health_check_valid_days",
+        "vip_health_check_source_refs",
+        "vip_health_check_reviews",
+        "vip_health_check_reports",
+        "vip_health_check_deliveries",
+        "vip_health_check_audit_log",
+        "dietitian_coaching_orders",
+    )
+    violations = []
+    for table_name in tables:
+        violations.extend(
+            (table_name, *row)
+            for row in conn.execute(f"PRAGMA foreign_key_check({table_name})").fetchall()
+        )
+    if violations:
+        raise sqlite3.IntegrityError(
+            f"VIP health-check foreign key violations: {violations!r}"
+        )
 
 
 def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
@@ -122,6 +395,7 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(case_id, review_version),
+            UNIQUE(case_id, review_id),
             FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id)
         );
 
@@ -137,7 +411,9 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             published_at TEXT NOT NULL,
             UNIQUE(case_id, report_kind, report_version),
             FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id),
-            FOREIGN KEY(review_id) REFERENCES vip_health_check_reviews(review_id)
+            FOREIGN KEY(review_id) REFERENCES vip_health_check_reviews(review_id),
+            FOREIGN KEY(case_id, review_id)
+                REFERENCES vip_health_check_reviews(case_id, review_id)
         );
 
         CREATE TRIGGER IF NOT EXISTS vip_health_check_reports_no_update
@@ -203,6 +479,8 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             ON vip_health_check_cases(status, updated_at);
         CREATE INDEX IF NOT EXISTS idx_vip_health_check_source_date
             ON vip_health_check_source_refs(case_id, local_date);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_vip_health_check_reviews_case_review
+            ON vip_health_check_reviews(case_id, review_id);
         CREATE INDEX IF NOT EXISTS idx_vip_health_check_deliveries_status
             ON vip_health_check_deliveries(status, created_at);
         """
@@ -210,66 +488,20 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
     report_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(vip_health_check_reports)")
     }
-    if "review_id" not in report_columns:
-        conn.execute(
-            "ALTER TABLE vip_health_check_reports ADD COLUMN review_id TEXT NOT NULL DEFAULT ''"
-        )
-    conn.execute("DROP TRIGGER IF EXISTS vip_health_check_reports_no_update")
-    _execute_sql_script_without_implicit_commit(
-        conn,
-        """
-        CREATE TRIGGER vip_health_check_reports_no_update
-        BEFORE UPDATE ON vip_health_check_reports
-        WHEN NOT (
-            OLD.review_id='' AND NEW.review_id<>''
-            AND NEW.report_id IS OLD.report_id
-            AND NEW.case_id IS OLD.case_id
-            AND NEW.report_kind IS OLD.report_kind
-            AND NEW.report_version IS OLD.report_version
-            AND NEW.report_json IS OLD.report_json
-            AND NEW.source_manifest_hash IS OLD.source_manifest_hash
-            AND NEW.published_by IS OLD.published_by
-            AND NEW.published_at IS OLD.published_at
-        )
-        BEGIN
-            SELECT RAISE(ABORT, 'published health-check reports are immutable');
-        END;
-        """
-    )
-    conn.execute(
-        """UPDATE vip_health_check_reports AS report
-           SET review_id=(
-               SELECT review.review_id
-               FROM vip_health_check_reviews AS review
-               WHERE review.case_id=report.case_id
-                 AND review.review_version=report.report_version
-                 AND review.status='approved'
-               ORDER BY review.approved_at DESC, review.review_id DESC
-               LIMIT 1
-           )
-           WHERE report.review_id=''
-             AND EXISTS (
-               SELECT 1 FROM vip_health_check_reviews AS review
-               WHERE review.case_id=report.case_id
-                 AND review.review_version=report.report_version
-                 AND review.status='approved'
-             )"""
-    )
-    conn.execute(
-        """CREATE UNIQUE INDEX IF NOT EXISTS idx_vip_health_check_reports_review
-           ON vip_health_check_reports(review_id) WHERE review_id<>''"""
-    )
-    _execute_sql_script_without_implicit_commit(
-        conn,
-        """
-        DROP TRIGGER IF EXISTS vip_health_check_reports_no_update;
-        CREATE TRIGGER vip_health_check_reports_no_update
-        BEFORE UPDATE ON vip_health_check_reports
-        BEGIN
-            SELECT RAISE(ABORT, 'published health-check reports are immutable');
-        END;
-        """
-    )
+    report_foreign_keys = {
+        (row[3], row[2], row[4])
+        for row in conn.execute("PRAGMA foreign_key_list(vip_health_check_reports)")
+    }
+    required_report_foreign_keys = {
+        ("case_id", "vip_health_check_cases", "case_id"),
+        ("review_id", "vip_health_check_reviews", "review_id"),
+        ("case_id", "vip_health_check_reviews", "case_id"),
+    }
+    if (
+        "review_id" not in report_columns
+        or not required_report_foreign_keys.issubset(report_foreign_keys)
+    ):
+        _rebuild_legacy_reports_table(conn, report_columns)
 
     case_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(vip_health_check_cases)")
@@ -279,6 +511,7 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             "ALTER TABLE vip_health_check_cases "
             "ADD COLUMN source_manifest_hash TEXT NOT NULL DEFAULT ''"
         )
+    _verify_vip_health_check_foreign_keys(conn)
 
 
 def _iso_seconds(value: datetime) -> str:
@@ -296,6 +529,7 @@ def create_first_vip_health_check_case(
     activated_at: datetime,
 ) -> dict[str, object]:
     """建立一次性首次 VIP 健檢；續期會回傳原案件且不重設窗口。"""
+    require_vip_health_check_connection(conn)
     user_id = str(user_id or "").strip()
     first_vip_activation_id = str(first_vip_activation_id or "").strip()
     activation_event_key = str(activation_event_key or "").strip()

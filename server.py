@@ -103,6 +103,7 @@ from meal_photo_system import (
     save_meal_photo_draft,
 )
 from vip_health_check import (
+    configure_vip_health_check_connection,
     create_first_vip_health_check_case,
     ensure_vip_health_check_schema,
     get_customer_health_check_state,
@@ -2814,6 +2815,7 @@ def get_vip_health_check_state_for_user(user_id: str):
     if not VIP_HEALTH_CHECK_ENABLED:
         return None
     with closing(sqlite3.connect(DB_PATH)) as conn:
+        configure_vip_health_check_connection(conn)
         return get_customer_health_check_state(conn, user_id=user_id)
 
 
@@ -2821,9 +2823,12 @@ def init_db():
     # 單一資料路徑來源：必須遵守 DATA_DIR／DB_PATH，才能安全掛載 Railway Volume。
     os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
 
+    conn = None
     try:
         # 🔗 3. 安全連線
         conn = sqlite3.connect(DB_PATH)
+        # VIP 三日健檔 schema 含跨表外鍵；必須在任何 transaction 前啟用。
+        configure_vip_health_check_connection(conn)
         c = conn.cursor()
         
         # --- 以下是您的原本表格定義 (保持不變) ---
@@ -3018,10 +3023,16 @@ def init_db():
 
         conn.commit()
         conn.close()
+        conn = None
         print(f"✅ 保險箱資料庫連線成功！路徑: {DB_PATH}")
 
     except Exception as e:
+        if conn is not None:
+            conn.rollback()
+            conn.close()
         print(f"❌ 啟動保險箱失敗，錯誤原因: {e}")
+        if APP_ENV != "legacy":
+            raise
 init_db()
 load_menu()  # 🔥 伺服器啟動時自動載入菜單
 sync_menu_to_food_catalog()  # 同步菜單到 food_catalog
@@ -7728,6 +7739,9 @@ def redeem_code(uid, code):
     linked_order = None
     with closing(sqlite3.connect(DB_PATH)) as conn:
         try:
+            if VIP_HEALTH_CHECK_ENABLED:
+                # PRAGMA 在 transaction 開始後不生效，必須先於任何兌換寫入。
+                configure_vip_health_check_connection(conn)
             c = conn.cursor()
             c.execute(
                 "SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0",

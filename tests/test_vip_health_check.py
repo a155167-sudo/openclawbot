@@ -17,8 +17,62 @@ os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy")
 def conn():
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
+    from vip_health_check import configure_vip_health_check_connection
+
+    configure_vip_health_check_connection(connection)
     yield connection
     connection.close()
+
+
+def test_connection_helper_enables_and_requires_foreign_keys_before_transaction():
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        require_vip_health_check_connection,
+    )
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        assert configure_vip_health_check_connection(connection) is connection
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert require_vip_health_check_connection(connection) is connection
+    finally:
+        connection.close()
+
+
+def test_connection_helper_fails_closed_when_transaction_started_with_fk_off():
+    from vip_health_check import configure_vip_health_check_connection
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match="foreign_keys"):
+            configure_vip_health_check_connection(connection)
+        assert connection.in_transaction is True
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def test_vip_write_fails_before_transaction_when_connection_was_not_configured():
+    from vip_health_check import create_first_vip_health_check_case
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("CREATE TABLE vip_health_check_cases(case_id TEXT)")
+        connection.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="foreign_keys"):
+            create_first_vip_health_check_case(
+                connection,
+                user_id="U1",
+                first_vip_activation_id="activation-1",
+                activation_event_key="event-1",
+                activated_at=datetime.now(timezone.utc),
+            )
+        assert connection.in_transaction is False
+    finally:
+        connection.close()
 
 
 def test_feature_flag_is_off_by_default_and_requires_explicit_truthy_value():
@@ -69,6 +123,80 @@ def test_schema_creates_isolated_health_check_tables_with_required_unique_constr
         )
 
 
+@pytest.mark.parametrize(
+    ("relation", "sql"),
+    [
+        (
+            "valid_days.case_id",
+            "INSERT INTO vip_health_check_valid_days VALUES "
+            "('missing','2026-09-03','v1',2,'qualified','2026-09-03T10:00:00+08:00')",
+        ),
+        (
+            "source_refs.case_id",
+            "INSERT INTO vip_health_check_source_refs VALUES "
+            "('missing','log-1',1,'2026-09-03','reason','hash','2026-09-03T10:00:00+08:00')",
+        ),
+        (
+            "reviews.case_id",
+            "INSERT INTO vip_health_check_reviews "
+            "(review_id,case_id,review_version,status,source_manifest_hash,created_at,updated_at) "
+            "VALUES ('orphan-review','missing',2,'draft','hash','now','now')",
+        ),
+        (
+            "reports.case_id",
+            "INSERT INTO vip_health_check_reports "
+            "(report_id,case_id,review_id,report_version,report_json,source_manifest_hash,published_by,published_at) "
+            "VALUES ('orphan-case-report','missing','valid-review',1,'{}','hash','dietitian','now')",
+        ),
+        (
+            "reports.review_id",
+            "INSERT INTO vip_health_check_reports "
+            "(report_id,case_id,review_id,report_version,report_json,source_manifest_hash,published_by,published_at) "
+            "VALUES ('orphan-review-report','valid-case','missing',1,'{}','hash','dietitian','now')",
+        ),
+        (
+            "deliveries.report_id",
+            "INSERT INTO vip_health_check_deliveries "
+            "(delivery_id,report_id,user_id,delivery_key,created_at) "
+            "VALUES ('orphan-delivery','missing','U1','delivery-key','now')",
+        ),
+        (
+            "audit.case_id",
+            "INSERT INTO vip_health_check_audit_log "
+            "(case_id,actor_type,to_status,created_at) VALUES ('missing','system','collecting','now')",
+        ),
+        (
+            "coaching.case_id",
+            "INSERT INTO dietitian_coaching_orders "
+            "(order_id,user_id,case_id,operation_key,requested_at,updated_at) "
+            "VALUES ('orphan-order','U1','missing','operation-key','now','now')",
+        ),
+    ],
+)
+def test_schema_rejects_every_vip_health_check_orphan(conn, relation, sql):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.execute(
+        """INSERT INTO vip_health_check_cases
+           (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+            window_started_at,window_ends_at,created_at,updated_at)
+           VALUES ('valid-case','U-valid','first_vip_baseline_check','activation-valid',
+                   'event-valid','start','end','now','now')"""
+    )
+    conn.execute(
+        """INSERT INTO vip_health_check_reviews
+           (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+            approved_at,created_at,updated_at)
+           VALUES ('valid-review','valid-case',1,'approved','hash','dietitian','now','now','now')"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(sql)
+
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == [], relation
+
+
 def test_schema_upgrades_earlier_reports_table_with_review_link(conn):
     from vip_health_check import ensure_vip_health_check_schema
 
@@ -96,6 +224,20 @@ def test_schema_upgrades_earlier_reports_table_with_review_link(conn):
 
     columns = {row[1] for row in conn.execute("PRAGMA table_info(vip_health_check_reports)")}
     assert "review_id" in columns
+    conn.executescript(
+        """
+        INSERT INTO vip_health_check_cases
+          (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+           window_started_at,window_ends_at,created_at,updated_at)
+        VALUES
+          ('c1','U-c1','first_vip_baseline_check','a-c1','e-c1','start','end','now','now'),
+          ('c2','U-c2','first_vip_baseline_check','a-c2','e-c2','start','end','now','now');
+        INSERT INTO vip_health_check_reviews
+          (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+           approved_at,created_at,updated_at)
+        VALUES ('review-1','c1',1,'approved','manifest','dietitian','now','now','now');
+        """
+    )
     values = ("{}", "manifest", "dietitian", "2026-09-03T10:00:00+08:00")
     conn.execute(
         """INSERT INTO vip_health_check_reports
@@ -120,10 +262,9 @@ class _FailingMigrationConnection(sqlite3.Connection):
     def execute(self, sql, parameters=()):
         if (
             self.fail_on_report_review_index
-            and "CREATE UNIQUE INDEX IF NOT EXISTS idx_vip_health_check_reports_review"
-            in sql
+            and "INSERT INTO vip_health_check_reports_rebuild_" in sql
         ):
-            raise sqlite3.IntegrityError("forced report review index failure")
+            raise sqlite3.IntegrityError("forced report rebuild failure")
         return super().execute(sql, parameters)
 
 
@@ -134,6 +275,16 @@ def _prepare_legacy_report_migration_failure_connection():
     ensure_vip_health_check_schema(connection)
     connection.executescript(
         """
+        INSERT INTO vip_health_check_cases
+          (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+           window_started_at,window_ends_at,created_at,updated_at)
+        VALUES ('legacy-case','U-legacy','first_vip_baseline_check','legacy-activation',
+                'legacy-event','start','end','now','now');
+        INSERT INTO vip_health_check_reviews
+          (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+           approved_at,created_at,updated_at)
+        VALUES ('legacy-review','legacy-case',1,'approved','manifest','dietitian',
+                'now','now','now');
         DROP TRIGGER vip_health_check_reports_no_update;
         DROP TRIGGER vip_health_check_reports_no_delete;
         DROP TABLE vip_health_check_reports;
@@ -174,7 +325,7 @@ def test_schema_migration_failure_does_not_commit_caller_transaction():
         connection.execute("INSERT INTO migration_sentinel VALUES ('must-rollback')")
         connection.fail_on_report_review_index = True
 
-        with pytest.raises(sqlite3.IntegrityError, match="forced report review index failure"):
+        with pytest.raises(sqlite3.IntegrityError, match="forced report rebuild failure"):
             ensure_vip_health_check_schema(connection)
         connection.rollback()
 
@@ -189,7 +340,7 @@ def test_schema_migration_failure_restores_strict_report_immutability():
     connection = _prepare_legacy_report_migration_failure_connection()
     try:
         connection.fail_on_report_review_index = True
-        with pytest.raises(sqlite3.IntegrityError, match="forced report review index failure"):
+        with pytest.raises(sqlite3.IntegrityError, match="forced report rebuild failure"):
             ensure_vip_health_check_schema(connection)
         connection.rollback()
 
@@ -264,6 +415,349 @@ def test_schema_report_review_backfill_is_idempotent(conn):
     assert conn.execute(
         "SELECT COUNT(*) FROM vip_health_check_reports WHERE report_id='legacy-report'"
     ).fetchone()[0] == 1
+
+
+def _install_legacy_report_with_delivery(conn, *, report_version=1):
+    conn.executescript(
+        """
+        DROP TABLE vip_health_check_deliveries;
+        DROP TRIGGER vip_health_check_reports_no_update;
+        DROP TRIGGER vip_health_check_reports_no_delete;
+        DROP TABLE vip_health_check_reports;
+        CREATE TABLE vip_health_check_reports (
+            report_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            report_kind TEXT NOT NULL DEFAULT 'baseline_3day',
+            report_version INTEGER NOT NULL,
+            report_json TEXT NOT NULL,
+            source_manifest_hash TEXT NOT NULL,
+            published_by TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            UNIQUE(case_id,report_kind,report_version)
+        );
+        CREATE TRIGGER vip_health_check_reports_no_update
+        BEFORE UPDATE ON vip_health_check_reports
+        BEGIN SELECT RAISE(ABORT, 'published health-check reports are immutable'); END;
+        CREATE TRIGGER vip_health_check_reports_no_delete
+        BEFORE DELETE ON vip_health_check_reports
+        BEGIN SELECT RAISE(ABORT, 'published health-check reports are immutable'); END;
+        CREATE TABLE vip_health_check_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            delivery_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            delivered_at TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id)
+        );
+        """
+    )
+    conn.execute(
+        """INSERT INTO vip_health_check_reports
+           (report_id,case_id,report_kind,report_version,report_json,
+            source_manifest_hash,published_by,published_at)
+           VALUES ('legacy-report','legacy-case','baseline_3day',?,'{}','manifest',
+                   'dietitian','2026-09-03T10:00:00+08:00')""",
+        (report_version,),
+    )
+    conn.execute(
+        """INSERT INTO vip_health_check_deliveries
+           (delivery_id,report_id,user_id,delivery_key,created_at)
+           VALUES ('legacy-delivery','legacy-report','U-legacy','legacy-key','now')"""
+    )
+    conn.commit()
+
+
+def test_legacy_report_rebuild_adds_both_fks_and_preserves_report_delivery_idempotently(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.execute(
+        """INSERT INTO vip_health_check_cases
+           (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+            window_started_at,window_ends_at,status,created_at,updated_at)
+           VALUES ('legacy-case','U-legacy','first_vip_baseline_check','legacy-activation',
+                   'legacy-event','start','end','approved_pending_delivery','now','now')"""
+    )
+    conn.execute(
+        """INSERT INTO vip_health_check_reviews
+           (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+            approved_at,created_at,updated_at)
+           VALUES ('legacy-review','legacy-case',1,'approved','manifest','dietitian',
+                   'now','now','now')"""
+    )
+    conn.commit()
+    _install_legacy_report_with_delivery(conn)
+
+    ensure_vip_health_check_schema(conn)
+    ensure_vip_health_check_schema(conn)
+
+    fk_targets = {
+        (row[3], row[2], row[4])
+        for row in conn.execute("PRAGMA foreign_key_list(vip_health_check_reports)")
+    }
+    assert fk_targets == {
+        ("case_id", "vip_health_check_cases", "case_id"),
+        ("review_id", "vip_health_check_reviews", "review_id"),
+        ("case_id", "vip_health_check_reviews", "case_id"),
+    }
+    assert tuple(map(tuple, conn.execute("SELECT report_id,case_id,review_id FROM vip_health_check_reports"))) == (
+        ("legacy-report", "legacy-case", "legacy-review"),
+    )
+    assert tuple(map(tuple, conn.execute("SELECT delivery_id,report_id FROM vip_health_check_deliveries"))) == (
+        ("legacy-delivery", "legacy-report"),
+    )
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    for operation in ("UPDATE vip_health_check_reports SET report_json='x'", "DELETE FROM vip_health_check_reports"):
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute(operation)
+
+
+def test_legacy_report_rebuild_rejects_unbackfillable_report_and_restores_old_schema(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.execute(
+        """INSERT INTO vip_health_check_cases
+           (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+            window_started_at,window_ends_at,created_at,updated_at)
+           VALUES ('legacy-case','U-legacy','first_vip_baseline_check','legacy-activation',
+                   'legacy-event','start','end','now','now')"""
+    )
+    conn.commit()
+    _install_legacy_report_with_delivery(conn, report_version=9)
+    before_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='vip_health_check_reports'"
+    ).fetchone()[0]
+
+    with pytest.raises(sqlite3.IntegrityError, match="unique approved review"):
+        ensure_vip_health_check_schema(conn)
+
+    assert conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='vip_health_check_reports'"
+    ).fetchone()[0] == before_sql
+    assert conn.execute("SELECT COUNT(*) FROM vip_health_check_reports").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM vip_health_check_deliveries").fetchone()[0] == 1
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("UPDATE vip_health_check_reports SET report_json='x'")
+
+
+def test_schema_rejects_historical_orphan_written_while_fk_checks_were_off(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        """INSERT INTO vip_health_check_valid_days
+           (case_id,local_date,rule_version,qualifying_meal_count,
+            completeness_status,evaluated_at)
+           VALUES ('missing-case','2026-09-03','v1',2,'qualified','now')"""
+    )
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    with pytest.raises(sqlite3.IntegrityError, match="foreign key violations"):
+        ensure_vip_health_check_schema(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM vip_health_check_valid_days").fetchone()[0] == 1
+
+
+def test_report_review_must_belong_to_the_same_case(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.executescript(
+        """
+        INSERT INTO vip_health_check_cases
+          (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+           window_started_at,window_ends_at,created_at,updated_at)
+        VALUES
+          ('case-a','U-a','first_vip_baseline_check','act-a','event-a','start','end','now','now'),
+          ('case-b','U-b','first_vip_baseline_check','act-b','event-b','start','end','now','now');
+        INSERT INTO vip_health_check_reviews
+          (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+           approved_at,created_at,updated_at)
+        VALUES ('review-b','case-b',1,'approved','manifest','dietitian','now','now','now');
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        conn.execute(
+            """INSERT INTO vip_health_check_reports
+               (report_id,case_id,review_id,report_version,report_json,
+                source_manifest_hash,published_by,published_at)
+               VALUES ('cross-case','case-a','review-b',1,'{}','manifest','dietitian','now')"""
+        )
+
+
+def test_legacy_nonempty_review_link_is_preserved_or_rejected_never_rewritten(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.executescript(
+        """
+        INSERT INTO vip_health_check_cases
+          (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+           window_started_at,window_ends_at,created_at,updated_at)
+        VALUES ('legacy-case','U-legacy','first_vip_baseline_check','act','event',
+                'start','end','now','now');
+        INSERT INTO vip_health_check_reviews
+          (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+           approved_at,created_at,updated_at)
+        VALUES
+          ('review-v1','legacy-case',1,'approved','manifest','dietitian','now','now','now'),
+          ('review-v2','legacy-case',2,'approved','manifest','dietitian','now','now','now');
+        DROP TABLE vip_health_check_deliveries;
+        DROP TRIGGER vip_health_check_reports_no_update;
+        DROP TRIGGER vip_health_check_reports_no_delete;
+        DROP TABLE vip_health_check_reports;
+        CREATE TABLE vip_health_check_reports (
+            report_id TEXT PRIMARY KEY, case_id TEXT NOT NULL,
+            review_id TEXT NOT NULL DEFAULT '', report_kind TEXT NOT NULL DEFAULT 'baseline_3day',
+            report_version INTEGER NOT NULL, report_json TEXT NOT NULL,
+            source_manifest_hash TEXT NOT NULL, published_by TEXT NOT NULL,
+            published_at TEXT NOT NULL, UNIQUE(case_id,report_kind,report_version)
+        );
+        INSERT INTO vip_health_check_reports
+          (report_id,case_id,review_id,report_version,report_json,
+           source_manifest_hash,published_by,published_at)
+        VALUES ('legacy-report','legacy-case','review-v2',1,'{}','manifest','dietitian','now');
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="unique approved review"):
+        ensure_vip_health_check_schema(conn)
+
+    assert conn.execute(
+        "SELECT review_id FROM vip_health_check_reports WHERE report_id='legacy-report'"
+    ).fetchone()[0] == "review-v2"
+
+
+def _prepare_legacy_report_for_schema_object_test(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.execute(
+        """INSERT INTO vip_health_check_cases
+           (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+            window_started_at,window_ends_at,created_at,updated_at)
+           VALUES ('legacy-case','U-legacy','first_vip_baseline_check','act','event',
+                   'start','end','now','now')"""
+    )
+    conn.execute(
+        """INSERT INTO vip_health_check_reviews
+           (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+            approved_at,created_at,updated_at)
+           VALUES ('legacy-review','legacy-case',1,'approved','manifest','dietitian',
+                   'now','now','now')"""
+    )
+    conn.commit()
+    _install_legacy_report_with_delivery(conn)
+
+
+def test_legacy_rebuild_fails_closed_on_unknown_schema_object(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    _prepare_legacy_report_for_schema_object_test(conn)
+    conn.execute(
+        "CREATE INDEX custom_legacy_publisher ON vip_health_check_reports(published_by)"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="unsupported custom schema objects"):
+        ensure_vip_health_check_schema(conn)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='custom_legacy_publisher'"
+    ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("object_name", "create_sql"),
+    [
+        (
+            "idx_vip_health_check_reports_review",
+            "CREATE INDEX idx_vip_health_check_reports_review "
+            "ON vip_health_check_reports(published_by)",
+        ),
+        (
+            "idx_vip_health_check_deliveries_status",
+            "CREATE INDEX idx_vip_health_check_deliveries_status "
+            "ON vip_health_check_deliveries(user_id)",
+        ),
+    ],
+)
+def test_legacy_rebuild_rejects_allowlisted_index_name_with_wrong_definition(
+    conn, object_name, create_sql
+):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    _prepare_legacy_report_for_schema_object_test(conn)
+    conn.execute(create_sql)
+
+    with pytest.raises(sqlite3.IntegrityError, match="unsupported custom schema objects"):
+        ensure_vip_health_check_schema(conn)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name=? AND sql=?",
+        (object_name, create_sql),
+    ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "custom_message",
+    [
+        "different custom policy",
+        "published  health-check reports are immutable",
+        "Published health-check reports are immutable",
+        "published ifnotexists health-check reports are immutable",
+    ],
+)
+def test_legacy_rebuild_rejects_allowlisted_trigger_name_with_wrong_definition(
+    conn, custom_message
+):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    _prepare_legacy_report_for_schema_object_test(conn)
+    conn.execute("DROP TRIGGER vip_health_check_reports_no_update")
+    malicious_definition = f"""CREATE TRIGGER vip_health_check_reports_no_update
+        BEFORE UPDATE ON vip_health_check_reports
+        BEGIN SELECT RAISE(ABORT, '{custom_message}'); END"""
+    conn.execute(malicious_definition)
+
+    with pytest.raises(sqlite3.IntegrityError, match="unsupported custom schema objects"):
+        ensure_vip_health_check_schema(conn)
+
+    stored = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='vip_health_check_reports_no_update'"
+    ).fetchone()[0]
+    assert custom_message in stored
+
+
+def test_legacy_rebuild_rejects_ifnotexists_identifier_outside_create_header(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    _prepare_legacy_report_for_schema_object_test(conn)
+    conn.execute("DROP TRIGGER vip_health_check_reports_no_update")
+    alias_definition = """CREATE TRIGGER vip_health_check_reports_no_update
+        BEFORE UPDATE ON vip_health_check_reports
+        BEGIN
+            SELECT RAISE(ABORT, 'published health-check reports are immutable') ifnotexists;
+        END"""
+    conn.execute(alias_definition)
+
+    with pytest.raises(sqlite3.IntegrityError, match="unsupported custom schema objects"):
+        ensure_vip_health_check_schema(conn)
+
+    stored = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='vip_health_check_reports_no_update'"
+    ).fetchone()[0]
+    assert "ifnotexists" in stored
 
 
 def test_first_vip_entitlement_is_idempotent_and_renewal_keeps_original_window(conn):
@@ -829,6 +1323,9 @@ def test_server_customer_state_service_is_feature_gated_and_user_scoped(monkeypa
     db_path = _prepare_server_db(server, monkeypatch, tmp_path)
     now = datetime(2026, 9, 3, 9, 0, tzinfo=timezone(timedelta(hours=8)))
     with sqlite3.connect(db_path) as db:
+        from vip_health_check import configure_vip_health_check_connection
+
+        configure_vip_health_check_connection(db)
         create_first_vip_health_check_case(
             db,
             user_id="U1",
@@ -1588,6 +2085,16 @@ def test_failed_legacy_delivery_cannot_regress_delivered_case(conn):
         "UPDATE vip_health_check_cases SET status='delivered',report_published_at=? WHERE case_id=?",
         (published, case["case_id"]),
     )
+    conn.executemany(
+        """INSERT INTO vip_health_check_reviews
+           (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+            approved_at,created_at,updated_at)
+           VALUES (?,?,?,'approved','manifest-v1','dietitian',?,?,?)""",
+        [
+            ("review-one", case["case_id"], 1, published, published, published),
+            ("review-two", case["case_id"], 2, published, published, published),
+        ],
+    )
     for suffix, status in (("one", "delivered"), ("two", "pending")):
         conn.execute(
             """INSERT INTO vip_health_check_reports
@@ -1620,15 +2127,89 @@ def test_schema_restores_strict_report_immutability_after_backfill(conn):
     from vip_health_check import ensure_vip_health_check_schema
 
     case, now = _ready_case(conn)
+    published = now.isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO vip_health_check_reviews
+           (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+            approved_at,created_at,updated_at)
+           VALUES ('review-99',?,99,'approved','manifest-v1','dietitian',?,?,?)""",
+        (case["case_id"], published, published, published),
+    )
+    conn.executescript(
+        """
+        DROP TABLE vip_health_check_deliveries;
+        DROP TRIGGER vip_health_check_reports_no_update;
+        DROP TRIGGER vip_health_check_reports_no_delete;
+        DROP TABLE vip_health_check_reports;
+        CREATE TABLE vip_health_check_reports (
+            report_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            report_kind TEXT NOT NULL DEFAULT 'baseline_3day',
+            report_version INTEGER NOT NULL,
+            report_json TEXT NOT NULL,
+            source_manifest_hash TEXT NOT NULL,
+            published_by TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            UNIQUE(case_id,report_kind,report_version)
+        );
+        """
+    )
     conn.execute(
         """INSERT INTO vip_health_check_reports
-           (report_id,case_id,report_kind,report_version,review_id,report_json,
+           (report_id,case_id,report_kind,report_version,report_json,
             source_manifest_hash,published_by,published_at)
-           VALUES ('legacy-empty-review',?,'baseline_3day',99,'','{}','manifest-v1','dietitian',?)""",
-        (case["case_id"], now.isoformat(timespec="seconds")),
+           VALUES ('legacy-empty-review',?,'baseline_3day',99,'{}','manifest-v1','dietitian',?)""",
+        (case["case_id"], published),
     )
     ensure_vip_health_check_schema(conn)
+    assert conn.execute(
+        "SELECT review_id FROM vip_health_check_reports WHERE report_id='legacy-empty-review'"
+    ).fetchone()[0] == "review-99"
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
         conn.execute(
-            "UPDATE vip_health_check_reports SET review_id='arbitrary-late-link' WHERE report_id='legacy-empty-review'"
+            "UPDATE vip_health_check_reports SET report_json='arbitrary-mutation' WHERE report_id='legacy-empty-review'"
         )
+
+
+@pytest.mark.parametrize("app_env", ["staging", "production"])
+def test_named_environment_init_db_fails_closed_on_vip_schema_error(
+    monkeypatch, tmp_path, app_env
+):
+    import server
+
+    db_path = tmp_path / f"{app_env}-schema-failure.db"
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "DB_PATH", str(db_path))
+    monkeypatch.setattr(server, "APP_ENV", app_env)
+
+    def fail_schema(_conn):
+        raise sqlite3.IntegrityError("forced VIP schema failure")
+
+    monkeypatch.setattr(server, "ensure_vip_health_check_schema", fail_schema)
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced VIP schema failure"):
+        server.init_db()
+
+    # Failure handling must close the connection and release the write lock.
+    with sqlite3.connect(db_path, timeout=0.1) as check:
+        check.execute("BEGIN IMMEDIATE")
+        check.rollback()
+
+
+def test_legacy_init_db_keeps_graceful_schema_failure_compatibility(monkeypatch, tmp_path):
+    import server
+
+    db_path = tmp_path / "legacy-schema-failure.db"
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "DB_PATH", str(db_path))
+    monkeypatch.setattr(server, "APP_ENV", "legacy")
+
+    def fail_schema(_conn):
+        raise sqlite3.IntegrityError("forced VIP schema failure")
+
+    monkeypatch.setattr(server, "ensure_vip_health_check_schema", fail_schema)
+
+    assert server.init_db() is None
+    with sqlite3.connect(db_path, timeout=0.1) as check:
+        check.execute("BEGIN IMMEDIATE")
+        check.rollback()
