@@ -2244,6 +2244,111 @@ def test_non_vip_image_message_is_silent_before_processing(monkeypatch):
     assert message_id not in server.processed_messages
 
 
+@pytest.mark.parametrize(
+    "event_key",
+    [
+        "MessageEvent_StickerMessage",
+        "MessageEvent_AudioMessage",
+        "MessageEvent_VideoMessage",
+        "MessageEvent_FileMessage",
+        "MessageEvent_LocationMessage",
+    ],
+)
+def test_unhandled_message_types_have_no_reply_handler(event_key):
+    assert event_key not in server.handler._handlers
+
+
+def test_non_vip_postback_is_silent_before_processing(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False)
+    monkeypatch.setattr(
+        server,
+        "_quick_log_catalog_card_once",
+        lambda **_kwargs: calls.append("write") or server.TextSendMessage(text="ok"),
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, _message: calls.append("reply"),
+    )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(
+            data="nlfood:v1:food_private_soy:servings:1.5:meal:早餐"
+        ),
+        source=SimpleNamespace(user_id="U_NON_VIP"),
+        reply_token="reply-non-vip-postback",
+        webhook_event_id="NON-VIP-POSTBACK",
+    )
+
+    server.handle_postback_event(event)
+
+    assert calls == []
+
+
+def test_active_vip_postback_reaches_processing(monkeypatch):
+    seen = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
+    monkeypatch.setattr(
+        server, "handle_meal_photo_postback", lambda event: seen.append(event.postback.data)
+    )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data="foodlog:v1:day:today:page:1"),
+        source=SimpleNamespace(user_id="U_VIP"),
+    )
+
+    assert server.handler._handlers["PostbackEvent"] is server.handle_postback_event
+    server.handle_postback_event(event)
+
+    assert seen == ["foodlog:v1:day:today:page:1"]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        "mpr:v1:abcdef123456:1:approve",
+        "mprn:v1:abcdef123456:approved",
+    ],
+)
+def test_unauthorized_admin_postback_is_silent_even_for_active_vip(
+    data, monkeypatch
+):
+    seen = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
+    monkeypatch.setattr(
+        server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN"
+    )
+    monkeypatch.setattr(
+        server, "handle_meal_photo_postback", lambda event: seen.append(event.postback.data)
+    )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=data),
+        source=SimpleNamespace(user_id="U_VIP"),
+    )
+
+    server.handle_postback_event(event)
+
+    assert seen == []
+
+
+def test_authorized_admin_postback_passes_without_vip(monkeypatch):
+    seen = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False)
+    monkeypatch.setattr(
+        server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN"
+    )
+    monkeypatch.setattr(
+        server, "handle_meal_photo_postback", lambda event: seen.append(event.postback.data)
+    )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data="mpr:v1:abcdef123456:1:approve"),
+        source=SimpleNamespace(user_id="U_ADMIN"),
+    )
+
+    server.handle_postback_event(event)
+
+    assert seen == ["mpr:v1:abcdef123456:1:approve"]
+
+
 def test_non_vip_carbon_cycle_command_is_silent(monkeypatch):
     replies = []
     server.processed_messages.clear()
@@ -2293,22 +2398,73 @@ def test_active_vip_access_requires_vip_status_valid_expiry_and_meals(tmp_path, 
     assert server.has_active_vip_access("U1") is False
 
 
-def test_non_vip_text_allowlist_only_permits_activation_and_authorized_roles(monkeypatch):
+def test_non_vip_text_allowlist_only_permits_valid_activation_codes(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "vip-command-gate.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
     monkeypatch.setattr(server, "COACH_UIDS", ["U_COACH"])
     monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE subscription_orders (id INTEGER PRIMARY KEY, user_id TEXT, status TEXT, formalized_at TEXT, vip_code TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO vips VALUES (?, 24, 31, 20, ?)",
+            [
+                ("#VIP24-ABC123", 0),
+                ("#VIP48-Z9Y8X7", 1),
+                ("#VIPORDER-1A2B3C", 0),
+                ("#VIPORDER-OWN123", 0),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO subscription_orders VALUES (1, 'U_OTHER', 'activated', '2026-09-01', '#VIPORDER-1A2B3C')"
+        )
+        conn.execute(
+            "INSERT INTO subscription_orders VALUES (2, 'U_CUSTOMER', 'activated', '2026-09-01', '#VIPORDER-OWN123')"
+        )
 
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#VIP24-ABC123") is True
-    assert server.is_text_command_allowed_without_vip("U_ADMIN", "#綁定老闆") is True
-    assert server.is_text_command_allowed_without_vip("U_COACH", "#教練") is True
+    assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#VIP48-Z9Y8X7") is False
+    assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#VIPORDER-1A2B3C") is False
+    assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#VIPORDER-OWN123") is True
+    assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#VIP24-NOT999") is False
+    for malformed in ("#VIP", "#VIP亂打", "#VIP24-ABC12", "#VIP24-ABC123 extra"):
+        assert server.is_text_command_allowed_without_vip("U_CUSTOMER", malformed) is False
+    assert server.is_text_command_allowed_without_vip("U_ADMIN", "#綁定老闆") is False
+    assert server.is_text_command_allowed_without_vip("U_COACH", "#教練") is False
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#教練") is False
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#綁定老闆") is False
     assert server.is_text_command_allowed_without_vip("U_ADMIN", "碳循環") is False
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "包月方案") is False
 
 
-def test_non_vip_vip_code_passes_global_text_gate(monkeypatch):
+def test_vip_activation_precheck_missing_db_fails_closed_without_creating_file(
+    tmp_path, monkeypatch
+):
+    missing_db = tmp_path / "must-not-be-created.db"
+    monkeypatch.setattr(server, "DB_PATH", str(missing_db))
+
+    assert server.is_valid_vip_activation_command("U_CUSTOMER", "#VIP24-ABC123") is False
+    assert missing_db.exists() is False
+
+
+def test_non_vip_vip_code_passes_global_text_gate(tmp_path, monkeypatch):
     seen = []
+    db = tmp_path / "valid-vip-command.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO vips VALUES ('#VIP24-ABC123', 24, 31, 20, 0)"
+        )
     monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False)
     monkeypatch.setattr(server, "_handle_message_impl", lambda event: seen.append(event.message.text))
 
@@ -2317,6 +2473,269 @@ def test_non_vip_vip_code_passes_global_text_gate(monkeypatch):
     )
 
     assert seen == ["#VIP24-ABC123"]
+
+
+def test_non_vip_valid_code_runs_real_outer_handler_and_redeems_once(
+    tmp_path, monkeypatch
+):
+    uid = "U_REAL_REDEEM"
+    code = "#VIP24-REAL01"
+    db = tmp_path / "real-outer-redeem.db"
+    replies = []
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)"
+        )
+        conn.execute("INSERT INTO vips VALUES (?, 24, 31, 20, 0)", (code,))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", False)
+    monkeypatch.setattr(
+        server, "get_subscription_form_link", lambda _uid: "https://example.test/form"
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message.text),
+    )
+    event = _text_event("REAL-OUTER-REDEEM", code, uid)
+    server.processed_messages.discard(event.message.id)
+
+    server.handle_message(event)
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT is_used FROM vips WHERE code=?", (code,)).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT status,remaining_meals FROM usage WHERE user_id=?", (uid,)
+        ).fetchone() == ("vip", 24)
+    assert len(replies) == 1
+    assert "兌換成功" in replies[0]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "#教練", "＃教練", "# 教練", "#教 練", "#教", "#管",
+        "#生24", "＃生24", "#生34",
+        "#綁定老闆 錯誤參數", "#喚醒ai U123", "@ 靜音 王小明",
+        "#更\u200b新菜單", "#喚醒\u2060AI U123", "＠解\ufeff除靜音 U123",
+        "#更\u034f新菜單", "#喚醒\x00AI U123",
+        "#更\u115f新菜單", "#更\u1160新菜單", "#更\u3164新菜單",
+        "#更\uffa0新菜單", "#更\u2800新菜單", "#更abc新菜單",
+        "#更" + "\u115f" * 10 + "新菜單", "#更" + "\u2800" * 10 + "新菜單",
+        "x#更新菜單", "。#更新菜單", "#更新菜", "#更新菜単",
+        "x#更abc新菜単", "。＃更\u2800新菜単",
+        "。健康回報｜體重70",
+        "健康回報｜體重70", "建康回報", "健回報｜體重70",
+        "今日健康日報", "今日健康報",
+        "重新整理今日報告", "重新整理今日報",
+        "#教煉", "#教鍊", "#校練", "#生x2肆",
+        "#教學#更新菜單", "#教我#綁定老闆", "#請教#生24",
+        "#生活#喚醒AI U123", "#重訓#刪除檔案",
+        "#重量訓練@靜音 王", "#管理飲食#點數庫存",
+    ],
+)
+def test_active_vip_unauthorized_reserved_commands_are_silent(message, monkeypatch):
+    seen = []
+    replies = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(server, "COACH_UIDS", ["U_COACH"])
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: seen.append(event.message.text)
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, reply: replies.append(reply),
+    )
+
+    server.handle_message(
+        _text_event(f"UNAUTHORIZED-RESERVED-{message}", message, "U_CUSTOMER")
+    )
+
+    assert seen == []
+    assert replies == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "#查狀態", "#重新排餐", "#延餐 5/31 午餐 -> 6/2 午餐", "#測距 台北市中山區",
+        "#生活習慣想改善", "#生\u200b活習慣想改善",
+        "#生活習慣改善30天", "#生活 2026目標",
+        "我想改善健康並回報今天飲食", "#重訓", "#教學",
+        "#請教今天重訓怎麼練比較有效？",
+        "#重量訓練怎麼設置組數？",
+        "健康餐吃完多久可以回家運動？",
+        "健康狀況多久才會回穩？",
+        "健康回家運動",
+        "健康回覆一下",
+        "健康回答問題",
+        "。健康回家",
+        "健康回報內容要怎麼看",
+        "健康回報告訴我今天狀況很好",
+        "今日健康日報告何時產生",
+        "重新整理今日報告訴我結果",
+        "#教我怎麼安排今天的飲食",
+        "#健康生活更新：今天菜單有雞胸肉",
+        "#管理飲食", "#管理今天飲食",
+        "#想知道剩餘點數，資料庫還有存嗎？",
+        "#等待教練審視我的餐點",
+        "#請問配送時間，明日會有提醒嗎？",
+    ],
+)
+def test_active_vip_public_commands_still_pass_global_text_gate(message, monkeypatch):
+    seen = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: seen.append(event.message.text)
+    )
+
+    server.handle_message(_text_event(f"PUBLIC-{message}", message, "U_VIP"))
+
+    assert seen == [message]
+
+
+@pytest.mark.parametrize(
+    ("user_id", "message"),
+    [("U_ADMIN", "#生24"), ("U_COACH", "#教練")],
+)
+def test_authorized_privileged_text_commands_still_require_active_vip(
+    user_id, message, monkeypatch
+):
+    seen = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False)
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(server, "COACH_UIDS", ["U_COACH"])
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: seen.append(event.message.text)
+    )
+
+    server.handle_message(
+        _text_event(f"AUTHORIZED-NO-VIP-{message}", message, user_id)
+    )
+
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    ("user_id", "message"),
+    [("U_ADMIN", "#生24"), ("U_COACH", "#教練")],
+)
+def test_authorized_privileged_commands_pass_for_active_vip(
+    user_id, message, monkeypatch
+):
+    seen = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(server, "COACH_UIDS", ["U_COACH"])
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: seen.append(event.message.text)
+    )
+
+    server.handle_message(
+        _text_event(f"AUTHORIZED-ACTIVE-VIP-{message}", message, user_id)
+    )
+
+    assert seen == [message]
+
+
+@pytest.mark.parametrize("database_state", ["missing", "corrupt"])
+def test_authorization_reads_fail_closed_without_creating_or_leaking_db_errors(
+    database_state, tmp_path, monkeypatch
+):
+    db_path = tmp_path / "authorization.db"
+    if database_state == "corrupt":
+        db_path.write_bytes(b"not-a-sqlite-database")
+    monkeypatch.setattr(server, "DB_PATH", str(db_path))
+    monkeypatch.setattr(
+        server,
+        "handle_meal_photo_postback",
+        lambda _event: pytest.fail("unauthorized postback reached inner handler"),
+    )
+
+    assert server.has_active_vip_access("U_CUSTOMER") is False
+    with pytest.raises(PermissionError):
+        server.get_bound_admin_uid_for_authorization()
+
+    server.handle_message(
+        _text_event(f"DB-{database_state}", "今天吃雞胸肉", "U_CUSTOMER")
+    )
+    server.handle_image_message(SimpleNamespace(source=SimpleNamespace(user_id="U_CUSTOMER")))
+    server.handle_postback_event(
+        SimpleNamespace(
+            source=SimpleNamespace(user_id="U_CUSTOMER"),
+            postback=SimpleNamespace(data="mpr:v1:malformed"),
+        )
+    )
+
+    if database_state == "missing":
+        assert not db_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("remaining_meals", "expiry_date"),
+    [("oops", "2099-12-31"), (12, "not-a-date"), (12, None), (12, "")],
+)
+def test_semantically_invalid_vip_rows_fail_closed_at_all_registered_gates(
+    remaining_meals, expiry_date, tmp_path, monkeypatch
+):
+    db_path = tmp_path / "invalid-vip-row.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE usage (
+                user_id TEXT PRIMARY KEY,
+                remaining_meals,
+                status TEXT,
+                expiry_date TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO usage VALUES ('U_CUSTOMER', ?, 'vip', ?)",
+            (remaining_meals, expiry_date),
+        )
+    seen = []
+    monkeypatch.setattr(server, "DB_PATH", str(db_path))
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda _event: seen.append("text")
+    )
+    monkeypatch.setattr(
+        server, "cleanup_nutrition_images", lambda: seen.append("image")
+    )
+    monkeypatch.setattr(
+        server, "handle_meal_photo_postback", lambda _event: seen.append("postback")
+    )
+
+    assert server.has_active_vip_access("U_CUSTOMER") is False
+    server.handle_message(
+        _text_event(f"INVALID-ROW-{remaining_meals}", "今天吃雞胸肉", "U_CUSTOMER")
+    )
+    server.handle_image_message(
+        SimpleNamespace(source=SimpleNamespace(user_id="U_CUSTOMER"))
+    )
+    server.handle_postback_event(
+        SimpleNamespace(
+            source=SimpleNamespace(user_id="U_CUSTOMER"),
+            postback=SimpleNamespace(data="nlfood:v1:anything"),
+        )
+    )
+
+    assert seen == []
+
+
+def test_privileged_intent_scan_handles_line_sized_introducer_flood_quickly():
+    from time import perf_counter
+
+    message = "#" * 5000 + "生活"
+    started = perf_counter()
+    result = server.is_privileged_command_intent(message)
+    elapsed = perf_counter() - started
+
+    assert result is True
+    assert elapsed < 0.5
 
 
 def test_selecting_self_pickup_clears_delivery_form_block(monkeypatch):
@@ -2410,6 +2829,43 @@ def _seed_vip_redemption_db(path, code, linked_uid=None):
                 "INSERT INTO subscription_orders VALUES (1, ?, ?, '2026-08-27 10:00:00', 'activated', '2026-08-27 09:00:00')",
                 (code, linked_uid),
             )
+
+
+@pytest.mark.parametrize("damage", ["duplicate_order", "malformed_formalized_at"])
+def test_subscription_vip_order_semantic_damage_never_prechecks_or_redeems(
+    damage, tmp_path, monkeypatch
+):
+    uid = "U_ORDER_OWNER"
+    code = "#VIPORDER-BAD001"
+    db = tmp_path / f"{damage}.db"
+    _seed_vip_redemption_db(db, code, linked_uid=uid)
+    with sqlite3.connect(db) as conn:
+        if damage == "duplicate_order":
+            conn.execute(
+                """INSERT INTO subscription_orders
+                   VALUES (2, ?, 'U_OTHER', '2026-08-27 10:00:00',
+                           'activated', '2026-08-27 09:00:00')""",
+                (code,),
+            )
+        else:
+            conn.execute(
+                "UPDATE subscription_orders SET formalized_at='not-a-date' WHERE vip_code=?",
+                (code,),
+            )
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", False)
+
+    assert server.is_valid_vip_activation_command(uid, code) is False
+    expiry, _message = server.redeem_code(uid, code)
+
+    assert expiry is None
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT is_used FROM vips WHERE code=?", (code,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE user_id=?", (uid,)
+        ).fetchone()[0] == 0
 
 
 def test_vip_redemption_does_not_expose_form_link_for_blocked_delivery(tmp_path, monkeypatch):
