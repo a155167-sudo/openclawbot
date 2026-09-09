@@ -1177,9 +1177,19 @@ def get_customer_health_check_state(
     report = None
     if row[1] == "delivered":
         report_row = conn.execute(
-            """SELECT report_json FROM vip_health_check_reports
-               WHERE case_id=? ORDER BY report_version DESC LIMIT 1""",
-            (row[0],),
+            """SELECT r.report_json
+               FROM vip_health_check_reports AS r
+               WHERE r.case_id=?
+                 AND EXISTS (
+                     SELECT 1
+                     FROM vip_health_check_deliveries AS d
+                     WHERE d.report_id=r.report_id
+                       AND d.user_id=?
+                       AND d.status='delivered'
+                 )
+               ORDER BY r.report_version DESC
+               LIMIT 1""",
+            (row[0], str(user_id or "").strip()),
         ).fetchone()
         if report_row:
             report = json.loads(report_row[0])

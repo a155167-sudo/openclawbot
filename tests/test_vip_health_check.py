@@ -1262,6 +1262,49 @@ def test_delivery_failure_and_retry_reuse_exact_report_then_customer_can_read_it
     assert customer["status"] == "delivered"
     assert customer["report"]["good"] == "穩定記錄"
 
+    timestamp = (now + timedelta(hours=4)).isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO vip_health_check_reviews (
+               review_id,case_id,review_version,status,ai_observations_json,
+               review_json,suggested_values_json,limitations,source_manifest_hash,
+               approved_by,approved_at,created_at,updated_at
+           ) VALUES ('review-v2',?,2,'approved','{}','{}','{}','',
+                     'manifest-v1','dietitian-2',?,?,?)""",
+        (case["case_id"], timestamp, timestamp, timestamp),
+    )
+    conn.execute(
+        """INSERT INTO vip_health_check_reports (
+               report_id,case_id,review_id,report_kind,report_version,report_json,
+               source_manifest_hash,published_by,published_at
+           ) VALUES ('report-v2',?,'review-v2','baseline_3day',2,?,
+                     'manifest-v1','dietitian-2',?)""",
+        (
+            case["case_id"],
+            json.dumps(
+                {
+                    "good": "NOT_DELIVERED",
+                    "priority": "不可曝光",
+                    "next_7_days": "不可曝光",
+                    "limitations": "pending",
+                }
+            ),
+            timestamp,
+        ),
+    )
+    conn.execute(
+        """INSERT INTO vip_health_check_deliveries (
+               delivery_id,report_id,user_id,delivery_key,status,attempts,
+               last_error,created_at,delivered_at
+           ) VALUES ('delivery-v2','report-v2','U1','delivery-v2-key',
+                     'pending',0,'',?,'')""",
+        (timestamp,),
+    )
+
+    customer_after_pending_v2 = get_customer_health_check_state(conn, user_id="U1")
+    assert customer_after_pending_v2 is not None
+    assert isinstance(customer_after_pending_v2["report"], dict)
+    assert customer_after_pending_v2["report"]["good"] == "穩定記錄"
+
 
 def test_manual_coaching_payment_activates_same_user_without_vip_code(conn):
     from vip_health_check import (
@@ -1342,6 +1385,30 @@ def test_server_customer_state_service_is_feature_gated_and_user_scoped(monkeypa
     assert state["status"] == "collecting"
     assert state["valid_day_count"] == 0
     assert server.get_vip_health_check_state_for_user("OTHER") is None
+
+
+def test_server_customer_liff_registration_uses_feature_flag_and_user_scoped_loader(
+    monkeypatch,
+):
+    import server
+    from fastapi import FastAPI
+
+    captured = {}
+    target_app = FastAPI()
+
+    def fake_attach(app, **kwargs):
+        captured["app"] = app
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    monkeypatch.setattr(server, "attach_customer_health_check_routes", fake_attach)
+
+    assert server.register_customer_health_check_liff(target_app) is True
+    assert captured["app"] is target_app
+    assert captured["enabled"] is True
+    assert captured["environ"] is server.os.environ
+    assert captured["state_loader"] is server.get_vip_health_check_state_for_user
 
 
 def test_redeem_health_check_failure_rolls_back_closes_and_unlocks_db(monkeypatch, tmp_path):
