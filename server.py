@@ -3,7 +3,7 @@ import hmac
 import os
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import secrets
 import string
 import base64
@@ -14,6 +14,7 @@ import random
 import re
 import requests
 import threading
+import unicodedata
 import uuid
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -1385,8 +1386,216 @@ ADMIN_ONLY_PREFIXES = (
     "#核准訂單 ", "#拒絕訂單 ", "#開通訂單 ", "#核准營養份量 "
 )
 
+# 未授權者即使是有效 VIP，也不得讓管理／教練指令或近似拼法落入一般 AI。
+PRIVILEGED_COMMAND_STEMS = (
+    "#教練", "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成",
+    "#發送明日提醒", "#測試週報", "#測試晚報", "#延餐清單",
+    "#待核訂單", "#清空熱量", "#刪除檔案", "#重置", "重置本週",
+    "檢查數據", "#待審營養份量", "#待審餐點", "@靜音", "@解除靜音",
+    "#喚醒AI", "#上傳點數", "#核准延餐", "#拒絕延餐", "#核准訂單",
+    "#拒絕訂單", "#開通訂單", "#核准營養份量",
+    "健康回報", "今日健康日報", "重新整理今日報告",
+)
+PRIVILEGED_SHORT_COMMANDS = {"#教", "#管"}
+
 def is_admin_only_command(msg: str) -> bool:
     return msg in ADMIN_ONLY_EXACT_COMMANDS or any(msg.startswith(prefix) for prefix in ADMIN_ONLY_PREFIXES)
+
+
+def _interleaved_stem_end(text, stem):
+    """回傳錨定開頭的詞幹子序列結束位置；中間插入任意字元仍可辨識。"""
+    if not text or not stem or text[0] != stem[0]:
+        return None
+    stem_index = 0
+    for text_index, char in enumerate(text):
+        if char == stem[stem_index]:
+            stem_index += 1
+            if stem_index == len(stem):
+                return text_index + 1
+    return None
+
+
+def _edit_distance_at_most_one(left, right):
+    """只判斷 Levenshtein 距離是否至多 1，供短命令近似分類使用。"""
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right)) <= 1
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    short_index = long_index = edits = 0
+    while short_index < len(shorter) and long_index < len(longer):
+        if shorter[short_index] == longer[long_index]:
+            short_index += 1
+            long_index += 1
+        else:
+            edits += 1
+            long_index += 1
+            if edits > 1:
+                return False
+    return True
+
+
+def _prefix_within_one_edit(text, stem):
+    for length in range(max(0, len(stem) - 1), min(len(text), len(stem) + 1) + 1):
+        if _edit_distance_at_most_one(text[:length], stem):
+            return True
+    return False
+
+
+def _interleaved_stem_with_one_edit(text, stem, require_first=True):
+    """允許任意插字，且詞幹本身至多一次缺字或替換。"""
+    if not text or not stem:
+        return False
+    if require_first and text[0] != stem[0]:
+        return False
+    target = stem[1:] if require_first else stem
+    source = text[1:] if require_first else text
+    costs = list(range(len(target) + 1))
+    for source_char in source:
+        previous = costs
+        costs = previous.copy()  # 跳過輸入插字不計編輯次數
+        costs[0] = 0
+        for target_length in range(1, len(target) + 1):
+            costs[target_length] = min(
+                costs[target_length],
+                costs[target_length - 1] + 1,
+                previous[target_length - 1]
+                + (target[target_length - 1] != source_char),
+            )
+    return costs[len(target)] <= 1
+
+
+def _is_exact_public_command(message):
+    normalized = str(message or "").strip()
+    return (
+        normalized in {"#查狀態", "#重新排餐"}
+        or normalized.startswith("#延餐 ")
+        or normalized.startswith("#測距 ")
+        or normalized.startswith(
+            (
+                "#生活",
+                "#教學",
+                "#教我",
+                "#請教",
+                "#重訓",
+                "#重量訓練",
+                "#管理飲食",
+                "#管理今天飲食",
+            )
+        )
+    )
+
+
+def _command_candidates(compact, stem):
+    if not stem:
+        return []
+    if stem[0] in {"#", "@"}:
+        return [
+            compact[index:index + 64]
+            for index, char in enumerate(compact)
+            if char == stem[0]
+        ]
+    start = 0
+    while start < len(compact) and unicodedata.category(compact[start])[0] in {"P", "S"}:
+        start += 1
+    candidate = compact[start:]
+    return [candidate] if candidate else []
+
+
+def is_privileged_command_intent(msg: str) -> bool:
+    """辨識管理／教練保留命名空間，包括插字、缺字及單字替換。"""
+    normalized = unicodedata.normalize("NFKC", str(msg or "")).strip()
+    has_public_leading_command = _is_exact_public_command(normalized)
+    compact = "".join(
+        char
+        for char in normalized
+        if not char.isspace()
+        and not unicodedata.category(char).startswith(("C", "M"))
+        and char not in {"\u115f", "\u1160", "\u2800"}
+    ).casefold()
+    if compact.count("#") + compact.count("@") > 64:
+        return True
+    if any(
+        candidate in PRIVILEGED_SHORT_COMMANDS
+        for candidate in _command_candidates(compact, "#")
+    ):
+        return True
+
+    for candidate in _command_candidates(compact, "#生24"):
+        if candidate.startswith("#生活"):
+            continue
+        if any(
+            (
+                (stem_end := _interleaved_stem_end(candidate, stem)) is not None
+                and stem_end <= len(stem) + 3
+            )
+            or _prefix_within_one_edit(candidate, stem)
+            or _interleaved_stem_with_one_edit(candidate[:len(stem) + 3], stem)
+            for stem in ("#生24", "#生48")
+        ):
+            return True
+
+    for raw_stem in PRIVILEGED_COMMAND_STEMS:
+        stem = "".join(
+            char for char in unicodedata.normalize("NFKC", raw_stem)
+            if not char.isspace()
+        ).casefold()
+        for candidate in _command_candidates(compact, stem):
+            uses_introducer = stem[0] in {"#", "@"}
+            if uses_introducer and has_public_leading_command and candidate == compact:
+                continue
+            if not uses_introducer:
+                prefix = candidate[:len(stem)]
+                suffix = candidate[len(stem):len(stem) + 1]
+                has_command_boundary = (
+                    not suffix
+                    or suffix in {"｜", "|", ":", "：", "，", ",", "；", ";"}
+                )
+                if prefix == stem and has_command_boundary:
+                    return True
+                if (
+                    len(prefix) == len(stem)
+                    and prefix[1:] == stem[1:]
+                    and prefix[0] != stem[0]
+                    and has_command_boundary
+                ):
+                    return True
+                shortened_prefix = candidate[:len(stem) - 1]
+                shortened_suffix = candidate[len(stem) - 1:len(stem)]
+                if (
+                    len(shortened_prefix) == len(stem) - 1
+                    and _edit_distance_at_most_one(shortened_prefix, stem)
+                    and (
+                        not shortened_suffix
+                        or shortened_suffix
+                        in {"｜", "|", ":", "：", "，", ",", "；", ";"}
+                    )
+                ):
+                    return True
+                continue
+            max_insertions = 1 if len(stem) <= 3 else 3
+            window = candidate[:len(stem) + max_insertions]
+            stem_end = _interleaved_stem_end(window, stem)
+            if (
+                (
+                    stem_end is not None
+                    and stem_end <= len(stem) + max_insertions
+                )
+                or (
+                    len(stem) == 3
+                    and _prefix_within_one_edit(candidate, stem)
+                )
+                or (
+                    len(stem) >= 4
+                    and _interleaved_stem_with_one_edit(
+                        window,
+                        stem,
+                        require_first=True,
+                    )
+                )
+            ):
+                return True
+    return False
 
 # ── 顧客清單同步 helper ──────────────────────────────────────────────────────
 def sync_customer_sheet(uid, name, status, remaining_meals, expiry_date, tdee):
@@ -1436,9 +1645,11 @@ def get_admin_notify_uid():
 
 
 def get_bound_admin_uid_for_authorization() -> str:
-    """嚴格讀取目前綁定管理員；授權用途遇到缺值或DB錯誤一律拒絕。"""
+    """嚴格唯讀目前綁定管理員；缺檔、缺值或DB錯誤一律拒絕且不建檔。"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
+        with closing(
+            sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        ) as conn:
             row = conn.execute(
                 "SELECT value FROM admin_settings WHERE key='admin_id'"
             ).fetchone()
@@ -6749,31 +6960,90 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
 # 6. 其他輔助函數與 Webhook (🔥 融合版：完整保留測距、VIP功能)
 # ==========================================
 def has_active_vip_access(user_id):
-    """只檢查VIP資格，不扣除每日諮詢額度。"""
+    """唯讀檢查VIP資格；DB 缺失或損毀時靜默拒絕且不建立檔案。"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
+        with closing(
+            sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        ) as conn:
             row = conn.execute(
                 "SELECT remaining_meals, status, expiry_date FROM usage WHERE user_id=?",
                 (user_id,),
             ).fetchone()
-    except sqlite3.OperationalError:
+    except sqlite3.Error:
         return False
     if not row:
         return False
     remaining_meals, status, expiry_date = row
     if status != "vip":
         return False
-    if expiry_date and tw_today().isoformat() > str(expiry_date):
+    try:
+        if not expiry_date:
+            return False
+        if tw_today() > date.fromisoformat(str(expiry_date)):
+            return False
+        return remaining_meals is None or int(remaining_meals) > 0
+    except (TypeError, ValueError):
         return False
-    return remaining_meals is None or int(remaining_meals) > 0
 
 
-def is_text_command_allowed_without_vip(user_id, message):
-    """非VIP僅可開通VIP；授權管理員與教練只放行各自專用指令。"""
-    if message.startswith("#VIP"):
-        return True
-    if message == "#教練" and user_id in COACH_UIDS:
-        return True
+def _validated_subscription_order_for_activation(conn, code, user_id):
+    """訂單碼必須唯一、屬於本人、已正式化且時間格式有效。"""
+    rows = conn.execute(
+        """SELECT id,user_id,formalized_at,status
+           FROM subscription_orders WHERE vip_code=?""",
+        (code,),
+    ).fetchall()
+    if len(rows) != 1:
+        return None, "missing_or_ambiguous"
+    order_row = rows[0]
+    if str(order_row[1] or "") != str(user_id or ""):
+        return None, "foreign_owner"
+    if str(order_row[3] or "") != "activated":
+        return None, "not_activated"
+    formalized_at = str(order_row[2] or "").strip()
+    try:
+        datetime.fromisoformat(formalized_at)
+    except (TypeError, ValueError):
+        return None, "not_activated"
+    return order_row, ""
+
+
+def is_valid_vip_activation_command(user_id, message):
+    """僅放行尚未使用且（訂單碼）屬於目前帳號的實際 VIP 序號。"""
+    code = str(message or "")
+    if not re.fullmatch(r"#(?:VIP24|VIP48|VIPORDER)-[A-Z0-9]{6}", code):
+        return False
+    try:
+        with closing(sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)) as conn:
+            vip_row = conn.execute(
+                "SELECT is_used FROM vips WHERE code=?", (code,)
+            ).fetchone()
+            if not vip_row or int(vip_row[0] or 0) != 0:
+                return False
+            if code.startswith("#VIPORDER-"):
+                order_row, validation_error = _validated_subscription_order_for_activation(
+                    conn, code, user_id
+                )
+                return bool(order_row and not validation_error)
+            return True
+    except Exception as exc:
+        print(f"⛔ VIP 開通碼預檢失敗，已靜默拒絕：{type(exc).__name__}")
+        return False
+
+
+def is_jason_only_command(message):
+    normalized = str(message or "").strip()
+    return normalized.startswith("健康回報") or normalized in {
+        "今日健康日報", "重新整理今日報告",
+    }
+
+
+def is_authorized_privileged_text_command(user_id, message):
+    """active VIP 的保留文字指令仍須符合 ADMIN／COACH 身分。"""
+    if message == "#教練":
+        return user_id in COACH_UIDS
+    if is_jason_only_command(message):
+        return user_id == ADMIN_UID
     if not is_admin_only_command(message):
         return False
     if message == "#待審餐點":
@@ -6784,6 +7054,11 @@ def is_text_command_allowed_without_vip(user_id, message):
     else:
         authorized_uid = ADMIN_UID
     return user_id == authorized_uid
+
+
+def is_text_command_allowed_without_vip(user_id, message):
+    """無有效 VIP 時只放行資料庫中實際合法的本人開通碼。"""
+    return is_valid_vip_activation_command(user_id, message)
 
 
 def check_permission_and_quota(user_id):
@@ -7753,17 +8028,15 @@ def redeem_code(uid, code):
             order_record = None
             is_subscription_order_code = code.startswith("#VIPORDER-")
             if is_subscription_order_code:
-                c.execute(
-                    "SELECT id, user_id, formalized_at, status FROM subscription_orders WHERE vip_code=?",
-                    (code,),
+                order_record, validation_error = _validated_subscription_order_for_activation(
+                    conn, code, uid
                 )
-                order_record = c.fetchone()
-                if not order_record:
+                if validation_error == "foreign_owner":
+                    return None, "❌ 此開通碼不屬於目前帳號，請使用原訂購LINE帳號兌換。"
+                if validation_error == "not_activated":
+                    return None, "⏳ 此訂單尚未完成付款確認與正式配餐，請先聯絡客服。"
+                if validation_error:
                     return None, "❌ 找不到對應的包月訂單，請聯絡客服確認開通碼。"
-            if order_record and order_record[1] != uid:
-                return None, "❌ 此開通碼不屬於目前帳號，請使用原訂購LINE帳號兌換。"
-            if order_record and (not order_record[2] or order_record[3] != "activated"):
-                return None, "⏳ 此訂單尚未完成付款確認與正式配餐，請先聯絡客服。"
             if order_record:
                 linked_order = (order_record[0], order_record[2], order_record[3])
             m, d, l = r
@@ -10903,7 +11176,29 @@ def build_meal_photo_notification_retry_message(draft, kind):
     )
 
 
+def is_authorized_admin_postback(user_id, data):
+    """管理員餐點審核 postback 僅允許目前綁定的管理員。"""
+    normalized = str(data or "").strip()
+    if not normalized.startswith(("mpr:v1:", "mprn:v1:")):
+        return None
+    try:
+        return user_id == get_bound_admin_uid_for_authorization()
+    except PermissionError:
+        return False
+
+
 @handler.add(PostbackEvent)
+def handle_postback_event(event):
+    uid = event.source.user_id
+    data = str(getattr(event.postback, "data", "") or "")
+    admin_authorization = is_authorized_admin_postback(uid, data)
+    if admin_authorization is False:
+        return
+    if admin_authorization is not True and not has_active_vip_access(uid):
+        return
+    return handle_meal_photo_postback(event)
+
+
 def handle_meal_photo_postback(event):
     data = str(getattr(event.postback, "data", "") or "")
     uid = event.source.user_id
@@ -13839,8 +14134,13 @@ def handle_message(event):
     try:
         message = event.message.text.strip()
         user_id = event.source.user_id
-        if not has_active_vip_access(user_id) and not is_text_command_allowed_without_vip(
-            user_id, message
+        has_vip = has_active_vip_access(user_id)
+        if not has_vip and not is_text_command_allowed_without_vip(user_id, message):
+            return
+        if (
+            has_vip
+            and is_privileged_command_intent(message)
+            and not is_authorized_privileged_text_command(user_id, message)
         ):
             return
         return _handle_message_impl(event)
