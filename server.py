@@ -7070,8 +7070,10 @@ def is_authorized_privileged_text_command(user_id, message):
 
 
 def is_text_command_allowed_without_vip(user_id, message):
-    """無有效 VIP 時只放行資料庫中實際合法的本人開通碼。"""
-    return is_valid_vip_activation_command(user_id, message)
+    """無有效 VIP 時只放行本人合法開通碼或已驗證角色的管理指令。"""
+    return is_valid_vip_activation_command(
+        user_id, message
+    ) or is_authorized_privileged_text_command(user_id, message)
 
 
 def check_permission_and_quota(user_id):

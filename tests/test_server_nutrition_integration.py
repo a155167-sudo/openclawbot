@@ -2398,7 +2398,7 @@ def test_active_vip_access_requires_vip_status_valid_expiry_and_meals(tmp_path, 
     assert server.has_active_vip_access("U1") is False
 
 
-def test_non_vip_text_allowlist_only_permits_valid_activation_codes(
+def test_non_vip_text_gate_only_permits_valid_activation_or_authorized_commands(
     tmp_path, monkeypatch
 ):
     db = tmp_path / "vip-command-gate.db"
@@ -2436,10 +2436,12 @@ def test_non_vip_text_allowlist_only_permits_valid_activation_codes(
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#VIP24-NOT999") is False
     for malformed in ("#VIP", "#VIP亂打", "#VIP24-ABC12", "#VIP24-ABC123 extra"):
         assert server.is_text_command_allowed_without_vip("U_CUSTOMER", malformed) is False
-    assert server.is_text_command_allowed_without_vip("U_ADMIN", "#綁定老闆") is False
-    assert server.is_text_command_allowed_without_vip("U_COACH", "#教練") is False
+    assert server.is_text_command_allowed_without_vip("U_ADMIN", "#綁定老闆") is True
+    assert server.is_text_command_allowed_without_vip("U_COACH", "#教練") is True
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#教練") is False
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "#綁定老闆") is False
+    assert server.is_text_command_allowed_without_vip("U_COACH", "#生24") is False
+    assert server.is_text_command_allowed_without_vip("U_ADMIN", "#教練") is False
     assert server.is_text_command_allowed_without_vip("U_ADMIN", "碳循環") is False
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "包月方案") is False
 
@@ -2603,7 +2605,7 @@ def test_active_vip_public_commands_still_pass_global_text_gate(message, monkeyp
     ("user_id", "message"),
     [("U_ADMIN", "#生24"), ("U_COACH", "#教練")],
 )
-def test_authorized_privileged_text_commands_still_require_active_vip(
+def test_authorized_privileged_text_commands_pass_without_active_vip(
     user_id, message, monkeypatch
 ):
     seen = []
@@ -2618,7 +2620,7 @@ def test_authorized_privileged_text_commands_still_require_active_vip(
         _text_event(f"AUTHORIZED-NO-VIP-{message}", message, user_id)
     )
 
-    assert seen == []
+    assert seen == [message]
 
 
 @pytest.mark.parametrize(
