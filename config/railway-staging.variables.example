@@ -18,6 +18,7 @@ ADMIN_SECRET=<secret admin command value>
 FORM_WEBHOOK_SECRET=<at least 32 random bytes, staging only>
 SURVEY_WEBHOOK_SECRET=<at least 32 random bytes, staging only>
 SURVEY_REWARD_LINK_COUNT=1
+SURVEY_REWARD_POINTS_PER_LINK=2
 
 SPREADSHEET_ID=<staging Google Sheet ID>
 ADMIN_UID=<staging provider Jason UID>
