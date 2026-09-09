@@ -2,6 +2,9 @@
 APP_ENV=production
 ENABLE_SCHEDULER=true
 VIP_HEALTH_CHECK_ENABLED=false
+# Keep disabled until the dedicated Production customer LIFF has passed isolated staging E2E.
+VIP_HEALTH_CHECK_LIFF_ID=<dedicated production customer health-check LIFF ID>
+VIP_HEALTH_CHECK_LINE_LOGIN_CHANNEL_ID=<owning production LINE Login Channel ID>
 DATA_DIR=/app/data
 PUBLIC_BASE_URL=https://YOUR-PRODUCTION-DOMAIN
 

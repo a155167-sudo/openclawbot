@@ -103,6 +103,7 @@ from meal_photo_system import (
     normalize_meal_photo_payload,
     save_meal_photo_draft,
 )
+from customer_health_check_liff import attach_customer_health_check_routes
 from vip_health_check import (
     configure_vip_health_check_connection,
     create_first_vip_health_check_case,
@@ -3022,12 +3023,24 @@ def ensure_subscription_menu_entitlement_schema(conn):
 
 
 def get_vip_health_check_state_for_user(user_id: str):
-    """內部唯讀服務；公開路由需待 LIFF ID token 驗證完成後另行建立。"""
+    """內部唯讀服務；公開路由只透過已驗證的 LINE ID token 呼叫。"""
     if not VIP_HEALTH_CHECK_ENABLED:
         return None
     with closing(sqlite3.connect(DB_PATH)) as conn:
         configure_vip_health_check_connection(conn)
         return get_customer_health_check_state(conn, user_id=user_id)
+
+
+def register_customer_health_check_liff(target_app=app):
+    return attach_customer_health_check_routes(
+        target_app,
+        enabled=VIP_HEALTH_CHECK_ENABLED,
+        environ=os.environ,
+        state_loader=get_vip_health_check_state_for_user,
+    )
+
+
+register_customer_health_check_liff()
 
 
 def init_db():
