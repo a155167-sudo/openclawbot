@@ -1,8 +1,24 @@
 from types import SimpleNamespace
+import sqlite3
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
+
+
+def test_server_customer_state_read_does_not_create_missing_database(
+    tmp_path, monkeypatch
+):
+    import server
+
+    missing = tmp_path / "missing-customer-state.db"
+    monkeypatch.setattr(server, "DB_PATH", str(missing))
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+
+    with pytest.raises(sqlite3.OperationalError):
+        server.get_vip_health_check_state_for_user("U123")
+
+    assert not missing.exists()
 
 
 def test_verify_line_id_token_uses_official_endpoint_and_returns_subject():

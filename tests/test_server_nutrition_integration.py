@@ -2516,6 +2516,49 @@ def test_non_vip_valid_code_runs_real_outer_handler_and_redeems_once(
     assert "兌換成功" in replies[0]
 
 
+def test_active_vip_valid_code_runs_outer_handler_and_renews(
+    tmp_path, monkeypatch
+):
+    uid = "U_REAL_RENEW"
+    code = "#VIP24-ABC123"
+    db = tmp_path / "real-outer-renew.db"
+    replies = []
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE vips (code TEXT PRIMARY KEY, meals INTEGER, duration_days INTEGER, chat_limit INTEGER, is_used INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE usage (user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER, remaining_meals INTEGER, last_date TEXT, status TEXT, expiry_date TEXT, daily_chat_limit INTEGER)"
+        )
+        conn.execute("INSERT INTO vips VALUES (?, 24, 31, 20, 0)", (code,))
+        conn.execute(
+            "INSERT INTO usage VALUES (?, 20, 5, '2026-09-10', 'vip', '2099-01-01', 20)",
+            (uid,),
+        )
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", False)
+    monkeypatch.setattr(
+        server, "get_subscription_form_link", lambda _uid: "https://example.test/form"
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message.text),
+    )
+    event = _text_event("REAL-OUTER-RENEW", code, uid)
+    server.processed_messages.discard(event.message.id)
+
+    server.handle_message(event)
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT is_used FROM vips WHERE code=?", (code,)).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT status,remaining_meals FROM usage WHERE user_id=?", (uid,)
+        ).fetchone() == ("vip", 29)
+    assert len(replies) == 1
+    assert "兌換成功" in replies[0]
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -2530,9 +2573,9 @@ def test_non_vip_valid_code_runs_real_outer_handler_and_redeems_once(
         "x#更新菜單", "。#更新菜單", "#更新菜", "#更新菜単",
         "x#更abc新菜単", "。＃更\u2800新菜単",
         "。健康回報｜體重70",
-        "健康回報｜體重70", "建康回報", "健回報｜體重70",
-        "今日健康日報", "今日健康報",
-        "重新整理今日報告", "重新整理今日報",
+        "健康回報｜體重70", "建康回報", "健回報｜體重70", "健庩回報｜體重70",
+        "今日健康日報", "今日健康報", "今日健庩日報",
+        "重新整理今日報告", "重新整理今日報", "重新整理今曰報告",
         "#教煉", "#教鍊", "#校練", "#生x2肆",
         "#教學#更新菜單", "#教我#綁定老闆", "#請教#生24",
         "#生活#喚醒AI U123", "#重訓#刪除檔案",
@@ -2569,6 +2612,7 @@ def test_active_vip_unauthorized_reserved_commands_are_silent(message, monkeypat
         "#生活習慣想改善", "#生\u200b活習慣想改善",
         "#生活習慣改善30天", "#生活 2026目標",
         "我想改善健康並回報今天飲食", "#重訓", "#教學",
+        "#教\u200b學今天怎麼安排？", "#重\u2060訓今天做幾組？", "＃教\u034f學",
         "#請教今天重訓怎麼練比較有效？",
         "#重量訓練怎麼設置組數？",
         "健康餐吃完多久可以回家運動？",
@@ -2868,6 +2912,37 @@ def test_subscription_vip_order_semantic_damage_never_prechecks_or_redeems(
         assert conn.execute(
             "SELECT COUNT(*) FROM usage WHERE user_id=?", (uid,)
         ).fetchone()[0] == 0
+
+
+def test_null_is_used_vip_order_fails_outer_gate_without_side_effects(
+    tmp_path, monkeypatch
+):
+    uid = "U_ORDER_OWNER"
+    code = "#VIPORDER-NULL00"
+    db = tmp_path / "null-is-used.db"
+    _seed_vip_redemption_db(db, code, linked_uid=uid)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE vips SET is_used=NULL WHERE code=?", (code,))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", False)
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False)
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, reply: replies.append(reply),
+    )
+    event = _text_event("NULL-IS-USED", code, uid)
+    server.processed_messages.discard(event.message.id)
+
+    assert server.is_valid_vip_activation_command(uid, code) is False
+    server.handle_message(event)
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT is_used FROM vips WHERE code=?", (code,)).fetchone()[0] is None
+        assert conn.execute("SELECT COUNT(*) FROM usage").fetchone()[0] == 0
+    assert replies == []
+    assert event.message.id not in server.processed_messages
 
 
 def test_vip_redemption_does_not_expose_form_link_for_blocked_delivery(tmp_path, monkeypatch):

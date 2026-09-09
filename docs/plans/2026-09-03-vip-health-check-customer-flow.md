@@ -88,6 +88,8 @@ VIP 首次開通同時建立一次健檢資格：
 - 真正營養師審核一次基準報告。
 - 不另發新序號。
 - 每一個 LINE user 僅有一次首次基準報告權益；補件與退回不消耗第二次資格。
+- `VIP_HEALTH_CHECK_ENABLED` 只控制顧客路由是否曝光；暗部署後的成功 VIP 兌換仍必須保存首次 activation provenance，避免續期錯當首次。
+- 暗部署前的歷史 generic VIP 無法可靠重建首次日期，不得從 `usage.last_date` 猜測；正式啟用前必須依 production runbook 完成 Jason 核准的 backfill／no-backfill 決策。
 
 ### 有效紀錄日 MVP 定義
 

@@ -16,6 +16,7 @@ import requests
 import threading
 import unicodedata
 import uuid
+from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -110,6 +111,7 @@ from vip_health_check import (
     ensure_vip_health_check_schema,
     get_customer_health_check_state,
     is_vip_health_check_enabled,
+    record_vip_activation_event,
 )
 
 APP_SETTINGS = load_settings(os.environ)
@@ -1506,14 +1508,14 @@ def _command_candidates(compact, stem):
 def is_privileged_command_intent(msg: str) -> bool:
     """辨識管理／教練保留命名空間，包括插字、缺字及單字替換。"""
     normalized = unicodedata.normalize("NFKC", str(msg or "")).strip()
-    has_public_leading_command = _is_exact_public_command(normalized)
-    compact = "".join(
+    visible = "".join(
         char
         for char in normalized
-        if not char.isspace()
-        and not unicodedata.category(char).startswith(("C", "M"))
+        if not unicodedata.category(char).startswith(("C", "M"))
         and char not in {"\u115f", "\u1160", "\u2800"}
-    ).casefold()
+    )
+    has_public_leading_command = _is_exact_public_command(visible)
+    compact = "".join(char for char in visible if not char.isspace()).casefold()
     if compact.count("#") + compact.count("@") > 64:
         return True
     if any(
@@ -1556,8 +1558,9 @@ def is_privileged_command_intent(msg: str) -> bool:
                     return True
                 if (
                     len(prefix) == len(stem)
-                    and prefix[1:] == stem[1:]
-                    and prefix[0] != stem[0]
+                    and sum(a != b for a, b in zip(prefix, stem)) == 1
+                    # 最後一字替換容易誤擋一般句（例如「健康回家」）。
+                    and prefix[-1] == stem[-1]
                     and has_command_boundary
                 ):
                     return True
@@ -3026,7 +3029,8 @@ def get_vip_health_check_state_for_user(user_id: str):
     """內部唯讀服務；公開路由只透過已驗證的 LINE ID token 呼叫。"""
     if not VIP_HEALTH_CHECK_ENABLED:
         return None
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    database_uri = Path(DB_PATH).resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(database_uri, uri=True)) as conn:
         configure_vip_health_check_connection(conn)
         return get_customer_health_check_state(conn, user_id=user_id)
 
@@ -3972,7 +3976,7 @@ async def receive_survey_data(request: Request):
                     TextSendMessage(
                         text=(
                             "❤️ 感謝您的寶貴回饋！目前 "
-                            f"{SURVEY_REWARD_LINK_COUNT} 點獎勵連結正在補貨中，"
+                            f"{SURVEY_REWARD_LINK_COUNT} 張獎勵連結正在補貨中，"
                             "尚未扣除您的領取資格；請稍後再填一次，或聯絡一日樂食客服協助。"
                         )
                     ),
@@ -3991,7 +3995,7 @@ async def receive_survey_data(request: Request):
                         TextSendMessage(
                             text=(
                                 "🚨 老闆緊急通知：滿意度問卷每人需發 "
-                                f"{SURVEY_REWARD_LINK_COUNT} 張一點連結，但目前可用庫存不足 "
+                                f"{SURVEY_REWARD_LINK_COUNT} 張獎勵連結，但目前可用庫存不足 "
                                 f"{SURVEY_REWARD_LINK_COUNT} 張。系統沒有消耗剩餘連結，"
                                 "也沒有標記客人已領取；請用 #上傳點數 補貨。"
                             )
@@ -7031,7 +7035,11 @@ def is_valid_vip_activation_command(user_id, message):
             vip_row = conn.execute(
                 "SELECT is_used FROM vips WHERE code=?", (code,)
             ).fetchone()
-            if not vip_row or int(vip_row[0] or 0) != 0:
+            if (
+                not vip_row
+                or not isinstance(vip_row[0], int)
+                or vip_row[0] != 0
+            ):
                 return False
             if code.startswith("#VIPORDER-"):
                 order_row, validation_error = _validated_subscription_order_for_activation(
@@ -8029,9 +8037,10 @@ def redeem_code(uid, code):
     linked_order = None
     with closing(sqlite3.connect(DB_PATH)) as conn:
         try:
-            if VIP_HEALTH_CHECK_ENABLED:
-                # PRAGMA 在 transaction 開始後不生效，必須先於任何兌換寫入。
-                configure_vip_health_check_connection(conn)
+            # 健檢路由可維持 dark，但首次 VIP activation provenance 必須永久保存。
+            # PRAGMA 與 schema 驗證必須先於任何兌換寫入。
+            configure_vip_health_check_connection(conn)
+            ensure_vip_health_check_schema(conn)
             c = conn.cursor()
             c.execute(
                 "SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0",
@@ -8064,9 +8073,23 @@ def redeem_code(uid, code):
             if c.rowcount != 1:
                 conn.rollback()
                 return None, "❌ 無效"
-            c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (uid,))
+            c.execute(
+                """SELECT remaining_meals,status,expiry_date
+                   FROM usage WHERE user_id=?""",
+                (uid,),
+            )
             u = c.fetchone()
             curr_m = u[0] if u else 0
+            activation_id = f"vip_redemption_event:{uuid.uuid4().hex}"
+            activation_type = record_vip_activation_event(
+                conn,
+                user_id=uid,
+                activation_event_key=activation_id,
+                activated_at=activated_at,
+                prior_usage_exists=u is not None,
+                prior_usage_status=u[1] if u else "",
+                prior_expiry_date=u[2] if u else "",
+            )
             exp = (today + timedelta(days=d)).isoformat()
             c.execute(
                 "INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)",
@@ -8096,8 +8119,7 @@ def redeem_code(uid, code):
                         tw_now().strftime("%Y-%m-%d %H:%M:%S"),
                     ),
                 )
-            if VIP_HEALTH_CHECK_ENABLED:
-                activation_id = f"vip_redemption_event:{uuid.uuid4().hex}"
+            if activation_type == "lifetime_first":
                 create_first_vip_health_check_case(
                     conn,
                     user_id=uid,
@@ -14154,6 +14176,7 @@ def handle_message(event):
             return
         if (
             has_vip
+            and not is_valid_vip_activation_command(user_id, message)
             and is_privileged_command_intent(message)
             and not is_authorized_privileged_text_command(user_id, message)
         ):

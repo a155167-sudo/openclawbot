@@ -96,6 +96,7 @@ def test_schema_creates_isolated_health_check_tables_with_required_unique_constr
         ).fetchall()
     }
     assert {
+        "vip_health_check_activation_events",
         "vip_health_check_cases",
         "vip_health_check_valid_days",
         "vip_health_check_source_refs",
@@ -471,6 +472,41 @@ def _install_legacy_report_with_delivery(conn, *, report_version=1):
     conn.commit()
 
 
+def test_legacy_report_rebuild_rejects_unknown_nonempty_column_without_data_loss(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.execute(
+        """INSERT INTO vip_health_check_cases
+           (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+            window_started_at,window_ends_at,created_at,updated_at)
+           VALUES ('legacy-case','U-legacy','first_vip_baseline_check','act','event',
+                   'start','end','now','now')"""
+    )
+    conn.execute(
+        """INSERT INTO vip_health_check_reviews
+           (review_id,case_id,review_version,status,source_manifest_hash,approved_by,
+            approved_at,created_at,updated_at)
+           VALUES ('legacy-review','legacy-case',1,'approved','manifest','dietitian',
+                   'now','now','now')"""
+    )
+    conn.commit()
+    _install_legacy_report_with_delivery(conn)
+    conn.execute(
+        "ALTER TABLE vip_health_check_reports "
+        "ADD COLUMN poison TEXT NOT NULL DEFAULT 'must-survive'"
+    )
+    before = tuple(conn.iterdump())
+
+    with pytest.raises(sqlite3.IntegrityError, match="unsupported legacy"):
+        ensure_vip_health_check_schema(conn)
+
+    assert tuple(conn.iterdump()) == before
+    assert conn.execute(
+        "SELECT poison FROM vip_health_check_reports WHERE report_id='legacy-report'"
+    ).fetchone()[0] == "must-survive"
+
+
 def test_legacy_report_rebuild_adds_both_fks_and_preserves_report_delivery_idempotently(conn):
     from vip_health_check import ensure_vip_health_check_schema
 
@@ -815,7 +851,7 @@ def test_server_init_creates_health_check_schema(monkeypatch, tmp_path):
     assert exists == (1,)
 
 
-def test_server_redeem_feature_flag_controls_first_case_and_renewal_is_idempotent(
+def test_server_redeem_records_first_activation_while_routes_are_dark_and_renewal_is_idempotent(
     monkeypatch, tmp_path
 ):
     import server
@@ -835,9 +871,10 @@ def test_server_redeem_feature_flag_controls_first_case_and_renewal_is_idempoten
     monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", False)
     assert server.redeem_code("U-OFF", "#VIP-OFF")[0] is not None
     with sqlite3.connect(db_path) as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM vip_health_check_cases WHERE user_id='U-OFF'"
-        ).fetchone()[0] == 0
+        dark_case = db.execute(
+            "SELECT window_started_at FROM vip_health_check_cases WHERE user_id='U-OFF'"
+        ).fetchone()
+    assert dark_case == (first_day.isoformat(timespec="seconds"),)
 
     monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
     assert server.redeem_code("U1", "#VIP-FIRST")[0] is not None
@@ -849,13 +886,389 @@ def test_server_redeem_feature_flag_controls_first_case_and_renewal_is_idempoten
         rows = db.execute(
             "SELECT * FROM vip_health_check_cases WHERE user_id='U1'"
         ).fetchall()
+        event_types = [
+            row[0]
+            for row in db.execute(
+                """SELECT activation_type
+                   FROM vip_health_check_activation_events
+                   WHERE user_id='U1' ORDER BY occurred_at, rowid"""
+            )
+        ]
+        dark_event_type = db.execute(
+            """SELECT activation_type FROM vip_health_check_activation_events
+               WHERE user_id='U-OFF'"""
+        ).fetchone()[0]
     assert len(rows) == 1
+    assert event_types == ["lifetime_first", "renewal"]
+    assert dark_event_type == "lifetime_first"
     assert rows[0]["window_started_at"] == first_day.isoformat(timespec="seconds")
     assert rows[0]["window_ends_at"] == (first_day + timedelta(days=7)).isoformat(timespec="seconds")
     assert rows[0]["first_vip_activation_id"].startswith("vip_redemption_event:")
     assert rows[0]["activation_event_key"] == rows[0]["first_vip_activation_id"]
     assert "#VIP-FIRST" not in rows[0]["first_vip_activation_id"]
     assert "#VIP-FIRST" not in rows[0]["activation_event_key"]
+
+
+@pytest.mark.parametrize(
+    "prior_status,prior_expiry",
+    [
+        ("vip", "2099-01-01"),
+        ("vip", "2026-01-01"),
+        ("free", ""),
+    ],
+)
+def test_preexisting_usage_redemption_is_audited_without_granting_first_case(
+    monkeypatch, tmp_path, prior_status, prior_expiry
+):
+    import server
+
+    db_path = _prepare_server_db(server, monkeypatch, tmp_path)
+    uid = f"U-HIST-{prior_status}-{prior_expiry or 'none'}"
+    with sqlite3.connect(db_path) as db:
+        db.executemany(
+            "INSERT INTO vips(code,meals,duration_days,chat_limit,is_used) VALUES (?,?,?,?,0)",
+            [("#VIP-HIST-ONE", 10, 31, 20), ("#VIP-HIST-TWO", 10, 31, 20)],
+        )
+        db.execute(
+            """INSERT INTO usage
+               (user_id,remaining_chat_quota,remaining_meals,last_date,status,
+                expiry_date,daily_chat_limit)
+               VALUES (?,20,3,'2026-09-01',?,?,20)""",
+            (uid, prior_status, prior_expiry),
+        )
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", False)
+
+    assert server.redeem_code(uid, "#VIP-HIST-ONE")[0] is not None
+    assert server.redeem_code(uid, "#VIP-HIST-TWO")[0] is not None
+
+    with sqlite3.connect(db_path) as db:
+        events = db.execute(
+            """SELECT activation_type,prior_usage_status,prior_expiry_date
+               FROM vip_health_check_activation_events
+               WHERE user_id=? ORDER BY rowid""",
+            (uid,),
+        ).fetchall()
+        case_count = db.execute(
+            "SELECT COUNT(*) FROM vip_health_check_cases WHERE user_id=?", (uid,)
+        ).fetchone()[0]
+    assert events[0] == ("historical_existing", prior_status, prior_expiry)
+    assert events[1][0] == "renewal"
+    assert case_count == 0
+
+
+def test_schema_rejects_existing_deliveries_table_without_report_foreign_key(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    conn.execute(
+        """CREATE TABLE vip_health_check_deliveries (
+               delivery_id TEXT PRIMARY KEY,
+               report_id TEXT NOT NULL,
+               user_id TEXT NOT NULL,
+               delivery_key TEXT NOT NULL UNIQUE,
+               status TEXT NOT NULL DEFAULT 'pending',
+               attempts INTEGER NOT NULL DEFAULT 0,
+               last_error TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL,
+               delivered_at TEXT NOT NULL DEFAULT ''
+           )"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="vip_health_check_deliveries"):
+        ensure_vip_health_check_schema(conn)
+
+
+def test_canonical_schema_rejects_null_text_primary_keys(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        conn.execute(
+            """INSERT INTO vip_health_check_cases
+               (case_id,user_id,benefit_key,first_vip_activation_id,
+                activation_event_key,window_started_at,window_ends_at,
+                status,valid_day_count,created_at,updated_at)
+               VALUES (NULL,'null-case-user','first_vip_baseline_check','activation-null',
+                       'event-null','now','later','collecting',0,'now','now')"""
+        )
+    conn.execute(
+        """INSERT INTO vip_health_check_cases
+           (case_id,user_id,benefit_key,first_vip_activation_id,
+            activation_event_key,window_started_at,window_ends_at,
+            status,valid_day_count,created_at,updated_at)
+           VALUES ('case-valid','valid-user','first_vip_baseline_check','activation-valid',
+                   'event-valid','now','later','collecting',0,'now','now')"""
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        conn.execute(
+            """INSERT INTO vip_health_check_reviews
+               (review_id,case_id,review_version,status,source_manifest_hash,
+                created_at,updated_at)
+               VALUES (NULL,'case-valid',1,'approved','hash','now','now')"""
+        )
+    conn.execute(
+        """INSERT INTO vip_health_check_reviews
+           (review_id,case_id,review_version,status,source_manifest_hash,
+            created_at,updated_at)
+           VALUES ('review-valid','case-valid',1,'approved','hash','now','now')"""
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        conn.execute(
+            """INSERT INTO vip_health_check_reports
+               (report_id,case_id,review_id,report_kind,report_version,
+                report_json,source_manifest_hash,published_by,published_at)
+               VALUES (NULL,'case-valid','review-valid','baseline_3day',1,
+                       '{}','hash','dietitian','now')"""
+        )
+    conn.execute(
+        """INSERT INTO vip_health_check_reports
+           (report_id,case_id,review_id,report_kind,report_version,
+            report_json,source_manifest_hash,published_by,published_at)
+           VALUES ('report-valid','case-valid','review-valid','baseline_3day',1,
+                   '{}','hash','dietitian','now')"""
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        conn.execute(
+            """INSERT INTO vip_health_check_deliveries
+               (delivery_id,report_id,user_id,delivery_key,status,created_at)
+               VALUES (NULL,'report-valid','valid-user','delivery-null-id',
+                       'pending','now')"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        conn.execute(
+            """INSERT INTO dietitian_coaching_orders
+               (order_id,user_id,case_id,product_type,operation_key,status,
+                requested_at,updated_at)
+               VALUES (NULL,'valid-user','case-valid','dietitian_coaching_4w',
+                       'coaching-null-id','payment_pending','now','now')"""
+        )
+
+
+@pytest.mark.parametrize(
+    "delivery_key_definition, extra_column, foreign_key_suffix",
+    [
+        ("TEXT NOT NULL UNIQUE", ", poison TEXT NOT NULL", ""),
+        ("TEXT NOT NULL COLLATE NOCASE UNIQUE", "", ""),
+        ("TEXT NOT NULL UNIQUE ON CONFLICT IGNORE", "", ""),
+        ("TEXT NOT NULL UNIQUE", "", " MATCH FULL"),
+    ],
+)
+def test_schema_rejects_extra_column_unique_collation_and_fk_match(
+    conn, delivery_key_definition, extra_column, foreign_key_suffix
+):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    conn.execute(
+        f"""CREATE TABLE vip_health_check_deliveries (
+                delivery_id TEXT PRIMARY KEY NOT NULL,
+                report_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                delivery_key {delivery_key_definition},
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','failed','delivered')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                delivered_at TEXT NOT NULL DEFAULT ''
+                {extra_column},
+                FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id)
+                    {foreign_key_suffix}
+            )"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="vip_health_check_deliveries"):
+        ensure_vip_health_check_schema(conn)
+
+
+def test_schema_rejects_decoy_check_that_allows_other_invalid_statuses(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    conn.execute(
+        """CREATE TABLE vip_health_check_deliveries (
+               delivery_id TEXT PRIMARY KEY NOT NULL,
+               report_id TEXT NOT NULL,
+               user_id TEXT NOT NULL,
+               delivery_key TEXT NOT NULL UNIQUE,
+               status TEXT NOT NULL DEFAULT 'pending' CHECK(status <> 'invalid'),
+               attempts INTEGER NOT NULL DEFAULT 0,
+               last_error TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL,
+               delivered_at TEXT NOT NULL DEFAULT '',
+               FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id)
+           )"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="vip_health_check_deliveries"):
+        ensure_vip_health_check_schema(conn)
+
+
+def test_schema_rejects_noncanonical_foreign_key_actions(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.execute("DROP TABLE vip_health_check_valid_days")
+    conn.execute(
+        """CREATE TABLE vip_health_check_valid_days (
+               case_id TEXT NOT NULL,
+               local_date TEXT NOT NULL,
+               rule_version TEXT NOT NULL,
+               qualifying_meal_count INTEGER NOT NULL DEFAULT 0,
+               completeness_status TEXT NOT NULL,
+               evaluated_at TEXT NOT NULL,
+               PRIMARY KEY(case_id, local_date),
+               FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id)
+                   ON DELETE CASCADE
+           )"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="vip_health_check_valid_days"):
+        ensure_vip_health_check_schema(conn)
+
+
+def test_schema_rejects_deliveries_without_unique_key_and_status_check(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    conn.execute(
+        """CREATE TABLE vip_health_check_deliveries (
+               delivery_id TEXT PRIMARY KEY,
+               report_id TEXT NOT NULL,
+               user_id TEXT NOT NULL,
+               delivery_key TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               attempts INTEGER NOT NULL DEFAULT 0,
+               last_error TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL,
+               delivered_at TEXT NOT NULL DEFAULT '',
+               FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id)
+           )"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="vip_health_check_deliveries"):
+        ensure_vip_health_check_schema(conn)
+
+
+def test_schema_rejects_nullable_delivery_key_and_status(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    conn.execute(
+        """CREATE TABLE vip_health_check_deliveries (
+               delivery_id TEXT PRIMARY KEY,
+               report_id TEXT NOT NULL,
+               user_id TEXT NOT NULL,
+               delivery_key TEXT UNIQUE,
+               status TEXT DEFAULT 'pending'
+                   CHECK(status IN ('pending','failed','delivered')),
+               attempts INTEGER NOT NULL DEFAULT 0,
+               last_error TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL,
+               delivered_at TEXT NOT NULL DEFAULT '',
+               FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id)
+           )"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="vip_health_check_deliveries"):
+        ensure_vip_health_check_schema(conn)
+
+
+def test_schema_rejects_noop_immutable_report_trigger(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.execute("DROP TRIGGER vip_health_check_reports_no_update")
+    conn.execute(
+        """CREATE TRIGGER vip_health_check_reports_no_update
+           BEFORE UPDATE ON vip_health_check_reports WHEN 0
+           BEGIN
+               SELECT RAISE(ABORT, 'published health-check reports are immutable');
+           END"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="trigger"):
+        ensure_vip_health_check_schema(conn)
+    trigger_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='vip_health_check_reports_no_update'"
+    ).fetchone()[0]
+    assert "WHEN 0" in trigger_sql
+
+
+def test_schema_rejects_comment_spoof_partial_unique_and_wrong_parent_index(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    conn.executescript(
+        """
+        CREATE TABLE hidden_delivery_index_parent (
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_vip_health_check_deliveries_status
+            ON hidden_delivery_index_parent(status, created_at);
+        CREATE TABLE vip_health_check_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            delivery_key TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                /* CHECK(status IN ('pending','failed','delivered')) */,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            delivered_at TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id)
+        );
+        CREATE UNIQUE INDEX partial_delivery_key_spoof
+            ON vip_health_check_deliveries(delivery_key) WHERE 0;
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="vip_health_check_deliveries"):
+        ensure_vip_health_check_schema(conn)
+
+
+@pytest.mark.parametrize(
+    "replacement_sql",
+    [
+        """CREATE INDEX idx_vip_health_check_deliveries_status
+           ON vip_health_check_deliveries(status DESC, created_at)""",
+        """CREATE INDEX idx_vip_health_check_deliveries_status
+           ON vip_health_check_deliveries(status COLLATE NOCASE, created_at)""",
+    ],
+)
+def test_schema_rejects_noncanonical_index_direction_or_collation(
+    conn, replacement_sql
+):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    ensure_vip_health_check_schema(conn)
+    conn.execute("DROP INDEX idx_vip_health_check_deliveries_status")
+    conn.execute(replacement_sql)
+
+    with pytest.raises(sqlite3.IntegrityError, match="index"):
+        ensure_vip_health_check_schema(conn)
+
+
+def test_schema_rejects_independent_foreign_keys_instead_of_report_composite_fk(conn):
+    from vip_health_check import ensure_vip_health_check_schema
+
+    conn.execute(
+        """CREATE TABLE vip_health_check_reports (
+               report_id TEXT PRIMARY KEY,
+               case_id TEXT NOT NULL,
+               review_id TEXT NOT NULL UNIQUE,
+               report_kind TEXT NOT NULL DEFAULT 'baseline_3day'
+                   CHECK(report_kind='baseline_3day'),
+               report_version INTEGER NOT NULL,
+               report_json TEXT NOT NULL,
+               source_manifest_hash TEXT NOT NULL,
+               published_by TEXT NOT NULL,
+               published_at TEXT NOT NULL,
+               UNIQUE(case_id, report_kind, report_version),
+               FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id),
+               FOREIGN KEY(review_id) REFERENCES vip_health_check_reviews(review_id),
+               FOREIGN KEY(case_id) REFERENCES vip_health_check_reviews(case_id)
+           )"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="vip_health_check_reports"):
+        ensure_vip_health_check_schema(conn)
 
 
 def _create_minimal_food_ledger(conn):
@@ -1304,6 +1717,41 @@ def test_delivery_failure_and_retry_reuse_exact_report_then_customer_can_read_it
     assert customer_after_pending_v2 is not None
     assert isinstance(customer_after_pending_v2["report"], dict)
     assert customer_after_pending_v2["report"]["good"] == "穩定記錄"
+
+    conn.execute(
+        """INSERT INTO vip_health_check_reviews (
+               review_id,case_id,review_version,status,ai_observations_json,
+               review_json,suggested_values_json,limitations,source_manifest_hash,
+               approved_by,approved_at,created_at,updated_at
+           ) VALUES ('review-v3',?,3,'approved','{}','{}','{}','',
+                     'manifest-v1','dietitian-3',?,?,?)""",
+        (case["case_id"], timestamp, timestamp, timestamp),
+    )
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    try:
+        conn.execute(
+            """INSERT INTO vip_health_check_reports (
+                   report_id,case_id,review_id,report_kind,report_version,report_json,
+                   source_manifest_hash,published_by,published_at
+               ) VALUES ('coaching-v3',?,'review-v3','coaching_summary',3,?,
+                         'manifest-v1','dietitian-3',?)""",
+            (case["case_id"], json.dumps({"good": "WRONG_KIND"}), timestamp),
+        )
+    finally:
+        conn.execute("PRAGMA ignore_check_constraints=OFF")
+    conn.execute(
+        """INSERT INTO vip_health_check_deliveries (
+               delivery_id,report_id,user_id,delivery_key,status,attempts,
+               last_error,created_at,delivered_at
+           ) VALUES ('delivery-v3','coaching-v3','U1','delivery-v3-key',
+                     'delivered',1,'',?,?)""",
+        (timestamp, timestamp),
+    )
+
+    customer_after_other_kind = get_customer_health_check_state(conn, user_id="U1")
+    assert customer_after_other_kind is not None
+    assert isinstance(customer_after_other_kind["report"], dict)
+    assert customer_after_other_kind["report"]["good"] == "穩定記錄"
 
 
 def test_manual_coaching_payment_activates_same_user_without_vip_code(conn):

@@ -1,6 +1,6 @@
 # Railway production variables — never commit real secret values.
 APP_ENV=production
-ENABLE_SCHEDULER=true
+ENABLE_SCHEDULER=false
 VIP_HEALTH_CHECK_ENABLED=false
 # Keep disabled until the dedicated Production customer LIFF has passed isolated staging E2E.
 VIP_HEALTH_CHECK_LIFF_ID=<dedicated production customer health-check LIFF ID>
