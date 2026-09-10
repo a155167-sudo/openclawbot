@@ -24,6 +24,7 @@ def valid_google_credentials():
 def isolated_environment(app_env="staging"):
     return {
         "APP_ENV": app_env,
+        "ENABLE_SCHEDULER": "false",
         "DATA_DIR": "/app/data",
         "PUBLIC_BASE_URL": f"https://{app_env}.example",
         "LINE_CHANNEL_ACCESS_TOKEN": f"{app_env}-token",
@@ -35,6 +36,7 @@ def isolated_environment(app_env="staging"):
         "FORM_WEBHOOK_SECRET": "f" * 32,
         "SURVEY_WEBHOOK_SECRET": "s" * 32,
         "SURVEY_REWARD_LINK_COUNT": "1",
+        "SURVEY_REWARD_POINTS_PER_LINK": "2",
         "ADMIN_UID": "U" + "1" * 32,
         "COACH_UIDS": "U" + "1" * 32,
         "LIFF_ID": "2000000000-" + app_env + "Liff",
@@ -75,6 +77,7 @@ def test_staging_environment_can_isolate_account_resources():
             "FORM_WEBHOOK_SECRET": "f" * 32,
             "SURVEY_WEBHOOK_SECRET": "s" * 32,
             "SURVEY_REWARD_LINK_COUNT": "1",
+            "SURVEY_REWARD_POINTS_PER_LINK": "2",
             "ADMIN_UID": "U" + "1" * 32,
             "COACH_UIDS": "U" + "1" * 32 + ", U" + "2" * 32,
             "LIFF_ID": "2000000000-stagingLiff",
@@ -95,34 +98,36 @@ def test_staging_environment_can_isolate_account_resources():
     assert settings.survey_form_url("U abc") == "https://example.test/survey?uid=U%20abc"
 
 
-def test_staging_defaults_scheduler_to_disabled():
+def test_staging_explicitly_disables_scheduler():
     assert load_settings(isolated_environment()).enable_scheduler is False
 
 
-def test_production_defaults_scheduler_to_enabled():
-    assert load_settings(isolated_environment("production")).enable_scheduler is True
+def test_production_explicitly_disables_scheduler_for_dark_release():
+    assert load_settings(isolated_environment("production")).enable_scheduler is False
 
 
 def test_survey_reward_link_count_defaults_to_one_for_staging():
     assert load_settings(isolated_environment()).survey_reward_link_count == 1
 
 
-def test_production_can_configure_two_survey_reward_links():
+def test_named_environment_rejects_more_than_one_survey_reward_link():
     environ = isolated_environment("production")
     environ["SURVEY_REWARD_LINK_COUNT"] = "2"
 
-    assert load_settings(environ).survey_reward_link_count == 2
+    with pytest.raises(ValueError, match="SURVEY_REWARD_LINK_COUNT"):
+        load_settings(environ)
 
 
 def test_survey_reward_points_per_link_defaults_to_two():
     assert load_settings(isolated_environment("production")).survey_reward_points_per_link == 2
 
 
-def test_survey_reward_points_per_link_can_be_overridden():
+def test_named_environment_rejects_reward_denominations_other_than_two_points():
     environ = isolated_environment("production")
     environ["SURVEY_REWARD_POINTS_PER_LINK"] = "3"
 
-    assert load_settings(environ).survey_reward_points_per_link == 3
+    with pytest.raises(ValueError, match="SURVEY_REWARD_POINTS_PER_LINK"):
+        load_settings(environ)
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "two", "101"])
@@ -150,6 +155,7 @@ def test_invalid_survey_reward_link_count_fails_closed(value):
         "ADMIN_SECRET",
         "COACH_UIDS",
         "DATA_DIR",
+        "ENABLE_SCHEDULER",
         "FORM_WEBHOOK_SECRET",
         "GOOGLE_CREDENTIALS",
         "LIFF_ID",
@@ -162,6 +168,7 @@ def test_invalid_survey_reward_link_count_fails_closed(value):
         "SUBSCRIPTION_FORM_URL_TEMPLATE",
         "SURVEY_WEBHOOK_SECRET",
         "SURVEY_REWARD_LINK_COUNT",
+        "SURVEY_REWARD_POINTS_PER_LINK",
         "SURVEY_FORM_URL_TEMPLATE",
     ],
 )

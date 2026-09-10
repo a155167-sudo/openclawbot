@@ -4,8 +4,8 @@
 
 | Environment | Git branch | LINE channel | SQLite volume | Scheduler |
 |---|---|---|---|---|
-| staging | `staging` | test Messaging API channel | dedicated `/app/data` volume | disabled by default |
-| production | `main` | official Messaging API channel | dedicated `/app/data` volume | enabled by default |
+| staging | `staging` | test Messaging API channel | dedicated `/app/data` volume | explicit; template is `false` |
+| production | `main` | official Messaging API channel | dedicated `/app/data` volume | explicit; dark-release template is `false` |
 
 Never share LINE credentials, SQLite volumes, Google Sheet IDs, or Google Form webhook destinations between these environments.
 
@@ -19,6 +19,7 @@ Use the checked-in templates:
 When `APP_ENV` is `staging` or `production`, startup fails unless these environment-specific values are explicit:
 
 - `DATA_DIR`
+- `ENABLE_SCHEDULER`
 - `LINE_CHANNEL_ACCESS_TOKEN`
 - `LINE_CHANNEL_SECRET`
 - `OPENAI_API_KEY`
@@ -27,6 +28,8 @@ When `APP_ENV` is `staging` or `production`, startup fails unless these environm
 - `ADMIN_SECRET`
 - `FORM_WEBHOOK_SECRET`
 - `SURVEY_WEBHOOK_SECRET`
+- `SURVEY_REWARD_LINK_COUNT` (must be `1`)
+- `SURVEY_REWARD_POINTS_PER_LINK` (must be `2`)
 - `PUBLIC_BASE_URL` or Railway-provided `RAILWAY_PUBLIC_DOMAIN`
 - `SPREADSHEET_ID`
 - `ADMIN_UID`
@@ -37,13 +40,16 @@ When `APP_ENV` is `staging` or `production`, startup fails unless these environm
 
 If any Railway deployment metadata is present while `APP_ENV` is missing, startup
 fails closed instead of falling back to legacy resources or enabling the scheduler.
+`VIP_HEALTH_CHECK_ENABLED` is separately fail-closed: an unset or unrecognised value
+keeps the feature disabled. Both checked-in Railway templates pin it to `false`; change
+it only during a reviewed rollout.
 `LIFF_ID` must match LINE's numeric-prefix format (for example,
 `2000000000-AbCdEfGh`). `GOOGLE_CREDENTIALS` must be valid service-account JSON,
 and a named environment stops at startup if its configured Sheet cannot initialize.
 
 `PUBLIC_BASE_URL` must be an HTTPS origin without a path. Form templates must use HTTPS. LINE user IDs are validated before startup.
 
-`SURVEY_REWARD_LINK_COUNT` controls how many one-point `reward_links` are reserved per completed survey. It defaults to `1` only in legacy/local mode; named staging and production environments must set it explicitly. Set staging to `1` and production to `2`. Values outside `1`–`10` fail closed. Reservations are atomic: when fewer than the configured number remain, the service consumes none and does not record the respondent as claimed. Reserved links are stored in `survey_reward_deliveries` until LINE push succeeds; a retry for the same UID reuses that exact set instead of consuming additional links. A per-UID operating-system file lock covers the complete active LINE send, so another callback cannot push the same links even if the SQLite delivery lease expires during a slow request. The OS releases that lock automatically if the sender process exits. The persistent SQLite lease still records delivery ownership; failed sends release it for immediate retry, and abandoned leases expire so the same links remain recoverable.
+Named staging and production environments must explicitly set `SURVEY_REWARD_LINK_COUNT=1` and `SURVEY_REWARD_POINTS_PER_LINK=2`: each completed survey receives exactly one two-point `reward_link`. Any other named-environment denomination fails closed at startup. Reservations are atomic: when no link remains, the service consumes none and does not record the respondent as claimed. Reserved links are stored in `survey_reward_deliveries` until LINE push succeeds; a retry for the same UID reuses that exact link instead of consuming another. A per-UID operating-system file lock covers the complete active LINE send, so another callback cannot push the same link even if the SQLite delivery lease expires during a slow request. The OS releases that lock automatically if the sender process exits. The persistent SQLite lease still records delivery ownership; failed sends release it for immediate retry, and abandoned leases expire so the same link remains recoverable.
 
 ## External endpoint mapping
 
@@ -79,13 +85,14 @@ for subscription/survey and for staging/production.
 1. Develop and deploy to `staging`.
 2. Test through the test LINE official account.
 3. Run the complete pytest suite and exact-commit review.
-4. Merge the reviewed commit into `main`.
-5. Verify production Railway deployment metadata, startup logs, and `/health`.
-6. Run LINE smoke tests with ordinary member and admin accounts.
+4. Complete `docs/production-vip-health-check-dark-deploy-runbook.md`, including a verified production online backup, candidate migration rehearsal, and rollback-SHA startup rehearsal on copies only.
+5. Merge the reviewed commit into `main`.
+6. Verify production Railway deployment metadata, startup logs, and `/health`.
+7. Run LINE smoke tests with ordinary member and admin accounts.
 
 ## Data policy
 
-Production starts with a fresh SQLite schema. Do not clone staging `usage`, `vips`, `subscription_orders`, `health_profile`, food logs, entitlements, or admin bindings. Official menu data is rebuilt from `menu.csv`; any other table migration requires an explicit table-by-table review.
+Only the one-time initial provisioning of a brand-new production environment may start with a fresh SQLite schema, and even then it must not clone staging `usage`, `vips`, `subscription_orders`, `health_profile`, food logs, entitlements, or admin bindings. Once a production volume exists, this release and every later deployment must preserve that live volume and use the verified backup/copy-only migration workflow above; never replace it with a blank database or any staging database. Official menu data is rebuilt from `menu.csv`; any other table migration requires an explicit table-by-table review.
 
 Both services mount their own Railway volume at `/app/data`. The identical path is
 inside separate containers; never attach the same volume resource to both services.

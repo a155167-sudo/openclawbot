@@ -227,7 +227,7 @@ def reserve_survey_reward_links(
     claim_date: str,
     reward_count: int = 2,
 ) -> RewardReservation:
-    """Atomically reserve one-point reward links for a survey respondent."""
+    """Atomically reserve reward links for a survey respondent."""
     if reward_count < 1:
         raise ValueError("reward_count must be at least 1")
 

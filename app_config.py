@@ -122,6 +122,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
             "ADMIN_SECRET",
             "COACH_UIDS",
             "DATA_DIR",
+            "ENABLE_SCHEDULER",
             "FORM_WEBHOOK_SECRET",
             "GOOGLE_CREDENTIALS",
             "LIFF_ID",
@@ -133,6 +134,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
             "SUBSCRIPTION_FORM_URL_TEMPLATE",
             "SURVEY_WEBHOOK_SECRET",
             "SURVEY_REWARD_LINK_COUNT",
+            "SURVEY_REWARD_POINTS_PER_LINK",
             "SURVEY_FORM_URL_TEMPLATE",
         )
         missing = [
@@ -228,6 +230,8 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         raise ValueError("SURVEY_REWARD_LINK_COUNT 必須是 1 到 10 的整數") from exc
     if not 1 <= survey_reward_link_count <= 10:
         raise ValueError("SURVEY_REWARD_LINK_COUNT 必須是 1 到 10 的整數")
+    if app_env != "legacy" and survey_reward_link_count != 1:
+        raise ValueError("SURVEY_REWARD_LINK_COUNT 在命名環境必須固定為 1")
 
     raw_points_per_link = str(
         environ.get("SURVEY_REWARD_POINTS_PER_LINK") or "2"
@@ -240,6 +244,8 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         ) from exc
     if not 1 <= survey_reward_points_per_link <= 100:
         raise ValueError("SURVEY_REWARD_POINTS_PER_LINK 必須是 1 到 100 的整數")
+    if app_env != "legacy" and survey_reward_points_per_link != 2:
+        raise ValueError("SURVEY_REWARD_POINTS_PER_LINK 在命名環境必須固定為 2")
 
     return AppSettings(
         app_env=app_env,

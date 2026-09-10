@@ -3,7 +3,7 @@ import hmac
 import os
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import secrets
 import string
 import base64
@@ -14,7 +14,9 @@ import random
 import re
 import requests
 import threading
+import unicodedata
 import uuid
+from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -102,6 +104,15 @@ from meal_photo_system import (
     normalize_meal_photo_payload,
     save_meal_photo_draft,
 )
+from customer_health_check_liff import attach_customer_health_check_routes
+from vip_health_check import (
+    configure_vip_health_check_connection,
+    create_first_vip_health_check_case,
+    ensure_vip_health_check_schema,
+    get_customer_health_check_state,
+    is_vip_health_check_enabled,
+    record_vip_activation_event,
+)
 
 APP_SETTINGS = load_settings(os.environ)
 APP_ENV = APP_SETTINGS.app_env
@@ -114,6 +125,7 @@ FORM_WEBHOOK_SECRET = APP_SETTINGS.form_webhook_secret
 SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
 SURVEY_REWARD_LINK_COUNT = APP_SETTINGS.survey_reward_link_count
 SURVEY_REWARD_POINTS_PER_LINK = APP_SETTINGS.survey_reward_points_per_link
+VIP_HEALTH_CHECK_ENABLED = is_vip_health_check_enabled()
 
 
 def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
@@ -412,7 +424,7 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
                   fl.meal_slot,fl.consumed_servings,fl.consumed_amount,fl.consumed_unit,
                   fl.nutrition_snapshot_json,fl.nutrient_sources_json,fl.version,
                   fl.approved_exchange_json,fc.fingerprint,a.food_fingerprint,
-                  a.suggestion_rule_version,a.approved_exchange_hash
+                  a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id
            FROM food_logs fl
            JOIN food_catalog fc ON fc.food_id=fl.food_id
            LEFT JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
@@ -1377,8 +1389,217 @@ ADMIN_ONLY_PREFIXES = (
     "#核准訂單 ", "#拒絕訂單 ", "#開通訂單 ", "#核准營養份量 "
 )
 
+# 未授權者即使是有效 VIP，也不得讓管理／教練指令或近似拼法落入一般 AI。
+PRIVILEGED_COMMAND_STEMS = (
+    "#教練", "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成",
+    "#發送明日提醒", "#測試週報", "#測試晚報", "#延餐清單",
+    "#待核訂單", "#清空熱量", "#刪除檔案", "#重置", "重置本週",
+    "檢查數據", "#待審營養份量", "#待審餐點", "@靜音", "@解除靜音",
+    "#喚醒AI", "#上傳點數", "#核准延餐", "#拒絕延餐", "#核准訂單",
+    "#拒絕訂單", "#開通訂單", "#核准營養份量",
+    "健康回報", "今日健康日報", "重新整理今日報告",
+)
+PRIVILEGED_SHORT_COMMANDS = {"#教", "#管"}
+
 def is_admin_only_command(msg: str) -> bool:
     return msg in ADMIN_ONLY_EXACT_COMMANDS or any(msg.startswith(prefix) for prefix in ADMIN_ONLY_PREFIXES)
+
+
+def _interleaved_stem_end(text, stem):
+    """回傳錨定開頭的詞幹子序列結束位置；中間插入任意字元仍可辨識。"""
+    if not text or not stem or text[0] != stem[0]:
+        return None
+    stem_index = 0
+    for text_index, char in enumerate(text):
+        if char == stem[stem_index]:
+            stem_index += 1
+            if stem_index == len(stem):
+                return text_index + 1
+    return None
+
+
+def _edit_distance_at_most_one(left, right):
+    """只判斷 Levenshtein 距離是否至多 1，供短命令近似分類使用。"""
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right)) <= 1
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    short_index = long_index = edits = 0
+    while short_index < len(shorter) and long_index < len(longer):
+        if shorter[short_index] == longer[long_index]:
+            short_index += 1
+            long_index += 1
+        else:
+            edits += 1
+            long_index += 1
+            if edits > 1:
+                return False
+    return True
+
+
+def _prefix_within_one_edit(text, stem):
+    for length in range(max(0, len(stem) - 1), min(len(text), len(stem) + 1) + 1):
+        if _edit_distance_at_most_one(text[:length], stem):
+            return True
+    return False
+
+
+def _interleaved_stem_with_one_edit(text, stem, require_first=True):
+    """允許任意插字，且詞幹本身至多一次缺字或替換。"""
+    if not text or not stem:
+        return False
+    if require_first and text[0] != stem[0]:
+        return False
+    target = stem[1:] if require_first else stem
+    source = text[1:] if require_first else text
+    costs = list(range(len(target) + 1))
+    for source_char in source:
+        previous = costs
+        costs = previous.copy()  # 跳過輸入插字不計編輯次數
+        costs[0] = 0
+        for target_length in range(1, len(target) + 1):
+            costs[target_length] = min(
+                costs[target_length],
+                costs[target_length - 1] + 1,
+                previous[target_length - 1]
+                + (target[target_length - 1] != source_char),
+            )
+    return costs[len(target)] <= 1
+
+
+def _is_exact_public_command(message):
+    normalized = str(message or "").strip()
+    return (
+        normalized in {"#查狀態", "#重新排餐"}
+        or normalized.startswith("#延餐 ")
+        or normalized.startswith("#測距 ")
+        or normalized.startswith(
+            (
+                "#生活",
+                "#教學",
+                "#教我",
+                "#請教",
+                "#重訓",
+                "#重量訓練",
+                "#管理飲食",
+                "#管理今天飲食",
+            )
+        )
+    )
+
+
+def _command_candidates(compact, stem):
+    if not stem:
+        return []
+    if stem[0] in {"#", "@"}:
+        return [
+            compact[index:index + 64]
+            for index, char in enumerate(compact)
+            if char == stem[0]
+        ]
+    start = 0
+    while start < len(compact) and unicodedata.category(compact[start])[0] in {"P", "S"}:
+        start += 1
+    candidate = compact[start:]
+    return [candidate] if candidate else []
+
+
+def is_privileged_command_intent(msg: str) -> bool:
+    """辨識管理／教練保留命名空間，包括插字、缺字及單字替換。"""
+    normalized = unicodedata.normalize("NFKC", str(msg or "")).strip()
+    visible = "".join(
+        char
+        for char in normalized
+        if not unicodedata.category(char).startswith(("C", "M"))
+        and char not in {"\u115f", "\u1160", "\u2800"}
+    )
+    has_public_leading_command = _is_exact_public_command(visible)
+    compact = "".join(char for char in visible if not char.isspace()).casefold()
+    if compact.count("#") + compact.count("@") > 64:
+        return True
+    if any(
+        candidate in PRIVILEGED_SHORT_COMMANDS
+        for candidate in _command_candidates(compact, "#")
+    ):
+        return True
+
+    for candidate in _command_candidates(compact, "#生24"):
+        if candidate.startswith("#生活"):
+            continue
+        if any(
+            (
+                (stem_end := _interleaved_stem_end(candidate, stem)) is not None
+                and stem_end <= len(stem) + 3
+            )
+            or _prefix_within_one_edit(candidate, stem)
+            or _interleaved_stem_with_one_edit(candidate[:len(stem) + 3], stem)
+            for stem in ("#生24", "#生48")
+        ):
+            return True
+
+    for raw_stem in PRIVILEGED_COMMAND_STEMS:
+        stem = "".join(
+            char for char in unicodedata.normalize("NFKC", raw_stem)
+            if not char.isspace()
+        ).casefold()
+        for candidate in _command_candidates(compact, stem):
+            uses_introducer = stem[0] in {"#", "@"}
+            if uses_introducer and has_public_leading_command and candidate == compact:
+                continue
+            if not uses_introducer:
+                prefix = candidate[:len(stem)]
+                suffix = candidate[len(stem):len(stem) + 1]
+                has_command_boundary = (
+                    not suffix
+                    or suffix in {"｜", "|", ":", "：", "，", ",", "；", ";"}
+                )
+                if prefix == stem and has_command_boundary:
+                    return True
+                if (
+                    len(prefix) == len(stem)
+                    and sum(a != b for a, b in zip(prefix, stem)) == 1
+                    # 最後一字替換容易誤擋一般句（例如「健康回家」）。
+                    and prefix[-1] == stem[-1]
+                    and has_command_boundary
+                ):
+                    return True
+                shortened_prefix = candidate[:len(stem) - 1]
+                shortened_suffix = candidate[len(stem) - 1:len(stem)]
+                if (
+                    len(shortened_prefix) == len(stem) - 1
+                    and _edit_distance_at_most_one(shortened_prefix, stem)
+                    and (
+                        not shortened_suffix
+                        or shortened_suffix
+                        in {"｜", "|", ":", "：", "，", ",", "；", ";"}
+                    )
+                ):
+                    return True
+                continue
+            max_insertions = 1 if len(stem) <= 3 else 3
+            window = candidate[:len(stem) + max_insertions]
+            stem_end = _interleaved_stem_end(window, stem)
+            if (
+                (
+                    stem_end is not None
+                    and stem_end <= len(stem) + max_insertions
+                )
+                or (
+                    len(stem) == 3
+                    and _prefix_within_one_edit(candidate, stem)
+                )
+                or (
+                    len(stem) >= 4
+                    and _interleaved_stem_with_one_edit(
+                        window,
+                        stem,
+                        require_first=True,
+                    )
+                )
+            ):
+                return True
+    return False
 
 # ── 顧客清單同步 helper ──────────────────────────────────────────────────────
 def sync_customer_sheet(uid, name, status, remaining_meals, expiry_date, tdee):
@@ -1428,9 +1649,11 @@ def get_admin_notify_uid():
 
 
 def get_bound_admin_uid_for_authorization() -> str:
-    """嚴格讀取目前綁定管理員；授權用途遇到缺值或DB錯誤一律拒絕。"""
+    """嚴格唯讀目前綁定管理員；缺檔、缺值或DB錯誤一律拒絕且不建檔。"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
+        with closing(
+            sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        ) as conn:
             row = conn.execute(
                 "SELECT value FROM admin_settings WHERE key='admin_id'"
             ).fetchone()
@@ -2802,13 +3025,38 @@ def ensure_subscription_menu_entitlement_schema(conn):
     """)
 
 
+def get_vip_health_check_state_for_user(user_id: str):
+    """內部唯讀服務；公開路由只透過已驗證的 LINE ID token 呼叫。"""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return None
+    database_uri = Path(DB_PATH).resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(database_uri, uri=True)) as conn:
+        configure_vip_health_check_connection(conn)
+        return get_customer_health_check_state(conn, user_id=user_id)
+
+
+def register_customer_health_check_liff(target_app=app):
+    return attach_customer_health_check_routes(
+        target_app,
+        enabled=VIP_HEALTH_CHECK_ENABLED,
+        environ=os.environ,
+        state_loader=get_vip_health_check_state_for_user,
+    )
+
+
+register_customer_health_check_liff()
+
+
 def init_db():
     # 單一資料路徑來源：必須遵守 DATA_DIR／DB_PATH，才能安全掛載 Railway Volume。
     os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
 
+    conn = None
     try:
         # 🔗 3. 安全連線
         conn = sqlite3.connect(DB_PATH)
+        # VIP 三日健檔 schema 含跨表外鍵；必須在任何 transaction 前啟用。
+        configure_vip_health_check_connection(conn)
         c = conn.cursor()
         
         # --- 以下是您的原本表格定義 (保持不變) ---
@@ -2996,15 +3244,23 @@ def init_db():
         ensure_daily_health_schema(conn)
         # 無營養標示餐點照片的持久草稿與按鈕確認狀態。
         ensure_meal_photo_schema(conn)
+        # 首次 VIP 三日健檢採獨立 additive schema；功能入口仍由 flag 控制。
+        ensure_vip_health_check_schema(conn)
 
         # --- 以上結束 ---
 
         conn.commit()
         conn.close()
+        conn = None
         print(f"✅ 保險箱資料庫連線成功！路徑: {DB_PATH}")
 
     except Exception as e:
+        if conn is not None:
+            conn.rollback()
+            conn.close()
         print(f"❌ 啟動保險箱失敗，錯誤原因: {e}")
+        if APP_ENV != "legacy":
+            raise
 init_db()
 load_menu()  # 🔥 伺服器啟動時自動載入菜單
 sync_menu_to_food_catalog()  # 同步菜單到 food_catalog
@@ -3720,7 +3976,7 @@ async def receive_survey_data(request: Request):
                     TextSendMessage(
                         text=(
                             "❤️ 感謝您的寶貴回饋！目前 "
-                            f"{SURVEY_REWARD_LINK_COUNT} 點獎勵連結正在補貨中，"
+                            f"{SURVEY_REWARD_LINK_COUNT} 張獎勵連結正在補貨中，"
                             "尚未扣除您的領取資格；請稍後再填一次，或聯絡一日樂食客服協助。"
                         )
                     ),
@@ -3739,7 +3995,7 @@ async def receive_survey_data(request: Request):
                         TextSendMessage(
                             text=(
                                 "🚨 老闆緊急通知：滿意度問卷每人需發 "
-                                f"{SURVEY_REWARD_LINK_COUNT} 張一點連結，但目前可用庫存不足 "
+                                f"{SURVEY_REWARD_LINK_COUNT} 張獎勵連結，但目前可用庫存不足 "
                                 f"{SURVEY_REWARD_LINK_COUNT} 張。系統沒有消耗剩餘連結，"
                                 "也沒有標記客人已領取；請用 #上傳點數 補貨。"
                             )
@@ -5298,6 +5554,7 @@ def compute_achievement_snapshot(user_id: str, dashboard: dict = None) -> dict:
 def get_dashboard_data(user_id: str) -> dict:
     """取得儀表板所需資料，Phase 1 Flex Message 和 Phase 2 LIFF API 都用這個"""
     hp = None
+    ledger_names = []
     checked_slots = set()
     workout_done = False
     frequent_foods = []
@@ -5315,6 +5572,33 @@ def get_dashboard_data(user_id: str) -> dict:
                             today_food_items, today_date, sheet_name
                      FROM health_profile WHERE user_id=?""", (user_id,))
         hp = c.fetchone()
+
+        ledger_rows = _daily_food_rows(conn, user_id, today_str)
+        ledger_items = [
+            _ledger_item_from_row(row) for row in ledger_rows
+        ]
+        ordinary_ledger_items = [
+            item for row, item in zip(ledger_rows, ledger_items)
+            if item.get("source_type") != "user_meal_photo"
+            and not str(row[17] or "").strip()
+        ]
+        ledger_names = [
+            item["product_name"] for item in ordinary_ledger_items
+        ]
+        ordinary_ledger_cal = ordinary_ledger_pro = 0.0
+        for item in ordinary_ledger_items:
+            nutrition = item.get("nutrition") or {}
+            if nutrition.get("calories_kcal") is not None:
+                ordinary_ledger_cal += float(nutrition["calories_kcal"])
+            if nutrition.get("protein_g") is not None:
+                ordinary_ledger_pro += float(nutrition["protein_g"])
+
+        if not hp:
+            # 新 VIP 可能先完成 LINE 飲食紀錄、稍後才填健康表單。
+            # Dashboard 只讀 canonical food_logs 作 fallback；不要建立空的
+            # health_profile，否則舊流程可能誤判為已完成 onboarding。
+            if ledger_items:
+                hp = ("", 2000, 100, 0, 0, "", today_str, "")
         
         if hp:
             # 2. 抓今日打卡紀錄
@@ -5349,6 +5633,7 @@ def get_dashboard_data(user_id: str) -> dict:
                          ON a.approval_id=fl.exchange_approval_id AND a.food_id=fl.food_id
                        WHERE fl.user_id=? AND date(fl.consumed_at, '+8 hours')=?
                          AND fl.confirmation_status='confirmed'
+                         AND COALESCE(fl.deleted_at,'')=''
                          AND fc.source_type='user_meal_photo'
                        ORDER BY fl.consumed_at, fl.created_at""",
                     (user_id, today_str),
@@ -5375,17 +5660,14 @@ def get_dashboard_data(user_id: str) -> dict:
     if not hp:
         return None
 
-    name, tdee, protein_goal, extra_cal, extra_pro, food_items, today_date, sheet_name = hp
+    name, tdee, protein_goal, _projected_cal, _projected_pro, _projected_foods, _projected_date, sheet_name = hp
     tdee = tdee or 2000
     protein_goal = protein_goal or 100
-    extra_cal = extra_cal or 0
-    extra_pro = extra_pro or 0
 
-    if today_date != today_str:
-        extra_cal, extra_pro, food_items = 0, 0, ""
-
-    extra_cal = round(float(extra_cal) + approved_photo_cal, 4)
-    extra_pro = round(float(extra_pro) + approved_photo_pro, 4)
+    # Dashboard 的今日飲食只信任 canonical food_logs。一般餐由逐筆快照加總，
+    # 照片餐則只加入上方通過 fingerprint／approval hash 驗證的數值。
+    extra_cal = round(ordinary_ledger_cal + approved_photo_cal, 4)
+    extra_pro = round(ordinary_ledger_pro + approved_photo_pro, 4)
 
     cal_remaining = max(0, tdee - extra_cal)
     pro_remaining = max(0, protein_goal - extra_pro)
@@ -5449,7 +5731,7 @@ def get_dashboard_data(user_id: str) -> dict:
     lunch_checked = "午餐" in checked_slots
     dinner_checked = "晚餐" in checked_slots
 
-    food_list = [f.strip() for f in food_items.split("、") if f.strip()] if food_items else []
+    food_list = list(ledger_names)
     food_list.extend(approved_photo_foods)
     recorded_count = len(food_list)
     task_logged_once = (extra_cal > 0 or extra_pro > 0 or recorded_count >= 1)
@@ -5680,6 +5962,11 @@ def build_dashboard_flex(user_id: str):
     # ==========================================
     # 👈 左卡：純飲食儀表板 Bubble
     # ==========================================
+    recorded_foods = [str(item or "").strip() for item in d.get("food_list", []) if str(item or "").strip()]
+    food_summary = "、".join(item[:32] for item in recorded_foods[:3]) or "尚無紀錄"
+    if len(recorded_foods) > 3:
+        food_summary += f"，另有 {len(recorded_foods) - 3} 筆"
+
     diet_bubble = {
         "type": "bubble", "size": "mega",
         "header": {
@@ -5701,6 +5988,10 @@ def build_dashboard_flex(user_id: str):
                 {"type": "text", "text": "🥩 蛋白進度", "size": "xs", "color": "#888888", "margin": "md"},
                 {"type": "text", "text": f"今日已記錄：{d['extra_pro']} / {d['protein_goal']} g", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm"},
                 dual_progress_bar(d["pro_recorded_segment"], d["pro_planned_segment"], d["pro_remaining_segment"], "#FF6B35", "#FFD2C2"),
+                {"type": "separator", "margin": "md"},
+
+                {"type": "text", "text": "🍽️ 今日飲食紀錄", "size": "xs", "color": "#888888", "margin": "md"},
+                {"type": "text", "text": food_summary, "size": "sm", "color": "#333333", "margin": "sm", "wrap": True},
                 {"type": "separator", "margin": "lg"},
 
                 {"type": "box", "layout": "vertical", "margin": "md", "backgroundColor": "#f8f8f8", "cornerRadius": "8px", "paddingAll": "12px", "contents": [
@@ -6686,31 +6977,94 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
 # 6. 其他輔助函數與 Webhook (🔥 融合版：完整保留測距、VIP功能)
 # ==========================================
 def has_active_vip_access(user_id):
-    """只檢查VIP資格，不扣除每日諮詢額度。"""
+    """唯讀檢查VIP資格；DB 缺失或損毀時靜默拒絕且不建立檔案。"""
     try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
+        with closing(
+            sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        ) as conn:
             row = conn.execute(
                 "SELECT remaining_meals, status, expiry_date FROM usage WHERE user_id=?",
                 (user_id,),
             ).fetchone()
-    except sqlite3.OperationalError:
+    except sqlite3.Error:
         return False
     if not row:
         return False
     remaining_meals, status, expiry_date = row
     if status != "vip":
         return False
-    if expiry_date and tw_today().isoformat() > str(expiry_date):
+    try:
+        if not expiry_date:
+            return False
+        if tw_today() > date.fromisoformat(str(expiry_date)):
+            return False
+        return remaining_meals is None or int(remaining_meals) > 0
+    except (TypeError, ValueError):
         return False
-    return remaining_meals is None or int(remaining_meals) > 0
 
 
-def is_text_command_allowed_without_vip(user_id, message):
-    """非VIP僅可開通VIP；授權管理員與教練只放行各自專用指令。"""
-    if message.startswith("#VIP"):
-        return True
-    if message == "#教練" and user_id in COACH_UIDS:
-        return True
+def _validated_subscription_order_for_activation(conn, code, user_id):
+    """訂單碼必須唯一、屬於本人、已正式化且時間格式有效。"""
+    rows = conn.execute(
+        """SELECT id,user_id,formalized_at,status
+           FROM subscription_orders WHERE vip_code=?""",
+        (code,),
+    ).fetchall()
+    if len(rows) != 1:
+        return None, "missing_or_ambiguous"
+    order_row = rows[0]
+    if str(order_row[1] or "") != str(user_id or ""):
+        return None, "foreign_owner"
+    if str(order_row[3] or "") != "activated":
+        return None, "not_activated"
+    formalized_at = str(order_row[2] or "").strip()
+    try:
+        datetime.fromisoformat(formalized_at)
+    except (TypeError, ValueError):
+        return None, "not_activated"
+    return order_row, ""
+
+
+def is_valid_vip_activation_command(user_id, message):
+    """僅放行尚未使用且（訂單碼）屬於目前帳號的實際 VIP 序號。"""
+    code = str(message or "")
+    if not re.fullmatch(r"#(?:VIP24|VIP48|VIPORDER)-[A-Z0-9]{6}", code):
+        return False
+    try:
+        with closing(sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)) as conn:
+            vip_row = conn.execute(
+                "SELECT is_used FROM vips WHERE code=?", (code,)
+            ).fetchone()
+            if (
+                not vip_row
+                or not isinstance(vip_row[0], int)
+                or vip_row[0] != 0
+            ):
+                return False
+            if code.startswith("#VIPORDER-"):
+                order_row, validation_error = _validated_subscription_order_for_activation(
+                    conn, code, user_id
+                )
+                return bool(order_row and not validation_error)
+            return True
+    except Exception as exc:
+        print(f"⛔ VIP 開通碼預檢失敗，已靜默拒絕：{type(exc).__name__}")
+        return False
+
+
+def is_jason_only_command(message):
+    normalized = str(message or "").strip()
+    return normalized.startswith("健康回報") or normalized in {
+        "今日健康日報", "重新整理今日報告",
+    }
+
+
+def is_authorized_privileged_text_command(user_id, message):
+    """active VIP 的保留文字指令仍須符合 ADMIN／COACH 身分。"""
+    if message == "#教練":
+        return user_id in COACH_UIDS
+    if is_jason_only_command(message):
+        return user_id == ADMIN_UID
     if not is_admin_only_command(message):
         return False
     if message == "#待審餐點":
@@ -6721,6 +7075,13 @@ def is_text_command_allowed_without_vip(user_id, message):
     else:
         authorized_uid = ADMIN_UID
     return user_id == authorized_uid
+
+
+def is_text_command_allowed_without_vip(user_id, message):
+    """無有效 VIP 時只放行本人合法開通碼或已驗證角色的管理指令。"""
+    return is_valid_vip_activation_command(
+        user_id, message
+    ) or is_authorized_privileged_text_command(user_id, message)
 
 
 def check_permission_and_quota(user_id):
@@ -7673,51 +8034,104 @@ def generate_package_codes(t, n):
     return codes
 
 def redeem_code(uid, code):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0", (code,))
-    r = c.fetchone()
-    if not r: conn.close(); return None, "❌ 無效"
-    order_record = None
-    is_subscription_order_code = code.startswith("#VIPORDER-")
-    if is_subscription_order_code:
-        c.execute("SELECT id, user_id, formalized_at, status FROM subscription_orders WHERE vip_code=?", (code,))
-        order_record = c.fetchone()
-        if not order_record:
-            conn.close()
-            return None, "❌ 找不到對應的包月訂單，請聯絡客服確認開通碼。"
-    if order_record and order_record[1] != uid:
-        conn.close()
-        return None, "❌ 此開通碼不屬於目前帳號，請使用原訂購LINE帳號兌換。"
-    if order_record and (not order_record[2] or order_record[3] != "activated"):
-        conn.close()
-        return None, "⏳ 此訂單尚未完成付款確認與正式配餐，請先聯絡客服。"
     linked_order = None
-    if order_record:
-        linked_order = (order_record[0], order_record[2], order_record[3])
-    m, d, l = r; today = tw_today()
-    c.execute("UPDATE vips SET is_used=1 WHERE code=?", (code,))
-    c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (uid,))
-    u = c.fetchone(); curr_m = u[0] if u else 0
-    exp = (today + timedelta(days=d)).isoformat()
-    c.execute("INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)", (uid, l, curr_m+m, today.isoformat(), 'vip', exp, l))
-    if linked_order and linked_order[1] and linked_order[2] == "activated":
-        ensure_subscription_menu_entitlement_schema(conn)
-        c.execute("""
-            INSERT INTO subscription_menu_entitlements
-                (user_id, order_id, vip_code, status, starts_on, expires_on, created_at)
-            VALUES (?, ?, ?, 'active', ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                order_id=excluded.order_id,
-                vip_code=excluded.vip_code,
-                status='active',
-                starts_on=excluded.starts_on,
-                expires_on=excluded.expires_on,
-                created_at=excluded.created_at
-        """, (
-            uid, linked_order[0], code, today.isoformat(), exp,
-            tw_now().strftime("%Y-%m-%d %H:%M:%S"),
-        ))
-    conn.commit(); conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        try:
+            # 健檢路由可維持 dark，但首次 VIP activation provenance 必須永久保存。
+            # PRAGMA 與 schema 驗證必須先於任何兌換寫入。
+            configure_vip_health_check_connection(conn)
+            ensure_vip_health_check_schema(conn)
+            c = conn.cursor()
+            c.execute(
+                "SELECT meals, duration_days, chat_limit FROM vips WHERE code=? AND is_used=0",
+                (code,),
+            )
+            r = c.fetchone()
+            if not r:
+                return None, "❌ 無效"
+            order_record = None
+            is_subscription_order_code = code.startswith("#VIPORDER-")
+            if is_subscription_order_code:
+                order_record, validation_error = _validated_subscription_order_for_activation(
+                    conn, code, uid
+                )
+                if validation_error == "foreign_owner":
+                    return None, "❌ 此開通碼不屬於目前帳號，請使用原訂購LINE帳號兌換。"
+                if validation_error == "not_activated":
+                    return None, "⏳ 此訂單尚未完成付款確認與正式配餐，請先聯絡客服。"
+                if validation_error:
+                    return None, "❌ 找不到對應的包月訂單，請聯絡客服確認開通碼。"
+            if order_record:
+                linked_order = (order_record[0], order_record[2], order_record[3])
+            m, d, l = r
+            today = tw_today()
+            activated_at = tw_now()
+            c.execute(
+                "UPDATE vips SET is_used=1 WHERE code=? AND is_used=0",
+                (code,),
+            )
+            if c.rowcount != 1:
+                conn.rollback()
+                return None, "❌ 無效"
+            c.execute(
+                """SELECT remaining_meals,status,expiry_date
+                   FROM usage WHERE user_id=?""",
+                (uid,),
+            )
+            u = c.fetchone()
+            curr_m = u[0] if u else 0
+            activation_id = f"vip_redemption_event:{uuid.uuid4().hex}"
+            activation_type = record_vip_activation_event(
+                conn,
+                user_id=uid,
+                activation_event_key=activation_id,
+                activated_at=activated_at,
+                prior_usage_exists=u is not None,
+                prior_usage_status=u[1] if u else "",
+                prior_expiry_date=u[2] if u else "",
+            )
+            exp = (today + timedelta(days=d)).isoformat()
+            c.execute(
+                "INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?)",
+                (uid, l, curr_m + m, today.isoformat(), "vip", exp, l),
+            )
+            if linked_order and linked_order[1] and linked_order[2] == "activated":
+                ensure_subscription_menu_entitlement_schema(conn)
+                c.execute(
+                    """
+                    INSERT INTO subscription_menu_entitlements
+                        (user_id, order_id, vip_code, status, starts_on, expires_on, created_at)
+                    VALUES (?, ?, ?, 'active', ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        order_id=excluded.order_id,
+                        vip_code=excluded.vip_code,
+                        status='active',
+                        starts_on=excluded.starts_on,
+                        expires_on=excluded.expires_on,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        uid,
+                        linked_order[0],
+                        code,
+                        today.isoformat(),
+                        exp,
+                        tw_now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
+                )
+            if activation_type == "lifetime_first":
+                create_first_vip_health_check_case(
+                    conn,
+                    user_id=uid,
+                    first_vip_activation_id=activation_id,
+                    activation_event_key=activation_id,
+                    activated_at=activated_at,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     if linked_order and linked_order[1] and linked_order[2] == "activated":
         return exp, (
             "🎉 兌換成功，包月會員權限已啟用！\n"
@@ -10799,7 +11213,29 @@ def build_meal_photo_notification_retry_message(draft, kind):
     )
 
 
+def is_authorized_admin_postback(user_id, data):
+    """管理員餐點審核 postback 僅允許目前綁定的管理員。"""
+    normalized = str(data or "").strip()
+    if not normalized.startswith(("mpr:v1:", "mprn:v1:")):
+        return None
+    try:
+        return user_id == get_bound_admin_uid_for_authorization()
+    except PermissionError:
+        return False
+
+
 @handler.add(PostbackEvent)
+def handle_postback_event(event):
+    uid = event.source.user_id
+    data = str(getattr(event.postback, "data", "") or "")
+    admin_authorization = is_authorized_admin_postback(uid, data)
+    if admin_authorization is False:
+        return
+    if admin_authorization is not True and not has_active_vip_access(uid):
+        return
+    return handle_meal_photo_postback(event)
+
+
 def handle_meal_photo_postback(event):
     data = str(getattr(event.postback, "data", "") or "")
     uid = event.source.user_id
@@ -13735,8 +14171,14 @@ def handle_message(event):
     try:
         message = event.message.text.strip()
         user_id = event.source.user_id
-        if not has_active_vip_access(user_id) and not is_text_command_allowed_without_vip(
-            user_id, message
+        has_vip = has_active_vip_access(user_id)
+        if not has_vip and not is_text_command_allowed_without_vip(user_id, message):
+            return
+        if (
+            has_vip
+            and not is_valid_vip_activation_command(user_id, message)
+            and is_privileged_command_intent(message)
+            and not is_authorized_privileged_text_command(user_id, message)
         ):
             return
         return _handle_message_impl(event)
