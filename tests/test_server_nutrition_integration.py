@@ -4570,15 +4570,34 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
 
 
 def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeypatch):
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+    )
+
     db = tmp_path / "meal-photo-admin-review.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
     monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
+    meal_time = server.tw_now() - timedelta(minutes=5)
+    meal_date = meal_time.date().isoformat()
     with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        server.ensure_daily_food_ledger_schema(conn)
+        health_case = create_first_vip_health_check_case(
+            conn,
+            user_id="U_CUSTOMER",
+            first_vip_activation_id="meal-photo-admin-review-activation",
+            activation_event_key="meal-photo-admin-review-event",
+            activated_at=meal_time - timedelta(minutes=5),
+        )
         token = save_meal_photo_draft(
             conn, user_id="U_CUSTOMER", source_message_id="M_CUSTOMER", payload=meal_photo_payload(),
-            consumed_at="2026-07-23T12:10:00+08:00", meal_slot="午餐",
+            consumed_at=meal_time.isoformat(timespec="seconds"), meal_slot="午餐",
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
@@ -4628,14 +4647,35 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     assert '"主食"' in done_text and '"6份"' in done_text
     assert '"中脂蛋白"' in done_text and '"2.5份"' in done_text
     with sqlite3.connect(db) as conn:
-        totals = daily_consumed_totals(conn, user_id="U_CUSTOMER", date_iso="2026-07-23")
-        admin_totals = daily_consumed_totals(conn, user_id="U_ADMIN", date_iso="2026-07-23")
+        totals = daily_consumed_totals(conn, user_id="U_CUSTOMER", date_iso=meal_date)
+        admin_totals = daily_consumed_totals(conn, user_id="U_ADMIN", date_iso=meal_date)
         assert totals["starch_exchange"] == 6.0
         assert totals["protein_medium_exchange"] == 2.5
         assert admin_totals["starch_exchange"] == 0.0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (health_case["case_id"],),
+        ).fetchone()[0] == 1
     assert pushes and pushes[-1][0] == "U_CUSTOMER"
     assert "已由營養師核准" in pushes[-1][1].text
     push_count = len(pushes)
+    with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        conn.execute(
+            "DELETE FROM vip_health_check_source_refs WHERE case_id=?",
+            (health_case["case_id"],),
+        )
+        conn.execute(
+            "DELETE FROM vip_health_check_valid_days WHERE case_id=?",
+            (health_case["case_id"],),
+        )
+        conn.execute(
+            """UPDATE vip_health_check_cases
+               SET valid_day_count=0,source_manifest_hash=''
+               WHERE case_id=?""",
+            (health_case["case_id"],),
+        )
+        conn.commit()
     replayed_done = send(f"mpr:v1:{token}:14:approve", "ADMIN-APPROVE")
     assert "已核准｜已計入正式份量" in json.dumps(
         json.loads(str(replayed_done.contents)), ensure_ascii=False
@@ -4643,8 +4683,15 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     assert len(pushes) == push_count
     with sqlite3.connect(db) as conn:
         assert daily_consumed_totals(
-            conn, user_id="U_CUSTOMER", date_iso="2026-07-23"
+            conn, user_id="U_CUSTOMER", date_iso=meal_date
         )["starch_exchange"] == 6.0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM food_logs WHERE user_id='U_CUSTOMER'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (health_case["case_id"],),
+        ).fetchone()[0] == 1
 
 
 def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(tmp_path, monkeypatch):

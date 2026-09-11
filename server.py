@@ -11434,6 +11434,7 @@ def handle_meal_photo_postback(event):
             else:
                 action, field, value = "approve", "", ""
             with sqlite3.connect(DB_PATH) as conn:
+                health_refresh_ready = _prepare_health_check_refresh_connection(conn)
                 admin_draft = get_meal_photo_draft_for_admin(
                     conn, token=token, admin_user_id=uid,
                     required_admin_user_id=configured_admin_uid,
@@ -11446,6 +11447,8 @@ def handle_meal_photo_postback(event):
                     field=field, value=value,
                 )
                 draft, result = applied["draft"], applied["result"]
+                if result.get("kind") == "approved" and health_refresh_ready:
+                    _refresh_health_check_after_food_log(conn, user_id=owner_uid)
             kind = result["kind"]
             if kind == "review_question":
                 reply = build_meal_photo_review_step_message(
