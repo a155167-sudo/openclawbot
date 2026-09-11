@@ -1703,6 +1703,131 @@ def test_failed_image_delete_keeps_reference_for_retry(tmp_path, monkeypatch):
     assert cleared == ""
 
 
+def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_path, monkeypatch):
+    db = tmp_path / "delivered-health-photo-cleanup.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    ref = server._store_nutrition_image(b"\xff\xd8\xff" + b"x" * 100, ".jpg")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn,
+            user_id="U_HEALTH",
+            source_message_id="M_HEALTH",
+            payload=meal_photo_payload(),
+            source_image_ref=ref,
+        )
+        server.ensure_daily_food_ledger_schema(conn)
+        server.configure_vip_health_check_connection(conn)
+        server.ensure_vip_health_check_schema(conn)
+        approved = insert_approved_meal_photo_log(
+            conn,
+            token=token,
+            user_id="U_HEALTH",
+            reviewer="U_DIETITIAN",
+            consumed_at="2026-09-11T12:00:00+08:00",
+            meal_slot="午餐",
+            source_image_ref=ref,
+            observed_payload=meal_photo_payload(),
+            answers={},
+            exact_exchange={
+                "milk_exchange": 0,
+                "protein_low_exchange": 1,
+                "protein_medium_exchange": 0,
+                "protein_high_exchange": 0,
+                "starch_exchange": 1,
+                "vegetable_exchange": 1,
+                "fruit_exchange": 0,
+                "fat_exchange": 0,
+            },
+        )
+        log_id = approved["log_id"]
+        log_row = conn.execute(
+            "SELECT nutrition_snapshot_json,version FROM food_logs WHERE log_id=?",
+            (log_id,),
+        ).fetchone()
+        source_hash = server.canonical_food_log_source_hash(
+            log_id, log_row[1], log_row[0]
+        )
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET status='approved',approved_log_id=? WHERE token=?",
+            (log_id, token),
+        )
+        conn.execute(
+            """INSERT INTO vip_health_check_cases
+               (case_id,user_id,benefit_key,first_vip_activation_id,
+                activation_event_key,window_started_at,window_ends_at,status,
+                created_at,updated_at)
+               VALUES ('case-health','U_HEALTH','first_vip_baseline_check',
+                       'activation-health','event-health',
+                       '2026-09-09T00:00:00+08:00','2026-09-16T00:00:00+08:00',
+                       'delivered','2026-09-09T00:00:00+08:00',
+                       '2026-09-11T12:00:00+08:00')"""
+        )
+        conn.execute(
+            """INSERT INTO vip_health_check_source_refs
+               (case_id,food_log_id,food_log_version,local_date,included_reason,
+                source_hash,created_at)
+               VALUES ('case-health',?,?,'2026-09-11',
+                       'confirmed_canonical_food_log_in_activation_window',?,
+                       '2026-09-11T12:00:00+08:00')""",
+            (log_id, log_row[1], source_hash),
+        )
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE vip_health_check_source_refs SET source_hash=? WHERE case_id='case-health'",
+            ("0" * 64,),
+        )
+    server.cleanup_nutrition_images()
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT source_image_ref FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()[0] == ref
+        assert conn.execute(
+            "SELECT source_image_ref FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0] == ref
+        conn.execute(
+            "UPDATE vip_health_check_source_refs SET source_hash=? WHERE case_id='case-health'",
+            (source_hash,),
+        )
+
+    original_remove = server.os.remove
+    monkeypatch.setattr(
+        server.os,
+        "remove",
+        lambda _path: (_ for _ in ()).throw(OSError("busy")),
+    )
+    server.cleanup_nutrition_images()
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT source_image_ref FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()[0] == ref
+        assert conn.execute(
+            "SELECT source_image_ref FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0] == ref
+
+    monkeypatch.setattr(server.os, "remove", original_remove)
+    server.cleanup_nutrition_images()
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT source_image_ref FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()[0] == ""
+        assert conn.execute(
+            "SELECT source_image_ref FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0] == ""
+        assert conn.execute(
+            """SELECT COUNT(*) FROM nutrition_sheet_outbox
+               WHERE entity_type='food_log' AND entity_id=? AND status='pending'""",
+            (log_id,),
+        ).fetchone()[0] >= 1
+    stored_path = server._nutrition_image_path(ref)
+    assert stored_path is not None
+    assert not os.path.exists(stored_path)
+
+
 def test_awaiting_identity_expiration_deletes_stored_back_image(tmp_path, monkeypatch):
     db = tmp_path / "awaiting-cleanup.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))

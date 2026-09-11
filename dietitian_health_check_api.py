@@ -10,12 +10,14 @@ import math
 import re
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Header, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import requests
+
+from vip_health_check import canonical_food_log_source_hash
 
 
 LINE_ID_TOKEN_VERIFY_URL = "https://api.line.me/oauth2/v2.1/verify"
@@ -382,18 +384,7 @@ def _source_hash_matches(log: sqlite3.Row) -> bool:
     raw_nutrition = log["nutrition_snapshot_json"]
     if not isinstance(raw_nutrition, str):
         return False
-    try:
-        canonical = json.dumps(
-            json.loads(raw_nutrition),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    except (TypeError, ValueError, json.JSONDecodeError):
-        canonical = raw_nutrition
-    actual = hashlib.sha256(
-        f"{log_id}:{version}:{canonical}".encode("utf-8")
-    ).hexdigest()
+    actual = canonical_food_log_source_hash(log_id, version, raw_nutrition)
     return hmac.compare_digest(actual, expected)
 
 
@@ -757,6 +748,7 @@ def create_dietitian_health_check_router(
     allowed_uids: frozenset[str],
     list_loader: Callable[..., Mapping[str, object]],
     detail_loader: Callable[[str], Mapping[str, object] | None],
+    image_loader: Callable[[str, str], tuple[bytes, str] | None] | None = None,
     token_verifier: Callable[..., str] = verify_line_id_token,
 ) -> APIRouter:
     if not CHANNEL_ID_PATTERN.fullmatch(channel_id):
@@ -814,7 +806,7 @@ def create_dietitian_health_check_router(
     @router.get("/api/dietitian/health-checks/{case_id}", response_class=JSONResponse)
     def case_detail(
         case_id: str,
-        authorization: str | None = Header(default=None),
+        authorization: Optional[str] = Header(default=None),
     ) -> JSONResponse:
         denied = authorize(authorization)
         if denied is not None:
@@ -829,22 +821,70 @@ def create_dietitian_health_check_router(
         except Exception:
             return _response("health-check data unavailable", 503)
 
-    def method_not_allowed() -> JSONResponse:
-        return _response("method not allowed", 405)
+    @router.get("/api/dietitian/health-checks/{case_id}/photos/{log_id}")
+    def source_photo(
+        case_id: str,
+        log_id: str,
+        authorization: Optional[str] = Header(default=None),
+    ) -> Response:
+        denied = authorize(authorization)
+        if denied is not None:
+            return denied
+        if (
+            not CASE_ID_PATTERN.fullmatch(case_id)
+            or not CASE_ID_PATTERN.fullmatch(log_id)
+        ):
+            return _response("invalid source photo id", 422)
+        if image_loader is None:
+            return _response("source photo not found", 404)
+        try:
+            loaded = image_loader(case_id, log_id)
+            if loaded is None:
+                return _response("source photo not found", 404)
+            content, media_type = loaded
+            if (
+                not isinstance(content, bytes)
+                or not 100 <= len(content) <= 1024 * 1024
+                or media_type != "image/jpeg"
+            ):
+                raise ValueError("invalid source photo payload")
+            return Response(
+                content=content,
+                media_type=media_type,
+                headers=NO_STORE_HEADERS,
+            )
+        except Exception:
+            return _response("source photo unavailable", 503)
 
-    unsupported_methods = ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-    router.add_api_route(
-        "/api/dietitian/health-checks",
-        method_not_allowed,
-        methods=unsupported_methods,
-        include_in_schema=False,
+    def method_not_allowed() -> JSONResponse:
+        return JSONResponse(
+            {"detail": "method not allowed"},
+            status_code=405,
+            headers={**NO_STORE_HEADERS, "Allow": "GET"},
+        )
+
+    route_handlers = (
+        ("/api/dietitian/health-checks", list_cases),
+        ("/api/dietitian/health-checks/{case_id}", case_detail),
+        ("/api/dietitian/health-checks/{case_id}/photos/{log_id}", source_photo),
     )
-    router.add_api_route(
-        "/api/dietitian/health-checks/{case_id}",
-        method_not_allowed,
-        methods=unsupported_methods,
-        include_in_schema=False,
-    )
+    for path, handler in route_handlers:
+        router.add_api_route(
+            path + "/",
+            handler,
+            methods=["GET"],
+            include_in_schema=False,
+        )
+
+    unsupported_methods = ["HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"]
+    for path, _handler in route_handlers:
+        for route_path in (path, path + "/"):
+            router.add_api_route(
+                route_path,
+                method_not_allowed,
+                methods=unsupported_methods,
+                include_in_schema=False,
+            )
 
     return router
 
@@ -855,6 +895,7 @@ def attach_dietitian_health_check_routes(
     config: DietitianHealthCheckConfig,
     list_loader: Callable[..., Mapping[str, object]],
     detail_loader: Callable[[str], Mapping[str, object] | None],
+    image_loader: Callable[[str, str], tuple[bytes, str] | None] | None = None,
     token_verifier: Callable[..., str] = verify_line_id_token,
 ) -> bool:
     if not config.enabled:
@@ -865,6 +906,7 @@ def attach_dietitian_health_check_routes(
             allowed_uids=config.allowed_uids,
             list_loader=list_loader,
             detail_loader=detail_loader,
+            image_loader=image_loader,
             token_verifier=token_verifier,
         )
     )

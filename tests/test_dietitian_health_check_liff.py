@@ -65,3 +65,27 @@ def test_liff_script_reads_live_collecting_and_ready_cases_without_persisting_to
     assert "U-AUTHORIZED" not in script
     assert "Authorization" in script
     assert "liff.getIDToken" in script
+
+
+def test_liff_fetches_case_bound_photos_as_ephemeral_blobs_and_degrades_safely():
+    from dietitian_health_check_liff import attach_dietitian_health_check_liff_routes
+
+    app = FastAPI()
+    attach_dietitian_health_check_liff_routes(app, _config())
+    client = TestClient(app)
+    page = client.get("/dietitian-health-check").text
+    script = client.get("/dietitian-health-check/app.js").text
+
+    assert "/photos/" in script
+    assert "response.blob()" in script
+    assert "URL.createObjectURL" in script
+    assert "URL.revokeObjectURL" in script
+    assert "new AbortController()" in script
+    assert "loadGeneration" in script
+    assert "container.isConnected" in script
+    assert "error.name!=='AbortError'" in script
+    assert "event.persisted&&idToken" in script
+    assert "照片已清除或無照片" in script
+    assert "source_image_ref" not in script
+    assert "innerHTML" not in script
+    assert "photo-grid" in page

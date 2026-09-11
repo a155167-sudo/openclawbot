@@ -3,6 +3,7 @@ import hmac
 import os
 import json
 import sqlite3
+import stat
 from datetime import datetime, timedelta
 import secrets
 import string
@@ -119,6 +120,7 @@ from dietitian_health_check_command import (
 )
 from dietitian_health_check_liff import attach_dietitian_health_check_liff_routes
 from vip_health_check import (
+    canonical_food_log_source_hash,
     configure_vip_health_check_connection,
     create_first_vip_health_check_case,
     ensure_vip_health_check_schema,
@@ -2919,6 +2921,60 @@ def get_dietitian_health_check(case_id: str):
         return load_health_check_detail(conn, case_id=case_id)
 
 
+def get_dietitian_health_check_photo(case_id: str, log_id: str):
+    """Load one approved meal-photo preview only when it belongs to the case source."""
+    with closing(_open_read_only_database()) as conn:
+        rows = conn.execute(
+            """SELECT d.source_image_ref,source.source_hash,
+                      source.food_log_version,food_log.nutrition_snapshot_json
+               FROM vip_health_check_source_refs AS source
+               JOIN vip_health_check_cases AS health_case
+                 ON health_case.case_id = source.case_id
+               JOIN food_logs AS food_log
+                 ON food_log.log_id = source.food_log_id
+                AND food_log.user_id = health_case.user_id
+               JOIN pending_meal_photo_drafts AS d
+                 ON d.approved_log_id = food_log.log_id
+                AND d.user_id = health_case.user_id
+              WHERE source.case_id = ?
+                AND source.food_log_id = ?
+                AND health_case.status IN (
+                    'collecting','ready_for_review','needs_more_info',
+                    'approved_pending_delivery','delivery_failed'
+                )
+                AND food_log.confirmation_status = 'confirmed'
+                AND COALESCE(food_log.deleted_at, '') = ''
+                AND food_log.version = source.food_log_version
+                AND food_log.source_image_ref = d.source_image_ref
+                AND d.status = 'approved'
+              LIMIT 2""",
+            (case_id, log_id),
+        ).fetchall()
+    if len(rows) != 1:
+        return None
+    image_ref, source_hash, source_version, nutrition_snapshot_json = rows[0]
+    if (
+        not isinstance(source_hash, str)
+        or not isinstance(source_version, int)
+        or isinstance(source_version, bool)
+        or source_version < 1
+        or not isinstance(nutrition_snapshot_json, str)
+    ):
+        return None
+    expected_hash = canonical_food_log_source_hash(
+        log_id, source_version, nutrition_snapshot_json
+    )
+    if not hmac.compare_digest(expected_hash, source_hash):
+        return None
+    image_ref = str(image_ref or "")
+    image_file = _open_nutrition_image_readonly(image_ref)
+    if image_file is None:
+        return None
+    with image_file:
+        preview = _meal_photo_preview_response(image_file)
+    return bytes(preview.body), "image/jpeg"
+
+
 def register_customer_health_check_liff(target_app=app):
     return attach_customer_health_check_routes(
         target_app,
@@ -2937,6 +2993,7 @@ def register_dietitian_health_check_api(target_app=app):
         config=DIETITIAN_HEALTH_CHECK_CONFIG,
         list_loader=list_dietitian_health_checks,
         detail_loader=get_dietitian_health_check,
+        image_loader=get_dietitian_health_check_photo,
     )
     attach_dietitian_health_check_liff_routes(
         target_app, DIETITIAN_HEALTH_CHECK_CONFIG
@@ -9553,6 +9610,47 @@ def _nutrition_image_path(image_ref):
     return path if os.path.dirname(path) == root else None
 
 
+def _open_nutrition_image_readonly(image_ref):
+    """Open a stored image beneath directory FDs without following symlinks."""
+    match = re.fullmatch(
+        r"nutrition-image:([0-9a-f]{32}\.(?:jpg|png|webp))",
+        str(image_ref or ""),
+    )
+    if not match:
+        return None
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    db_fd = image_fd = file_fd = None
+    try:
+        db_fd = os.open(DB_DIR, directory_flags)
+        image_fd = os.open("nutrition_images", directory_flags, dir_fd=db_fd)
+        file_fd = os.open(match.group(1), file_flags, dir_fd=image_fd)
+        metadata = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or not 100 <= metadata.st_size <= 10 * 1024 * 1024
+        ):
+            os.close(file_fd)
+            file_fd = None
+            return None
+        result = os.fdopen(file_fd, "rb")
+        file_fd = None
+        return result
+    except OSError:
+        return None
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if image_fd is not None:
+            os.close(image_fd)
+        if db_fd is not None:
+            os.close(db_fd)
+
+
 MEAL_PHOTO_IMAGE_URL_TTL_SECONDS = 10 * 60
 MEAL_PHOTO_MAX_PREVIEW_PIXELS = 25_000_000
 
@@ -9878,14 +9976,177 @@ def cleanup_nutrition_images():
                 (status, now_text, now_text, token, user_id),
             )
             if ref:
-                meal_photo_rows.append((token, user_id, ref))
-        conn.commit()
-    for token, user_id, ref in meal_photo_rows:
-        if _delete_nutrition_image(ref):
-            with sqlite3.connect(DB_PATH) as conn:
-                clear_meal_photo_image_ref(
-                    conn, user_id=user_id, token=token, expected_ref=ref
+                meal_photo_rows.append(
+                    {
+                        "token": token,
+                        "user_id": user_id,
+                        "ref": ref,
+                        "reason": "retired",
+                    }
                 )
+        required_tables = {
+            "vip_health_check_cases",
+            "vip_health_check_source_refs",
+            "food_logs",
+        }
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                """SELECT name FROM sqlite_master
+                   WHERE type='table' AND name IN (
+                     'vip_health_check_cases','vip_health_check_source_refs','food_logs'
+                   )"""
+            ).fetchall()
+        }
+        if existing_tables == required_tables:
+            delivered_rows = conn.execute(
+                """SELECT health_case.case_id,draft.token,draft.user_id,
+                          draft.source_image_ref,food_log.log_id,food_log.food_id,
+                          source.food_log_version,source.source_hash,
+                          food_log.nutrition_snapshot_json
+                   FROM pending_meal_photo_drafts AS draft
+                   JOIN vip_health_check_source_refs AS source
+                     ON source.food_log_id=draft.approved_log_id
+                   JOIN vip_health_check_cases AS health_case
+                     ON health_case.case_id=source.case_id
+                    AND health_case.user_id=draft.user_id
+                   JOIN food_logs AS food_log
+                     ON food_log.log_id=source.food_log_id
+                    AND food_log.user_id=health_case.user_id
+                  WHERE draft.status='approved'
+                    AND draft.source_image_ref<>''
+                    AND health_case.status IN ('delivered','expired','cancelled')
+                    AND food_log.confirmation_status='confirmed'
+                    AND COALESCE(food_log.deleted_at,'')=''
+                    AND food_log.version=source.food_log_version
+                    AND food_log.source_image_ref=draft.source_image_ref"""
+            ).fetchall()
+            for (
+                case_id,
+                token,
+                user_id,
+                ref,
+                log_id,
+                food_id,
+                source_version,
+                source_hash,
+                nutrition_snapshot_json,
+            ) in delivered_rows:
+                if (
+                    not isinstance(source_version, int)
+                    or isinstance(source_version, bool)
+                    or source_version < 1
+                    or not isinstance(source_hash, str)
+                    or not isinstance(nutrition_snapshot_json, str)
+                ):
+                    continue
+                actual_hash = canonical_food_log_source_hash(
+                    log_id, source_version, nutrition_snapshot_json
+                )
+                if not hmac.compare_digest(actual_hash, source_hash):
+                    continue
+                meal_photo_rows.append(
+                    {
+                        "case_id": case_id,
+                        "token": token,
+                        "user_id": user_id,
+                        "ref": ref,
+                        "log_id": log_id,
+                        "food_id": food_id,
+                        "source_version": source_version,
+                        "source_hash": source_hash,
+                        "reason": "health_case_terminal",
+                    }
+                )
+        conn.commit()
+    for candidate in meal_photo_rows:
+        token = candidate["token"]
+        user_id = candidate["user_id"]
+        ref = candidate["ref"]
+        if candidate["reason"] == "retired":
+            if _delete_nutrition_image(ref):
+                with sqlite3.connect(DB_PATH) as conn:
+                    clear_meal_photo_image_ref(
+                        conn, user_id=user_id, token=token, expected_ref=ref
+                    )
+            continue
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """SELECT source.source_hash,source.food_log_version,
+                          food_log.nutrition_snapshot_json
+                   FROM pending_meal_photo_drafts AS draft
+                   JOIN vip_health_check_source_refs AS source
+                     ON source.case_id=? AND source.food_log_id=draft.approved_log_id
+                   JOIN vip_health_check_cases AS health_case
+                     ON health_case.case_id=source.case_id
+                    AND health_case.user_id=draft.user_id
+                   JOIN food_logs AS food_log
+                     ON food_log.log_id=source.food_log_id
+                    AND food_log.user_id=health_case.user_id
+                  WHERE draft.token=? AND draft.user_id=?
+                    AND draft.status='approved' AND draft.source_image_ref=?
+                    AND health_case.status IN ('delivered','expired','cancelled')
+                    AND food_log.log_id=? AND food_log.food_id=?
+                    AND food_log.confirmation_status='confirmed'
+                    AND COALESCE(food_log.deleted_at,'')=''
+                    AND food_log.version=source.food_log_version
+                    AND food_log.source_image_ref=draft.source_image_ref""",
+                (
+                    candidate["case_id"],
+                    token,
+                    user_id,
+                    ref,
+                    candidate["log_id"],
+                    candidate["food_id"],
+                ),
+            ).fetchall()
+            if len(current) != 1:
+                conn.rollback()
+                continue
+            source_hash, source_version, nutrition_snapshot_json = current[0]
+            if (
+                not isinstance(source_version, int)
+                or isinstance(source_version, bool)
+                or source_version < 1
+                or not isinstance(source_hash, str)
+                or not isinstance(nutrition_snapshot_json, str)
+                or not hmac.compare_digest(
+                    canonical_food_log_source_hash(
+                        candidate["log_id"], source_version, nutrition_snapshot_json
+                    ),
+                    source_hash,
+                )
+            ):
+                conn.rollback()
+                continue
+            if not _delete_nutrition_image(ref):
+                conn.rollback()
+                continue
+            draft_changed = conn.execute(
+                """UPDATE pending_meal_photo_drafts SET source_image_ref=''
+                   WHERE token=? AND user_id=? AND source_image_ref=?
+                     AND status='approved'""",
+                (token, user_id, ref),
+            ).rowcount
+            log_changed = conn.execute(
+                """UPDATE food_logs SET source_image_ref='',updated_at=?
+                   WHERE log_id=? AND user_id=? AND source_image_ref=?""",
+                (now_text, candidate["log_id"], user_id, ref),
+            ).rowcount
+            if draft_changed != 1 or log_changed != 1:
+                conn.rollback()
+                continue
+            catalog_changed = conn.execute(
+                """UPDATE food_catalog SET original_image_ref='',updated_at=?
+                   WHERE food_id=? AND original_image_ref=?""",
+                (now_text, candidate["food_id"], ref),
+            ).rowcount
+            _queue_nutrition_outbox(conn, "food_log", candidate["log_id"])
+            if catalog_changed:
+                _queue_nutrition_outbox(conn, "food", candidate["food_id"])
+            conn.commit()
 
     meal_tombstone_cutoff = now_dt - timedelta(days=30)
     with sqlite3.connect(DB_PATH) as conn:

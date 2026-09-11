@@ -665,6 +665,16 @@ def _canonical_json_text(value: str) -> str:
         return str(value or "")
 
 
+def canonical_food_log_source_hash(
+    log_id: str, version: int, nutrition_snapshot_json: str
+) -> str:
+    """Return the immutable hash used by canonical health-check source refs."""
+    source_material = (
+        f"{log_id}:{version}:{_canonical_json_text(nutrition_snapshot_json)}"
+    )
+    return hashlib.sha256(source_material.encode("utf-8")).hexdigest()
+
+
 def refresh_case_source_manifest(
     conn: sqlite3.Connection,
     *,
@@ -717,16 +727,14 @@ def refresh_case_source_manifest(
                 continue
             local_date = local_time.date().isoformat()
             version = int(version or 1)
-            source_material = (
-                f"{log_id}:{version}:"
-                f"{_canonical_json_text(nutrition_snapshot_json)}"
-            )
             item = {
                 "food_log_id": log_id,
                 "version": version,
                 "local_date": local_date,
                 "meal_slot": str(meal_slot or ""),
-                "source_hash": hashlib.sha256(source_material.encode("utf-8")).hexdigest(),
+                "source_hash": canonical_food_log_source_hash(
+                    log_id, version, nutrition_snapshot_json
+                ),
             }
             included.append(item)
             by_date[local_date].append(item)

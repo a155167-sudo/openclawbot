@@ -156,7 +156,7 @@ def _populated_db(tmp_path):
     return path
 
 
-def _client(*, loader, verifier=None, allowed=(DIETITIAN_UID,)):
+def _client(*, loader, verifier=None, allowed=(DIETITIAN_UID,), image_loader=None):
     from dietitian_health_check_api import create_dietitian_health_check_router
 
     seen = []
@@ -172,6 +172,7 @@ def _client(*, loader, verifier=None, allowed=(DIETITIAN_UID,)):
             allowed_uids=frozenset(allowed),
             list_loader=lambda **kwargs: recording_loader("list", **kwargs),
             detail_loader=lambda case_id: recording_loader("detail", case_id=case_id),
+            image_loader=image_loader,
             token_verifier=verifier or (lambda _token, *, channel_id: DIETITIAN_UID),
         )
     )
@@ -350,6 +351,60 @@ def test_detail_case_id_is_strict_and_rejected_before_loader():
         response = client.get("/api/dietitian/health-checks/" + case_id, headers=headers)
         assert response.status_code == expected
     assert seen == []
+
+
+def test_source_photo_requires_authorized_line_identity_before_loading():
+    calls = []
+    image_loader = lambda case_id, log_id: calls.append((case_id, log_id))
+    path = "/api/dietitian/health-checks/case-1/photos/log-owned"
+
+    client, _ = _client(loader=lambda *_args, **_kwargs: {}, image_loader=image_loader)
+    assert client.get(path).status_code == 401
+
+    forbidden, _ = _client(
+        loader=lambda *_args, **_kwargs: {},
+        allowed=(OTHER_UID,),
+        image_loader=image_loader,
+    )
+    assert forbidden.get(path, headers={"Authorization": "Bearer signed"}).status_code == 403
+    assert calls == []
+
+
+def test_source_photo_is_case_bound_no_store_and_fail_closed():
+    photo = b"\xff\xd8\xff" + b"x" * 200
+    calls = []
+
+    def load_photo(case_id, log_id):
+        calls.append((case_id, log_id))
+        if (case_id, log_id) == ("case-1", "log-owned"):
+            return photo, "image/jpeg"
+        return None
+
+    client, _ = _client(loader=lambda *_args, **_kwargs: {}, image_loader=load_photo)
+    headers = {"Authorization": "Bearer signed"}
+    path = "/api/dietitian/health-checks/case-1/photos/log-owned"
+    response = client.get(path, headers=headers)
+    assert response.status_code == 200
+    assert response.content == photo
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+    assert client.get(
+        "/api/dietitian/health-checks/other-case/photos/log-owned", headers=headers
+    ).status_code == 404
+    assert client.get(
+        "/api/dietitian/health-checks/case-1/photos/contains%20space", headers=headers
+    ).status_code == 422
+
+    broken, _ = _client(
+        loader=lambda *_args, **_kwargs: {},
+        image_loader=lambda *_args: (_ for _ in ()).throw(RuntimeError("private-path")),
+    )
+    failed = broken.get(path, headers=headers)
+    assert failed.status_code == 503
+    assert failed.json() == {"detail": "source photo unavailable"}
+    assert "private-path" not in failed.text
 
 
 def test_projection_lists_and_details_canonical_owned_data_without_secrets(tmp_path):
@@ -743,7 +798,9 @@ def test_detail_not_found_is_404_and_database_error_is_generic_503(tmp_path):
     assert "private-db-path" not in response.text
 
 
-@pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete", "options"])
+@pytest.mark.parametrize(
+    "method", ["get", "head", "post", "put", "patch", "delete", "options", "trace"]
+)
 def test_disabled_routes_are_dark_for_every_method(method):
     from dietitian_health_check_api import attach_dietitian_health_check_routes
 
@@ -753,18 +810,51 @@ def test_disabled_routes_are_dark_for_every_method(method):
         detail_loader=lambda _case_id: None,
     ) is False
     client = TestClient(app)
-    for path in ("/api/dietitian/health-checks", "/api/dietitian/health-checks/case-1"):
-        assert getattr(client, method)(path).status_code == 404
+    for path in (
+        "/api/dietitian/health-checks",
+        "/api/dietitian/health-checks/case-1",
+        "/api/dietitian/health-checks/case-1/photos/log-owned",
+    ):
+        assert client.request(method.upper(), path).status_code == 404
 
 
-@pytest.mark.parametrize("method", ["post", "put", "patch", "delete", "options"])
+@pytest.mark.parametrize(
+    "method", ["head", "post", "put", "patch", "delete", "options", "trace"]
+)
 def test_enabled_wrong_methods_are_405_with_sensitive_headers(method):
     client, seen = _client(loader=lambda *_args, **_kwargs: {"items": []})
-    for path in ("/api/dietitian/health-checks", "/api/dietitian/health-checks/case-1"):
-        response = getattr(client, method)(path)
+    for path in (
+        "/api/dietitian/health-checks",
+        "/api/dietitian/health-checks/case-1",
+        "/api/dietitian/health-checks/case-1/photos/log-owned",
+    ):
+        response = client.request(method.upper(), path)
         assert response.status_code == 405
+        assert response.headers["allow"] == "GET"
         assert response.headers["cache-control"] == "no-store"
         assert response.headers["pragma"] == "no-cache"
         assert response.headers["x-content-type-options"] == "nosniff"
         assert response.headers["referrer-policy"] == "no-referrer"
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/dietitian/health-checks/",
+        "/api/dietitian/health-checks/case-1/",
+        "/api/dietitian/health-checks/case-1/photos/log-owned/",
+    ],
+)
+def test_trailing_slash_routes_do_not_redirect_around_sensitive_policy(path):
+    client, seen = _client(loader=lambda *_args, **_kwargs: {"items": []})
+
+    response = client.get(path, follow_redirects=False)
+
+    assert response.status_code == 401
+    assert "location" not in response.headers
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "no-referrer"
     assert seen == []
