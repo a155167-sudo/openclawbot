@@ -9798,63 +9798,112 @@ def get_meal_photo_image(token: str, extension: str, expires: int, sig: str, pre
 
 
 def _store_nutrition_image(image_bytes, extension, image_ref=""):
-    root = os.path.join(DB_DIR, "nutrition_images")
-    os.makedirs(root, mode=0o700, exist_ok=True)
-    os.chmod(root, 0o700)
+    if extension not in {".jpg", ".png", ".webp"}:
+        raise ValueError("圖片格式不支援")
     ref = image_ref or f"nutrition-image:{secrets.token_hex(16)}{extension}"
-    if not ref.endswith(extension):
+    match = re.fullmatch(
+        r"nutrition-image:([0-9a-f]{32}\.(?:jpg|png|webp))", str(ref)
+    )
+    if not match or not ref.endswith(extension):
         raise ValueError("圖片參照與格式不一致")
-    path = _nutrition_image_path(ref)
-    if not path:
-        raise RuntimeError("無法建立安全的圖片路徑")
-    if os.path.exists(path):
-        try:
-            with open(path, "rb") as existing_file:
-                existing_bytes = existing_file.read(10 * 1024 * 1024 + 1)
-            existing_extension, _ = _validate_image_bytes(existing_bytes)
-            if existing_extension == extension:
-                return ref
-        except (OSError, ValueError):
-            pass
-    temp_path = f"{path}.{secrets.token_hex(8)}.tmp"
-    fd = None
+    filename = match.group(1)
+    temp_filename = f"{filename}.{secrets.token_hex(8)}.tmp"
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    db_fd = image_fd = existing_fd = temp_fd = None
     try:
-        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as image_file:
-            fd = None
+        db_fd = os.open(DB_DIR, directory_flags)
+        try:
+            os.mkdir("nutrition_images", mode=0o700, dir_fd=db_fd)
+        except FileExistsError:
+            pass
+        image_fd = os.open("nutrition_images", directory_flags, dir_fd=db_fd)
+        os.fchmod(image_fd, 0o700)
+        try:
+            existing_fd = os.open(filename, file_read_flags, dir_fd=image_fd)
+            metadata = os.fstat(existing_fd)
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 10 * 1024 * 1024:
+                with os.fdopen(existing_fd, "rb") as existing_file:
+                    existing_fd = None
+                    existing_bytes = existing_file.read(10 * 1024 * 1024 + 1)
+                existing_extension, _ = _validate_image_bytes(existing_bytes)
+                if existing_extension == extension:
+                    return ref
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+        finally:
+            if existing_fd is not None:
+                os.close(existing_fd)
+                existing_fd = None
+        temp_fd = os.open(
+            temp_filename,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=image_fd,
+        )
+        with os.fdopen(temp_fd, "wb") as image_file:
+            temp_fd = None
             image_file.write(image_bytes)
             image_file.flush()
             os.fsync(image_file.fileno())
-        os.replace(temp_path, path)
-        try:
-            dir_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+        os.replace(
+            temp_filename,
+            filename,
+            src_dir_fd=image_fd,
+            dst_dir_fd=image_fd,
+        )
+        os.fsync(image_fd)
         return ref
     finally:
-        if fd is not None:
-            os.close(fd)
-        if os.path.exists(temp_path):
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if image_fd is not None:
             try:
-                os.remove(temp_path)
-            except OSError:
+                os.unlink(temp_filename, dir_fd=image_fd)
+            except FileNotFoundError:
                 pass
+            if existing_fd is not None:
+                os.close(existing_fd)
+            os.close(image_fd)
+        if db_fd is not None:
+            os.close(db_fd)
 
 
 def _delete_nutrition_image(image_ref):
-    path = _nutrition_image_path(image_ref)
-    if not path or not os.path.exists(path):
+    match = re.fullmatch(
+        r"nutrition-image:([0-9a-f]{32}\.(?:jpg|png|webp))",
+        str(image_ref or ""),
+    )
+    if not match:
         return True
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    db_fd = image_fd = None
     try:
-        os.remove(path)
+        db_fd = os.open(DB_DIR, directory_flags)
+        image_fd = os.open("nutrition_images", directory_flags, dir_fd=db_fd)
+        metadata = os.stat(match.group(1), dir_fd=image_fd, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            return False
+        os.unlink(match.group(1), dir_fd=image_fd)
+        return True
+    except FileNotFoundError:
         return True
     except OSError as exc:
         print(f"⚠️ 刪除營養圖片失敗，保留參照供下次重試：{exc}")
         return False
+    finally:
+        if image_fd is not None:
+            os.close(image_fd)
+        if db_fd is not None:
+            os.close(db_fd)
 
 
 def _queue_nutrition_outbox(conn, entity_type, entity_id):
@@ -9876,18 +9925,38 @@ def _queue_nutrition_outbox(conn, entity_type, entity_id):
 
 def cleanup_nutrition_images():
     """刪除成功後才清除參照；失敗的檔案會在下一輪再次嘗試。"""
-    image_root = os.path.join(DB_DIR, "nutrition_images")
-    if os.path.isdir(image_root):
-        for filename in os.listdir(image_root):
-            temp_path = os.path.join(image_root, filename)
-            if not filename.endswith(".tmp") or not os.path.isfile(temp_path):
+    now_dt = tw_now()
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    db_fd = image_fd = None
+    try:
+        db_fd = os.open(DB_DIR, directory_flags)
+        image_fd = os.open("nutrition_images", directory_flags, dir_fd=db_fd)
+        for filename in os.listdir(image_fd):
+            if not re.fullmatch(
+                r"[0-9a-f]{32}\.(?:jpg|png|webp)\.[0-9a-f]{16}\.tmp",
+                filename,
+            ):
                 continue
             try:
-                if tw_now().timestamp() - os.path.getmtime(temp_path) > 3600:
-                    os.remove(temp_path)
+                metadata = os.stat(filename, dir_fd=image_fd, follow_symlinks=False)
+                if (
+                    stat.S_ISREG(metadata.st_mode)
+                    and now_dt.timestamp() - metadata.st_mtime > 3600
+                ):
+                    os.unlink(filename, dir_fd=image_fd)
             except OSError:
                 pass
-    now_dt = tw_now()
+    except OSError:
+        pass
+    finally:
+        if image_fd is not None:
+            os.close(image_fd)
+        if db_fd is not None:
+            os.close(db_fd)
     cutoff = (now_dt - timedelta(days=90)).isoformat(timespec="seconds")
 
     def is_before(value, reference):
@@ -10212,16 +10281,42 @@ def cleanup_nutrition_images():
             (cutoff,),
         ).fetchall()
     for log_id, food_id, ref in old_logs:
-        if not _delete_nutrition_image(ref):
-            continue
         with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """SELECT 1 FROM food_logs
+                   WHERE log_id=? AND food_id=? AND created_at<?
+                     AND source_image_ref=?""",
+                (log_id, food_id, cutoff, ref),
+            ).fetchone()
+            if current is None:
+                conn.rollback()
+                continue
+            if not _delete_nutrition_image(ref):
+                conn.rollback()
+                continue
+            log_changed = conn.execute(
+                """UPDATE food_logs SET source_image_ref='',updated_at=?
+                   WHERE log_id=? AND food_id=? AND source_image_ref=?""",
+                (now_text, log_id, food_id, ref),
+            ).rowcount
+            if log_changed != 1:
+                conn.rollback()
+                continue
             conn.execute(
-                "UPDATE food_logs SET source_image_ref='' WHERE log_id=? AND source_image_ref=?",
+                """UPDATE food_catalog SET original_image_ref='',updated_at=?
+                   WHERE food_id=? AND original_image_ref=?""",
+                (now_text, food_id, ref),
+            )
+            conn.execute(
+                """UPDATE pending_meal_photo_drafts SET source_image_ref=''
+                   WHERE approved_log_id=? AND source_image_ref=?""",
                 (log_id, ref),
             )
             conn.execute(
-                "UPDATE food_catalog SET original_image_ref='' WHERE food_id=? AND original_image_ref=?",
-                (food_id, ref),
+                """UPDATE pending_nutrition_logs SET source_image_ref=''
+                   WHERE confirmed_log_id=? AND source_image_ref=?""",
+                (log_id, ref),
             )
             _queue_nutrition_outbox(conn, "food", food_id)
             _queue_nutrition_outbox(conn, "food_log", log_id)

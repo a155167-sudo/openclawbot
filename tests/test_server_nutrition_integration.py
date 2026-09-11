@@ -1686,21 +1686,173 @@ def test_failed_image_delete_keeps_reference_for_retry(tmp_path, monkeypatch):
         token = save_pending_label(conn, user_id="U1", payload=valid_label(), source_image_ref=ref)
         conn.execute("UPDATE pending_nutrition_logs SET expires_at='2000-01-01T00:00:00+08:00' WHERE token=?", (token,))
         conn.commit()
-    original_remove = server.os.remove
+    original_unlink = server.os.unlink
 
-    def fail_remove(_):
+    def fail_unlink(*_args, **_kwargs):
         raise OSError("busy")
 
-    monkeypatch.setattr(server.os, "remove", fail_remove)
+    monkeypatch.setattr(server.os, "unlink", fail_unlink)
     server.cleanup_nutrition_images()
     with sqlite3.connect(db) as conn:
         retained = conn.execute("SELECT source_image_ref FROM pending_nutrition_logs WHERE token=?", (token,)).fetchone()[0]
     assert retained == ref
-    monkeypatch.setattr(server.os, "remove", original_remove)
+    monkeypatch.setattr(server.os, "unlink", original_unlink)
     server.cleanup_nutrition_images()
     with sqlite3.connect(db) as conn:
         cleared = conn.execute("SELECT source_image_ref FROM pending_nutrition_logs WHERE token=?", (token,)).fetchone()[0]
     assert cleared == ""
+
+
+def test_cleanup_rejects_symlinked_root_for_stale_temp_files(tmp_path, monkeypatch):
+    db_dir = tmp_path / "db"
+    outside_dir = tmp_path / "outside"
+    db_dir.mkdir()
+    outside_dir.mkdir()
+    temp_file = outside_dir / (("a" * 32) + ".jpg." + ("b" * 16) + ".tmp")
+    temp_file.write_bytes(b"temporary")
+    os.utime(temp_file, (1, 1))
+    (db_dir / "nutrition_images").symlink_to(outside_dir, target_is_directory=True)
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db_dir / "cleanup.db"))
+
+    server.cleanup_nutrition_images()
+
+    assert temp_file.exists()
+
+
+def test_store_nutrition_image_rejects_symlinked_storage_root(tmp_path, monkeypatch):
+    db_dir = tmp_path / "db"
+    outside_dir = tmp_path / "outside"
+    db_dir.mkdir()
+    outside_dir.mkdir()
+    (db_dir / "nutrition_images").symlink_to(outside_dir, target_is_directory=True)
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+
+    with pytest.raises(OSError):
+        server._store_nutrition_image(b"\xff\xd8\xff" + b"x" * 100, ".jpg")
+
+    assert list(outside_dir.iterdir()) == []
+
+
+def test_delete_nutrition_image_rejects_symlinked_storage_root(tmp_path, monkeypatch):
+    db_dir = tmp_path / "db"
+    outside_dir = tmp_path / "outside"
+    db_dir.mkdir()
+    outside_dir.mkdir()
+    filename = "a" * 32 + ".jpg"
+    outside_file = outside_dir / filename
+    outside_file.write_bytes(b"\xff\xd8\xff" + b"x" * 100)
+    (db_dir / "nutrition_images").symlink_to(outside_dir, target_is_directory=True)
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+
+    deleted = server._delete_nutrition_image(f"nutrition-image:{filename}")
+
+    assert deleted is False
+    assert outside_file.exists()
+
+
+def test_ninety_day_cleanup_clears_approved_draft_log_and_catalog_refs(tmp_path, monkeypatch):
+    db = tmp_path / "old-approved-photo-cleanup.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    ref = server._store_nutrition_image(b"\xff\xd8\xff" + b"x" * 100, ".jpg")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn,
+            user_id="U_OLD_HEALTH",
+            source_message_id="M_OLD_HEALTH",
+            payload=meal_photo_payload(),
+            source_image_ref=ref,
+        )
+        server.ensure_daily_food_ledger_schema(conn)
+        server.configure_vip_health_check_connection(conn)
+        server.ensure_vip_health_check_schema(conn)
+        approved = insert_approved_meal_photo_log(
+            conn,
+            token=token,
+            user_id="U_OLD_HEALTH",
+            reviewer="U_DIETITIAN",
+            consumed_at="2026-01-01T12:00:00+08:00",
+            meal_slot="午餐",
+            source_image_ref=ref,
+            observed_payload=meal_photo_payload(),
+            answers={},
+            exact_exchange={
+                "milk_exchange": 0,
+                "protein_low_exchange": 1,
+                "protein_medium_exchange": 0,
+                "protein_high_exchange": 0,
+                "starch_exchange": 1,
+                "vegetable_exchange": 1,
+                "fruit_exchange": 0,
+                "fat_exchange": 0,
+            },
+        )
+        log_id = approved["log_id"]
+        food_id = approved["food_id"]
+        nutrition_json, version = conn.execute(
+            "SELECT nutrition_snapshot_json,version FROM food_logs WHERE log_id=?",
+            (log_id,),
+        ).fetchone()
+        conn.execute(
+            """UPDATE food_logs SET created_at='2000-01-01T00:00:00+08:00'
+               WHERE log_id=?""",
+            (log_id,),
+        )
+        conn.execute(
+            """UPDATE pending_meal_photo_drafts
+               SET status='approved',approved_log_id=? WHERE token=?""",
+            (log_id, token),
+        )
+        conn.execute(
+            """INSERT INTO vip_health_check_cases
+               (case_id,user_id,benefit_key,first_vip_activation_id,
+                activation_event_key,window_started_at,window_ends_at,status,
+                created_at,updated_at)
+               VALUES ('case-old-health','U_OLD_HEALTH','first_vip_baseline_check',
+                       'activation-old-health','event-old-health',
+                       '2026-01-01T00:00:00+08:00','2026-01-08T00:00:00+08:00',
+                       'collecting','2026-01-01T00:00:00+08:00',
+                       '2026-01-01T00:00:00+08:00')"""
+        )
+        conn.execute(
+            """INSERT INTO vip_health_check_source_refs
+               (case_id,food_log_id,food_log_version,local_date,included_reason,
+                source_hash,created_at)
+               VALUES ('case-old-health',?,?,'2026-01-01',
+                       'confirmed_canonical_food_log_in_activation_window',?,
+                       '2026-01-01T12:00:00+08:00')""",
+            (
+                log_id,
+                version,
+                server.canonical_food_log_source_hash(log_id, version, nutrition_json),
+            ),
+        )
+
+    server.cleanup_nutrition_images()
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT source_image_ref FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()[0] == ""
+        assert conn.execute(
+            "SELECT source_image_ref FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0] == ""
+        assert conn.execute(
+            "SELECT original_image_ref FROM food_catalog WHERE food_id=?", (food_id,)
+        ).fetchone()[0] == ""
+        assert conn.execute(
+            """SELECT COUNT(*) FROM nutrition_sheet_outbox
+               WHERE status='pending' AND (
+                 (entity_type='food_log' AND entity_id=?) OR
+                 (entity_type='food' AND entity_id=?)
+               )""",
+            (log_id, food_id),
+        ).fetchone()[0] == 2
+    stored_path = server._nutrition_image_path(ref)
+    assert stored_path is not None
+    assert not os.path.exists(stored_path)
 
 
 def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_path, monkeypatch):
@@ -1792,11 +1944,11 @@ def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_
             (source_hash,),
         )
 
-    original_remove = server.os.remove
+    original_unlink = server.os.unlink
     monkeypatch.setattr(
         server.os,
-        "remove",
-        lambda _path: (_ for _ in ()).throw(OSError("busy")),
+        "unlink",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("busy")),
     )
     server.cleanup_nutrition_images()
     with sqlite3.connect(db) as conn:
@@ -1808,7 +1960,7 @@ def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_
             "SELECT source_image_ref FROM food_logs WHERE log_id=?", (log_id,)
         ).fetchone()[0] == ref
 
-    monkeypatch.setattr(server.os, "remove", original_remove)
+    monkeypatch.setattr(server.os, "unlink", original_unlink)
     server.cleanup_nutrition_images()
     with sqlite3.connect(db) as conn:
         assert conn.execute(
