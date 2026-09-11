@@ -41,16 +41,27 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validated_fixture(environ: Mapping[str, str]) -> Path:
+def _validated_fixture(
+    environ: Mapping[str, str], *, safe_root: str | Path | None = None
+) -> Path:
     raw_path = str(environ.get("DIETITIAN_HEALTH_CHECK_DB_PATH") or "").strip()
     expected = str(environ.get("DIETITIAN_HEALTH_CHECK_DB_SHA256") or "").strip()
-    if not raw_path:
-        raise RuntimeError("DIETITIAN_HEALTH_CHECK_DB_PATH is required")
+    if raw_path != "staging-data/deidentified.db":
+        raise RuntimeError(
+            "DIETITIAN_HEALTH_CHECK_DB_PATH must be staging-data/deidentified.db"
+        )
     if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
         raise RuntimeError("DIETITIAN_HEALTH_CHECK_DB_SHA256 must be canonical sha256")
-    path = Path(raw_path).resolve(strict=True)
-    if not path.is_file():
-        raise RuntimeError("dietitian staging fixture must be a regular file")
+
+    root = Path(safe_root) if safe_root is not None else Path(__file__).resolve().parent
+    root = root.resolve(strict=True)
+    staging_directory = root / "staging-data"
+    candidate = staging_directory / "deidentified.db"
+    if staging_directory.is_symlink() or candidate.is_symlink():
+        raise RuntimeError("dietitian staging fixture symlinks are forbidden")
+    path = candidate.resolve(strict=True)
+    if path.parent != staging_directory.resolve(strict=True) or not path.is_file():
+        raise RuntimeError("dietitian staging fixture must remain inside staging-data")
     actual = _sha256(path)
     if actual != expected:
         raise RuntimeError("dietitian staging fixture hash mismatch")
@@ -61,12 +72,13 @@ def create_app(
     environ: Mapping[str, str] | None = None,
     *,
     token_verifier: Any = verify_line_id_token,
+    safe_root: str | Path | None = None,
 ) -> FastAPI:
     selected_environ = os.environ if environ is None else environ
     config: DietitianHealthCheckConfig = load_dietitian_health_check_config(selected_environ)
     if not config.enabled:
         raise RuntimeError("dedicated staging API must be explicitly enabled")
-    fixture_path = _validated_fixture(selected_environ)
+    fixture_path = _validated_fixture(selected_environ, safe_root=safe_root)
 
     app = FastAPI(
         title="一日樂食｜營養師三日健檢唯讀 Staging",

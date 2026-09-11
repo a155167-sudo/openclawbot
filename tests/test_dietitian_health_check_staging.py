@@ -20,13 +20,13 @@ def _environment(path: Path, digest: str) -> dict[str, str]:
         "DIETITIAN_HEALTH_CHECK_LIFF_ID": CHANNEL_ID + "-dietitianCheck",
         "DIETITIAN_HEALTH_CHECK_LINE_LOGIN_CHANNEL_ID": CHANNEL_ID,
         "DIETITIAN_HEALTH_CHECK_ALLOWED_UIDS": ALLOWED_UID,
-        "DIETITIAN_HEALTH_CHECK_DB_PATH": str(path),
+        "DIETITIAN_HEALTH_CHECK_DB_PATH": "staging-data/deidentified.db",
         "DIETITIAN_HEALTH_CHECK_DB_SHA256": digest,
     }
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, str]:
-    path = tmp_path / "deidentified.db"
+    path = tmp_path / "staging-data" / "deidentified.db"
     digest = build_fixture(path)
     return path, digest
 
@@ -36,11 +36,31 @@ def test_staging_adapter_refuses_disabled_or_hash_mismatched_fixture(tmp_path):
     disabled = _environment(path, digest)
     disabled["DIETITIAN_HEALTH_CHECK_READ_ENABLED"] = "false"
     with pytest.raises(RuntimeError, match="explicitly enabled"):
-        create_app(disabled)
+        create_app(disabled, safe_root=tmp_path)
 
     mismatched = _environment(path, "0" * 64)
     with pytest.raises(RuntimeError, match="hash mismatch"):
-        create_app(mismatched)
+        create_app(mismatched, safe_root=tmp_path)
+
+
+def test_staging_adapter_rejects_external_paths_and_symlinks(tmp_path):
+    path, digest = _fixture(tmp_path)
+    for raw_path in (str(path), "../staging-data/deidentified.db", "deidentified.db"):
+        environment = _environment(path, digest)
+        environment["DIETITIAN_HEALTH_CHECK_DB_PATH"] = raw_path
+        with pytest.raises(RuntimeError, match="must be staging-data/deidentified.db"):
+            create_app(environment, safe_root=tmp_path)
+
+    external_root = tmp_path / "external"
+    external_path = external_root / "deidentified.db"
+    external_digest = build_fixture(external_path)
+    symlink_root = tmp_path / "symlink-root"
+    symlink_root.mkdir()
+    (symlink_root / "staging-data").symlink_to(external_root, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="symlinks are forbidden"):
+        create_app(
+            _environment(external_path, external_digest), safe_root=symlink_root
+        )
 
 
 def test_staging_adapter_authentication_and_method_boundaries_are_fail_closed(tmp_path):
@@ -50,7 +70,11 @@ def test_staging_adapter_authentication_and_method_boundaries_are_fail_closed(tm
         assert channel_id == CHANNEL_ID
         return ALLOWED_UID if token == "allowed" else OTHER_UID
 
-    client = TestClient(create_app(_environment(path, digest), token_verifier=verifier))
+    client = TestClient(
+        create_app(
+            _environment(path, digest), token_verifier=verifier, safe_root=tmp_path
+        )
+    )
     endpoint = "/api/dietitian/health-checks"
 
     unauthenticated = client.get(endpoint)
@@ -75,6 +99,7 @@ def test_authorized_reads_use_deidentified_fixture_without_mutating_it(tmp_path)
         create_app(
             _environment(path, digest),
             token_verifier=lambda _token, *, channel_id: ALLOWED_UID,
+            safe_root=tmp_path,
         )
     )
     headers = {"Authorization": "Bearer allowed"}
@@ -109,6 +134,7 @@ def test_health_and_liff_shell_disclose_no_identity_and_are_no_store(tmp_path):
         create_app(
             _environment(path, digest),
             token_verifier=lambda _token, *, channel_id: ALLOWED_UID,
+            safe_root=tmp_path,
         )
     )
     response = client.get("/health")
