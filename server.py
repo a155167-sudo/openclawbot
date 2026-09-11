@@ -15,6 +15,7 @@ import re
 import requests
 import threading
 import uuid
+from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -116,12 +117,14 @@ from dietitian_health_check_command import (
     load_dietitian_health_check_command_allowed_uids,
     load_dietitian_health_check_command_liff_id,
 )
+from dietitian_health_check_liff import attach_dietitian_health_check_liff_routes
 from vip_health_check import (
     configure_vip_health_check_connection,
     create_first_vip_health_check_case,
     ensure_vip_health_check_schema,
     get_customer_health_check_state,
     is_vip_health_check_enabled,
+    refresh_user_health_check_case,
 )
 
 APP_SETTINGS = load_settings(os.environ)
@@ -143,6 +146,26 @@ DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID = (
 DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS = (
     load_dietitian_health_check_command_allowed_uids(os.environ)
 )
+
+
+def _validate_dietitian_health_check_command_identity() -> None:
+    """Fail closed when the LINE command points outside the enabled read boundary."""
+    config = DIETITIAN_HEALTH_CHECK_CONFIG
+    if not config.enabled:
+        return
+    if DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID != config.liff_id:
+        raise RuntimeError(
+            "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID must match "
+            "DIETITIAN_HEALTH_CHECK_LIFF_ID when read access is enabled"
+        )
+    if frozenset(DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS) != config.allowed_uids:
+        raise RuntimeError(
+            "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS must match "
+            "DIETITIAN_HEALTH_CHECK_ALLOWED_UIDS when read access is enabled"
+        )
+
+
+_validate_dietitian_health_check_command_identity()
 
 
 def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
@@ -168,6 +191,33 @@ def tw_today():
 
 def tw_now():
     return datetime.now(TW_TZ)
+
+
+def _prepare_health_check_refresh_connection(conn: sqlite3.Connection) -> bool:
+    """Best-effort FK preparation; authoritative food logging must remain available."""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return False
+    try:
+        configure_vip_health_check_connection(conn)
+        return True
+    except Exception as exc:
+        print(f"⚠️ 三日健檢連線準備失敗，保留飲食主帳本：{exc}")
+        return False
+
+
+def _refresh_health_check_after_food_log(
+    conn: sqlite3.Connection, *, user_id: str
+):
+    """Refresh derived health-check state without making food logging depend on it."""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return None
+    try:
+        return refresh_user_health_check_case(
+            conn, user_id=user_id, evaluated_at=tw_now()
+        )
+    except Exception as exc:
+        print(f"⚠️ 三日健檢來源刷新失敗，飲食紀錄仍保留：{exc}")
+        return None
 
 
 DAILY_FOOD_NUTRIENT_FIELDS = (
@@ -264,17 +314,20 @@ def create_daily_food_log(
     nutrition: dict, source_type: str, operation_key: str = "",
 ) -> dict:
     """建立可編輯逐筆飲食紀錄；營養快照保留未知 None。"""
+    _prepare_health_check_refresh_connection(conn)
     if not conn.in_transaction:
         ensure_daily_food_ledger_schema(conn)
+    user_id = str(user_id or "").strip()
     operation_key = str(operation_key or "").strip()[:180]
     if operation_key:
         existing_log = conn.execute(
             """SELECT fl.log_id,fl.food_id,fc.product_name,fl.meal_slot,fl.consumed_at,
                       fl.consumed_servings,fl.nutrition_snapshot_json,fl.version
                FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
-               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, str(user_id or "").strip()),
+               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, user_id),
         ).fetchone()
         if existing_log:
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
             return {
                 "log_id": existing_log[0], "food_id": existing_log[1],
                 "product_name": existing_log[2], "meal_slot": existing_log[3] or "",
@@ -282,7 +335,6 @@ def create_daily_food_log(
                 "nutrition": json.loads(existing_log[6] or "{}"),
                 "version": int(existing_log[7] or 1), "replayed": True,
             }
-    user_id = str(user_id or "").strip()
     product_name = str(product_name or "").strip()[:120]
     source_type = str(source_type or "user_private_food").strip()[:60]
     meal_slot = str(meal_slot or "").strip()
@@ -354,9 +406,10 @@ def create_daily_food_log(
             """SELECT fl.log_id,fl.food_id,fc.product_name,fl.meal_slot,fl.consumed_at,
                       fl.consumed_servings,fl.nutrition_snapshot_json,fl.version
                FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
-               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, str(user_id or "").strip()),
+               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, user_id),
         ).fetchone()
         if existing_log:
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
             return {
                 "log_id": existing_log[0], "food_id": existing_log[1],
                 "product_name": existing_log[2], "meal_slot": existing_log[3] or "",
@@ -374,6 +427,7 @@ def create_daily_food_log(
         )
     except sqlite3.OperationalError:
         pass
+    _refresh_health_check_after_food_log(conn, user_id=user_id)
     return {
         "log_id": log_id, "food_id": food_id, "product_name": product_name,
         "meal_slot": meal_slot, "consumed_at": consumed_at,
@@ -551,6 +605,7 @@ def apply_daily_food_log_edit(
         raise ValueError("缺少操作事件識別碼")
     with sqlite3.connect(DB_PATH) as conn:
         ensure_daily_food_ledger_schema(conn)
+        _prepare_health_check_refresh_connection(conn)
         conn.execute("BEGIN IMMEDIATE")
         previous = conn.execute(
             "SELECT result_json FROM daily_food_log_events WHERE event_id=? AND user_id=?",
@@ -559,6 +614,7 @@ def apply_daily_food_log_edit(
         if previous:
             result = json.loads(previous[0])
             result["replayed"] = True
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
             conn.commit()
             return result
         row = conn.execute(
@@ -731,6 +787,7 @@ def apply_daily_food_log_edit(
             )
         except sqlite3.OperationalError:
             pass
+        _refresh_health_check_after_food_log(conn, user_id=user_id)
         conn.commit()
         return result
 
@@ -744,6 +801,7 @@ def clear_daily_food_ledger(user_id: str, *, event_id: str) -> dict:
     today = tw_today().isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         ensure_daily_food_ledger_schema(conn)
+        _prepare_health_check_refresh_connection(conn)
         conn.execute("BEGIN IMMEDIATE")
         previous = conn.execute(
             "SELECT result_json FROM daily_food_log_events WHERE event_id=? AND user_id=?",
@@ -752,6 +810,7 @@ def clear_daily_food_ledger(user_id: str, *, event_id: str) -> dict:
         if previous:
             result = json.loads(previous[0])
             result["replayed"] = True
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
             conn.commit()
             return result
         log_ids = [row[0] for row in conn.execute(
@@ -796,6 +855,7 @@ def clear_daily_food_ledger(user_id: str, *, event_id: str) -> dict:
                 json.dumps(result, ensure_ascii=False, sort_keys=True), now,
             ),
         )
+        _refresh_health_check_after_food_log(conn, user_id=user_id)
         conn.commit()
         return result
 
@@ -2872,12 +2932,16 @@ register_customer_health_check_liff()
 
 
 def register_dietitian_health_check_api(target_app=app):
-    return attach_dietitian_health_check_routes(
+    attached = attach_dietitian_health_check_routes(
         target_app,
         config=DIETITIAN_HEALTH_CHECK_CONFIG,
         list_loader=list_dietitian_health_checks,
         detail_loader=get_dietitian_health_check,
     )
+    attach_dietitian_health_check_liff_routes(
+        target_app, DIETITIAN_HEALTH_CHECK_CONFIG
+    )
+    return attached
 
 
 register_dietitian_health_check_api()
@@ -10391,6 +10455,7 @@ def _quick_log_catalog_card_once(
         str(event_ref or "").encode("utf-8")
     ).hexdigest()
     with sqlite3.connect(DB_PATH) as conn:
+        _prepare_health_check_refresh_connection(conn)
         ensure_nutrition_schema(conn)
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -10479,6 +10544,7 @@ def _quick_log_catalog_card_once(
                     logged_at.isoformat(timespec="seconds"),
                 ),
             )
+        _refresh_health_check_after_food_log(conn, user_id=user_id)
         conn.commit()
     return build_meal_log_flex(
         card_state["logged_name"], card_state.get("logged_cal"),
@@ -11564,6 +11630,7 @@ def _build_breakfast_combo_reply_once(
         f"{user_id}|{message_id}|{combo_name}".encode("utf-8")
     ).hexdigest()
     with sqlite3.connect(DB_PATH) as conn:
+        _prepare_health_check_refresh_connection(conn)
         ensure_nutrition_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -11676,7 +11743,8 @@ def _build_breakfast_combo_reply_once(
                         json.dumps(payload, ensure_ascii=False, sort_keys=True), now_tw,
                     ),
                 )
-                conn.commit()
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
+            conn.commit()
         except Exception:
             if conn.in_transaction:
                 conn.rollback()
@@ -12231,6 +12299,7 @@ def _handle_message_impl(event):
                 except Exception as plan_exc:
                     print(f"⚠️ 飲食紀錄連結營養計畫失敗，將由排程重試：{plan_exc}")
             with sqlite3.connect(DB_PATH) as conn:
+                _prepare_health_check_refresh_connection(conn)
                 ensure_nutrition_schema(conn)
                 result = confirm_pending_label(
                     conn, token=token, user_id=uid, plan_id=plan_id,
@@ -12238,6 +12307,7 @@ def _handle_message_impl(event):
                 )
                 confirmation_committed = True
                 clear_nutrition_input_state(conn, user_id=uid)
+                _refresh_health_check_after_food_log(conn, user_id=uid)
             sync_confirmed_nutrition_to_sheet(result)
             dashboard_flex = apply_confirmed_nutrition_to_legacy_dashboard(uid, result)
             if dashboard_flex:
@@ -13919,6 +13989,8 @@ def handle_message(event):
         raw_message = event.message.text
         user_id = event.source.user_id
         if is_dietitian_health_check_command_intent(raw_message):
+            if not DIETITIAN_HEALTH_CHECK_CONFIG.enabled:
+                return
             if is_authorized_dietitian_health_check_command(
                 user_id,
                 raw_message,
