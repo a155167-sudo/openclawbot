@@ -497,7 +497,7 @@ def test_projection_exposes_integrity_bound_customer_estimate_ranges(tmp_path):
             answers={"protein_type": "chicken"},
             estimate={
                 "protein_total_exchange": {"min": 2, "max": 3, "basis": "hand_portion_range_v1"},
-                "starch_exchange": {"min": 1, "max": 2, "basis": "hand_portion_range_v1"},
+                "starch_exchange": {"min": 1.5, "max": 2.5, "basis": "hand_portion_range_v1"},
                 "vegetable_exchange": {"min": 1, "max": 2, "basis": "hand_portion_range_v1"},
             },
         )

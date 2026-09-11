@@ -4134,8 +4134,8 @@ def test_customer_confirmed_photo_sheet_exports_na_and_exchange_ranges(tmp_path,
             answers={"protein_type": "chicken"},
             estimate={
                 "protein_total_exchange": {"min": 2, "max": 3, "basis": "hand_portion_range_v1"},
-                "starch_exchange": {"min": 1, "max": 2, "basis": "hand_portion_range_v1"},
-                "vegetable_exchange": {"min": 1, "max": 1.5, "basis": "hand_portion_range_v1"},
+                "starch_exchange": {"min": 1.5, "max": 2.5, "basis": "hand_portion_range_v1"},
+                "vegetable_exchange": {"min": 1, "max": 2, "basis": "hand_portion_range_v1"},
             },
         )
     monkeypatch.setattr(server, "DB_PATH", str(db))
@@ -4156,8 +4156,8 @@ def test_customer_confirmed_photo_sheet_exports_na_and_exchange_ranges(tmp_path,
     assert row[29:] == [
         "user_meal_photo", "user_confirmed_ai_estimate",
         2.0, 3.0, "hand_portion_range_v1",
+        1.5, 2.5, "hand_portion_range_v1",
         1.0, 2.0, "hand_portion_range_v1",
-        1.0, 1.5, "hand_portion_range_v1",
     ]
 
 
@@ -4576,7 +4576,8 @@ def test_meal_photo_postback_confirms_ai_estimate_as_formal_log(tmp_path, monkey
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
         ), start=1):
             apply_meal_photo_action(
@@ -4586,7 +4587,7 @@ def test_meal_photo_postback_confirms_ai_estimate_as_formal_log(tmp_path, monkey
     replies = []
     monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
     event = SimpleNamespace(
-        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        postback=SimpleNamespace(data=f"mp:v1:{token}:8:answer:sauce_level:half"),
         source=SimpleNamespace(user_id="U_MEAL"), reply_token="reply-final",
         webhook_event_id="WEBHOOK-FINAL", timestamp=1784740620000,
     )
@@ -4620,7 +4621,8 @@ def test_meal_photo_customer_postback_is_silent_and_read_free_without_active_vip
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
         ), start=1):
             apply_meal_photo_action(
@@ -4644,7 +4646,7 @@ def test_meal_photo_customer_postback_is_silent_and_read_free_without_active_vip
     )
     event = SimpleNamespace(
         postback=SimpleNamespace(
-            data=f"mp:v1:{token}:7:answer:sauce_level:half"
+            data=f"mp:v1:{token}:8:answer:sauce_level:half"
         ),
         source=SimpleNamespace(user_id="U_EXPIRED"),
         reply_token="reply-expired",
@@ -4660,7 +4662,7 @@ def test_meal_photo_customer_postback_is_silent_and_read_free_without_active_vip
     with sqlite3.connect(db) as conn:
         draft = get_meal_photo_draft(conn, user_id="U_EXPIRED", token=token)
         assert draft["status"] == "confirming"
-        assert draft["version"] == 7
+        assert draft["version"] == 8
         assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
         assert conn.execute(
             "SELECT COUNT(*) FROM meal_photo_events WHERE event_id='WEBHOOK-EXPIRED'"
@@ -4680,7 +4682,8 @@ def test_meal_photo_confirmation_replays_after_line_reply_failure_without_double
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
         ), start=1):
             apply_meal_photo_action(
@@ -4697,7 +4700,7 @@ def test_meal_photo_confirmation_replays_after_line_reply_failure_without_double
     monkeypatch.setattr(server.line_bot_api, "reply_message", flaky_reply)
     monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", False)
     event = SimpleNamespace(
-        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        postback=SimpleNamespace(data=f"mp:v1:{token}:8:answer:sauce_level:half"),
         source=SimpleNamespace(user_id="U_REPLAY"), reply_token="reply-replay",
         webhook_event_id="WEBHOOK-REPLAY", timestamp=1784740620000,
     )
@@ -4732,7 +4735,8 @@ def test_customer_confirmation_does_not_push_per_meal_review_to_admin(tmp_path, 
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
         ), start=1):
             apply_meal_photo_action(
@@ -4756,7 +4760,7 @@ def test_customer_confirmation_does_not_push_per_meal_review_to_admin(tmp_path, 
         ),
     )
     event = SimpleNamespace(
-        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        postback=SimpleNamespace(data=f"mp:v1:{token}:8:answer:sauce_level:half"),
         source=SimpleNamespace(user_id="U_CUSTOMER"), reply_token="reply-customer-final",
         webhook_event_id="WEBHOOK-CUSTOMER-FINAL", timestamp=1784740620000,
     )
@@ -5321,7 +5325,8 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         ), start=1):
@@ -5337,7 +5342,7 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
     assert "待審餐點（1筆" in message.text
     assert "U_CUSTOMER"[-8:] in message.text
     actions = [item.action.data for item in message.quick_reply.items]
-    assert actions == [f"mpr:v1:{token}:8:start"]
+    assert actions == [f"mpr:v1:{token}:9:start"]
     with sqlite3.connect(db) as conn:
         conn.execute(
             """UPDATE pending_meal_photo_drafts
@@ -5387,7 +5392,8 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "one_half_bowl"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "one_half_bowl"),
             ("vegetable_portion", "none"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         ), start=1):
@@ -5413,22 +5419,22 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
         server.handle_meal_photo_postback(event)
         return replies[-1]
 
-    first = send(f"mpr:v1:{token}:8:start", "ADMIN-START")
+    first = send(f"mpr:v1:{token}:9:start", "ADMIN-START")
     assert "蛋白質分類" in first.text
-    assert any(":9:set:protein_class:medium" in item.action.data for item in first.quick_reply.items)
-    resumed_step = send(f"mpr:v1:{token}:9:resume", "ADMIN-RESUME")
+    assert any(":10:set:protein_class:medium" in item.action.data for item in first.quick_reply.items)
+    resumed_step = send(f"mpr:v1:{token}:10:resume", "ADMIN-RESUME")
     assert "蛋白質分類" in resumed_step.text
-    assert any(":9:set:protein_class:medium" in item.action.data for item in resumed_step.quick_reply.items)
-    send(f"mpr:v1:{token}:9:set:protein_class:medium", "ADMIN-CLASS")
-    send(f"mpr:v1:{token}:10:set:protein_exchange:2.5", "ADMIN-PROTEIN")
-    send(f"mpr:v1:{token}:11:set:starch_exchange:6", "ADMIN-STARCH")
-    send(f"mpr:v1:{token}:12:set:milk_exchange:0", "ADMIN-MILK")
-    ready = send(f"mpr:v1:{token}:13:set:fruit_exchange:0", "ADMIN-FRUIT")
+    assert any(":10:set:protein_class:medium" in item.action.data for item in resumed_step.quick_reply.items)
+    send(f"mpr:v1:{token}:10:set:protein_class:medium", "ADMIN-CLASS")
+    send(f"mpr:v1:{token}:11:set:protein_exchange:2.5", "ADMIN-PROTEIN")
+    send(f"mpr:v1:{token}:12:set:starch_exchange:6", "ADMIN-STARCH")
+    send(f"mpr:v1:{token}:13:set:milk_exchange:0", "ADMIN-MILK")
+    ready = send(f"mpr:v1:{token}:14:set:fruit_exchange:0", "ADMIN-FRUIT")
     ready_text = json.dumps(json.loads(str(ready.contents)), ensure_ascii=False)
     assert "最終核准份量" in ready_text
-    assert f"mpr:v1:{token}:14:approve" in ready_text
+    assert f"mpr:v1:{token}:15:approve" in ready_text
 
-    done = send(f"mpr:v1:{token}:14:approve", "ADMIN-APPROVE")
+    done = send(f"mpr:v1:{token}:15:approve", "ADMIN-APPROVE")
     done_text = json.dumps(json.loads(str(done.contents)), ensure_ascii=False)
     assert "已核准｜已計入正式份量" in done_text
     assert '"主食"' in done_text and '"6份"' in done_text
@@ -5463,7 +5469,7 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
             (health_case["case_id"],),
         )
         conn.commit()
-    replayed_done = send(f"mpr:v1:{token}:14:approve", "ADMIN-APPROVE")
+    replayed_done = send(f"mpr:v1:{token}:15:approve", "ADMIN-APPROVE")
     assert "已核准｜已計入正式份量" in json.dumps(
         json.loads(str(replayed_done.contents)), ensure_ascii=False
     )
@@ -5493,7 +5499,8 @@ def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(t
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         ), start=1):
@@ -5511,12 +5518,12 @@ def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(t
         ),
     )
     server.handle_meal_photo_postback(SimpleNamespace(
-        postback=SimpleNamespace(data=f"mpr:v1:{token}:8:start"),
+        postback=SimpleNamespace(data=f"mpr:v1:{token}:9:start"),
         source=SimpleNamespace(user_id="U_ADMIN"), reply_token="reject-start",
         webhook_event_id="REJECT-START", timestamp=1784740620000,
     ))
     server.handle_meal_photo_postback(SimpleNamespace(
-        postback=SimpleNamespace(data=f"mpr:v1:{token}:9:reject"),
+        postback=SimpleNamespace(data=f"mpr:v1:{token}:10:reject"),
         source=SimpleNamespace(user_id="U_ADMIN"), reply_token="reject-final",
         webhook_event_id="REJECT-FINAL", timestamp=1784740620001,
     ))

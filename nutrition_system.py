@@ -2032,6 +2032,17 @@ def insert_customer_confirmed_meal_photo_log(
     if not user_id or len(user_id) > 120:
         raise ValueError("餐點照片確認身分無效")
 
+    valid_v1_ranges = {
+        "protein_total_exchange": {
+            (1.0, 2.0), (2.0, 3.0), (3.0, 5.0), (4.0, 6.0),
+        },
+        "starch_exchange": {
+            (1.5, 2.5), (3.0, 5.0), (5.0, 7.0), (6.0, 10.0),
+        },
+        "vegetable_exchange": {
+            (0.5, 1.0), (1.0, 2.0), (1.5, 3.0), (2.0, 4.0), (3.0, 6.0),
+        },
+    }
     ranges: dict[str, Any] = {}
     for key in ("protein_total_exchange", "starch_exchange", "vegetable_exchange"):
         raw = estimate.get(key)
@@ -2043,13 +2054,92 @@ def insert_customer_confirmed_meal_photo_log(
         minimum = _number(raw.get("min"), f"{key}.min", max_value=100)
         maximum = _number(raw.get("max"), f"{key}.max", max_value=100)
         basis = str(raw.get("basis") or "").strip()
-        if maximum < minimum or basis not in {
-            "hand_portion_range_v1", "user_confirmed_none",
-        }:
+        if maximum < minimum:
             raise ValueError("餐點照片估算範圍無效")
-        if basis == "user_confirmed_none" and (minimum != 0 or maximum != 0):
-            raise ValueError("餐點照片零份確認無效")
+        if basis == "user_confirmed_none":
+            if minimum != 0 or maximum != 0:
+                raise ValueError("餐點照片零份確認無效")
+        elif basis == "hand_portion_range_v1":
+            if (minimum, maximum) not in valid_v1_ranges[key]:
+                raise ValueError("餐點照片估算範圍無效")
+        elif basis == "summed_hand_portion_ranges_v2":
+            if key != "protein_total_exchange":
+                raise ValueError("餐點照片估算範圍無效")
+        else:
+            raise ValueError("餐點照片估算範圍無效")
         ranges[key] = {"min": minimum, "max": maximum, "basis": basis}
+
+    normalized_protein_items: list[dict[str, Any]] = []
+    raw_protein_items = estimate.get("protein_items")
+    if raw_protein_items is not None:
+        if not isinstance(raw_protein_items, list) or not 2 <= len(raw_protein_items) <= 4:
+            raise ValueError("複數蛋白質明細無效")
+        type_values = {"chicken", "pork", "fish", "egg", "tofu", "other", "unknown"}
+        portion_ranges = {
+            "half_palm": (1.0, 2.0), "one_palm": (2.0, 3.0),
+            "one_half_palm": (3.0, 5.0), "two_palm": (4.0, 6.0),
+        }
+        seen_types: set[str] = set()
+        for raw_item in raw_protein_items:
+            if not isinstance(raw_item, Mapping):
+                raise ValueError("複數蛋白質明細無效")
+            protein_type = str(raw_item.get("type") or "")
+            portion = str(raw_item.get("portion") or "")
+            expected_range = portion_ranges.get(portion)
+            raw_exchange = raw_item.get("exchange")
+            if protein_type not in type_values or portion not in {*portion_ranges, "unknown"}:
+                raise ValueError("複數蛋白質明細無效")
+            if protein_type != "unknown" and protein_type in seen_types:
+                raise ValueError("複數蛋白質種類重複")
+            seen_types.add(protein_type)
+            if portion == "unknown":
+                if raw_exchange is not None:
+                    raise ValueError("不確定蛋白質份量必須為NA")
+                normalized_protein_items.append({
+                    "type": protein_type, "portion": portion, "exchange": None,
+                })
+                continue
+            if expected_range is None or not isinstance(raw_exchange, Mapping):
+                raise ValueError("複數蛋白質明細無效")
+            item_min = _number(raw_exchange.get("min"), "protein_item.min", max_value=100)
+            item_max = _number(raw_exchange.get("max"), "protein_item.max", max_value=100)
+            if (
+                (item_min, item_max) != expected_range
+                or raw_exchange.get("basis") != "hand_portion_range_v1"
+            ):
+                raise ValueError("複數蛋白質明細與份量不符")
+            normalized_protein_items.append({
+                "type": protein_type,
+                "portion": portion,
+                "exchange": {
+                    "min": item_min, "max": item_max,
+                    "basis": "hand_portion_range_v1",
+                },
+            })
+        protein_total = ranges.get("protein_total_exchange")
+        if any(item["exchange"] is None for item in normalized_protein_items):
+            if protein_total is not None:
+                raise ValueError("含不確定份量時蛋白質合計必須為NA")
+        else:
+            expected_min = sum(
+                item["exchange"]["min"] for item in normalized_protein_items
+            )
+            expected_max = sum(
+                item["exchange"]["max"] for item in normalized_protein_items
+            )
+            if (
+                not isinstance(protein_total, Mapping)
+                or protein_total.get("basis") != "summed_hand_portion_ranges_v2"
+                or protein_total.get("min") != expected_min
+                or protein_total.get("max") != expected_max
+            ):
+                raise ValueError("複數蛋白質合計與明細不符")
+    elif (
+        isinstance(ranges.get("protein_total_exchange"), Mapping)
+        and ranges["protein_total_exchange"].get("basis")
+        == "summed_hand_portion_ranges_v2"
+    ):
+        raise ValueError("蛋白質加總範圍缺少明細")
 
     created_at = utcish_now()
     estimate_snapshot = {
@@ -2065,6 +2155,9 @@ def insert_customer_confirmed_meal_photo_log(
         "_source_type": "meal_photo",
         "_warnings": ["calories_and_macros_na", "not_dietitian_approved"],
     }
+    if normalized_protein_items:
+        estimate_snapshot["protein_items"] = normalized_protein_items
+        estimate_snapshot["_rule_version"] = "hand-portion-range-v2"
     estimate_json = json.dumps(
         estimate_snapshot, ensure_ascii=False, sort_keys=True, allow_nan=False
     )
