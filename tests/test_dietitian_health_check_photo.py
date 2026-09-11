@@ -166,6 +166,28 @@ def test_dietitian_photo_loader_is_case_owner_and_approval_bound(tmp_path, monke
     assert server.get_dietitian_health_check_photo(CASE_ID, LOG_ID) is None
 
 
+def test_dietitian_photo_loader_accepts_customer_confirmed_ai_estimate(tmp_path, monkeypatch):
+    db = tmp_path / "health-photo-customer-confirmed.db"
+    image_dir = tmp_path / "nutrition_images"
+    _seed(db)
+    image_dir.mkdir()
+    Image.new("RGB", (40, 30), "green").save(
+        image_dir / ("a" * 32 + ".jpg"), format="JPEG"
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET status='confirmed' WHERE token='draft-photo'"
+        )
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+
+    loaded = server.get_dietitian_health_check_photo(CASE_ID, LOG_ID)
+
+    assert loaded is not None
+    assert loaded[1] == "image/jpeg"
+    assert loaded[0].startswith(b"\xff\xd8")
+
+
 def test_dietitian_photo_loader_fails_closed_for_missing_or_cross_owner_image(tmp_path, monkeypatch):
     db = tmp_path / "health-photo.db"
     _seed(db)

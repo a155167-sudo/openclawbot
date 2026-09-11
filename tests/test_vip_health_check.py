@@ -1068,6 +1068,11 @@ def test_third_qualified_day_moves_case_to_ready_without_copying_planned_meal(co
         "SELECT status,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
         (case["case_id"],),
     ).fetchone()) == ("ready_for_review", 3)
+    assert tuple(conn.execute(
+        """SELECT status,attempts FROM vip_health_check_notifications
+           WHERE case_id=? AND notification_kind='dietitian_ready_for_review'""",
+        (case["case_id"],),
+    ).fetchone()) == ("pending", 0)
 
     conn.execute(
         "UPDATE vip_health_check_cases SET status='needs_more_info' WHERE case_id=?",
@@ -1085,6 +1090,55 @@ def test_third_qualified_day_moves_case_to_ready_without_copying_planned_meal(co
         "WHERE case_id=? ORDER BY audit_id DESC LIMIT 1",
         (case["case_id"],),
     ).fetchone()) == ("needs_more_info", "ready_for_review")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM vip_health_check_notifications WHERE case_id=?",
+        (case["case_id"],),
+    ).fetchone()[0] == 1
+
+
+def test_health_check_ready_notification_claim_release_and_complete(conn):
+    from vip_health_check import (
+        claim_next_health_check_notification,
+        complete_health_check_notification,
+        release_health_check_notification,
+    )
+
+    case, now = _ready_case(conn)
+    ensure_time = now.isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO vip_health_check_notifications
+           (notification_id,case_id,notification_kind,status,attempts,claim_token,
+            lease_until,last_error,created_at,updated_at,delivered_at)
+           VALUES ('notice-1',?,'dietitian_ready_for_review','pending',0,'','','',?,?,'')""",
+        (case["case_id"], ensure_time, ensure_time),
+    )
+    conn.commit()
+
+    first = claim_next_health_check_notification(conn, claimed_at=now)
+    conn.commit()
+    assert first is not None
+    assert first["notification_id"] == "notice-1"
+    assert first["case_id"] == case["case_id"]
+    assert first["valid_day_count"] == 3
+    assert claim_next_health_check_notification(conn, claimed_at=now) is None
+    conn.commit()
+
+    release_health_check_notification(
+        conn, notification_id="notice-1", claim_token=first["claim_token"],
+        error="temporary LINE error", released_at=now,
+    )
+    conn.commit()
+    second = claim_next_health_check_notification(conn, claimed_at=now)
+    conn.commit()
+    assert second is not None
+    assert second["claim_token"] != first["claim_token"]
+    assert second["attempts"] == 2
+    assert complete_health_check_notification(
+        conn, notification_id="notice-1", claim_token=second["claim_token"],
+        delivered_at=now,
+    ) is True
+    conn.commit()
+    assert claim_next_health_check_notification(conn, claimed_at=now) is None
 
 
 def _ready_case(conn):

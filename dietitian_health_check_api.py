@@ -368,7 +368,7 @@ def _local_date_text(value: object, field: str) -> str:
     return text
 
 
-def _source_hash_matches(log: sqlite3.Row) -> bool:
+def _source_hash_version(log: sqlite3.Row) -> str | None:
     expected = log["source_hash"]
     version = log["food_log_version"]
     log_id = log["log_id"]
@@ -380,15 +380,66 @@ def _source_hash_matches(log: sqlite3.Row) -> bool:
         or version < 1
         or not isinstance(log_id, str)
     ):
-        return False
+        return None
     raw_nutrition = log["nutrition_snapshot_json"]
     source_image_ref = log["source_image_ref"]
     if not isinstance(raw_nutrition, str) or not isinstance(source_image_ref, str):
-        return False
-    actual = canonical_food_log_source_hash(
+        return None
+    keys = set(log.keys())
+    if {
+        "exchange_snapshot_json", "source_type", "verification_status"
+    }.issubset(keys):
+        raw_exchange = log["exchange_snapshot_json"]
+        source_type = log["source_type"]
+        verification_status = log["verification_status"]
+        if all(
+            isinstance(value, str)
+            for value in (raw_exchange, source_type, verification_status)
+        ):
+            actual_v2 = canonical_food_log_source_hash(
+                log_id,
+                version,
+                raw_nutrition,
+                source_image_ref,
+                exchange_snapshot_json=raw_exchange,
+                source_type=source_type,
+                verification_status=verification_status,
+            )
+            if hmac.compare_digest(actual_v2, expected):
+                return "v2"
+    actual_v1 = canonical_food_log_source_hash(
         log_id, version, raw_nutrition, source_image_ref
     )
-    return hmac.compare_digest(actual, expected)
+    return "v1" if hmac.compare_digest(actual_v1, expected) else None
+
+
+def _project_customer_estimate(value: object) -> dict[str, object] | None:
+    if not isinstance(value, str) or len(value) > 20_000:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    projected: dict[str, object] = {}
+    for field in (
+        "protein_total_exchange", "starch_exchange", "vegetable_exchange"
+    ):
+        raw_range = parsed.get(field)
+        if not isinstance(raw_range, dict):
+            continue
+        minimum = _bounded_number(raw_range.get("min"), f"{field}.min", maximum=100)
+        maximum = _bounded_number(raw_range.get("max"), f"{field}.max", maximum=100)
+        basis = _optional_text(raw_range.get("basis"), f"{field}.basis", maximum=100)
+        if minimum is None or maximum is None or float(minimum) > float(maximum):
+            continue
+        projected[field] = {
+            "min": float(minimum),
+            "max": float(maximum),
+            "basis": basis or "",
+        }
+    return projected or None
 
 
 def _profile_from_row(row: sqlite3.Row | None) -> dict[str, object | None]:
@@ -632,19 +683,22 @@ def load_health_check_detail(
     referenced_count = len(source_refs)
     logs = conn.execute(
         """SELECT fl.log_id,sr.food_log_version,sr.source_hash,
-                  fl.nutrition_snapshot_json,fl.source_image_ref
+                  fl.nutrition_snapshot_json,fl.source_image_ref,
+                  fl.exchange_snapshot_json,fc.source_type,fc.verification_status
            FROM vip_health_check_source_refs sr
            JOIN vip_health_check_cases c ON c.case_id=sr.case_id
            JOIN food_logs fl ON fl.log_id=sr.food_log_id AND fl.user_id=c.user_id
               AND fl.version=sr.food_log_version
               AND fl.confirmation_status='confirmed' AND COALESCE(fl.deleted_at,'')=''
+           JOIN food_catalog fc ON fc.food_id=fl.food_id
            WHERE sr.case_id=?
            ORDER BY fl.log_id""",
         (case_id,),
     ).fetchall()
     source_logs = []
     for log in logs:
-        if not _source_hash_matches(log):
+        hash_version = _source_hash_version(log)
+        if hash_version is None:
             continue
         version = log["food_log_version"]
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
@@ -654,13 +708,32 @@ def load_health_check_detail(
         )
         if nutrition_snapshot is None:
             continue
-        source_logs.append(
-            {
-                "log_id": _required_text(log["log_id"], "source_log.log_id", maximum=128),
-                "food_log_version": version,
-                "nutrition_snapshot": nutrition_snapshot,
-            }
-        )
+        source_log: dict[str, object] = {
+            "log_id": _required_text(log["log_id"], "source_log.log_id", maximum=128),
+            "food_log_version": version,
+            "nutrition_snapshot": nutrition_snapshot,
+        }
+        if hash_version == "v2":
+            source_type = _required_text(
+                log["source_type"], "source_log.source_type", maximum=64
+            )
+            verification_status = _required_text(
+                log["verification_status"],
+                "source_log.verification_status",
+                maximum=64,
+            )
+            source_log["source_type"] = source_type
+            source_log["verification_status"] = verification_status
+            if (
+                source_type == "user_meal_photo"
+                and verification_status == "user_confirmed_ai_estimate"
+            ):
+                customer_estimate = _project_customer_estimate(
+                    log["exchange_snapshot_json"]
+                )
+                if customer_estimate is not None:
+                    source_log["customer_estimate"] = customer_estimate
+        source_logs.append(source_log)
     result["source_logs"] = source_logs
     result["source_integrity"] = {
         "referenced_count": referenced_count,

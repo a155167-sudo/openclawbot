@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import uuid
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
@@ -21,6 +22,7 @@ from nutrition_system import (
     daily_consumed_totals,
     ensure_nutrition_schema,
     insert_approved_meal_photo_log,
+    insert_customer_confirmed_meal_photo_log,
     new_id,
     save_pending_label,
     set_nutrition_input_state,
@@ -623,8 +625,8 @@ def test_daily_food_log_refreshes_open_health_check_case(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
     started_at = server.tw_now() - server.timedelta(minutes=5)
     with sqlite3.connect(db) as conn:
-        configure_vip_health_check_connection(conn)
-        ensure_vip_health_check_schema(conn)
+        server.configure_vip_health_check_connection(conn)
+        server.ensure_vip_health_check_schema(conn)
         case = create_first_vip_health_check_case(
             conn,
             user_id="U1",
@@ -690,8 +692,8 @@ def _seed_ready_health_check_case(db, monkeypatch):
     now = server.tw_now()
     log_ids = []
     with sqlite3.connect(db) as conn:
-        configure_vip_health_check_connection(conn)
-        ensure_vip_health_check_schema(conn)
+        server.configure_vip_health_check_connection(conn)
+        server.ensure_vip_health_check_schema(conn)
         case = create_first_vip_health_check_case(
             conn,
             user_id="U1",
@@ -721,6 +723,118 @@ def _seed_ready_health_check_case(db, monkeypatch):
         ).fetchone()
         assert state == ("ready_for_review", 3)
     return case["case_id"], log_ids
+
+
+def test_ready_health_check_notification_flushes_once(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-ready-notify.db")
+    case_id, _log_ids = _seed_ready_health_check_case(db, monkeypatch)
+    pushed = []
+
+    class MutatingRetryClient:
+        def __init__(self):
+            self.headers = {"Authorization": "Bearer test"}
+
+        def push_message(self, target, message, **kwargs):
+            self.headers["X-Line-Retry-Key"] = kwargs.get("retry_key", "")
+            pushed.append((target, message, kwargs))
+
+    shared_client = MutatingRetryClient()
+    original_headers = dict(shared_client.headers)
+    dietitian_uid = "U" + "a" * 32
+    monkeypatch.setattr(server, "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID", "2009824277-W3lYtSjF")
+    monkeypatch.setattr(server, "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS", frozenset({dietitian_uid}))
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: dietitian_uid)
+    monkeypatch.setattr(server, "line_bot_api", shared_client)
+
+    assert server.flush_health_check_ready_notifications(limit=10) == 1
+    assert server.flush_health_check_ready_notifications(limit=10) == 0
+
+    assert shared_client.headers == original_headers
+    assert len(pushed) == 1
+    assert pushed[0][0] == dietitian_uid
+    payload = json.dumps(json.loads(str(pushed[0][1])), ensure_ascii=False)
+    assert "三日健檢資料已完成" in payload
+    assert "整體審查" in payload
+    assert pushed[0][2].get("retry_key")
+    with sqlite3.connect(db) as conn:
+        assert tuple(conn.execute(
+            "SELECT status,attempts FROM vip_health_check_notifications WHERE case_id=?",
+            (case_id,),
+        ).fetchone()) == ("delivered", 1)
+
+
+def test_health_refresh_outbox_recovers_without_webhook_replay(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-refresh-outbox.db")
+    case_id, _log_ids = _seed_ready_health_check_case(db, monkeypatch)
+    now = server.tw_now().isoformat(timespec="seconds")
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM vip_health_check_notifications WHERE case_id=?", (case_id,))
+        conn.execute("DELETE FROM vip_health_check_source_refs WHERE case_id=?", (case_id,))
+        conn.execute(
+            """UPDATE vip_health_check_cases
+               SET status='collecting',valid_day_count=0,source_manifest_hash=''
+               WHERE case_id=?""",
+            (case_id,),
+        )
+        conn.execute(
+            """INSERT INTO health_check_refresh_outbox
+               (user_id,status,attempts,claim_token,lease_until,last_error,
+                resync_required,requested_at,updated_at)
+               VALUES ('U1','pending',0,'','','',0,?,?)""",
+            (now, now),
+        )
+        conn.commit()
+
+    actual_refresh = server.refresh_user_health_check_case
+    monkeypatch.setattr(
+        server,
+        "refresh_user_health_check_case",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("locked")),
+    )
+    assert server.flush_health_check_refresh_outbox(limit=1) == 0
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT status,attempts FROM health_check_refresh_outbox WHERE user_id='U1'"
+        ).fetchone() == ("pending", 1)
+        assert conn.execute(
+            "SELECT status FROM vip_health_check_cases WHERE case_id=?", (case_id,)
+        ).fetchone() == ("collecting",)
+
+    monkeypatch.setattr(server, "refresh_user_health_check_case", actual_refresh)
+    assert server.flush_health_check_refresh_outbox(limit=1) == 1
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM health_check_refresh_outbox WHERE user_id='U1'"
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT status,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
+            (case_id,),
+        ).fetchone() == ("ready_for_review", 3)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_notifications WHERE case_id=?",
+            (case_id,),
+        ).fetchone()[0] == 1
+
+
+def test_ready_health_check_notification_failure_releases_for_retry(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-ready-notify-retry.db")
+    case_id, _log_ids = _seed_ready_health_check_case(db, monkeypatch)
+    dietitian_uid = "U" + "b" * 32
+    monkeypatch.setattr(server, "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID", "2009824277-W3lYtSjF")
+    monkeypatch.setattr(server, "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS", frozenset({dietitian_uid}))
+    monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: dietitian_uid)
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(push_message=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("LINE down"))),
+    )
+
+    assert server.flush_health_check_ready_notifications(limit=1) == 0
+
+    with sqlite3.connect(db) as conn:
+        assert tuple(conn.execute(
+            "SELECT status,attempts,last_error FROM vip_health_check_notifications WHERE case_id=?",
+            (case_id,),
+        ).fetchone()) == ("pending", 1, "LINE down")
 
 
 def test_food_log_edit_refreshes_manifest_and_delete_downgrades_case(tmp_path, monkeypatch):
@@ -795,8 +909,8 @@ def test_operation_key_replay_repairs_a_failed_health_check_refresh(tmp_path, mo
     db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-replay-repair.db")
     monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
     with sqlite3.connect(db) as conn:
-        configure_vip_health_check_connection(conn)
-        ensure_vip_health_check_schema(conn)
+        server.configure_vip_health_check_connection(conn)
+        server.ensure_vip_health_check_schema(conn)
         case = create_first_vip_health_check_case(
             conn, user_id="U1", first_vip_activation_id="activation-repair",
             activation_event_key="event-repair",
@@ -1752,7 +1866,10 @@ def test_delete_nutrition_image_rejects_symlinked_storage_root(tmp_path, monkeyp
     assert outside_file.exists()
 
 
-def test_ninety_day_cleanup_clears_approved_draft_log_and_catalog_refs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("case_status", ["collecting", "expired", "cancelled"])
+def test_ninety_day_cleanup_retains_health_check_photo_until_report_delivered(
+    tmp_path, monkeypatch, case_status
+):
     db = tmp_path / "old-approved-photo-cleanup.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
@@ -1817,6 +1934,10 @@ def test_ninety_day_cleanup_clears_approved_draft_log_and_catalog_refs(tmp_path,
                        '2026-01-01T00:00:00+08:00')"""
         )
         conn.execute(
+            "UPDATE vip_health_check_cases SET status=? WHERE case_id='case-old-health'",
+            (case_status,),
+        )
+        conn.execute(
             """INSERT INTO vip_health_check_source_refs
                (case_id,food_log_id,food_log_version,local_date,included_reason,
                 source_hash,created_at)
@@ -1838,31 +1959,90 @@ def test_ninety_day_cleanup_clears_approved_draft_log_and_catalog_refs(tmp_path,
         assert conn.execute(
             "SELECT source_image_ref FROM pending_meal_photo_drafts WHERE token=?",
             (token,),
-        ).fetchone()[0] == ""
+        ).fetchone()[0] == ref
         assert conn.execute(
             "SELECT source_image_ref FROM food_logs WHERE log_id=?", (log_id,)
-        ).fetchone()[0] == ""
+        ).fetchone()[0] == ref
         assert conn.execute(
             "SELECT original_image_ref FROM food_catalog WHERE food_id=?", (food_id,)
-        ).fetchone()[0] == ""
-        assert conn.execute(
-            """SELECT COUNT(*) FROM nutrition_sheet_outbox
-               WHERE status='pending' AND (
-                 (entity_type='food_log' AND entity_id=?) OR
-                 (entity_type='food' AND entity_id=?)
-               )""",
-            (log_id, food_id),
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == ref
     stored_path = server._nutrition_image_path(ref)
     assert stored_path is not None
-    assert not os.path.exists(stored_path)
+    assert os.path.exists(stored_path)
 
 
-def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_path, monkeypatch):
-    db = tmp_path / "delivered-health-photo-cleanup.db"
+@pytest.mark.parametrize("invalid_invariant", ["draft_review", "wrong_owner", "hash_mismatch"])
+def test_health_check_report_worker_fails_closed_on_unapproved_or_misowned_rows(
+    tmp_path, monkeypatch, invalid_invariant
+):
+    db = tmp_path / f"health-report-worker-{invalid_invariant}.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    review_status = "draft" if invalid_invariant == "draft_review" else "approved"
+    delivery_user = "U_WRONG" if invalid_invariant == "wrong_owner" else "U_OWNER"
+    report_hash = "other-manifest" if invalid_invariant == "hash_mismatch" else "manifest"
+    with sqlite3.connect(db) as conn:
+        server.configure_vip_health_check_connection(conn)
+        server.ensure_vip_health_check_schema(conn)
+        conn.execute(
+            """INSERT INTO vip_health_check_cases
+               (case_id,user_id,benefit_key,first_vip_activation_id,activation_event_key,
+                window_started_at,window_ends_at,status,valid_day_count,
+                source_manifest_hash,submitted_at,report_published_at,created_at,updated_at)
+               VALUES ('case-guard','U_OWNER','first_vip_baseline_check','activation-guard',
+                       'event-guard','2026-09-01T00:00:00+08:00','2026-09-08T00:00:00+08:00',
+                       'approved_pending_delivery',3,'manifest','','2026-09-04T00:00:00+08:00',
+                       '2026-09-01T00:00:00+08:00','2026-09-04T00:00:00+08:00')"""
+        )
+        conn.execute(
+            """INSERT INTO vip_health_check_reviews
+               (review_id,case_id,review_version,status,source_manifest_hash,created_at,updated_at)
+               VALUES ('review-guard','case-guard',1,?,'manifest',
+                       '2026-09-04T00:00:00+08:00','2026-09-04T00:00:00+08:00')""",
+            (review_status,),
+        )
+        conn.execute(
+            """INSERT INTO vip_health_check_reports
+               (report_id,case_id,review_id,report_version,report_json,
+                source_manifest_hash,published_by,published_at)
+               VALUES ('report-guard','case-guard','review-guard',1,
+                       '{"good":"UNAPPROVED_SENTINEL"}',?,'dietitian',
+                       '2026-09-04T00:00:00+08:00')""",
+            (report_hash,),
+        )
+        conn.execute(
+            """INSERT INTO vip_health_check_deliveries
+               (delivery_id,report_id,user_id,delivery_key,created_at)
+               VALUES ('delivery-guard','report-guard',?,'delivery-key-guard',
+                       '2026-09-04T00:00:00+08:00')""",
+            (delivery_user,),
+        )
+        conn.commit()
+    pushed = []
+    monkeypatch.setattr(
+        server.line_bot_api, "push_message",
+        lambda *args, **kwargs: pushed.append((args, kwargs)),
+    )
+
+    assert server.flush_health_check_report_deliveries(limit=1) == 0
+    assert pushed == []
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT status FROM vip_health_check_deliveries WHERE delivery_id='delivery-guard'"
+        ).fetchone()[0] == "pending"
+
+
+@pytest.mark.parametrize("draft_status", ["approved", "confirmed"])
+@pytest.mark.parametrize("source_hash_version", ["v1", "v2"])
+def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(
+    tmp_path, monkeypatch, draft_status, source_hash_version
+):
+    db = tmp_path / f"delivered-health-photo-cleanup-{draft_status}.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
-    ref = server._store_nutrition_image(b"\xff\xd8\xff" + b"x" * 100, ".jpg")
+    image_bytes = BytesIO()
+    Image.new("RGB", (2, 2), "white").save(image_bytes, format="JPEG")
+    ref = server._store_nutrition_image(image_bytes.getvalue(), ".jpg")
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
             conn,
@@ -1897,15 +2077,25 @@ def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_
         )
         log_id = approved["log_id"]
         log_row = conn.execute(
-            "SELECT nutrition_snapshot_json,version FROM food_logs WHERE log_id=?",
+            """SELECT l.nutrition_snapshot_json,l.version,l.exchange_snapshot_json,
+                      f.source_type,f.verification_status
+               FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
+               WHERE l.log_id=?""",
             (log_id,),
         ).fetchone()
+        hash_kwargs = {}
+        if source_hash_version == "v2":
+            hash_kwargs = {
+                "exchange_snapshot_json": log_row[2],
+                "source_type": log_row[3],
+                "verification_status": log_row[4],
+            }
         source_hash = server.canonical_food_log_source_hash(
-            log_id, log_row[1], log_row[0], ref
+            log_id, log_row[1], log_row[0], ref, **hash_kwargs
         )
         conn.execute(
-            "UPDATE pending_meal_photo_drafts SET status='approved',approved_log_id=? WHERE token=?",
-            (log_id, token),
+            "UPDATE pending_meal_photo_drafts SET status=?,approved_log_id=? WHERE token=?",
+            (draft_status, log_id, token),
         )
         conn.execute(
             """INSERT INTO vip_health_check_cases
@@ -1915,7 +2105,7 @@ def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_
                VALUES ('case-health','U_HEALTH','first_vip_baseline_check',
                        'activation-health','event-health',
                        '2026-09-09T00:00:00+08:00','2026-09-16T00:00:00+08:00',
-                       'delivered','2026-09-09T00:00:00+08:00',
+                       'ready_for_review','2026-09-09T00:00:00+08:00',
                        '2026-09-11T12:00:00+08:00')"""
         )
         conn.execute(
@@ -1927,8 +2117,36 @@ def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_
                        '2026-09-11T12:00:00+08:00')""",
             (log_id, log_row[1], source_hash),
         )
+        conn.execute(
+            """INSERT INTO vip_health_check_reviews
+               (review_id,case_id,review_version,status,source_manifest_hash,
+                approved_by,approved_at,created_at,updated_at)
+               VALUES ('review-health','case-health',1,'approved','manifest-health',
+                       'U_DIETITIAN','2026-09-11T13:00:00+08:00',
+                       '2026-09-11T13:00:00+08:00','2026-09-11T13:00:00+08:00')"""
+        )
+        conn.execute(
+            """INSERT INTO vip_health_check_reports
+               (report_id,case_id,review_id,report_version,report_json,
+                source_manifest_hash,published_by,published_at)
+               VALUES ('report-health','case-health','review-health',1,'{}',
+                       'manifest-health','U_DIETITIAN','2026-09-11T13:00:00+08:00')"""
+        )
+        conn.execute(
+            """INSERT INTO vip_health_check_deliveries
+               (delivery_id,report_id,user_id,delivery_key,created_at)
+               VALUES ('delivery-health','report-health','U_HEALTH','delivery-key-health',
+                       '2026-09-11T13:00:00+08:00')"""
+        )
+
+    photo = server.get_dietitian_health_check_photo("case-health", log_id)
+    assert photo is not None
+    assert photo[1] == "image/jpeg"
 
     with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE vip_health_check_cases SET status='delivered' WHERE case_id='case-health'"
+        )
         conn.execute(
             "UPDATE vip_health_check_source_refs SET source_hash=? WHERE case_id='case-health'",
             ("0" * 64,),
@@ -1946,15 +2164,32 @@ def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_
             "UPDATE vip_health_check_source_refs SET source_hash=? WHERE case_id='case-health'",
             (source_hash,),
         )
+        conn.execute(
+            """UPDATE vip_health_check_cases
+               SET status='approved_pending_delivery',source_manifest_hash='manifest-health'
+               WHERE case_id='case-health'"""
+        )
 
     original_unlink = server.os.unlink
+    pushed = []
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "push_message",
+        lambda target, message, **kwargs: pushed.append((target, message, kwargs)),
+    )
     monkeypatch.setattr(
         server.os,
         "unlink",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("busy")),
     )
-    server.cleanup_nutrition_images()
+    assert server.flush_health_check_report_deliveries(limit=1) == 1
+    assert pushed[0][0] == "U_HEALTH"
+    assert pushed[0][2]["retry_key"]
     with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT status FROM vip_health_check_deliveries WHERE delivery_key='delivery-key-health'"
+        ).fetchone()[0] == "delivered"
         assert conn.execute(
             "SELECT source_image_ref FROM pending_meal_photo_drafts WHERE token=?",
             (token,),
@@ -1964,7 +2199,14 @@ def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_
         ).fetchone()[0] == ref
 
     monkeypatch.setattr(server.os, "unlink", original_unlink)
-    server.cleanup_nutrition_images()
+    delivery = server.record_health_check_delivery_result(
+        delivery_key="delivery-key-health",
+        succeeded=True,
+        attempted_at=datetime(2026, 9, 11, 14, 0, tzinfo=timezone(timedelta(hours=8))),
+    )
+    assert delivery["status"] == "delivered"
+    assert delivery["case_id"] == "case-health"
+    assert delivery["image_cleanup"] == "completed"
     with sqlite3.connect(db) as conn:
         assert conn.execute(
             "SELECT source_image_ref FROM pending_meal_photo_drafts WHERE token=?",
@@ -3833,6 +4075,92 @@ def test_meal_log_flex_distinguishes_pending_and_approved_exchange_status():
     assert "已納入個人計畫" in approved_payload
 
 
+def test_existing_food_log_sheet_appends_only_missing_headers(monkeypatch):
+    expected = server.nutrition_sheet_specs()["飲食紀錄"]["headers"]
+    legacy = expected[:29]
+    updates = []
+
+    class ExistingWorksheet:
+        def row_values(self, row):
+            assert row == 1
+            return legacy
+
+        def update(self, **kwargs):
+            updates.append(kwargs)
+
+    worksheet = ExistingWorksheet()
+    monkeypatch.setattr(
+        server,
+        "sh",
+        SimpleNamespace(worksheet=lambda title: worksheet),
+    )
+
+    assert server._nutrition_ws("飲食紀錄") is worksheet
+    assert updates == [{
+        "values": [expected[29:]],
+        "range_name": "AD1:AN1",
+        "value_input_option": "RAW",
+    }]
+
+
+def test_existing_food_log_sheet_rejects_noncanonical_header_prefix(monkeypatch):
+    expected = server.nutrition_sheet_specs()["飲食紀錄"]["headers"]
+
+    class ExistingWorksheet:
+        def row_values(self, _row):
+            return ["wrong-header", *expected[1:29]]
+
+    monkeypatch.setattr(
+        server,
+        "sh",
+        SimpleNamespace(worksheet=lambda _title: ExistingWorksheet()),
+    )
+    with pytest.raises(RuntimeError, match="header"):
+        server._nutrition_ws("飲食紀錄")
+
+
+def test_customer_confirmed_photo_sheet_exports_na_and_exchange_ranges(tmp_path, monkeypatch):
+    db = tmp_path / "customer-photo-sheet.db"
+    with sqlite3.connect(db) as conn:
+        server.ensure_daily_food_ledger_schema(conn)
+        created = insert_customer_confirmed_meal_photo_log(
+            conn,
+            token="abcdef123456",
+            user_id="U_CUSTOMER",
+            consumed_at="2026-09-11T12:00:00+08:00",
+            meal_slot="午餐",
+            source_image_ref="nutrition-image:" + "a" * 32 + ".jpg",
+            observed_payload=meal_photo_payload(),
+            answers={"protein_type": "chicken"},
+            estimate={
+                "protein_total_exchange": {"min": 2, "max": 3, "basis": "hand_portion_range_v1"},
+                "starch_exchange": {"min": 1, "max": 2, "basis": "hand_portion_range_v1"},
+                "vegetable_exchange": {"min": 1, "max": 1.5, "basis": "hand_portion_range_v1"},
+            },
+        )
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    captured = []
+    monkeypatch.setattr(server, "_nutrition_ws", lambda _title: object())
+    monkeypatch.setattr(
+        server,
+        "_upsert_raw_sheet_row",
+        lambda _ws, entity_id, values: captured.append((entity_id, values)),
+    )
+
+    server._sync_food_log_outbox(created["log_id"])
+
+    row = captured[-1][1]
+    headers = server.nutrition_sheet_specs()["飲食紀錄"]["headers"]
+    assert len(row) == len(headers)
+    assert row[9:13] == [None, None, None, None]
+    assert row[29:] == [
+        "user_meal_photo", "user_confirmed_ai_estimate",
+        2.0, 3.0, "hand_portion_range_v1",
+        1.0, 2.0, "hand_portion_range_v1",
+        1.0, 1.5, "hand_portion_range_v1",
+    ]
+
+
 def test_food_log_sheet_exports_exchange_only_after_approval(tmp_path, monkeypatch):
     db = tmp_path / "exchange-sheet.db"
     with sqlite3.connect(db) as conn:
@@ -4069,6 +4397,7 @@ def test_food_photo_image_handler_stages_durable_unknown_safe_flex(tmp_path, mon
 def test_meal_photo_postback_request_add_then_text_updates_confirmation_card(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-add-item.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
             conn, user_id="U_MEAL", source_message_id="M_ADD", payload=meal_photo_payload()
@@ -4135,6 +4464,7 @@ def test_meal_photo_postback_request_add_then_text_updates_confirmation_card(tmp
 def test_meal_photo_request_add_can_be_cancelled_from_quick_reply(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-cancel-add-postback.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
             conn, user_id="U_CANCEL", source_message_id="M_CANCEL", payload=meal_photo_payload()
@@ -4234,10 +4564,11 @@ def test_meal_photo_add_item_rejects_name_when_encoded_postback_exceeds_line_lim
     assert waiting["version"] == 2
 
 
-def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
+def test_meal_photo_postback_confirms_ai_estimate_as_formal_log(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-postback-final.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "ADMIN_UID", "U_MEAL")
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     with sqlite3.connect(db) as conn:
         ensure_meal_photo_schema(conn)
         token = save_meal_photo_draft(
@@ -4264,18 +4595,132 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
 
     assert len(replies) == 1
     estimate_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
-    assert "照片估算" in estimate_text
-    assert "審核並加入" in estimate_text
-    assert f"mpr:v1:{token}:8:start" in estimate_text
+    assert "已記錄" in estimate_text
+    assert "顧客確認" in estimate_text
+    assert "AI估算" in estimate_text
+    assert "審核並加入" not in estimate_text
+    assert "mpr:v1:" not in estimate_text
     with sqlite3.connect(db) as conn:
         draft = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
-    assert draft["status"] == "estimated"
+    assert draft["status"] == "confirmed"
+    assert draft["approved_log_id"]
     assert draft["estimate"]["starch_exchange"] == {"min": 0.0, "max": 0.0, "basis": "user_confirmed_none"}
 
 
-def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, monkeypatch):
+@pytest.mark.parametrize("entitlement_mode", ["inactive", "error"])
+def test_meal_photo_customer_postback_is_silent_and_read_free_without_active_vip(
+    tmp_path, monkeypatch, entitlement_mode
+):
+    db = tmp_path / f"meal-photo-vip-gate-{entitlement_mode}.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_EXPIRED", source_message_id="M_EXPIRED",
+            payload=meal_photo_payload(),
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"EXPIRED-PREP-{index}", user_id="U_EXPIRED",
+                token=token, expected_version=index, action="answer", field=field,
+                value=value,
+            )
+    before = db.read_bytes()
+    replies = []
+    calls = []
+
+    def entitlement(_uid):
+        calls.append(_uid)
+        if entitlement_mode == "error":
+            raise sqlite3.OperationalError("entitlement unavailable")
+        return False
+
+    monkeypatch.setattr(server, "has_active_vip_access", entitlement)
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda *_args: replies.append(_args)
+    )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(
+            data=f"mp:v1:{token}:7:answer:sauce_level:half"
+        ),
+        source=SimpleNamespace(user_id="U_EXPIRED"),
+        reply_token="reply-expired",
+        webhook_event_id="WEBHOOK-EXPIRED",
+        timestamp=1784740620000,
+    )
+
+    server.handle_meal_photo_postback(event)
+
+    assert calls == ["U_EXPIRED"]
+    assert replies == []
+    assert db.read_bytes() == before
+    with sqlite3.connect(db) as conn:
+        draft = get_meal_photo_draft(conn, user_id="U_EXPIRED", token=token)
+        assert draft["status"] == "confirming"
+        assert draft["version"] == 7
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM meal_photo_events WHERE event_id='WEBHOOK-EXPIRED'"
+        ).fetchone()[0] == 0
+
+
+def test_meal_photo_confirmation_replays_after_line_reply_failure_without_double_log(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "meal-photo-confirm-reply-replay.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_REPLAY", source_message_id="M_REPLAY",
+            payload=meal_photo_payload(),
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"REPLAY-PREP-{index}", user_id="U_REPLAY",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+    replies = []
+
+    def flaky_reply(_token, message):
+        replies.append(message)
+        if len(replies) == 1:
+            raise RuntimeError("simulated LINE reply failure")
+
+    monkeypatch.setattr(server.line_bot_api, "reply_message", flaky_reply)
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", False)
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        source=SimpleNamespace(user_id="U_REPLAY"), reply_token="reply-replay",
+        webhook_event_id="WEBHOOK-REPLAY", timestamp=1784740620000,
+    )
+
+    with pytest.raises(RuntimeError, match="LINE reply failure"):
+        server.handle_meal_photo_postback(event)
+    server.handle_meal_photo_postback(event)
+
+    assert len(replies) == 2
+    assert replies[0].as_json_string() == replies[1].as_json_string()
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM food_catalog").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM nutrition_sheet_outbox").fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM meal_photo_events WHERE event_id='WEBHOOK-REPLAY'"
+        ).fetchone()[0] == 1
+
+
+def test_customer_confirmation_does_not_push_per_meal_review_to_admin(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-customer-push.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     monkeypatch.setattr(server, "ADMIN_UID", "U_FALLBACK_ADMIN")
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
     monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
@@ -4296,19 +4741,18 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
             )
     replies = []
     pushes = []
+    refreshed = []
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    monkeypatch.setattr(
+        server, "refresh_user_health_check_case",
+        lambda _conn, *, user_id, evaluated_at: refreshed.append(user_id)
+        or {"status": "collecting"},
+    )
     monkeypatch.setattr(
         server, "line_bot_api",
         SimpleNamespace(
             reply_message=lambda _token, message: replies.append(message),
             push_message=lambda target, message, **_kwargs: pushes.append((target, message)),
-        ),
-    )
-    monkeypatch.setattr(
-        server,
-        "build_meal_photo_image_url",
-        lambda _draft, *, preview=False, now=None: (
-            "https://example.test/meal-photo-image/token.jpg?preview="
-            + ("1" if preview else "0")
         ),
     )
     event = SimpleNamespace(
@@ -4320,21 +4764,10 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
     server.handle_meal_photo_postback(event)
 
     customer_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
+    assert "已記錄" in customer_text
     assert "審核並加入" not in customer_text
-    assert len(pushes) == 2
-    assert all(target == "U_ADMIN" for target, _message in pushes)
-    image_message = pushes[0][1]
-    assert isinstance(image_message, server.ImageSendMessage)
-    assert str(image_message.original_content_url).endswith("preview=0")
-    assert str(image_message.preview_image_url).endswith("preview=1")
-    admin_payload = pushes[1][1]
-    assert isinstance(admin_payload, list)
-    assert len(admin_payload) == 2
-    admin_text = json.dumps(
-        [json.loads(str(message)) for message in admin_payload], ensure_ascii=False
-    )
-    assert "新的餐點審核需求" in admin_text
-    assert f"mpr:v1:{token}:8:start" in admin_text
+    assert pushes == []
+    assert refreshed == ["U_CUSTOMER"]
 
 
 def test_meal_photo_review_photo_failure_falls_back_to_text_and_card(monkeypatch):
@@ -4855,6 +5288,27 @@ def test_bound_admin_authorization_fails_closed_on_database_error(tmp_path, monk
         server.get_bound_admin_uid_for_authorization()
 
 
+def _restore_server_test_draft_as_legacy_estimated(conn, token):
+    log_id = conn.execute(
+        "SELECT approved_log_id FROM pending_meal_photo_drafts WHERE token=?", (token,)
+    ).fetchone()[0]
+    food_id = conn.execute(
+        "SELECT food_id FROM food_logs WHERE log_id=?", (log_id,)
+    ).fetchone()[0]
+    conn.execute(
+        "DELETE FROM nutrition_sheet_outbox WHERE entity_id IN (?,?)", (log_id, food_id)
+    )
+    conn.execute("DELETE FROM food_logs WHERE log_id=?", (log_id,))
+    conn.execute("DELETE FROM food_catalog WHERE food_id=?", (food_id,))
+    conn.execute(
+        """UPDATE pending_meal_photo_drafts
+           SET status='estimated',approved_log_id='',approved_at='',approved_by=''
+           WHERE token=?""",
+        (token,),
+    )
+    conn.commit()
+
+
 def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-pending-command.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
@@ -4875,6 +5329,7 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
                 conn, event_id=f"PENDING-PREP-{index}", user_id="U_CUSTOMER",
                 token=token, expected_version=index, action="answer", field=field, value=value,
             )
+        _restore_server_test_draft_as_legacy_estimated(conn, token)
 
     with pytest.raises(PermissionError, match="管理員限定"):
         server.build_pending_meal_photo_review_message("U_FORGED")
@@ -4904,6 +5359,11 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
 
     db = tmp_path / "meal-photo-admin-review.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(AssertionError("admin review must not use VIP gate")),
+    )
     monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
     monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
@@ -4911,8 +5371,8 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     meal_time = server.tw_now() - timedelta(minutes=5)
     meal_date = meal_time.date().isoformat()
     with sqlite3.connect(db) as conn:
-        configure_vip_health_check_connection(conn)
-        ensure_vip_health_check_schema(conn)
+        server.configure_vip_health_check_connection(conn)
+        server.ensure_vip_health_check_schema(conn)
         server.ensure_daily_food_ledger_schema(conn)
         health_case = create_first_vip_health_check_case(
             conn,
@@ -4935,6 +5395,7 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
                 conn, event_id=f"PREP-ADMIN-{index}", user_id="U_CUSTOMER", token=token,
                 expected_version=index, action="answer", field=field, value=value,
             )
+        _restore_server_test_draft_as_legacy_estimated(conn, token)
     replies = []
     pushes = []
     monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
@@ -4986,7 +5447,7 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     assert "已由營養師核准" in pushes[-1][1].text
     push_count = len(pushes)
     with sqlite3.connect(db) as conn:
-        configure_vip_health_check_connection(conn)
+        server.configure_vip_health_check_connection(conn)
         conn.execute(
             "DELETE FROM vip_health_check_source_refs WHERE case_id=?",
             (health_case["case_id"],),
@@ -5040,6 +5501,7 @@ def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(t
                 conn, event_id=f"REJECT-PREP-{index}", user_id="U_CUSTOMER",
                 token=token, expected_version=index, action="answer", field=field, value=value,
             )
+        _restore_server_test_draft_as_legacy_estimated(conn, token)
     replies, pushes = [], []
     monkeypatch.setattr(
         server, "line_bot_api",
@@ -5070,6 +5532,7 @@ def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(t
 def test_meal_photo_postback_replays_after_reply_failure_without_double_update(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-postback.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     with sqlite3.connect(db) as conn:
         token = save_meal_photo_draft(
             conn, user_id="U_MEAL", source_message_id="M_POST", payload=meal_photo_payload()
@@ -5120,6 +5583,7 @@ def test_meal_photo_postback_replays_after_reply_failure_without_double_update(t
 def test_cancel_meal_photo_deletes_file_before_clearing_reference(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-cancel.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     with sqlite3.connect(db) as conn:
         ensure_meal_photo_schema(conn)
         token = save_meal_photo_draft(

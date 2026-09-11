@@ -84,7 +84,11 @@ def _schema(conn: sqlite3.Connection) -> None:
             source_manifest_hash TEXT NOT NULL, approved_by TEXT NOT NULL,
             approved_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
-        CREATE TABLE food_catalog (food_id TEXT PRIMARY KEY, product_name TEXT NOT NULL);
+        CREATE TABLE food_catalog (
+            food_id TEXT PRIMARY KEY, product_name TEXT NOT NULL,
+            source_type TEXT NOT NULL DEFAULT 'user_private_food',
+            verification_status TEXT NOT NULL DEFAULT 'user_confirmed'
+        );
         CREATE TABLE food_logs (
             log_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, food_id TEXT NOT NULL,
             consumed_at TEXT NOT NULL, meal_slot TEXT, consumed_servings REAL,
@@ -130,7 +134,9 @@ def _populated_db(tmp_path):
                     "2026-09-05T00:00:00+08:00",
                 ),
             )
-        conn.execute("INSERT INTO food_catalog VALUES ('food-1','雞胸便當')")
+        conn.execute(
+            "INSERT INTO food_catalog (food_id,product_name) VALUES ('food-1','雞胸便當')"
+        )
         conn.execute(
             """INSERT INTO food_logs VALUES
                ('log-owned',?,'food-1','2026-09-02T12:00:00+08:00','lunch',1,300,'g',
@@ -437,6 +443,83 @@ def test_projection_lists_and_details_canonical_owned_data_without_secrets(tmp_p
         "approved_by", "U99999999999999999999999999999999", "benefit_key", "vip_code",
     ):
         assert forbidden not in serialized
+
+
+def test_projection_exposes_integrity_bound_customer_estimate_ranges(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from nutrition_system import (
+        ensure_nutrition_schema,
+        insert_customer_confirmed_meal_photo_log,
+    )
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        ensure_vip_health_check_schema,
+        refresh_case_source_manifest,
+    )
+
+    path = tmp_path / "customer-estimate-detail.db"
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        ensure_nutrition_schema(conn)
+        existing_log_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(food_logs)")
+        }
+        if "version" not in existing_log_columns:
+            conn.execute("ALTER TABLE food_logs ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+        if "deleted_at" not in existing_log_columns:
+            conn.execute("ALTER TABLE food_logs ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """CREATE TABLE health_profile (
+               user_id TEXT PRIMARY KEY,name TEXT,tdee REAL,protein REAL,
+               goal TEXT,restrictions TEXT,active_days TEXT)"""
+        )
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        conn.execute(
+            """INSERT INTO vip_health_check_cases
+               (case_id,user_id,benefit_key,first_vip_activation_id,
+                activation_event_key,window_started_at,window_ends_at,status,
+                created_at,updated_at)
+               VALUES ('case-range',?,'first_vip_baseline_check','act-range','event-range',
+                       '2026-09-01T00:00:00+08:00','2026-09-08T00:00:00+08:00',
+                       'collecting','2026-09-01T00:00:00+08:00',
+                       '2026-09-01T00:00:00+08:00')""",
+            (CUSTOMER_UID,),
+        )
+        created = insert_customer_confirmed_meal_photo_log(
+            conn,
+            token="abcdef123456",
+            user_id=CUSTOMER_UID,
+            consumed_at="2026-09-02T12:00:00+08:00",
+            meal_slot="午餐",
+            source_image_ref="nutrition-image:" + "a" * 32 + ".jpg",
+            observed_payload={"visible_items": [{"name": "雞肉", "category": "protein"}]},
+            answers={"protein_type": "chicken"},
+            estimate={
+                "protein_total_exchange": {"min": 2, "max": 3, "basis": "hand_portion_range_v1"},
+                "starch_exchange": {"min": 1, "max": 2, "basis": "hand_portion_range_v1"},
+                "vegetable_exchange": {"min": 1, "max": 2, "basis": "hand_portion_range_v1"},
+            },
+        )
+        refresh_case_source_manifest(
+            conn,
+            case_id="case-range",
+            evaluated_at=datetime(2026, 9, 3, tzinfo=timezone.utc),
+        )
+        detail = load_health_check_detail(conn, case_id="case-range")
+        source = detail["source_logs"][0]
+        assert source["source_type"] == "user_meal_photo"
+        assert source["verification_status"] == "user_confirmed_ai_estimate"
+        assert source["customer_estimate"]["protein_total_exchange"] == {
+            "min": 2.0, "max": 3.0, "basis": "hand_portion_range_v1"
+        }
+
+        conn.execute(
+            "UPDATE food_logs SET exchange_snapshot_json='{}' WHERE log_id=?",
+            (created["log_id"],),
+        )
+        tampered = load_health_check_detail(conn, case_id="case-range")
+        assert tampered["source_logs"] == []
 
 
 def test_projection_excludes_foreign_unconfirmed_and_deleted_source_logs(tmp_path):

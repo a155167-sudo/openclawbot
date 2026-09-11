@@ -1,8 +1,10 @@
 import hashlib
 import hmac
-import os
 import json
+import math
+import os
 import sqlite3
+
 import stat
 from datetime import datetime, timedelta
 import secrets
@@ -89,6 +91,7 @@ from daily_health_report import (
 from meal_photo_system import (
     apply_meal_photo_action,
     build_meal_photo_confirmation_bubble,
+    build_meal_photo_confirmed_bubble,
     build_meal_photo_estimate_bubble,
     clear_meal_photo_image_ref,
     daily_pending_meal_photo_count,
@@ -113,6 +116,7 @@ from dietitian_health_check_api import (
 )
 from dietitian_health_check_command import (
     build_dietitian_health_check_flex,
+    build_dietitian_health_check_ready_flex,
     is_authorized_dietitian_health_check_command,
     is_dietitian_health_check_command_intent,
     load_dietitian_health_check_command_allowed_uids,
@@ -121,11 +125,15 @@ from dietitian_health_check_command import (
 from dietitian_health_check_liff import attach_dietitian_health_check_liff_routes
 from vip_health_check import (
     canonical_food_log_source_hash,
+    claim_next_health_check_notification,
+    complete_health_check_notification,
     configure_vip_health_check_connection,
     create_first_vip_health_check_case,
     ensure_vip_health_check_schema,
     get_customer_health_check_state,
     is_vip_health_check_enabled,
+    record_health_check_delivery_attempt,
+    release_health_check_notification,
     refresh_user_health_check_case,
 )
 
@@ -220,6 +228,281 @@ def _refresh_health_check_after_food_log(
     except Exception as exc:
         print(f"⚠️ 三日健檢來源刷新失敗，飲食紀錄仍保留：{exc}")
         return None
+
+
+def flush_health_check_refresh_outbox(*, limit: int = 10) -> int:
+    """重建健檢衍生投影；主帳本交易寫入的queue確保失敗後可收斂。"""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return 0
+    if not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit 必須介於1～100")
+    refreshed = 0
+    for _ in range(limit):
+        now = tw_now()
+        now_text = now.isoformat(timespec="seconds")
+        lease_until = (now + timedelta(minutes=2)).isoformat(timespec="seconds")
+        claim_token = uuid.uuid4().hex
+        try:
+            with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                ensure_nutrition_schema(conn)
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """UPDATE health_check_refresh_outbox
+                       SET status='processing',attempts=attempts+1,claim_token=?,
+                           lease_until=?,last_error='',updated_at=?
+                       WHERE user_id=(
+                         SELECT user_id FROM health_check_refresh_outbox
+                         WHERE status='pending'
+                            OR (status='processing' AND lease_until<=?)
+                         ORDER BY requested_at,user_id LIMIT 1
+                       )
+                         AND (status='pending'
+                              OR (status='processing' AND lease_until<=?))
+                       RETURNING user_id""",
+                    (claim_token, lease_until, now_text, now_text, now_text),
+                ).fetchone()
+                conn.commit()
+            if row is None:
+                break
+            user_id = str(row[0])
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                configure_vip_health_check_connection(conn)
+                ensure_vip_health_check_schema(conn)
+                refresh_user_health_check_case(conn, user_id=user_id, evaluated_at=now)
+                conn.commit()
+        except Exception as exc:
+            try:
+                with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                    ensure_nutrition_schema(conn)
+                    conn.execute(
+                        """UPDATE health_check_refresh_outbox
+                           SET status='pending',claim_token='',lease_until='',
+                               last_error=?,resync_required=0,updated_at=?
+                           WHERE claim_token=? AND status='processing'""",
+                        (str(exc)[:500], now_text, claim_token),
+                    )
+                    conn.commit()
+            except Exception as release_exc:
+                print(f"⚠️ 釋放三日健檢refresh lease失敗：{release_exc}")
+            print(f"⚠️ 三日健檢durable refresh失敗：{exc}")
+            break
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            ensure_nutrition_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """SELECT resync_required FROM health_check_refresh_outbox
+                   WHERE user_id=? AND status='processing' AND claim_token=?""",
+                (user_id, claim_token),
+            ).fetchone()
+            if current is None:
+                conn.rollback()
+                break
+            if int(current[0] or 0):
+                conn.execute(
+                    """UPDATE health_check_refresh_outbox
+                       SET status='pending',claim_token='',lease_until='',last_error='',
+                           resync_required=0,updated_at=?
+                       WHERE user_id=? AND claim_token=?""",
+                    (now_text, user_id, claim_token),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM health_check_refresh_outbox WHERE user_id=? AND claim_token=?",
+                    (user_id, claim_token),
+                )
+            conn.commit()
+        refreshed += 1
+    return refreshed
+
+
+def flush_health_check_ready_notifications(*, limit: int = 10) -> int:
+    """推送已滿三日的營養師通知；outbox + LINE retry key提供可重試去重。"""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return 0
+    if not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit 必須介於1～100")
+    dietitian_uid = str(get_bound_admin_uid_for_authorization() or "").strip()
+    if (
+        not dietitian_uid
+        or dietitian_uid not in DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS
+        or not DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID
+    ):
+        print("⚠️ 三日健檢通知目標未同時通過admin綁定與工作台allowlist")
+        return 0
+
+    delivered = 0
+    for _ in range(limit):
+        now = datetime.now(ZoneInfo("Asia/Taipei"))
+        try:
+            with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                configure_vip_health_check_connection(conn)
+                notice = claim_next_health_check_notification(conn, claimed_at=now)
+                conn.commit()
+        except Exception as exc:
+            print(f"⚠️ 取得三日健檢通知失敗：{exc}")
+            break
+        if notice is None:
+            break
+
+        notification_id = str(notice["notification_id"])
+        claim_token = str(notice["claim_token"])
+        retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"vip-health-check-ready:{notification_id}"))
+        try:
+            retry_client = copy.copy(line_bot_api)
+            if hasattr(retry_client, "headers"):
+                retry_client.headers = dict(getattr(line_bot_api, "headers", {}) or {})
+            retry_client.push_message(
+                dietitian_uid,
+                build_dietitian_health_check_ready_flex(
+                    DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID,
+                    valid_day_count=int(str(notice["valid_day_count"])),
+                ),
+                retry_key=retry_key,
+            )
+        except Exception as exc:
+            line_accepted = (
+                getattr(exc, "status_code", None) == 409
+                and bool(str(getattr(exc, "accepted_request_id", "") or "").strip())
+            )
+            if not line_accepted:
+                try:
+                    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                        configure_vip_health_check_connection(conn)
+                        release_health_check_notification(
+                            conn,
+                            notification_id=notification_id,
+                            claim_token=claim_token,
+                            error=str(exc),
+                            released_at=now,
+                        )
+                        conn.commit()
+                except Exception as release_exc:
+                    print(f"⚠️ 釋放三日健檢通知lease失敗：{release_exc}")
+                print(f"⚠️ 推播三日健檢ready通知失敗：{exc}")
+                break
+        try:
+            with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                configure_vip_health_check_connection(conn)
+                completed = complete_health_check_notification(
+                    conn,
+                    notification_id=notification_id,
+                    claim_token=claim_token,
+                    delivered_at=now,
+                )
+                conn.commit()
+            if not completed:
+                print("⚠️ LINE已接受三日健檢通知，但delivered marker未更新")
+                break
+        except Exception as exc:
+            print(f"⚠️ LINE已接受三日健檢通知，但寫入delivered marker失敗：{exc}")
+            break
+        delivered += 1
+    return delivered
+
+
+def _build_health_check_report_message(report_json):
+    """Render only the immutable, dietitian-approved report fields for LINE."""
+    try:
+        report = json.loads(report_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        report = {}
+    if not isinstance(report, dict):
+        report = {}
+    fields = (
+        ("做得好的地方", "good"),
+        ("優先調整", "priority"),
+        ("未來7天行動", "next_7_days"),
+        ("報告限制", "limitations"),
+    )
+    lines = ["📋 您的三日飲食健檢報告"]
+    for label, key in fields:
+        value = str(report.get(key) or "").strip()
+        if value:
+            lines.extend(("", f"【{label}】", value))
+    return TextSendMessage(text="\n".join(lines)[:4900])
+
+
+def flush_health_check_report_deliveries(*, limit: int = 10) -> int:
+    """Deliver immutable approved reports; accepted LINE pushes finalize and purge."""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return 0
+    if not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit 必須介於1～100")
+    delivered = 0
+    for _ in range(limit):
+        try:
+            with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                configure_vip_health_check_connection(conn)
+                row = conn.execute(
+                    """SELECT delivery.delivery_id,delivery.delivery_key,
+                              delivery.user_id,report.report_json
+                       FROM vip_health_check_deliveries AS delivery
+                       JOIN vip_health_check_reports AS report
+                         ON report.report_id=delivery.report_id
+                       JOIN vip_health_check_cases AS health_case
+                         ON health_case.case_id=report.case_id
+                       JOIN vip_health_check_reviews AS review
+                         ON review.review_id=report.review_id
+                        AND review.case_id=health_case.case_id
+                       WHERE delivery.status IN ('pending','failed')
+                         AND health_case.status IN (
+                           'approved_pending_delivery','delivery_failed'
+                         )
+                         AND review.status='approved'
+                         AND delivery.user_id=health_case.user_id
+                         AND report.source_manifest_hash=review.source_manifest_hash
+                         AND report.source_manifest_hash=health_case.source_manifest_hash
+                       ORDER BY delivery.created_at,delivery.delivery_id
+                       LIMIT 1"""
+                ).fetchone()
+        except Exception as exc:
+            print(f"⚠️ 取得三日健檢報告delivery失敗：{exc}")
+            break
+        if row is None:
+            break
+
+        delivery_id, delivery_key, user_id, report_json = map(str, row)
+        retry_key = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"vip-health-check-report:{delivery_id}")
+        )
+        now = tw_now()
+        line_accepted = False
+        error = ""
+        try:
+            retry_client = copy.copy(line_bot_api)
+            if hasattr(retry_client, "headers"):
+                retry_client.headers = dict(getattr(line_bot_api, "headers", {}) or {})
+            retry_client.push_message(
+                user_id,
+                _build_health_check_report_message(report_json),
+                retry_key=retry_key,
+            )
+            line_accepted = True
+        except Exception as exc:
+            line_accepted = (
+                getattr(exc, "status_code", None) == 409
+                and bool(str(getattr(exc, "accepted_request_id", "") or "").strip())
+            )
+            if not line_accepted:
+                error = str(exc)
+        try:
+            result = record_health_check_delivery_result(
+                delivery_key=delivery_key,
+                succeeded=line_accepted,
+                error=error,
+                attempted_at=now,
+            )
+        except Exception as exc:
+            print(f"⚠️ 三日健檢報告LINE結果寫入失敗：{exc}")
+            break
+        if not line_accepted:
+            print(f"⚠️ 三日健檢報告推播失敗：{error}")
+            break
+        if result.get("status") != "delivered":
+            print("⚠️ LINE已接受三日健檢報告，但delivery未標記delivered")
+            break
+        delivered += 1
+    return delivered
 
 
 DAILY_FOOD_NUTRIENT_FIELDS = (
@@ -1770,10 +2053,16 @@ async def lifespan(app: FastAPI):
     register_daily_health_jobs(scheduler)
     scheduler.add_job(retry_pending_nutrition_plan_links, 'interval', minutes=10, max_instances=1, coalesce=True)
     scheduler.add_job(flush_nutrition_sheet_outbox, 'interval', minutes=10, max_instances=1, coalesce=True)
+    scheduler.add_job(flush_health_check_refresh_outbox, 'interval', minutes=10, max_instances=1, coalesce=True)
+    scheduler.add_job(flush_health_check_ready_notifications, 'interval', minutes=10, max_instances=1, coalesce=True)
+    scheduler.add_job(flush_health_check_report_deliveries, 'interval', minutes=10, max_instances=1, coalesce=True)
     register_nutrition_cleanup_job(scheduler)
     try:
         retry_pending_nutrition_plan_links()
         flush_nutrition_sheet_outbox()
+        flush_health_check_refresh_outbox()
+        flush_health_check_ready_notifications()
+        flush_health_check_report_deliveries()
         cleanup_nutrition_images()
     except Exception as exc:
         print(f"⚠️ 啟動時營養資料維護失敗：{exc}")
@@ -2921,51 +3210,132 @@ def get_dietitian_health_check(case_id: str):
         return load_health_check_detail(conn, case_id=case_id)
 
 
+def _food_log_source_hash_matches(
+    *,
+    log_id: str,
+    version: int,
+    nutrition_snapshot_json: str,
+    source_image_ref: str,
+    source_hash: str,
+    exchange_snapshot_json: str = "",
+    source_type: str = "",
+    verification_status: str = "",
+) -> bool:
+    if exchange_snapshot_json or source_type or verification_status:
+        expected_v2 = canonical_food_log_source_hash(
+            log_id,
+            version,
+            nutrition_snapshot_json,
+            source_image_ref,
+            exchange_snapshot_json=exchange_snapshot_json,
+            source_type=source_type,
+            verification_status=verification_status,
+        )
+        if hmac.compare_digest(expected_v2, source_hash):
+            return True
+    expected_v1 = canonical_food_log_source_hash(
+        log_id, version, nutrition_snapshot_json, source_image_ref
+    )
+    return hmac.compare_digest(expected_v1, source_hash)
+
+
 def get_dietitian_health_check_photo(case_id: str, log_id: str):
     """Load one approved meal-photo preview only when it belongs to the case source."""
     with closing(_open_read_only_database()) as conn:
-        rows = conn.execute(
-            """SELECT d.source_image_ref,source.source_hash,
-                      source.food_log_version,food_log.nutrition_snapshot_json
-               FROM vip_health_check_source_refs AS source
-               JOIN vip_health_check_cases AS health_case
-                 ON health_case.case_id = source.case_id
-               JOIN food_logs AS food_log
-                 ON food_log.log_id = source.food_log_id
-                AND food_log.user_id = health_case.user_id
-               JOIN pending_meal_photo_drafts AS d
-                 ON d.approved_log_id = food_log.log_id
-                AND d.user_id = health_case.user_id
-              WHERE source.case_id = ?
-                AND source.food_log_id = ?
-                AND health_case.status IN (
-                    'collecting','ready_for_review','needs_more_info',
-                    'approved_pending_delivery','delivery_failed'
-                )
-                AND food_log.confirmation_status = 'confirmed'
-                AND COALESCE(food_log.deleted_at, '') = ''
-                AND food_log.version = source.food_log_version
-                AND food_log.source_image_ref = d.source_image_ref
-                AND d.status = 'approved'
-              LIMIT 2""",
-            (case_id, log_id),
-        ).fetchall()
+        has_food_catalog = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='food_catalog'"
+        ).fetchone() is not None
+        if has_food_catalog:
+            rows = conn.execute(
+                """SELECT d.source_image_ref,source.source_hash,
+                          source.food_log_version,food_log.nutrition_snapshot_json,
+                          food_log.exchange_snapshot_json,food.source_type,
+                          food.verification_status
+                   FROM vip_health_check_source_refs AS source
+                   JOIN vip_health_check_cases AS health_case
+                     ON health_case.case_id = source.case_id
+                   JOIN food_logs AS food_log
+                     ON food_log.log_id = source.food_log_id
+                    AND food_log.user_id = health_case.user_id
+                   JOIN food_catalog AS food ON food.food_id = food_log.food_id
+                   JOIN pending_meal_photo_drafts AS d
+                     ON d.approved_log_id = food_log.log_id
+                    AND d.user_id = health_case.user_id
+                  WHERE source.case_id = ?
+                    AND source.food_log_id = ?
+                    AND health_case.status IN (
+                        'collecting','ready_for_review','needs_more_info',
+                        'approved_pending_delivery','delivery_failed'
+                    )
+                    AND food_log.confirmation_status = 'confirmed'
+                    AND COALESCE(food_log.deleted_at, '') = ''
+                    AND food_log.version = source.food_log_version
+                    AND food_log.source_image_ref = d.source_image_ref
+                    AND d.status IN ('approved','confirmed')
+                  LIMIT 2""",
+                (case_id, log_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT d.source_image_ref,source.source_hash,
+                          source.food_log_version,food_log.nutrition_snapshot_json,
+                          '','',''
+                   FROM vip_health_check_source_refs AS source
+                   JOIN vip_health_check_cases AS health_case
+                     ON health_case.case_id = source.case_id
+                   JOIN food_logs AS food_log
+                     ON food_log.log_id = source.food_log_id
+                    AND food_log.user_id = health_case.user_id
+                   JOIN pending_meal_photo_drafts AS d
+                     ON d.approved_log_id = food_log.log_id
+                    AND d.user_id = health_case.user_id
+                  WHERE source.case_id = ?
+                    AND source.food_log_id = ?
+                    AND health_case.status IN (
+                        'collecting','ready_for_review','needs_more_info',
+                        'approved_pending_delivery','delivery_failed'
+                    )
+                    AND food_log.confirmation_status = 'confirmed'
+                    AND COALESCE(food_log.deleted_at, '') = ''
+                    AND food_log.version = source.food_log_version
+                    AND food_log.source_image_ref = d.source_image_ref
+                    AND d.status IN ('approved','confirmed')
+                  LIMIT 2""",
+                (case_id, log_id),
+            ).fetchall()
     if len(rows) != 1:
         return None
-    image_ref, source_hash, source_version, nutrition_snapshot_json = rows[0]
+    (
+        image_ref,
+        source_hash,
+        source_version,
+        nutrition_snapshot_json,
+        exchange_snapshot_json,
+        source_type,
+        verification_status,
+    ) = rows[0]
     if (
         not isinstance(source_hash, str)
         or not isinstance(source_version, int)
         or isinstance(source_version, bool)
         or source_version < 1
         or not isinstance(nutrition_snapshot_json, str)
+        or not isinstance(exchange_snapshot_json, str)
     ):
         return None
+    source_type = str(source_type or "")
+    verification_status = str(verification_status or "")
     image_ref = str(image_ref or "")
-    expected_hash = canonical_food_log_source_hash(
-        log_id, source_version, nutrition_snapshot_json, image_ref
-    )
-    if not hmac.compare_digest(expected_hash, source_hash):
+    if not _food_log_source_hash_matches(
+        log_id=log_id,
+        version=source_version,
+        nutrition_snapshot_json=nutrition_snapshot_json,
+        source_image_ref=image_ref,
+        source_hash=source_hash,
+        exchange_snapshot_json=exchange_snapshot_json,
+        source_type=source_type,
+        verification_status=verification_status,
+    ):
         return None
     image_file = _open_nutrition_image_readonly(image_ref)
     if image_file is None:
@@ -8592,6 +8962,26 @@ async def callback(request: Request):
     return "OK"
 
 
+def _ensure_nutrition_sheet_headers(ws, *, title: str, expected_headers: list[str]):
+    if not hasattr(ws, "row_values"):
+        return
+    current_headers = list(ws.row_values(1) or [])
+    if current_headers == expected_headers:
+        return
+    if current_headers != expected_headers[: len(current_headers)]:
+        raise RuntimeError(f"{title} header與程式定義不一致，已停止同步")
+    missing = expected_headers[len(current_headers):]
+    if not missing:
+        return
+    start = gspread.utils.rowcol_to_a1(1, len(current_headers) + 1)
+    end = gspread.utils.rowcol_to_a1(1, len(expected_headers))
+    ws.update(
+        values=[missing],
+        range_name=f"{start}:{end}",
+        value_input_option="RAW",
+    )
+
+
 def _nutrition_ws(title):
     if not sh:
         raise RuntimeError("Google Sheet 尚未連線")
@@ -8605,6 +8995,11 @@ def _nutrition_ws(title):
         for row in spec.get("seed_rows", []):
             ws.append_row(row)
         ws.freeze(rows=1)
+        return ws
+    spec = specs[title]
+    _ensure_nutrition_sheet_headers(
+        ws, title=title, expected_headers=[str(value) for value in spec["headers"]]
+    )
     return ws
 
 
@@ -8671,7 +9066,8 @@ def _sync_food_log_outbox(entity_id):
                    l.nutrition_snapshot_json, l.approved_exchange_json, l.source_image_ref,
                    l.plan_id, l.confirmation_status, l.created_at, l.updated_at,
                    l.exchange_approval_id, a.food_fingerprint, a.suggestion_rule_version,
-                   a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint
+                   a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint,
+                   l.exchange_snapshot_json,f.source_type,f.verification_status
             FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
             LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
             WHERE l.log_id=?
@@ -8700,6 +9096,40 @@ def _sync_food_log_outbox(entity_id):
         )
     if not approval_valid:
         exch = {}
+    customer_range_cells: list[object] = ["NA"] * 9
+    if log[23] == "user_meal_photo" and log[24] == "user_confirmed_ai_estimate":
+        try:
+            estimated_exchange = json.loads(log[22] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            estimated_exchange = {}
+        cells: list[object] = []
+        for field in (
+            "protein_total_exchange", "starch_exchange", "vegetable_exchange"
+        ):
+            value = estimated_exchange.get(field) if isinstance(estimated_exchange, dict) else None
+            if not isinstance(value, dict):
+                cells.extend(["NA", "NA", "NA"])
+                continue
+            try:
+                minimum = float(value["min"])
+                maximum = float(value["max"])
+            except (KeyError, TypeError, ValueError):
+                cells.extend(["NA", "NA", "NA"])
+                continue
+            basis = str(value.get("basis") or "").strip()
+            if (
+                not math.isfinite(minimum)
+                or not math.isfinite(maximum)
+                or minimum < 0
+                or maximum < minimum
+                or maximum > 100
+                or not basis
+                or len(basis) > 100
+            ):
+                cells.extend(["NA", "NA", "NA"])
+                continue
+            cells.extend([minimum, maximum, basis])
+        customer_range_cells = cells
     ws = _nutrition_ws("飲食紀錄")
     row_values = [
         log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7], log[8],
@@ -8709,7 +9139,8 @@ def _sync_food_log_outbox(entity_id):
         exch.get("protein_low_exchange", 0), exch.get("protein_medium_exchange", 0),
         exch.get("protein_high_exchange", 0), exch.get("starch_exchange", 0),
         exch.get("vegetable_exchange", 0), exch.get("fruit_exchange", 0),
-        exch.get("fat_exchange", 0), log[11], log[12], log[13], log[14], log[15]
+        exch.get("fat_exchange", 0), log[11], log[12], log[13], log[14], log[15],
+        log[23], log[24], *customer_range_cells,
     ]
     _upsert_raw_sheet_row(ws, entity_id, row_values)
 
@@ -9930,8 +10361,14 @@ def _queue_nutrition_outbox(conn, entity_type, entity_id):
     )
 
 
-def cleanup_nutrition_images():
-    """刪除成功後才清除參照；失敗的檔案會在下一輪再次嘗試。"""
+def cleanup_nutrition_images(*, health_case_id=None):
+    """Delete eligible images; optionally prioritize one delivered health-check case."""
+    selected_health_case_id = None
+    if health_case_id is not None:
+        selected_health_case_id = str(health_case_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", selected_health_case_id):
+            raise ValueError("health_case_id 格式錯誤")
+    cleanup_result = {"delivered_candidates": 0, "delivered_deleted": 0}
     now_dt = tw_now()
     directory_flags = (
         os.O_RDONLY
@@ -9942,7 +10379,8 @@ def cleanup_nutrition_images():
     try:
         db_fd = os.open(DB_DIR, directory_flags)
         image_fd = os.open("nutrition_images", directory_flags, dir_fd=db_fd)
-        for filename in os.listdir(image_fd):
+        filenames = [] if selected_health_case_id is not None else os.listdir(image_fd)
+        for filename in filenames:
             if not re.fullmatch(
                 r"[0-9a-f]{32}\.(?:jpg|png|webp)\.[0-9a-f]{16}\.tmp",
                 filename,
@@ -9983,6 +10421,8 @@ def cleanup_nutrition_images():
                FROM pending_nutrition_logs
                WHERE status IN ('pending','awaiting_identity','expired','cancelled')"""
         ).fetchall()
+        if selected_health_case_id is not None:
+            candidates = []
         pending_rows = []
         now_text = now_dt.isoformat(timespec="seconds")
         for token, source_image_ref, status, expires_at, retired_at in candidates:
@@ -10005,18 +10445,21 @@ def cleanup_nutrition_images():
         input_states = conn.execute(
             "SELECT user_id,expires_at FROM nutrition_input_states"
         ).fetchall()
+        if selected_health_case_id is not None:
+            input_states = []
         for state_user_id, state_expires_at in input_states:
             if is_before(state_expires_at, now_dt):
                 conn.execute(
                     "DELETE FROM nutrition_input_states WHERE user_id=?", (state_user_id,)
                 )
-        conn.execute(
-            """DELETE FROM nutrition_input_states
-               WHERE token IN (
-                 SELECT token FROM pending_nutrition_logs
-                 WHERE status NOT IN ('pending','awaiting_identity')
-               )"""
-        )
+        if selected_health_case_id is None:
+            conn.execute(
+                """DELETE FROM nutrition_input_states
+                   WHERE token IN (
+                     SELECT token FROM pending_nutrition_logs
+                     WHERE status NOT IN ('pending','awaiting_identity')
+                   )"""
+            )
         conn.commit()
     for token, ref in pending_rows:
         if _delete_nutrition_image(ref):
@@ -10037,6 +10480,8 @@ def cleanup_nutrition_images():
                FROM pending_meal_photo_drafts
                WHERE status IN ('awaiting_confirmation','confirming','estimated','expired','cancelled')"""
         ).fetchall()
+        if selected_health_case_id is not None:
+            candidates = []
         for token, user_id, ref, status, expires_at in candidates:
             should_retire = status in {"expired", "cancelled"}
             if status in {"awaiting_confirmation", "confirming", "estimated"} and is_before(expires_at, now_dt):
@@ -10079,7 +10524,9 @@ def cleanup_nutrition_images():
                 """SELECT health_case.case_id,draft.token,draft.user_id,
                           draft.source_image_ref,food_log.log_id,food_log.food_id,
                           source.food_log_version,source.source_hash,
-                          food_log.nutrition_snapshot_json
+                          food_log.nutrition_snapshot_json,
+                          food_log.exchange_snapshot_json,food.source_type,
+                          food.verification_status
                    FROM pending_meal_photo_drafts AS draft
                    JOIN vip_health_check_source_refs AS source
                      ON source.food_log_id=draft.approved_log_id
@@ -10089,14 +10536,18 @@ def cleanup_nutrition_images():
                    JOIN food_logs AS food_log
                      ON food_log.log_id=source.food_log_id
                     AND food_log.user_id=health_case.user_id
-                  WHERE draft.status='approved'
+                   LEFT JOIN food_catalog AS food ON food.food_id=food_log.food_id
+                  WHERE draft.status IN ('approved','confirmed')
                     AND draft.source_image_ref<>''
-                    AND health_case.status IN ('delivered','expired','cancelled')
+                    AND health_case.status='delivered'
+                    AND (? IS NULL OR health_case.case_id=?)
                     AND food_log.confirmation_status='confirmed'
                     AND COALESCE(food_log.deleted_at,'')=''
                     AND food_log.version=source.food_log_version
-                    AND food_log.source_image_ref=draft.source_image_ref"""
+                    AND food_log.source_image_ref=draft.source_image_ref""",
+                (selected_health_case_id, selected_health_case_id),
             ).fetchall()
+            cleanup_result["delivered_candidates"] = len(delivered_rows)
             for (
                 case_id,
                 token,
@@ -10107,6 +10558,9 @@ def cleanup_nutrition_images():
                 source_version,
                 source_hash,
                 nutrition_snapshot_json,
+                exchange_snapshot_json,
+                source_type,
+                verification_status,
             ) in delivered_rows:
                 if (
                     not isinstance(source_version, int)
@@ -10114,12 +10568,21 @@ def cleanup_nutrition_images():
                     or source_version < 1
                     or not isinstance(source_hash, str)
                     or not isinstance(nutrition_snapshot_json, str)
+                    or not isinstance(exchange_snapshot_json, str)
                 ):
                     continue
-                actual_hash = canonical_food_log_source_hash(
-                    log_id, source_version, nutrition_snapshot_json, ref
-                )
-                if not hmac.compare_digest(actual_hash, source_hash):
+                source_type = str(source_type or "")
+                verification_status = str(verification_status or "")
+                if not _food_log_source_hash_matches(
+                    log_id=log_id,
+                    version=source_version,
+                    nutrition_snapshot_json=nutrition_snapshot_json,
+                    source_image_ref=ref,
+                    source_hash=source_hash,
+                    exchange_snapshot_json=exchange_snapshot_json,
+                    source_type=source_type,
+                    verification_status=verification_status,
+                ):
                     continue
                 meal_photo_rows.append(
                     {
@@ -10151,7 +10614,9 @@ def cleanup_nutrition_images():
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
                 """SELECT source.source_hash,source.food_log_version,
-                          food_log.nutrition_snapshot_json
+                          food_log.nutrition_snapshot_json,
+                          food_log.exchange_snapshot_json,food.source_type,
+                          food.verification_status
                    FROM pending_meal_photo_drafts AS draft
                    JOIN vip_health_check_source_refs AS source
                      ON source.case_id=? AND source.food_log_id=draft.approved_log_id
@@ -10161,9 +10626,10 @@ def cleanup_nutrition_images():
                    JOIN food_logs AS food_log
                      ON food_log.log_id=source.food_log_id
                     AND food_log.user_id=health_case.user_id
+                   LEFT JOIN food_catalog AS food ON food.food_id=food_log.food_id
                   WHERE draft.token=? AND draft.user_id=?
-                    AND draft.status='approved' AND draft.source_image_ref=?
-                    AND health_case.status IN ('delivered','expired','cancelled')
+                    AND draft.status IN ('approved','confirmed') AND draft.source_image_ref=?
+                    AND health_case.status='delivered'
                     AND food_log.log_id=? AND food_log.food_id=?
                     AND food_log.confirmation_status='confirmed'
                     AND COALESCE(food_log.deleted_at,'')=''
@@ -10181,21 +10647,32 @@ def cleanup_nutrition_images():
             if len(current) != 1:
                 conn.rollback()
                 continue
-            source_hash, source_version, nutrition_snapshot_json = current[0]
+            (
+                source_hash,
+                source_version,
+                nutrition_snapshot_json,
+                exchange_snapshot_json,
+                source_type,
+                verification_status,
+            ) = current[0]
+            source_type = str(source_type or "")
+            verification_status = str(verification_status or "")
             if (
                 not isinstance(source_version, int)
                 or isinstance(source_version, bool)
                 or source_version < 1
                 or not isinstance(source_hash, str)
                 or not isinstance(nutrition_snapshot_json, str)
-                or not hmac.compare_digest(
-                    canonical_food_log_source_hash(
-                        candidate["log_id"],
-                        source_version,
-                        nutrition_snapshot_json,
-                        ref,
-                    ),
-                    source_hash,
+                or not isinstance(exchange_snapshot_json, str)
+                or not _food_log_source_hash_matches(
+                    log_id=candidate["log_id"],
+                    version=source_version,
+                    nutrition_snapshot_json=nutrition_snapshot_json,
+                    source_image_ref=ref,
+                    source_hash=source_hash,
+                    exchange_snapshot_json=exchange_snapshot_json,
+                    source_type=source_type,
+                    verification_status=verification_status,
                 )
             ):
                 conn.rollback()
@@ -10206,7 +10683,7 @@ def cleanup_nutrition_images():
             draft_changed = conn.execute(
                 """UPDATE pending_meal_photo_drafts SET source_image_ref=''
                    WHERE token=? AND user_id=? AND source_image_ref=?
-                     AND status='approved'""",
+                     AND status IN ('approved','confirmed')""",
                 (token, user_id, ref),
             ).rowcount
             log_changed = conn.execute(
@@ -10226,6 +10703,12 @@ def cleanup_nutrition_images():
             if catalog_changed:
                 _queue_nutrition_outbox(conn, "food", candidate["food_id"])
             conn.commit()
+            cleanup_result["delivered_deleted"] += 1
+
+    if selected_health_case_id is not None:
+        # Immediate post-delivery cleanup is case-scoped.  Do not fall through
+        # into the site-wide retention lanes below.
+        return cleanup_result
 
     meal_tombstone_cutoff = now_dt - timedelta(days=30)
     with sqlite3.connect(DB_PATH) as conn:
@@ -10285,11 +10768,26 @@ def cleanup_nutrition_images():
         conn.commit()
 
     with sqlite3.connect(DB_PATH) as conn:
-        old_logs = conn.execute(
-            """SELECT log_id, food_id, source_image_ref FROM food_logs
-               WHERE created_at<? AND source_image_ref<>''""",
-            (cutoff,),
-        ).fetchall()
+        if existing_tables == required_tables:
+            old_logs = conn.execute(
+                """SELECT log_id,food_id,source_image_ref FROM food_logs AS old_log
+                   WHERE created_at<? AND source_image_ref<>''
+                     AND NOT EXISTS (
+                       SELECT 1
+                       FROM vip_health_check_source_refs AS source
+                       JOIN vip_health_check_cases AS health_case
+                         ON health_case.case_id=source.case_id
+                       WHERE source.food_log_id=old_log.log_id
+                         AND health_case.status<>'delivered'
+                     )""",
+                (cutoff,),
+            ).fetchall()
+        else:
+            old_logs = conn.execute(
+                """SELECT log_id,food_id,source_image_ref FROM food_logs
+                   WHERE created_at<? AND source_image_ref<>''""",
+                (cutoff,),
+            ).fetchall()
     for log_id, food_id, ref in old_logs:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -10300,6 +10798,17 @@ def cleanup_nutrition_images():
                 (log_id, food_id, cutoff, ref),
             ).fetchone()
             if current is None:
+                conn.rollback()
+                continue
+            if existing_tables == required_tables and conn.execute(
+                """SELECT 1
+                   FROM vip_health_check_source_refs AS source
+                   JOIN vip_health_check_cases AS health_case
+                     ON health_case.case_id=source.case_id
+                   WHERE source.food_log_id=? AND health_case.status<>'delivered'
+                   LIMIT 1""",
+                (log_id,),
+            ).fetchone():
                 conn.rollback()
                 continue
             if not _delete_nutrition_image(ref):
@@ -10331,6 +10840,46 @@ def cleanup_nutrition_images():
             _queue_nutrition_outbox(conn, "food", food_id)
             _queue_nutrition_outbox(conn, "food_log", log_id)
             conn.commit()
+
+    return cleanup_result
+
+
+def record_health_check_delivery_result(
+    *, delivery_key, succeeded, error="", attempted_at=None
+):
+    """Persist a LINE delivery result, then immediately purge that case's images.
+
+    LINE success is an external fact and is committed before file cleanup.  A file
+    failure therefore leaves the canonical refs intact for the hourly retry job.
+    """
+    attempted_at = attempted_at or tw_now()
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        configure_vip_health_check_connection(conn)
+        result = record_health_check_delivery_attempt(
+            conn,
+            delivery_key=delivery_key,
+            succeeded=bool(succeeded),
+            error=error,
+            attempted_at=attempted_at,
+        )
+        conn.commit()
+    result = dict(result)
+    result["image_cleanup"] = "not_applicable"
+    if result.get("status") != "delivered":
+        return result
+    try:
+        cleanup = cleanup_nutrition_images(health_case_id=result["case_id"])
+        candidates = int(cleanup.get("delivered_candidates", 0))
+        deleted = int(cleanup.get("delivered_deleted", 0))
+        result["image_cleanup"] = (
+            "completed" if deleted == candidates else "retry_pending"
+        )
+    except Exception as exc:
+        # Delivery already happened and was committed.  Never report it as failed
+        # or regenerate the report; retain refs so the hourly cleanup can retry.
+        print(f"⚠️ 三日健檢報告已送達，圖片立即清理失敗，將由排程重試：{exc}")
+        result["image_cleanup"] = "retry_pending"
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -11732,7 +12281,18 @@ def handle_meal_photo_postback(event):
     if not (start or cancel or answer or remove_item or request_add or cancel_add or add_category or review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
         return
     uid = event.source.user_id
-    if not (review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
+    is_admin_review = bool(
+        review_start or review_resume or review_set or review_cancel
+        or review_reject or review_approve
+    )
+    if not is_admin_review:
+        try:
+            if not has_active_vip_access(uid):
+                return
+        except Exception:
+            # Customer meal-photo postbacks are fail-closed: an unavailable or
+            # malformed entitlement store must not read/mutate the draft or reply.
+            return
         matched = start or cancel or answer or remove_item or request_add or cancel_add or add_category
         assert matched is not None
         token, version = matched.group(1), int(matched.group(2))
@@ -11914,12 +12474,19 @@ def handle_meal_photo_postback(event):
                     conn, event_id=event_id, user_id=uid, token=token,
                     expected_version=version, action="answer",
                     field=answer.group(3), value=answer.group(4),
+                    enqueue_health_refresh=VIP_HEALTH_CHECK_ENABLED,
                 )
                 draft, result = applied["draft"], applied["result"]
         kind = result["kind"]
         if kind == "question":
             reply = build_meal_photo_step_message(
                 token, result["step"], result["version"]
+            )
+        elif kind == "confirmed":
+            from linebot.models import FlexSendMessage
+            reply = FlexSendMessage(
+                alt_text="✅ 餐點已記錄｜顧客確認／AI估算",
+                contents=build_meal_photo_confirmed_bubble(draft),
             )
         elif kind == "estimate":
             from linebot.models import FlexSendMessage
@@ -11968,6 +12535,9 @@ def handle_meal_photo_postback(event):
         else:
             raise ValueError("餐點操作結果無效")
         line_bot_api.reply_message(event.reply_token, reply)
+        if kind == "confirmed" and VIP_HEALTH_CHECK_ENABLED:
+            flush_health_check_refresh_outbox()
+            flush_health_check_ready_notifications()
     except PermissionError as exc:
         line_bot_api.reply_message(
             event.reply_token,

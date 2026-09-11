@@ -314,6 +314,7 @@ def _verify_vip_health_check_foreign_keys(conn: sqlite3.Connection) -> None:
         "vip_health_check_reviews",
         "vip_health_check_reports",
         "vip_health_check_deliveries",
+        "vip_health_check_notifications",
         "vip_health_check_audit_log",
         "dietitian_coaching_orders",
     )
@@ -453,6 +454,24 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id)
         );
 
+        CREATE TABLE IF NOT EXISTS vip_health_check_notifications (
+            notification_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            notification_kind TEXT NOT NULL
+                CHECK(notification_kind='dietitian_ready_for_review'),
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','sending','delivered')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            claim_token TEXT NOT NULL DEFAULT '',
+            lease_until TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            delivered_at TEXT NOT NULL DEFAULT '',
+            UNIQUE(case_id, notification_kind),
+            FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id)
+        );
+
         CREATE TABLE IF NOT EXISTS dietitian_coaching_orders (
             order_id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -483,6 +502,8 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             ON vip_health_check_reviews(case_id, review_id);
         CREATE INDEX IF NOT EXISTS idx_vip_health_check_deliveries_status
             ON vip_health_check_deliveries(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_vip_health_check_notifications_status
+            ON vip_health_check_notifications(status, updated_at);
         """
     )
     report_columns = {
@@ -666,13 +687,40 @@ def _canonical_json_text(value: str) -> str:
 
 
 def canonical_food_log_source_hash(
-    log_id: str, version: int, nutrition_snapshot_json: str, source_image_ref: str
+    log_id: str,
+    version: int,
+    nutrition_snapshot_json: str,
+    source_image_ref: str,
+    *,
+    exchange_snapshot_json: str | None = None,
+    source_type: str | None = None,
+    verification_status: str | None = None,
 ) -> str:
-    """Return the immutable hash used by canonical health-check source refs."""
-    source_material = (
-        f"{log_id}:{version}:{_canonical_json_text(nutrition_snapshot_json)}:"
-        f"{str(source_image_ref or '')}"
-    )
+    """Return a backward-compatible immutable hash for health-check source refs."""
+    if (
+        exchange_snapshot_json is None
+        and source_type is None
+        and verification_status is None
+    ):
+        source_material = (
+            f"{log_id}:{version}:{_canonical_json_text(nutrition_snapshot_json)}:"
+            f"{str(source_image_ref or '')}"
+        )
+    else:
+        source_material = "v2:" + json.dumps(
+            {
+                "exchange_snapshot": _canonical_json_text(exchange_snapshot_json or "{}"),
+                "log_id": str(log_id),
+                "nutrition_snapshot": _canonical_json_text(nutrition_snapshot_json),
+                "source_image_ref": str(source_image_ref or ""),
+                "source_type": str(source_type or ""),
+                "verification_status": str(verification_status or ""),
+                "version": int(version),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     return hashlib.sha256(source_material.encode("utf-8")).hexdigest()
 
 
@@ -712,14 +760,30 @@ def refresh_case_source_manifest(
 
         window_start = _parse_ledger_time(window_start_text)
         window_end = _parse_ledger_time(window_end_text)
-        rows = conn.execute(
-            """SELECT log_id,consumed_at,meal_slot,nutrition_snapshot_json,version,
-                      source_image_ref
-               FROM food_logs
-               WHERE user_id=? AND confirmation_status='confirmed'
-                 AND COALESCE(deleted_at,'')=''""",
-            (user_id,),
-        ).fetchall()
+        has_food_catalog = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='food_catalog'"
+        ).fetchone() is not None
+        if has_food_catalog:
+            rows = conn.execute(
+                """SELECT fl.log_id,fl.consumed_at,fl.meal_slot,
+                          fl.nutrition_snapshot_json,fl.version,fl.source_image_ref,
+                          fl.exchange_snapshot_json,fc.source_type,fc.verification_status
+                   FROM food_logs fl
+                   JOIN food_catalog fc ON fc.food_id=fl.food_id
+                   WHERE fl.user_id=? AND fl.confirmation_status='confirmed'
+                     AND COALESCE(fl.deleted_at,'')=''""",
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT fl.log_id,fl.consumed_at,fl.meal_slot,
+                          fl.nutrition_snapshot_json,fl.version,fl.source_image_ref,
+                          '','',''
+                   FROM food_logs fl
+                   WHERE fl.user_id=? AND fl.confirmation_status='confirmed'
+                     AND COALESCE(fl.deleted_at,'')=''""",
+                (user_id,),
+            ).fetchall()
 
         included: list[dict[str, object]] = []
         by_date: dict[str, list[dict[str, object]]] = defaultdict(list)
@@ -730,20 +794,35 @@ def refresh_case_source_manifest(
             nutrition_snapshot_json,
             version,
             source_image_ref,
+            exchange_snapshot_json,
+            source_type,
+            verification_status,
         ) in rows:
             local_time = _parse_ledger_time(consumed_at)
             if not window_start <= local_time < window_end:
                 continue
             local_date = local_time.date().isoformat()
             version = int(version or 1)
+            hash_kwargs = {}
+            if source_type and verification_status:
+                hash_kwargs = {
+                    "exchange_snapshot_json": exchange_snapshot_json,
+                    "source_type": source_type,
+                    "verification_status": verification_status,
+                }
+            source_hash = canonical_food_log_source_hash(
+                str(log_id),
+                version,
+                str(nutrition_snapshot_json),
+                str(source_image_ref or ""),
+                **hash_kwargs,
+            )
             item = {
                 "food_log_id": log_id,
                 "version": version,
                 "local_date": local_date,
                 "meal_slot": str(meal_slot or ""),
-                "source_hash": canonical_food_log_source_hash(
-                    log_id, version, nutrition_snapshot_json, source_image_ref
-                ),
+                "source_hash": source_hash,
             }
             included.append(item)
             by_date[local_date].append(item)
@@ -814,6 +893,14 @@ def refresh_case_source_manifest(
                     evaluated_text,
                 ),
             )
+        if next_status == "ready_for_review":
+            conn.execute(
+                """INSERT OR IGNORE INTO vip_health_check_notifications
+                   (notification_id,case_id,notification_kind,status,attempts,
+                    claim_token,lease_until,last_error,created_at,updated_at,delivered_at)
+                   VALUES (?,?,'dietitian_ready_for_review','pending',0,'','','',?,?,'')""",
+                ("vhcn_" + uuid.uuid4().hex, case_id, evaluated_text, evaluated_text),
+            )
         conn.execute("RELEASE SAVEPOINT refresh_case_source_manifest")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT refresh_case_source_manifest")
@@ -828,6 +915,103 @@ def refresh_case_source_manifest(
         "source_manifest_hash": manifest_hash,
         "rule_version": rule_version,
     }
+
+
+def claim_next_health_check_notification(
+    conn: sqlite3.Connection,
+    *,
+    claimed_at: datetime,
+    lease_seconds: int = 60,
+) -> dict[str, object] | None:
+    """原子取得一筆待送或lease逾時的營養師ready通知。"""
+    if not isinstance(lease_seconds, int) or not 1 <= lease_seconds <= 600:
+        raise ValueError("lease_seconds 必須介於 1～600")
+    ensure_vip_health_check_schema(conn)
+    claimed_text = _iso_seconds(claimed_at)
+    lease_text = _iso_seconds(claimed_at + timedelta(seconds=lease_seconds))
+    claim_token = uuid.uuid4().hex
+    row = conn.execute(
+        """UPDATE vip_health_check_notifications
+           SET status='sending',attempts=attempts+1,claim_token=?,lease_until=?,
+               last_error='',updated_at=?
+           WHERE notification_id=(
+               SELECT n.notification_id
+               FROM vip_health_check_notifications n
+               JOIN vip_health_check_cases c ON c.case_id=n.case_id
+               WHERE n.notification_kind='dietitian_ready_for_review'
+                 AND c.status='ready_for_review'
+                 AND (n.status='pending' OR (n.status='sending' AND n.lease_until<=?))
+               ORDER BY n.created_at,n.notification_id LIMIT 1
+           )
+             AND (status='pending' OR (status='sending' AND lease_until<=?))
+           RETURNING notification_id,case_id,notification_kind,attempts,claim_token""",
+        (claim_token, lease_text, claimed_text, claimed_text, claimed_text),
+    ).fetchone()
+    if row is None:
+        return None
+    case = conn.execute(
+        "SELECT user_id,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
+        (row[1],),
+    ).fetchone()
+    if case is None or int(case[1]) < 3:
+        raise sqlite3.IntegrityError("ready notification has invalid case")
+    return {
+        "notification_id": str(row[0]),
+        "case_id": str(row[1]),
+        "notification_kind": str(row[2]),
+        "attempts": int(row[3]),
+        "claim_token": str(row[4]),
+        "user_id": str(case[0]),
+        "valid_day_count": int(case[1]),
+    }
+
+
+def complete_health_check_notification(
+    conn: sqlite3.Connection,
+    *,
+    notification_id: str,
+    claim_token: str,
+    delivered_at: datetime,
+) -> bool:
+    """僅目前lease持有人可標記ready通知已送達。"""
+    delivered_text = _iso_seconds(delivered_at)
+    changed = conn.execute(
+        """UPDATE vip_health_check_notifications
+           SET status='delivered',claim_token='',lease_until='',last_error='',
+               delivered_at=?,updated_at=?
+           WHERE notification_id=? AND status='sending' AND claim_token=?""",
+        (
+            delivered_text,
+            delivered_text,
+            str(notification_id or "").strip(),
+            str(claim_token or "").strip(),
+        ),
+    ).rowcount
+    return changed == 1
+
+
+def release_health_check_notification(
+    conn: sqlite3.Connection,
+    *,
+    notification_id: str,
+    claim_token: str,
+    error: str,
+    released_at: datetime,
+) -> bool:
+    """LINE未接受通知時釋放lease，保留pending供後續重試。"""
+    released_text = _iso_seconds(released_at)
+    changed = conn.execute(
+        """UPDATE vip_health_check_notifications
+           SET status='pending',claim_token='',lease_until='',last_error=?,updated_at=?
+           WHERE notification_id=? AND status='sending' AND claim_token=?""",
+        (
+            str(error or "")[:500],
+            released_text,
+            str(notification_id or "").strip(),
+            str(claim_token or "").strip(),
+        ),
+    ).rowcount
+    return changed == 1
 
 
 def _json_object(value: Mapping[str, object], field: str) -> str:
@@ -1117,6 +1301,7 @@ def record_health_check_delivery_attempt(
     delivery_id, report_id, old_status, attempts, case_id, report_json = row
     if old_status == "delivered":
         return {
+            "case_id": case_id,
             "delivery_key": delivery_key,
             "report_id": report_id,
             "status": "delivered",
@@ -1203,6 +1388,7 @@ def record_health_check_delivery_attempt(
         conn.execute("RELEASE SAVEPOINT record_health_check_delivery")
         raise
     return {
+        "case_id": case_id,
         "delivery_key": delivery_key,
         "report_id": report_id,
         "status": final_status,

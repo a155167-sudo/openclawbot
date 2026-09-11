@@ -615,6 +615,10 @@ def nutrition_sheet_specs() -> dict[str, dict[str, list[list[Any]] | list[str]]]
                 "熱量kcal", "蛋白質g", "脂肪g", "碳水g", "糖g", "膳食纖維g", "鈉mg", "奶份",
                 "低脂蛋白份", "中脂蛋白份", "高脂蛋白份", "主食份", "蔬菜份", "水果份", "油脂份",
                 "來源圖片Ref", "plan_id", "確認狀態", "建立時間", "更新時間",
+                "來源類型", "驗證狀態",
+                "蛋白質份數Min", "蛋白質份數Max", "蛋白質估算Basis",
+                "主食份數Min", "主食份數Max", "主食估算Basis",
+                "蔬菜份數Min", "蔬菜份數Max", "蔬菜估算Basis",
             ],
             "seed_rows": [],
         },
@@ -769,6 +773,19 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             synced_at TEXT DEFAULT '',
             UNIQUE(entity_type, entity_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS health_check_refresh_outbox (
+            user_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','processing')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            claim_token TEXT NOT NULL DEFAULT '',
+            lease_until TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            resync_required INTEGER NOT NULL DEFAULT 0,
+            requested_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS combo_log_events (
@@ -1972,6 +1989,159 @@ def insert_approved_meal_photo_log(
     }
 
 
+def enqueue_health_check_refresh(
+    conn: sqlite3.Connection, *, user_id: str, requested_at: str
+) -> None:
+    """在主帳本交易內標記健檢投影待重建；processing期間的新變更不可遺失。"""
+    user_id = str(user_id or "").strip()
+    requested_at = str(requested_at or "").strip()
+    if not user_id or len(user_id) > 120 or not requested_at:
+        raise ValueError("健檢刷新事件無效")
+    conn.execute(
+        """INSERT INTO health_check_refresh_outbox
+           (user_id,status,attempts,claim_token,lease_until,last_error,
+            resync_required,requested_at,updated_at)
+           VALUES (?,'pending',0,'','','',0,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             status=CASE WHEN status='processing' THEN status ELSE 'pending' END,
+             resync_required=CASE WHEN status='processing' THEN 1 ELSE resync_required END,
+             requested_at=excluded.requested_at,
+             updated_at=excluded.updated_at""",
+        (user_id, requested_at, requested_at),
+    )
+
+
+def insert_customer_confirmed_meal_photo_log(
+    conn: sqlite3.Connection,
+    *,
+    token: str,
+    user_id: str,
+    consumed_at: str,
+    meal_slot: str,
+    source_image_ref: str,
+    observed_payload: Mapping[str, Any],
+    answers: Mapping[str, Any],
+    estimate: Mapping[str, Any],
+    enqueue_health_refresh: bool = False,
+) -> dict[str, Any]:
+    """建立顧客確認的正式餐點紀錄，但不冒充營養師核准。"""
+    token = str(token or "").strip()
+    user_id = str(user_id or "").strip()
+    if len(token) != 12 or any(ch not in "0123456789abcdef" for ch in token):
+        raise ValueError("餐點照片token無效")
+    if not user_id or len(user_id) > 120:
+        raise ValueError("餐點照片確認身分無效")
+
+    ranges: dict[str, Any] = {}
+    for key in ("protein_total_exchange", "starch_exchange", "vegetable_exchange"):
+        raw = estimate.get(key)
+        if raw is None:
+            ranges[key] = None
+            continue
+        if not isinstance(raw, Mapping):
+            raise ValueError("餐點照片估算範圍無效")
+        minimum = _number(raw.get("min"), f"{key}.min", max_value=100)
+        maximum = _number(raw.get("max"), f"{key}.max", max_value=100)
+        basis = str(raw.get("basis") or "").strip()
+        if maximum < minimum or basis not in {
+            "hand_portion_range_v1", "user_confirmed_none",
+        }:
+            raise ValueError("餐點照片估算範圍無效")
+        if basis == "user_confirmed_none" and (minimum != 0 or maximum != 0):
+            raise ValueError("餐點照片零份確認無效")
+        ranges[key] = {"min": minimum, "max": maximum, "basis": basis}
+
+    created_at = utcish_now()
+    estimate_snapshot = {
+        **ranges,
+        "cooking_oil_confirmation": estimate.get("cooking_oil_confirmation"),
+        "sauce_confirmation": estimate.get("sauce_confirmation"),
+        "calories_kcal": None,
+        "protein_g": None,
+        "fat_g": None,
+        "carbohydrate_g": None,
+        "_review_status": "customer_confirmed_ai_estimate",
+        "_rule_version": "hand-portion-range-v1",
+        "_source_type": "meal_photo",
+        "_warnings": ["calories_and_macros_na", "not_dietitian_approved"],
+    }
+    estimate_json = json.dumps(
+        estimate_snapshot, ensure_ascii=False, sort_keys=True, allow_nan=False
+    )
+    nutrition_json = json.dumps(
+        {
+            "calories_kcal": None,
+            "protein_g": None,
+            "fat_g": None,
+            "carbohydrate_g": None,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    identity = json.dumps(
+        {
+            "source_type": "meal_photo", "token": token, "user_id": user_id,
+            "observed_payload": dict(observed_payload or {}),
+            "answers": dict(answers or {}),
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    )
+    fingerprint = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    visible_names = [
+        str(item.get("name") or "").strip()
+        for item in list((observed_payload or {}).get("visible_items") or [])[:4]
+        if isinstance(item, Mapping) and str(item.get("name") or "").strip()
+    ]
+    product_name = "餐點照片" + ("：" + "、".join(visible_names) if visible_names else "")
+    food_id = new_id("food")
+    log_id = new_id("log")
+    image_ref = str(source_image_ref or "")[:240]
+    conn.execute(
+        """INSERT INTO food_catalog
+           (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+            package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+            exchange_json,exchange_review_status,fingerprint,original_image_ref,
+            recognition_confidence,verification_status,created_at,updated_at)
+           VALUES (?,?, '', '', 'user_meal_photo',?,'private',1,'meal',1,'{}','{}',
+                   ?,'not_required',?,?,0,'user_confirmed_ai_estimate',?,?)""",
+        (
+            food_id, product_name[:160], user_id, estimate_json, fingerprint,
+            image_ref, created_at, created_at,
+        ),
+    )
+    conn.execute(
+        """INSERT INTO food_logs
+           (log_id,user_id,food_id,consumed_at,meal_slot,consumed_servings,
+            consumed_amount,consumed_unit,nutrition_snapshot_json,exchange_snapshot_json,
+            approved_exchange_json,exchange_approval_id,source_image_ref,plan_id,
+            plan_link_status,confirmation_status,legacy_applied_at,created_at,updated_at)
+           VALUES (?,?,?,?,?,1,1,'meal',?,?,'{}','',?,'','pending','confirmed',
+                   'not_applicable',?,?)""",
+        (
+            log_id, user_id, food_id, str(consumed_at or created_at)[:50],
+            str(meal_slot or "")[:30], nutrition_json, estimate_json, image_ref,
+            created_at, created_at,
+        ),
+    )
+    for entity_type, entity_id in (("food", food_id), ("food_log", log_id)):
+        conn.execute(
+            """INSERT OR IGNORE INTO nutrition_sheet_outbox
+               (outbox_id,entity_type,entity_id,status,attempts,last_error,created_at,synced_at)
+               VALUES (?,?,?,'pending',0,'',?,'')""",
+            (new_id("outbox"), entity_type, entity_id, created_at),
+        )
+    if enqueue_health_refresh:
+        enqueue_health_check_refresh(
+            conn, user_id=user_id, requested_at=created_at
+        )
+    return {
+        "food_id": food_id, "log_id": log_id, "product_name": product_name[:160],
+        "estimate": estimate_snapshot,
+    }
+
+
 def quick_log_from_catalog(
     conn: sqlite3.Connection,
     *,
@@ -2432,7 +2602,8 @@ def daily_food_summary(
         SELECT l.consumed_at,f.product_name,l.nutrition_snapshot_json,
                l.exchange_approval_id,a.food_fingerprint,a.suggestion_rule_version,
                a.approved_exchange_json,a.approved_exchange_hash,f.fingerprint,
-               l.approved_exchange_json,l.consumed_servings
+               l.approved_exchange_json,l.consumed_servings,
+               f.source_type,f.verification_status
         FROM food_logs l
         JOIN food_catalog f ON f.food_id=l.food_id
         LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
@@ -2447,7 +2618,7 @@ def daily_food_summary(
     for (
         consumed_at, product_name, nutrition_json, approval_id, approval_fingerprint,
         rule_version, approved_json, approval_hash, food_fingerprint_value,
-        applied_json, consumed_servings,
+        applied_json, consumed_servings, source_type, verification_status,
     ) in rows:
         nutrition = json.loads(nutrition_json or "{}")
         try:
@@ -2464,8 +2635,16 @@ def daily_food_summary(
                 "time": consumed_time,
                 "consumed_at": consumed_at,
                 "name": product_name,
-                "calories_kcal": float(nutrition.get("calories_kcal", 0) or 0),
-                "protein_g": float(nutrition.get("protein_g", 0) or 0),
+                "calories_kcal": (
+                    None
+                    if nutrition.get("calories_kcal") is None
+                    else float(nutrition["calories_kcal"])
+                ),
+                "protein_g": (
+                    None
+                    if nutrition.get("protein_g") is None
+                    else float(nutrition["protein_g"])
+                ),
             }
         )
         valid_approval = False
@@ -2487,7 +2666,11 @@ def daily_food_summary(
                 abs(float(applied_data.get(key, 0) or 0) - value) <= 0.0001
                 for key, value in expected_applied.items()
             )
-        if not valid_approval:
+        customer_estimate_accepted = (
+            source_type == "user_meal_photo"
+            and verification_status == "user_confirmed_ai_estimate"
+        )
+        if not valid_approval and not customer_estimate_accepted:
             pending_reviews += 1
     return {
         "foods": foods,

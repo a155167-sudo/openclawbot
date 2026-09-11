@@ -12,7 +12,11 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
-from nutrition_system import ensure_nutrition_schema, insert_approved_meal_photo_log
+from nutrition_system import (
+    ensure_nutrition_schema,
+    insert_approved_meal_photo_log,
+    insert_customer_confirmed_meal_photo_log,
+)
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
@@ -672,7 +676,7 @@ def _estimate_from_answers(answers: Mapping[str, Any]) -> dict[str, Any]:
         "vegetable_exchange": _range_value("vegetable_portion", answers.get("vegetable_portion")),
         "cooking_oil_confirmation": answers.get("cooking_oil"),
         "sauce_confirmation": answers.get("sauce_level"),
-        "formal_status": "pending_review_not_counted",
+        "formal_status": "customer_confirmed_ai_estimate",
         "rule_version": "hand-portion-range-v1",
     }
 
@@ -687,9 +691,11 @@ def apply_meal_photo_action(
     action: str,
     field: str = "",
     value: str = "",
+    enqueue_health_refresh: bool = False,
 ) -> dict[str, Any]:
     """以durable event與版本鎖原子套用LINE Postback；重送回傳原result。"""
     ensure_meal_photo_schema(conn)
+    ensure_nutrition_schema(conn)
     event_id = _short_text(event_id, "event_id", maximum=180)
     user_id = _short_text(user_id, "user_id", maximum=120)
     if not re.fullmatch(r"[0-9a-f]{12}", str(token or "")):
@@ -751,7 +757,7 @@ def apply_meal_photo_action(
             }
         row = conn.execute(
             """SELECT answers_json,status,expires_at,version,source_image_ref,
-                      observed_payload_json
+                      observed_payload_json,meal_slot,consumed_at
                FROM pending_meal_photo_drafts WHERE token=? AND user_id=?""",
             (token, user_id),
         ).fetchone()
@@ -771,6 +777,7 @@ def apply_meal_photo_action(
             raise ValueError("餐點確認畫面已更新，請使用最新按鈕")
         next_version = current_version + 1
         now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
+        formal_result: dict[str, Any] = {}
         if action == "cancel":
             result = {
                 "kind": "cancel", "version": next_version, "source_image_ref": row[4],
@@ -858,9 +865,22 @@ def apply_meal_photo_action(
             step = next_meal_photo_step({"answers": answers})
             if step == "complete":
                 estimate = _estimate_from_answers(answers)
-                status = "estimated"
+                formal_result = insert_customer_confirmed_meal_photo_log(
+                    conn,
+                    token=token,
+                    user_id=user_id,
+                    consumed_at=str(row[7] or ""),
+                    meal_slot=str(row[6] or ""),
+                    source_image_ref=str(row[4] or ""),
+                    observed_payload=json.loads(row[5] or "{}"),
+                    answers=answers,
+                    estimate=estimate,
+                    enqueue_health_refresh=enqueue_health_refresh,
+                )
+                status = "confirmed"
                 result = {
-                    "kind": "estimate", "version": next_version, "estimate": estimate,
+                    "kind": "confirmed", "version": next_version, "estimate": estimate,
+                    "log_id": formal_result["log_id"],
                 }
             else:
                 estimate = {}
@@ -868,13 +888,14 @@ def apply_meal_photo_action(
                 result = {"kind": "question", "step": step, "version": next_version}
             changed = conn.execute(
                 """UPDATE pending_meal_photo_drafts
-                   SET answers_json=?,estimate_json=?,status=?,updated_at=?,version=?
+                   SET answers_json=?,estimate_json=?,status=?,approved_log_id=?,updated_at=?,version=?
                    WHERE token=? AND user_id=? AND version=?
                      AND status IN ('awaiting_confirmation','confirming')""",
                 (
                     json.dumps(answers, ensure_ascii=False, sort_keys=True, allow_nan=False),
                     json.dumps(estimate, ensure_ascii=False, sort_keys=True, allow_nan=False),
-                    status, now, next_version, token, user_id, current_version,
+                    status, formal_result.get("log_id", ""), now, next_version,
+                    token, user_id, current_version,
                 ),
             ).rowcount
         if changed != 1:
@@ -1253,6 +1274,45 @@ def build_meal_photo_estimate_bubble(
             }],
         }
     return bubble
+
+
+def build_meal_photo_confirmed_bubble(draft: Mapping[str, Any]) -> dict[str, Any]:
+    """顯示顧客已確認入帳的AI區間估算，不提供逐筆審核按鈕。"""
+    estimate = dict(draft.get("estimate") or {})
+    if draft.get("status") != "confirmed" or not draft.get("approved_log_id") or not estimate:
+        raise ValueError("餐點照片尚未完成顧客確認")
+    line = lambda text, color="#333333", size="sm": {
+        "type": "text", "text": text, "wrap": True, "size": size, "color": color,
+    }
+    oil_text = {
+        "none": "沒有／水煮蒸烤", "light": "少油", "normal": "一般用油",
+        "heavy": "多油／油炸", "unknown": "NA（不確定）",
+    }.get(str(estimate.get("cooking_oil_confirmation") or ""), "NA（待確認）")
+    sauce_text = {
+        "none": "沒有", "little": "少量", "half": "約一半",
+        "all": "全部", "unknown": "NA（不確定）",
+    }.get(str(estimate.get("sauce_confirmation") or ""), "NA（不確定）")
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": "#E8F5E9",
+            "contents": [line("✅ 已記錄｜顧客確認／AI估算", "#176B3A", "md")],
+        },
+        "body": {
+            "type": "box", "layout": "vertical", "spacing": "md",
+            "contents": [
+                line("這筆餐點已直接加入正式飲食紀錄。"),
+                line("熱量：NA（沒有營養標示，無法精確判定）", "#B00020"),
+                line(_format_exchange_range(estimate.get("starch_exchange"), "主食")),
+                line(_format_exchange_range(estimate.get("protein_total_exchange"), "蛋白質食物")),
+                line(_format_exchange_range(estimate.get("vegetable_exchange"), "蔬菜")),
+                line(f"烹調用油：{oil_text}（顧客確認）"),
+                line(f"湯汁／醬汁：{sauce_text}（顧客確認）"),
+                line("營養師會在三日健檢工作台整體查看，不需逐筆等待核准。", "#176B3A"),
+                line("未知維持NA；此紀錄不代表營養師已核准。", "#777777", "xs"),
+            ],
+        },
+    }
 
 
 def build_meal_photo_confirmation_bubble(
