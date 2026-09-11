@@ -89,3 +89,18 @@ def test_liff_fetches_case_bound_photos_as_ephemeral_blobs_and_degrades_safely()
     assert "source_image_ref" not in script
     assert "innerHTML" not in script
     assert "photo-grid" in page
+
+
+def test_liff_distinguishes_referenced_sources_from_currently_verifiable_snapshots():
+    from dietitian_health_check_liff import attach_dietitian_health_check_liff_routes
+
+    app = FastAPI()
+    attach_dietitian_health_check_liff_routes(app, _config())
+    script = TestClient(app).get("/dietitian-health-check/app.js").text
+
+    assert "source_integrity" in script
+    assert "referenced_count" in script
+    assert "available_snapshot_count" in script
+    assert "已引用" in script
+    assert "目前可驗證" in script
+    assert "不代表有效日歸零" in script

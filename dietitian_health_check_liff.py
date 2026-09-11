@@ -101,7 +101,13 @@ function renderCase(item,detail,generation,signal){{
   card.append(days);
   const sources=(detail&&detail.source_logs)||[];
   const sourceCount=sources.length;
-  card.append(node('div',`來源餐點：${{sourceCount}} 筆`,'meta'));
+  const integrity=(detail&&detail.source_integrity)||{{}};
+  const referencedCount=Number.isSafeInteger(integrity.referenced_count)?integrity.referenced_count:sourceCount;
+  const availableCount=Number.isSafeInteger(integrity.available_snapshot_count)?integrity.available_snapshot_count:sourceCount;
+  card.append(node('div',`來源餐點：已引用 ${{referencedCount}} 筆｜目前可驗證 ${{availableCount}} 筆`,'meta'));
+  if(integrity.all_snapshots_available===false){{
+    card.append(node('div','部分來源快照目前未通過完整性驗證，或已於報告送達後依保留政策清除；系統不顯示未驗證內容，且不代表有效日歸零。','error'));
+  }}
   const disclosure=node('details');
   disclosure.append(node('summary','查看去識別化來源與營養快照'));
   const photoGrid=node('div',undefined,'photo-grid');

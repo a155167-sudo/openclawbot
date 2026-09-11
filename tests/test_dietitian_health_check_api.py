@@ -564,6 +564,29 @@ def test_projection_never_substitutes_mutated_log_for_snapshotted_version(tmp_pa
     assert "CURRENT-MUTATED" not in json.dumps(detail)
 
 
+def test_projection_reports_reference_count_after_retention_clears_image_ref(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+
+    path = _populated_db(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE vip_health_check_cases SET status='delivered' WHERE case_id='case-1'"
+        )
+        conn.execute(
+            "UPDATE food_logs SET source_image_ref='' WHERE log_id='log-owned'"
+        )
+        detail = load_health_check_detail(conn, case_id="case-1")
+
+    assert detail is not None
+    assert detail["valid_day_count"] == 3
+    assert detail["source_logs"] == []
+    assert detail["source_integrity"] == {
+        "referenced_count": 1,
+        "available_snapshot_count": 0,
+        "all_snapshots_available": False,
+    }
+
+
 def test_projection_verifies_source_hash_even_when_writer_failed_to_increment_version(tmp_path):
     from dietitian_health_check_api import load_health_check_detail
 
