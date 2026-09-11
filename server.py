@@ -103,6 +103,13 @@ from meal_photo_system import (
     save_meal_photo_draft,
 )
 from customer_health_check_liff import attach_customer_health_check_routes
+from dietitian_health_check_command import (
+    build_dietitian_health_check_flex,
+    is_authorized_dietitian_health_check_command,
+    is_dietitian_health_check_command_intent,
+    load_dietitian_health_check_command_allowed_uids,
+    load_dietitian_health_check_command_liff_id,
+)
 from vip_health_check import (
     configure_vip_health_check_connection,
     create_first_vip_health_check_case,
@@ -123,6 +130,12 @@ SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
 SURVEY_REWARD_LINK_COUNT = APP_SETTINGS.survey_reward_link_count
 SURVEY_REWARD_POINTS_PER_LINK = APP_SETTINGS.survey_reward_points_per_link
 VIP_HEALTH_CHECK_ENABLED = is_vip_health_check_enabled()
+DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID = (
+    load_dietitian_health_check_command_liff_id(os.environ)
+)
+DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS = (
+    load_dietitian_health_check_command_allowed_uids(os.environ)
+)
 
 
 def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
@@ -11687,7 +11700,22 @@ def _handle_message_impl(event):
         processed_messages.clear()
     processed_messages.add(msg_id)
 
-    msg, uid = event.message.text.strip(), event.source.user_id
+    raw_msg = event.message.text
+    msg, uid = raw_msg.strip(), event.source.user_id
+
+    if is_authorized_dietitian_health_check_command(
+        uid,
+        raw_msg,
+        allowed_uids=DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS,
+        liff_id=DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID,
+    ):
+        line_bot_api.reply_message(
+            event.reply_token,
+            build_dietitian_health_check_flex(
+                DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID
+            ),
+        )
+        return
 
     # 飲食帳本編輯的文字輸入（營養數值、修改品項、私人食品名稱）優先於 AI 對話。
     ledger_state = get_daily_food_edit_state(uid)
@@ -13850,8 +13878,18 @@ def _handle_message_impl(event):
 def handle_message(event):
     message_id = str(event.message.id)
     try:
-        message = event.message.text.strip()
+        raw_message = event.message.text
         user_id = event.source.user_id
+        if is_dietitian_health_check_command_intent(raw_message):
+            if is_authorized_dietitian_health_check_command(
+                user_id,
+                raw_message,
+                allowed_uids=DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS,
+                liff_id=DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID,
+            ):
+                return _handle_message_impl(event)
+            return
+        message = raw_message.strip()
         if not has_active_vip_access(user_id) and not is_text_command_allowed_without_vip(
             user_id, message
         ):
