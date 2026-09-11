@@ -2961,12 +2961,12 @@ def get_dietitian_health_check_photo(case_id: str, log_id: str):
         or not isinstance(nutrition_snapshot_json, str)
     ):
         return None
+    image_ref = str(image_ref or "")
     expected_hash = canonical_food_log_source_hash(
-        log_id, source_version, nutrition_snapshot_json
+        log_id, source_version, nutrition_snapshot_json, image_ref
     )
     if not hmac.compare_digest(expected_hash, source_hash):
         return None
-    image_ref = str(image_ref or "")
     image_file = _open_nutrition_image_readonly(image_ref)
     if image_file is None:
         return None
@@ -9739,10 +9739,7 @@ def _authorize_meal_photo_image_request(
     expected_extension = "jpg" if preview or source_extension == "webp" else source_extension
     if extension != expected_extension:
         raise HTTPException(status_code=404, detail="image not found")
-    path = _nutrition_image_path(image_ref)
-    if not path or not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="image not found")
-    return path
+    return image_ref, source_extension
 
 
 def _meal_photo_preview_response(path):
@@ -9780,20 +9777,30 @@ def _meal_photo_preview_response(path):
 
 @app.get("/meal-photo-image/{token}.{extension}")
 def get_meal_photo_image(token: str, extension: str, expires: int, sig: str, preview: bool = False):
-    path = _authorize_meal_photo_image_request(
+    image_ref, source_extension = _authorize_meal_photo_image_request(
         token=token,
         extension=extension,
         expires=expires,
         signature=sig,
         preview=preview,
     )
-    if preview or path.lower().endswith(".webp"):
-        return _meal_photo_preview_response(path)
+    image_file = _open_nutrition_image_readonly(image_ref)
+    if image_file is None:
+        raise HTTPException(status_code=404, detail="image not found")
+    with image_file:
+        if preview or source_extension == "webp":
+            return _meal_photo_preview_response(image_file)
+        data = image_file.read(10 * 1024 * 1024 + 1)
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="image too large")
     media_type = "image/jpeg" if extension == "jpg" else "image/png"
-    return FileResponse(
-        path,
+    return Response(
+        content=data,
         media_type=media_type,
-        headers={"Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"},
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -10110,7 +10117,7 @@ def cleanup_nutrition_images():
                 ):
                     continue
                 actual_hash = canonical_food_log_source_hash(
-                    log_id, source_version, nutrition_snapshot_json
+                    log_id, source_version, nutrition_snapshot_json, ref
                 )
                 if not hmac.compare_digest(actual_hash, source_hash):
                     continue
@@ -10183,7 +10190,10 @@ def cleanup_nutrition_images():
                 or not isinstance(nutrition_snapshot_json, str)
                 or not hmac.compare_digest(
                     canonical_food_log_source_hash(
-                        candidate["log_id"], source_version, nutrition_snapshot_json
+                        candidate["log_id"],
+                        source_version,
+                        nutrition_snapshot_json,
+                        ref,
                     ),
                     source_hash,
                 )
@@ -10436,9 +10446,7 @@ def handle_image_message(event):
                         source_image_ref = refreshed[0] if refreshed else ""
                 if not source_image_ref:
                     raise RuntimeError("無法保留營養圖片參照")
-                image_path = _nutrition_image_path(source_image_ref)
-                if not image_path or not os.path.exists(image_path):
-                    _store_nutrition_image(image_bytes, extension, source_image_ref)
+                _store_nutrition_image(image_bytes, extension, source_image_ref)
             if staged["needs_identity"]:
                 line_bot_api.reply_message(
                     event.reply_token,
@@ -10526,11 +10534,7 @@ def handle_image_message(event):
                 )
                 draft = get_meal_photo_draft(conn, user_id=uid, token=token)
             source_image_ref = draft["source_image_ref"]
-            image_path = _nutrition_image_path(source_image_ref)
-            if not image_path:
-                raise RuntimeError("餐點圖片參照無效")
-            if not os.path.exists(image_path):
-                _store_nutrition_image(image_bytes, extension, source_image_ref)
+            _store_nutrition_image(image_bytes, extension, source_image_ref)
             from linebot.models import FlexSendMessage
             line_bot_api.reply_message(
                 event.reply_token,

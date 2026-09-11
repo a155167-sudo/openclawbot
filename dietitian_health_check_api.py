@@ -382,9 +382,12 @@ def _source_hash_matches(log: sqlite3.Row) -> bool:
     ):
         return False
     raw_nutrition = log["nutrition_snapshot_json"]
-    if not isinstance(raw_nutrition, str):
+    source_image_ref = log["source_image_ref"]
+    if not isinstance(raw_nutrition, str) or not isinstance(source_image_ref, str):
         return False
-    actual = canonical_food_log_source_hash(log_id, version, raw_nutrition)
+    actual = canonical_food_log_source_hash(
+        log_id, version, raw_nutrition, source_image_ref
+    )
     return hmac.compare_digest(actual, expected)
 
 
@@ -629,7 +632,7 @@ def load_health_check_detail(
     referenced_count = len(source_refs)
     logs = conn.execute(
         """SELECT fl.log_id,sr.food_log_version,sr.source_hash,
-                  fl.nutrition_snapshot_json
+                  fl.nutrition_snapshot_json,fl.source_image_ref
            FROM vip_health_check_source_refs sr
            JOIN vip_health_check_cases c ON c.case_id=sr.case_id
            JOIN food_logs fl ON fl.log_id=sr.food_log_id AND fl.user_id=c.user_id

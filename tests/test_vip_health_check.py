@@ -867,6 +867,7 @@ def _create_minimal_food_ledger(conn):
             consumed_at TEXT NOT NULL,
             meal_slot TEXT DEFAULT '',
             nutrition_snapshot_json TEXT NOT NULL,
+            source_image_ref TEXT NOT NULL DEFAULT '',
             confirmation_status TEXT NOT NULL DEFAULT 'confirmed',
             version INTEGER NOT NULL DEFAULT 1,
             deleted_at TEXT NOT NULL DEFAULT ''

@@ -17,7 +17,9 @@ DIETITIAN_UID = "U1234567890abcdef1234567890abcdef"
 OTHER_UID = "Uabcdef1234567890abcdef1234567890"
 CUSTOMER_UID = "U11111111111111111111111111111111"
 NOW = 1_789_056_000
-SOURCE_HASH = hashlib.sha256(b'log-owned:3:{"calories_kcal":500}').hexdigest()
+SOURCE_HASH = hashlib.sha256(
+    b'log-owned:3:{"calories_kcal":500}:private-image'
+).hexdigest()
 VALID_DAY_ROWS = (
     ("2026-09-02", "v1", 2, "qualified"),
     ("2026-09-03", "v1", 2, "qualified"),
@@ -548,7 +550,7 @@ def test_json_projection_allowlists_domain_fields_and_strips_nested_identifiers(
         sort_keys=True,
     )
     source_hash = hashlib.sha256(
-        f"log-owned:3:{nutrition_payload}".encode()
+        f"log-owned:3:{nutrition_payload}:private-image".encode()
     ).hexdigest()
     bound_manifest = _manifest_for_source_hash(source_hash)
     with sqlite3.connect(path) as conn:

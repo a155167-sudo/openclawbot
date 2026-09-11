@@ -60,7 +60,7 @@ def _seed(path):
             (
                 CASE_ID,
                 LOG_ID,
-                server.canonical_food_log_source_hash(LOG_ID, 1, NUTRITION_JSON),
+                server.canonical_food_log_source_hash(LOG_ID, 1, NUTRITION_JSON, IMAGE_REF),
             ),
         )
         conn.execute(
@@ -71,6 +71,16 @@ def _seed(path):
             "INSERT INTO pending_meal_photo_drafts VALUES ('draft-photo',?,?, 'approved',?)",
             (OWNER_UID, IMAGE_REF, LOG_ID),
         )
+
+
+def test_canonical_source_hash_binds_image_reference():
+    original = server.canonical_food_log_source_hash(
+        LOG_ID, 1, NUTRITION_JSON, IMAGE_REF
+    )
+    replacement = server.canonical_food_log_source_hash(
+        LOG_ID, 1, NUTRITION_JSON, OTHER_IMAGE_REF
+    )
+    assert original != replacement
 
 
 def test_dietitian_photo_loader_is_case_owner_and_approval_bound(tmp_path, monkeypatch):
@@ -107,7 +117,7 @@ def test_dietitian_photo_loader_is_case_owner_and_approval_bound(tmp_path, monke
         conn.execute(
             "UPDATE vip_health_check_source_refs SET source_hash=? WHERE food_log_id=?",
             (
-                server.canonical_food_log_source_hash(LOG_ID, 1, NUTRITION_JSON),
+                server.canonical_food_log_source_hash(LOG_ID, 1, NUTRITION_JSON, IMAGE_REF),
                 LOG_ID,
             ),
         )
@@ -122,7 +132,21 @@ def test_dietitian_photo_loader_is_case_owner_and_approval_bound(tmp_path, monke
     with sqlite3.connect(db) as conn:
         conn.execute(
             "UPDATE pending_meal_photo_drafts SET source_image_ref=? WHERE token='draft-photo'",
+            (OTHER_IMAGE_REF,),
+        )
+        conn.execute(
+            "UPDATE food_logs SET source_image_ref=? WHERE log_id=?",
+            (OTHER_IMAGE_REF, LOG_ID),
+        )
+    assert server.get_dietitian_health_check_photo(CASE_ID, LOG_ID) is None
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET source_image_ref=? WHERE token='draft-photo'",
             (IMAGE_REF,),
+        )
+        conn.execute(
+            "UPDATE food_logs SET source_image_ref=? WHERE log_id=?",
+            (IMAGE_REF, LOG_ID),
         )
 
     with sqlite3.connect(db) as conn:

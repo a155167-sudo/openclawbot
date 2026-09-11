@@ -666,11 +666,12 @@ def _canonical_json_text(value: str) -> str:
 
 
 def canonical_food_log_source_hash(
-    log_id: str, version: int, nutrition_snapshot_json: str
+    log_id: str, version: int, nutrition_snapshot_json: str, source_image_ref: str
 ) -> str:
     """Return the immutable hash used by canonical health-check source refs."""
     source_material = (
-        f"{log_id}:{version}:{_canonical_json_text(nutrition_snapshot_json)}"
+        f"{log_id}:{version}:{_canonical_json_text(nutrition_snapshot_json)}:"
+        f"{str(source_image_ref or '')}"
     )
     return hashlib.sha256(source_material.encode("utf-8")).hexdigest()
 
@@ -712,7 +713,8 @@ def refresh_case_source_manifest(
         window_start = _parse_ledger_time(window_start_text)
         window_end = _parse_ledger_time(window_end_text)
         rows = conn.execute(
-            """SELECT log_id,consumed_at,meal_slot,nutrition_snapshot_json,version
+            """SELECT log_id,consumed_at,meal_slot,nutrition_snapshot_json,version,
+                      source_image_ref
                FROM food_logs
                WHERE user_id=? AND confirmation_status='confirmed'
                  AND COALESCE(deleted_at,'')=''""",
@@ -721,7 +723,14 @@ def refresh_case_source_manifest(
 
         included: list[dict[str, object]] = []
         by_date: dict[str, list[dict[str, object]]] = defaultdict(list)
-        for log_id, consumed_at, meal_slot, nutrition_snapshot_json, version in rows:
+        for (
+            log_id,
+            consumed_at,
+            meal_slot,
+            nutrition_snapshot_json,
+            version,
+            source_image_ref,
+        ) in rows:
             local_time = _parse_ledger_time(consumed_at)
             if not window_start <= local_time < window_end:
                 continue
@@ -733,7 +742,7 @@ def refresh_case_source_manifest(
                 "local_date": local_date,
                 "meal_slot": str(meal_slot or ""),
                 "source_hash": canonical_food_log_source_hash(
-                    log_id, version, nutrition_snapshot_json
+                    log_id, version, nutrition_snapshot_json, source_image_ref
                 ),
             }
             included.append(item)

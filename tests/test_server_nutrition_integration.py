@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from PIL import Image
 
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
 os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
@@ -1825,7 +1826,9 @@ def test_ninety_day_cleanup_clears_approved_draft_log_and_catalog_refs(tmp_path,
             (
                 log_id,
                 version,
-                server.canonical_food_log_source_hash(log_id, version, nutrition_json),
+                server.canonical_food_log_source_hash(
+                    log_id, version, nutrition_json, ref
+                ),
             ),
         )
 
@@ -1898,7 +1901,7 @@ def test_delivered_health_check_photo_cleanup_is_delete_first_and_retryable(tmp_
             (log_id,),
         ).fetchone()
         source_hash = server.canonical_food_log_source_hash(
-            log_id, log_row[1], log_row[0]
+            log_id, log_row[1], log_row[0], ref
         )
         conn.execute(
             "UPDATE pending_meal_photo_drafts SET status='approved',approved_log_id=? WHERE token=?",
@@ -4449,7 +4452,10 @@ def test_meal_photo_image_url_is_signed_expiring_and_bound_to_variant(tmp_path, 
         preview=True,
         now=1_800_000_001,
     )
-    assert resolved == str(image_path)
+    assert resolved == (
+        "nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg",
+        "jpg",
+    )
     with pytest.raises(server.HTTPException) as tampered:
         server._authorize_meal_photo_image_request(
             token=token,
@@ -4521,6 +4527,49 @@ def test_meal_photo_image_url_is_signed_expiring_and_bound_to_variant(tmp_path, 
             now=1_800_000_001,
         )
     assert cancelled.value.status_code == 410
+
+
+def test_meal_photo_image_route_rejects_final_file_symlink(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-image-symlink.db"
+    image_root = tmp_path / "nutrition_images"
+    outside_root = tmp_path / "outside"
+    image_root.mkdir()
+    outside_root.mkdir()
+    outside_image = outside_root / "private.jpg"
+    Image.new("RGB", (40, 30), "red").save(outside_image, format="JPEG")
+    stored_name = "a" * 32 + ".jpg"
+    (image_root / stored_name).symlink_to(outside_image)
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "MEAL_PHOTO_IMAGE_SECRET", "s" * 32)
+    now = int(server.tw_now().timestamp())
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn,
+            user_id="U_CUSTOMER",
+            source_message_id="M_SYMLINK_IMAGE",
+            payload=meal_photo_payload(),
+            source_image_ref=f"nutrition-image:{stored_name}",
+        )
+        conn.execute(
+            """UPDATE pending_meal_photo_drafts SET status='estimated',expires_at=?
+               WHERE token=?""",
+            (datetime.fromtimestamp(now + 1_200, timezone.utc).isoformat(), token),
+        )
+        conn.commit()
+    expires = now + 600
+    signature = server._meal_photo_image_signature(token, "jpg", expires, False)
+
+    with pytest.raises(server.HTTPException) as blocked:
+        server.get_meal_photo_image(
+            token=token,
+            extension="jpg",
+            expires=expires,
+            sig=signature,
+            preview=False,
+        )
+
+    assert blocked.value.status_code == 404
 
 
 def test_owner_notification_retries_after_failure_and_then_deduplicates(tmp_path, monkeypatch):
