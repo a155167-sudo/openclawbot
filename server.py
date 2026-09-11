@@ -103,6 +103,12 @@ from meal_photo_system import (
     save_meal_photo_draft,
 )
 from customer_health_check_liff import attach_customer_health_check_routes
+from dietitian_health_check_api import (
+    attach_dietitian_health_check_routes,
+    load_dietitian_health_check_config,
+    load_health_check_detail,
+    load_health_check_list,
+)
 from dietitian_health_check_command import (
     build_dietitian_health_check_flex,
     is_authorized_dietitian_health_check_command,
@@ -130,6 +136,7 @@ SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
 SURVEY_REWARD_LINK_COUNT = APP_SETTINGS.survey_reward_link_count
 SURVEY_REWARD_POINTS_PER_LINK = APP_SETTINGS.survey_reward_points_per_link
 VIP_HEALTH_CHECK_ENABLED = is_vip_health_check_enabled()
+DIETITIAN_HEALTH_CHECK_CONFIG = load_dietitian_health_check_config(os.environ)
 DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID = (
     load_dietitian_health_check_command_liff_id(os.environ)
 )
@@ -2833,6 +2840,25 @@ def get_vip_health_check_state_for_user(user_id: str):
         return get_customer_health_check_state(conn, user_id=user_id)
 
 
+def _open_read_only_database():
+    database_uri = Path(DB_PATH).resolve().as_uri() + "?mode=ro"
+    return sqlite3.connect(database_uri, uri=True)
+
+
+def list_dietitian_health_checks(*, statuses, limit: int, offset: int):
+    """Read the canonical dietitian queue without migrations or file creation."""
+    with closing(_open_read_only_database()) as conn:
+        return load_health_check_list(
+            conn, statuses=statuses, limit=limit, offset=offset
+        )
+
+
+def get_dietitian_health_check(case_id: str):
+    """Read one canonical health-check case without mutating its database."""
+    with closing(_open_read_only_database()) as conn:
+        return load_health_check_detail(conn, case_id=case_id)
+
+
 def register_customer_health_check_liff(target_app=app):
     return attach_customer_health_check_routes(
         target_app,
@@ -2843,6 +2869,18 @@ def register_customer_health_check_liff(target_app=app):
 
 
 register_customer_health_check_liff()
+
+
+def register_dietitian_health_check_api(target_app=app):
+    return attach_dietitian_health_check_routes(
+        target_app,
+        config=DIETITIAN_HEALTH_CHECK_CONFIG,
+        list_loader=list_dietitian_health_checks,
+        detail_loader=get_dietitian_health_check,
+    )
+
+
+register_dietitian_health_check_api()
 
 
 def init_db():
