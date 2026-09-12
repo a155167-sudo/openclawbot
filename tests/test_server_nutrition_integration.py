@@ -1895,21 +1895,60 @@ def test_failed_image_delete_keeps_reference_for_retry(tmp_path, monkeypatch):
         token = save_pending_label(conn, user_id="U1", payload=valid_label(), source_image_ref=ref)
         conn.execute("UPDATE pending_nutrition_logs SET expires_at='2000-01-01T00:00:00+08:00' WHERE token=?", (token,))
         conn.commit()
-    original_remove = server.os.remove
+    original_unlink = server.safe_unlink_nutrition_image
 
-    def fail_remove(_):
+    def fail_unlink(_root, _ref):
         raise OSError("busy")
 
-    monkeypatch.setattr(server.os, "remove", fail_remove)
+    monkeypatch.setattr(server, "safe_unlink_nutrition_image", fail_unlink)
     server.cleanup_nutrition_images()
     with sqlite3.connect(db) as conn:
         retained = conn.execute("SELECT source_image_ref FROM pending_nutrition_logs WHERE token=?", (token,)).fetchone()[0]
     assert retained == ref
-    monkeypatch.setattr(server.os, "remove", original_remove)
+    monkeypatch.setattr(server, "safe_unlink_nutrition_image", original_unlink)
     server.cleanup_nutrition_images()
     with sqlite3.connect(db) as conn:
         cleared = conn.execute("SELECT source_image_ref FROM pending_nutrition_logs WHERE token=?", (token,)).fetchone()[0]
     assert cleared == ""
+
+
+@pytest.mark.parametrize(
+    ("root_state", "leaf_state", "expected"),
+    [
+        ("missing", "missing", False),
+        ("directory", "regular", True),
+        ("directory", "missing", True),
+        ("directory", "symlink", False),
+        ("symlink", "regular", False),
+    ],
+)
+def test_delete_nutrition_image_uses_no_follow_root_and_leaf_semantics(
+    tmp_path, monkeypatch, root_state, leaf_state, expected
+):
+    root = tmp_path / "nutrition_images"
+    external = tmp_path / "external"
+    external.mkdir()
+    ref = "nutrition-image:" + "a" * 32 + ".jpg"
+    filename = ref.removeprefix("nutrition-image:")
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"outside")
+    if root_state == "directory":
+        root.mkdir()
+        if leaf_state == "regular":
+            (root / filename).write_bytes(b"inside")
+        elif leaf_state == "symlink":
+            (root / filename).symlink_to(outside)
+    elif root_state == "symlink":
+        (external / filename).write_bytes(b"external")
+        root.symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+
+    assert server._delete_nutrition_image(ref) is expected
+    assert outside.read_bytes() == b"outside"
+    if root_state == "symlink":
+        assert (external / filename).read_bytes() == b"external"
+    if leaf_state == "symlink":
+        assert (root / filename).is_symlink()
 
 
 def test_awaiting_identity_expiration_deletes_stored_back_image(tmp_path, monkeypatch):
@@ -2056,7 +2095,7 @@ def test_nutrition_cleanup_is_registered_hourly():
     )]
 
 
-def test_confirmed_image_cleanup_requeues_sheet_updates(tmp_path, monkeypatch):
+def test_confirmed_label_reference_protects_90_day_image_cleanup(tmp_path, monkeypatch):
     db = tmp_path / "confirmed-cleanup.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
@@ -2073,8 +2112,8 @@ def test_confirmed_image_cleanup_requeues_sheet_updates(tmp_path, monkeypatch):
         log_ref = conn.execute("SELECT source_image_ref FROM food_logs").fetchone()[0]
         food_ref = conn.execute("SELECT original_image_ref FROM food_catalog").fetchone()[0]
         states = dict(conn.execute("SELECT entity_type,status FROM nutrition_sheet_outbox"))
-    assert log_ref == food_ref == ""
-    assert states == {"food": "pending", "food_log": "pending"}
+    assert log_ref == food_ref == ref
+    assert states["food"] == states["food_log"] == "synced"
 
 
 def test_plan_link_failure_is_retried(tmp_path, monkeypatch):

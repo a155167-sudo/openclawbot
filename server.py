@@ -123,6 +123,13 @@ from dietitian_health_check_api import (
     load_health_check_image,
     load_health_check_list,
 )
+from health_check_image_cleanup import (
+    CleanupBlocked,
+    cleanup_delivered_health_check_images,
+    cleanup_stale_nutrition_image_temps,
+    nutrition_image_reference_is_protected,
+    safe_unlink_nutrition_image,
+)
 from dietitian_health_check_liff import attach_dietitian_health_check_liff_routes
 from dietitian_health_check_command import (
     COMMAND_TEXT as DIETITIAN_HEALTH_CHECK_COMMAND_TEXT,
@@ -10360,13 +10367,14 @@ def _store_nutrition_image(image_bytes, extension, image_ref=""):
 
 
 def _delete_nutrition_image(image_ref):
-    path = _nutrition_image_path(image_ref)
-    if not path or not os.path.exists(path):
-        return True
     try:
-        os.remove(path)
+        outcome = safe_unlink_nutrition_image(
+            os.path.join(DB_DIR, "nutrition_images"), image_ref
+        )
+        if outcome not in {"deleted", "missing"}:
+            return False
         return True
-    except OSError as exc:
+    except (CleanupBlocked, OSError) as exc:
         print(f"⚠️ 刪除營養圖片失敗，保留參照供下次重試：{exc}")
         return False
 
@@ -10388,21 +10396,17 @@ def _queue_nutrition_outbox(conn, entity_type, entity_id):
     )
 
 
-def cleanup_nutrition_images():
-    """刪除成功後才清除參照；失敗的檔案會在下一輪再次嘗試。"""
+def cleanup_nutrition_images(*, _before_candidate_lock=None):
+    """鎖內重新驗證每個候選；刪除成功後才以 exact CAS 清除參照。"""
     image_root = os.path.join(DB_DIR, "nutrition_images")
-    if os.path.isdir(image_root):
-        for filename in os.listdir(image_root):
-            temp_path = os.path.join(image_root, filename)
-            if not filename.endswith(".tmp") or not os.path.isfile(temp_path):
-                continue
-            try:
-                if tw_now().timestamp() - os.path.getmtime(temp_path) > 3600:
-                    os.remove(temp_path)
-            except OSError:
-                pass
     now_dt = tw_now()
+    now_text = now_dt.isoformat(timespec="seconds")
     cutoff = (now_dt - timedelta(days=90)).isoformat(timespec="seconds")
+    before_lock = _before_candidate_lock or (lambda _lane, _key: None)
+    cleanup_stale_nutrition_image_temps(
+        image_root, now_timestamp=now_dt.timestamp()
+    )
+    cleanup_delivered_health_check_images(DB_PATH, image_root)
 
     def is_before(value, reference):
         if not value:
@@ -10416,88 +10420,103 @@ def cleanup_nutrition_images():
 
     with sqlite3.connect(DB_PATH) as conn:
         ensure_nutrition_schema(conn)
-        candidates = conn.execute(
-            """SELECT token,source_image_ref,status,expires_at,retired_at
+        ensure_meal_photo_schema(conn)
+        pending_rows = conn.execute(
+            """SELECT token,user_id,source_image_ref,status,expires_at,created_at
                FROM pending_nutrition_logs
                WHERE status IN ('pending','awaiting_identity','expired','cancelled')"""
         ).fetchall()
-        pending_rows = []
-        now_text = now_dt.isoformat(timespec="seconds")
-        for token, source_image_ref, status, expires_at, retired_at in candidates:
-            should_retire = status in {"expired", "cancelled"}
-            if status in {"pending", "awaiting_identity"} and is_before(expires_at, now_dt):
-                status = "expired"
-                should_retire = True
-            if not should_retire:
-                continue
-            conn.execute(
-                """UPDATE pending_nutrition_logs
-                   SET status=?,label_payload_json='{}',
-                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
-                   WHERE token=?""",
-                (status, now_text, token),
-            )
-            conn.execute("DELETE FROM nutrition_input_states WHERE token=?", (token,))
-            if source_image_ref:
-                pending_rows.append((token, source_image_ref))
-        input_states = conn.execute(
-            "SELECT user_id,expires_at FROM nutrition_input_states"
-        ).fetchall()
+        input_states = conn.execute("SELECT user_id,expires_at FROM nutrition_input_states").fetchall()
         for state_user_id, state_expires_at in input_states:
             if is_before(state_expires_at, now_dt):
-                conn.execute(
-                    "DELETE FROM nutrition_input_states WHERE user_id=?", (state_user_id,)
-                )
-        conn.execute(
-            """DELETE FROM nutrition_input_states
-               WHERE token IN (
-                 SELECT token FROM pending_nutrition_logs
-                 WHERE status NOT IN ('pending','awaiting_identity')
-               )"""
-        )
+                conn.execute("DELETE FROM nutrition_input_states WHERE user_id=?", (state_user_id,))
         conn.commit()
-    for token, ref in pending_rows:
-        if _delete_nutrition_image(ref):
-            with sqlite3.connect(DB_PATH) as conn:
+    for expected in pending_rows:
+        token, user_id, ref, expected_status, expires_at, created_at = expected
+        eligible = expected_status in {"expired", "cancelled"} or (
+            expected_status in {"pending", "awaiting_identity"} and is_before(expires_at, now_dt)
+        )
+        if not eligible:
+            continue
+        before_lock("label", token)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """SELECT token,user_id,source_image_ref,status,expires_at,created_at
+                   FROM pending_nutrition_logs WHERE token=?""", (token,)
+            ).fetchone()
+            if current != expected:
+                conn.rollback()
+                continue
+            status = "expired" if expected_status in {"pending", "awaiting_identity"} else expected_status
+            conn.execute(
+                """UPDATE pending_nutrition_logs SET status=?,label_payload_json='{}',
+                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+                   WHERE token=? AND user_id=? AND source_image_ref=? AND status=?
+                     AND expires_at IS ? AND created_at IS ?""",
+                (status, now_text, token, user_id, ref, expected_status, expires_at, created_at),
+            )
+            conn.execute("DELETE FROM nutrition_input_states WHERE token=?", (token,))
+            if not ref or nutrition_image_reference_is_protected(conn, ref, nutrition_token=token):
+                conn.commit()
+                continue
+            if _delete_nutrition_image(ref):
                 conn.execute(
-                    "UPDATE pending_nutrition_logs SET source_image_ref='' WHERE token=? AND source_image_ref=?",
-                    (token, ref),
+                    """UPDATE pending_nutrition_logs SET source_image_ref=''
+                       WHERE token=? AND user_id=? AND source_image_ref=? AND status=?""",
+                    (token, user_id, ref, status),
                 )
                 conn.commit()
+            else:
+                # Retirement/scrubbing is authoritative even when file I/O is retryable.
+                conn.commit()
 
-    # 無標示餐點草稿同樣遵守24小時到期與delete-first/reference-clear-second。
-    meal_photo_rows = []
+    # 無標示餐點草稿同樣在逐候選 write lock 內重新驗證狀態、期限、owner、ref、version。
     with sqlite3.connect(DB_PATH) as conn:
         ensure_meal_photo_schema(conn)
-        now_text = now_dt.isoformat(timespec="seconds")
-        candidates = conn.execute(
-            """SELECT token,user_id,source_image_ref,status,expires_at
+        meal_photo_rows = conn.execute(
+            """SELECT token,user_id,source_image_ref,status,expires_at,created_at,version
                FROM pending_meal_photo_drafts
                WHERE status IN ('awaiting_confirmation','confirming','estimated','expired','cancelled')"""
         ).fetchall()
-        for token, user_id, ref, status, expires_at in candidates:
-            should_retire = status in {"expired", "cancelled"}
-            if status in {"awaiting_confirmation", "confirming", "estimated"} and is_before(expires_at, now_dt):
-                status = "expired"
-                should_retire = True
-            if not should_retire:
+    for expected in meal_photo_rows:
+        token, user_id, ref, expected_status, expires_at, created_at, version = expected
+        eligible = expected_status in {"expired", "cancelled"} or (
+            expected_status in {"awaiting_confirmation", "confirming", "estimated"}
+            and is_before(expires_at, now_dt)
+        )
+        if not eligible:
+            continue
+        before_lock("meal", token)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """SELECT token,user_id,source_image_ref,status,expires_at,created_at,version
+                   FROM pending_meal_photo_drafts WHERE token=?""", (token,)
+            ).fetchone()
+            if current != expected:
+                conn.rollback()
                 continue
+            status = "expired" if expected_status in {"awaiting_confirmation", "confirming", "estimated"} else expected_status
             conn.execute(
                 """UPDATE pending_meal_photo_drafts
                    SET status=?,observed_payload_json='{}',answers_json='{}',estimate_json='{}',
-                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END,
-                       updated_at=? WHERE token=? AND user_id=?""",
-                (status, now_text, now_text, token, user_id),
+                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END,updated_at=?
+                   WHERE token=? AND user_id=? AND source_image_ref=? AND status=?
+                     AND expires_at IS ? AND created_at IS ? AND version=?""",
+                (status, now_text, now_text, token, user_id, ref, expected_status,
+                 expires_at, created_at, version),
             )
-            if ref:
-                meal_photo_rows.append((token, user_id, ref))
-        conn.commit()
-    for token, user_id, ref in meal_photo_rows:
-        if _delete_nutrition_image(ref):
-            with sqlite3.connect(DB_PATH) as conn:
+            if not ref or nutrition_image_reference_is_protected(conn, ref, meal_token=token):
+                conn.commit()
+                continue
+            if _delete_nutrition_image(ref):
                 clear_meal_photo_image_ref(
                     conn, user_id=user_id, token=token, expected_ref=ref
                 )
+            else:
+                # Keep the ref for retry, but retain the locked expiry transition/scrub.
+                conn.commit()
 
     meal_tombstone_cutoff = now_dt - timedelta(days=30)
     with sqlite3.connect(DB_PATH) as conn:
@@ -10557,23 +10576,66 @@ def cleanup_nutrition_images():
         conn.commit()
 
     with sqlite3.connect(DB_PATH) as conn:
+        log_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_logs)")}
+        version_expr = "fl.version" if "version" in log_columns else "NULL"
         old_logs = conn.execute(
-            """SELECT log_id, food_id, source_image_ref FROM food_logs
-               WHERE created_at<? AND source_image_ref<>''""",
+            f"""SELECT fl.log_id,fl.user_id,fl.food_id,{version_expr} AS version,
+                       fl.created_at,fl.source_image_ref,
+                       fc.owner_user_id,fc.visibility,fc.original_image_ref
+                FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+                WHERE fl.created_at<? AND fl.source_image_ref<>''""",
             (cutoff,),
         ).fetchall()
-    for log_id, food_id, ref in old_logs:
-        if not _delete_nutrition_image(ref):
-            continue
+    for expected in old_logs:
+        (
+            log_id, owner_id, food_id, version, created_at, ref,
+            catalog_owner, catalog_visibility, catalog_ref,
+        ) = expected
+        before_lock("90day", log_id)
         with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "UPDATE food_logs SET source_image_ref='' WHERE log_id=? AND source_image_ref=?",
-                (log_id, ref),
-            )
-            conn.execute(
-                "UPDATE food_catalog SET original_image_ref='' WHERE food_id=? AND original_image_ref=?",
-                (food_id, ref),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            version_expr = "fl.version" if version is not None else "NULL"
+            current = conn.execute(
+                f"""SELECT fl.log_id,fl.user_id,fl.food_id,{version_expr} AS version,
+                            fl.created_at,fl.source_image_ref,
+                            fc.owner_user_id,fc.visibility,fc.original_image_ref
+                     FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+                     WHERE fl.log_id=?""", (log_id,)
+            ).fetchone()
+            if current != expected or not is_before(current[4] if current else "", now_dt - timedelta(days=90)):
+                conn.rollback()
+                continue
+            if owner_id != catalog_owner or catalog_visibility != "private":
+                conn.rollback()
+                continue
+            if ref != catalog_ref:
+                conn.rollback()
+                continue
+            if nutrition_image_reference_is_protected(
+                conn, ref, food_log_id=log_id, food_id=food_id,
+                food_owner_id=owner_id,
+            ):
+                conn.rollback()
+                continue
+            if not _delete_nutrition_image(ref):
+                conn.rollback()
+                continue
+            version_clause = " AND version=?" if version is not None else ""
+            log_params = (log_id, owner_id, food_id, created_at, ref) + ((version,) if version is not None else ())
+            changed_log = conn.execute(
+                """UPDATE food_logs SET source_image_ref=''
+                   WHERE log_id=? AND user_id=? AND food_id=? AND created_at IS ?
+                     AND source_image_ref=?""" + version_clause,
+                log_params,
+            ).rowcount
+            changed_food = conn.execute(
+                """UPDATE food_catalog SET original_image_ref=''
+                   WHERE food_id=? AND owner_user_id=? AND original_image_ref=?""",
+                (food_id, catalog_owner, ref),
+            ).rowcount
+            if (changed_log, changed_food) != (1, 1):
+                conn.rollback()
+                continue
             _queue_nutrition_outbox(conn, "food", food_id)
             _queue_nutrition_outbox(conn, "food_log", log_id)
             conn.commit()
