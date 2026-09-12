@@ -611,6 +611,319 @@ def _daily_ledger_db(tmp_path, monkeypatch, name="daily-ledger.db"):
     return db
 
 
+def test_daily_food_log_refreshes_open_health_check_case(tmp_path, monkeypatch):
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+    )
+
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-refresh.db")
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    started_at = server.tw_now() - server.timedelta(minutes=5)
+    with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        case = create_first_vip_health_check_case(
+            conn,
+            user_id="U1",
+            first_vip_activation_id="activation-live-refresh",
+            activation_event_key="event-live-refresh",
+            activated_at=started_at,
+        )
+        server.create_daily_food_log(
+            conn,
+            user_id="U1",
+            product_name="測試早餐",
+            meal_slot="早餐",
+            consumed_at=server.tw_now().isoformat(timespec="seconds"),
+            servings=1,
+            nutrition={"calories_kcal": 300, "protein_g": 15},
+            source_type="user_private_food",
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()[0] == 1
+
+
+def test_daily_food_log_survives_best_effort_health_check_refresh_failure(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-refresh-failure.db")
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    calls = []
+
+    def fail_refresh(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise sqlite3.OperationalError("refresh unavailable")
+
+    monkeypatch.setattr(
+        server, "refresh_user_health_check_case", fail_refresh, raising=False
+    )
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn,
+            user_id="U1",
+            product_name="仍要保留的餐",
+            meal_slot="午餐",
+            consumed_at=server.tw_now().isoformat(timespec="seconds"),
+            servings=1,
+            nutrition={"calories_kcal": 500, "protein_g": 25},
+            source_type="user_private_food",
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM food_logs WHERE user_id='U1'"
+        ).fetchone()[0] == 1
+    assert len(calls) == 1
+
+
+def _seed_ready_health_check_case(db, monkeypatch):
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+    )
+
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    now = server.tw_now()
+    log_ids = []
+    with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        case = create_first_vip_health_check_case(
+            conn,
+            user_id="U1",
+            first_vip_activation_id="activation-edit-refresh",
+            activation_event_key="event-edit-refresh",
+            activated_at=now - server.timedelta(days=3),
+        )
+        for day_offset in (2, 1, 0):
+            day = server.tw_today() - server.timedelta(days=day_offset)
+            for hour, slot in ((8, "早餐"), (12, "午餐")):
+                result = server.create_daily_food_log(
+                    conn,
+                    user_id="U1",
+                    product_name=f"{day.isoformat()}-{slot}",
+                    meal_slot=slot,
+                    consumed_at=f"{day.isoformat()}T{hour:02d}:00:00+08:00",
+                    servings=1,
+                    nutrition={"calories_kcal": 300, "protein_g": 15},
+                    source_type="user_private_food",
+                    operation_key=f"seed:{day.isoformat()}:{slot}",
+                )
+                log_ids.append(result["log_id"])
+        conn.commit()
+        state = conn.execute(
+            "SELECT status,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()
+        assert state == ("ready_for_review", 3)
+    return case["case_id"], log_ids
+
+
+def test_food_log_edit_refreshes_manifest_and_delete_downgrades_case(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-edit-refresh.db")
+    case_id, log_ids = _seed_ready_health_check_case(db, monkeypatch)
+    edited_log = log_ids[0]
+    with sqlite3.connect(db) as conn:
+        before = conn.execute(
+            "SELECT food_log_version,source_hash FROM vip_health_check_source_refs "
+            "WHERE case_id=? AND food_log_id=?",
+            (case_id, edited_log),
+        ).fetchone()
+
+    server.apply_daily_food_log_edit(
+        user_id="U1", log_id=edited_log, expected_version=1,
+        event_id="edit-health-check-1", action="correct_nutrition",
+        field="calories_kcal", value=321,
+    )
+    with sqlite3.connect(db) as conn:
+        after = conn.execute(
+            "SELECT food_log_version,source_hash FROM vip_health_check_source_refs "
+            "WHERE case_id=? AND food_log_id=?",
+            (case_id, edited_log),
+        ).fetchone()
+        assert after[0] == 2
+        assert after[1] != before[1]
+
+    server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log_ids[1], expected_version=1,
+        event_id="delete-health-check-1", action="delete",
+    )
+    with sqlite3.connect(db) as conn:
+        state = conn.execute(
+            "SELECT status,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
+            (case_id,),
+        ).fetchone()
+        refs = conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case_id,),
+        ).fetchone()[0]
+    assert state == ("collecting", 2)
+    assert refs == 5
+
+
+def test_clear_daily_food_ledger_refreshes_and_downgrades_case(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-clear-refresh.db")
+    case_id, _log_ids = _seed_ready_health_check_case(db, monkeypatch)
+
+    server.clear_daily_food_ledger("U1", event_id="clear-health-check-1")
+
+    with sqlite3.connect(db) as conn:
+        state = conn.execute(
+            "SELECT status,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
+            (case_id,),
+        ).fetchone()
+        refs = conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case_id,),
+        ).fetchone()[0]
+    assert state == ("collecting", 2)
+    assert refs == 4
+
+
+def test_operation_key_replay_repairs_a_failed_health_check_refresh(tmp_path, monkeypatch):
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+        refresh_user_health_check_case as real_refresh,
+    )
+
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-replay-repair.db")
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        case = create_first_vip_health_check_case(
+            conn, user_id="U1", first_vip_activation_id="activation-repair",
+            activation_event_key="event-repair",
+            activated_at=server.tw_now() - server.timedelta(minutes=5),
+        )
+        monkeypatch.setattr(
+            server, "refresh_user_health_check_case",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sqlite3.OperationalError("temporary refresh failure")
+            ),
+        )
+        first = server.create_daily_food_log(
+            conn, user_id="U1", product_name="可修復早餐", meal_slot="早餐",
+            consumed_at=server.tw_now().isoformat(timespec="seconds"), servings=1,
+            nutrition={"calories_kcal": 250, "protein_g": 12},
+            source_type="user_private_food", operation_key="repair-op-1",
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()[0] == 0
+        monkeypatch.setattr(server, "refresh_user_health_check_case", real_refresh)
+        replay = server.create_daily_food_log(
+            conn, user_id="U1", product_name="可修復早餐", meal_slot="早餐",
+            consumed_at=server.tw_now().isoformat(timespec="seconds"), servings=1,
+            nutrition={"calories_kcal": 250, "protein_g": 12},
+            source_type="user_private_food", operation_key="repair-op-1",
+        )
+        conn.commit()
+        assert replay["replayed"] is True
+        assert replay["log_id"] == first["log_id"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("operation", ["edit", "delete", "clear", "quick", "breakfast", "label"])
+@pytest.mark.parametrize("fail_first_refresh", [False, True])
+def test_food_entry_manifest_replay_and_failure_isolation(
+    tmp_path, monkeypatch, operation, fail_first_refresh,
+):
+    """Real SQLite projection repair must not duplicate committed ledger/outbox events."""
+    db = _daily_ledger_db(tmp_path, monkeypatch, f"manifest-{operation}.db")
+    case_id, log_ids = _seed_ready_health_check_case(db, monkeypatch)
+    token = ""
+    with sqlite3.connect(db) as conn:
+        food_ids = [row[0] for row in conn.execute(
+            "SELECT food_id FROM food_logs ORDER BY log_id"
+        )]
+        if operation == "breakfast":
+            for food_id, (name, _servings) in zip(food_ids, server.BREAKFAST_COMBOS["早餐1"]):
+                conn.execute("UPDATE food_catalog SET product_name=? WHERE food_id=?", (name, food_id))
+        if operation == "label":
+            token = save_pending_label(conn, user_id="U1", payload=valid_label())
+        before = conn.execute(
+            "SELECT source_manifest_hash FROM vip_health_check_cases WHERE case_id=?", (case_id,)
+        ).fetchone()[0]
+        before_refs = conn.execute(
+            "SELECT * FROM vip_health_check_source_refs WHERE case_id=? ORDER BY food_log_id", (case_id,)
+        ).fetchall()
+        if fail_first_refresh:
+            conn.execute("""CREATE TRIGGER reject_manifest_update
+                BEFORE UPDATE ON vip_health_check_cases
+                BEGIN SELECT RAISE(ABORT, 'temporary refresh update failure'); END""")
+
+    monkeypatch.setattr(server, "get_active_nutrition_target", lambda *_: None)
+    monkeypatch.setattr(server, "sync_confirmed_nutrition_to_sheet", lambda *_: None)
+    monkeypatch.setattr(server, "apply_confirmed_nutrition_to_legacy_dashboard", lambda *_: None)
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    def run():
+        if operation in {"edit", "delete"}:
+            return server.apply_daily_food_log_edit(
+                user_id="U1", log_id=log_ids[0], expected_version=1,
+                event_id="manifest-mutation", action="delete" if operation == "delete" else "correct_nutrition",
+                **({} if operation == "delete" else {"field": "calories_kcal", "value": 321}),
+            )
+        if operation == "clear":
+            return server.clear_daily_food_ledger("U1", event_id="manifest-clear")
+        if operation == "quick":
+            return server._quick_log_catalog_card_once(
+                user_id="U1", food_id=food_ids[0], servings=1,
+                meal_slot="晚餐", event_ref="manifest-quick", display_quantity="1份",
+            )
+        if operation == "breakfast":
+            return server._build_breakfast_combo_reply_once("U1", "早餐1", "manifest-breakfast")
+        # Re-delivery gets through the transient in-memory duplicate cache.
+        server.processed_messages.clear()
+        return server._handle_message_impl(_text_event(
+            "manifest-label", f"確認營養紀錄:{token}", user_id="U1",
+        ))
+
+    run()
+    with sqlite3.connect(db) as conn:
+        after = conn.execute(
+            "SELECT source_manifest_hash FROM vip_health_check_cases WHERE case_id=?", (case_id,)
+        ).fetchone()[0]
+        assert (after == before) is fail_first_refresh
+        if fail_first_refresh:
+            assert conn.execute(
+                "SELECT * FROM vip_health_check_source_refs WHERE case_id=? ORDER BY food_log_id", (case_id,)
+            ).fetchall() == before_refs
+            conn.execute("DROP TRIGGER reject_manifest_update")
+        # Capture authoritative data, not just counts, before replay repairs the projection.
+        tables = ["food_logs", "nutrition_sheet_outbox", "daily_food_log_events", "health_profile"]
+        if operation == "breakfast":
+            tables += ["combo_log_events", "frequent_foods"]
+        committed = {table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in tables}
+    run()
+    with sqlite3.connect(db) as conn:
+        repaired = conn.execute(
+            "SELECT source_manifest_hash FROM vip_health_check_cases WHERE case_id=?", (case_id,)
+        ).fetchone()[0]
+        assert repaired != before
+        assert {table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in tables} == committed
+        refs = conn.execute(
+            "SELECT food_log_id,food_log_version FROM vip_health_check_source_refs WHERE case_id=? ORDER BY food_log_id", (case_id,)
+        ).fetchall()
+        expected = conn.execute(
+            "SELECT log_id,version FROM food_logs WHERE user_id='U1' AND confirmation_status='confirmed' "
+            "AND COALESCE(deleted_at,'')='' ORDER BY log_id"
+        ).fetchall()
+        assert refs == expected
+
+
 def test_daily_food_ledger_separates_today_and_yesterday_and_keeps_unknown_na(tmp_path, monkeypatch):
     db = _daily_ledger_db(tmp_path, monkeypatch)
     today = server.tw_today()
@@ -4010,6 +4323,12 @@ def test_committed_confirmation_reply_failure_is_retriable(tmp_path, monkeypatch
     monkeypatch.setattr(server, "get_active_nutrition_target", lambda *_: None)
     monkeypatch.setattr(server, "sync_confirmed_nutrition_to_sheet", lambda *_: None)
     monkeypatch.setattr(server, "apply_confirmed_nutrition_to_legacy_dashboard", lambda *_: None)
+    refresh_users = []
+    monkeypatch.setattr(
+        server,
+        "_refresh_health_check_after_food_log",
+        lambda _conn, *, user_id: refresh_users.append(user_id),
+    )
 
     def fail_reply(*_):
         raise RuntimeError("LINE unavailable")
@@ -4034,6 +4353,7 @@ def test_committed_confirmation_reply_failure_is_retriable(tmp_path, monkeypatch
     assert "低脂蛋白 2.71份" in reply_text
     assert "主食 0.53份" in reply_text
     assert "尚未扣入個人計畫" in reply_text
+    assert refresh_users == ["U_CONFIRM_REPLY", "U_CONFIRM_REPLY"]
 
 
 def test_exchange_review_admin_commands_list_approve_and_replay(tmp_path, monkeypatch):
@@ -5205,10 +5525,42 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
     assert resumed.quick_reply.items[0].action.data == f"mpr:v1:{token}:9:resume"
 
 
-def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeypatch):
+@pytest.mark.parametrize("refresh_mode", ["spy", "live", "repair"])
+def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeypatch, refresh_mode):
     db = tmp_path / "meal-photo-admin-review.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    refresh_users = []
+    case = {}
+    if refresh_mode == "spy":
+        monkeypatch.setattr(server, "_prepare_health_check_refresh_connection", lambda _conn: True)
+        monkeypatch.setattr(
+            server,
+            "_refresh_health_check_after_food_log",
+            lambda _conn, *, user_id: refresh_users.append(user_id),
+        )
+    else:
+        from vip_health_check import (
+            configure_vip_health_check_connection,
+            create_first_vip_health_check_case,
+            ensure_vip_health_check_schema,
+        )
+
+        monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+        with sqlite3.connect(db) as conn:
+            server.ensure_daily_food_ledger_schema(conn)
+            configure_vip_health_check_connection(conn)
+            ensure_vip_health_check_schema(conn)
+            case = create_first_vip_health_check_case(
+                conn, user_id="U_CUSTOMER",
+                first_vip_activation_id="approval-activation",
+                activation_event_key="approval-activation-event",
+                activated_at=datetime(2026, 7, 23, 7, tzinfo=server.TW_TZ),
+            )
+            if refresh_mode == "repair":
+                conn.execute("""CREATE TRIGGER reject_health_check_source
+                    BEFORE INSERT ON vip_health_check_source_refs
+                    BEGIN SELECT RAISE(ABORT, 'temporary manifest failure'); END""")
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
     monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
     with sqlite3.connect(db) as conn:
@@ -5273,11 +5625,42 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     assert pushes and pushes[-1][0] == "U_CUSTOMER"
     assert "已由營養師核准" in pushes[-1][1].text
     push_count = len(pushes)
+    if refresh_mode != "spy":
+        with sqlite3.connect(db) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+                (case["case_id"],),
+            ).fetchone()[0] == (0 if refresh_mode == "repair" else 1)
+            assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+            if refresh_mode == "repair":
+                conn.execute("DROP TRIGGER reject_health_check_source")
     replayed_done = send(f"mpr:v1:{token}:15:approve", "ADMIN-APPROVE")
     assert "已核准｜已計入正式份量" in json.dumps(
         json.loads(str(replayed_done.contents)), ensure_ascii=False
     )
     assert len(pushes) == push_count
+    if refresh_mode == "spy":
+        assert refresh_users == ["U_CUSTOMER", "U_CUSTOMER"]
+    else:
+        with sqlite3.connect(db) as conn:
+            refs = conn.execute(
+                "SELECT food_log_id,food_log_version,source_hash "
+                "FROM vip_health_check_source_refs WHERE case_id=?",
+                (case["case_id"],),
+            ).fetchall()
+            assert len(refs) == 1
+            log = conn.execute(
+                "SELECT log_id,version,nutrition_snapshot_json FROM food_logs"
+            ).fetchall()
+            assert len(log) == 1
+            assert refs[0][:2] == log[0][:2]
+            canonical = json.dumps(json.loads(log[0][2]), ensure_ascii=False,
+                                   sort_keys=True, separators=(",", ":"))
+            import hashlib
+            assert refs[0][2] == hashlib.sha256(
+                f"{log[0][0]}:{log[0][1]}:{canonical}".encode()
+            ).hexdigest()
+            assert conn.execute("SELECT COUNT(*) FROM food_exchange_approvals").fetchone()[0] == 1
     with sqlite3.connect(db) as conn:
         assert daily_consumed_totals(
             conn, user_id="U_CUSTOMER", date_iso="2026-07-23"
@@ -5810,6 +6193,12 @@ def test_natural_food_log_not_found_or_incompatible_unit_never_silently_logs(
 
 def test_quick_log_uses_one_timestamp_across_midnight(tmp_path, monkeypatch):
     db = _daily_ledger_db(tmp_path, monkeypatch, "natural-midnight.db")
+    refresh_users = []
+    monkeypatch.setattr(
+        server,
+        "_refresh_health_check_after_food_log",
+        lambda _conn, *, user_id: refresh_users.append(user_id),
+    )
     logged_at = datetime(2026, 8, 10, 23, 59, 59, tzinfo=server.TW_TZ)
     monkeypatch.setattr(server, "tw_now", lambda: logged_at)
     monkeypatch.setattr(
@@ -5843,6 +6232,7 @@ def test_quick_log_uses_one_timestamp_across_midnight(tmp_path, monkeypatch):
     assert consumed_at.startswith("2026-08-10T23:59:59")
     assert profile[:2] == pytest.approx((200.0, 10.0))
     assert profile[2] == "2026-08-10"
+    assert refresh_users == ["U1"]
 
 
 def test_natural_exact_filters_unit_before_private_priority(tmp_path, monkeypatch):
@@ -6361,6 +6751,12 @@ def test_search_no_results_shows_guidance(tmp_path, monkeypatch):
 def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
     db = tmp_path / "combo.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    refresh_users = []
+    monkeypatch.setattr(
+        server,
+        "_refresh_health_check_after_food_log",
+        lambda _conn, *, user_id: refresh_users.append(user_id),
+    )
     now = utcish_now()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
@@ -6402,6 +6798,7 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
         ).fetchall()
         assert len(rows) == 3
         assert all(r[0] == "早餐" for r in rows)
+    assert refresh_users == ["U1"]
 
 
 def test_dashboard_uses_food_ledger_without_creating_placeholder_health_profile(tmp_path, monkeypatch):

@@ -1478,6 +1478,40 @@ _TAIPEI = ZoneInfo("Asia/Taipei")
 _REFRESHABLE_CASE_STATUSES = {"collecting", "ready_for_review", "needs_more_info"}
 
 
+def refresh_user_health_check_case(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    evaluated_at: datetime,
+    minimum_meals_per_day: int = 2,
+    rule_version: str = "draft-confirmed-meals-v1",
+) -> dict[str, object] | None:
+    """Refresh the one open baseline case for a user, or no-op when none exists."""
+    require_vip_health_check_connection(conn)
+    principal = str(user_id or "").strip()
+    if not principal:
+        raise ValueError("user_id 不可空白")
+    statuses = sorted(_REFRESHABLE_CASE_STATUSES)
+    placeholders = ",".join("?" for _ in statuses)
+    rows = conn.execute(
+        f"""SELECT case_id FROM vip_health_check_cases
+            WHERE user_id=? AND status IN ({placeholders})
+            ORDER BY created_at,case_id LIMIT 2""",
+        (principal, *statuses),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise sqlite3.IntegrityError("multiple refreshable health-check cases")
+    return refresh_case_source_manifest(
+        conn,
+        case_id=str(rows[0][0]),
+        evaluated_at=evaluated_at,
+        minimum_meals_per_day=minimum_meals_per_day,
+        rule_version=rule_version,
+    )
+
+
 def _parse_ledger_time(value: str) -> datetime:
     text = str(value or "").strip()
     if text.endswith(("Z", "z")):

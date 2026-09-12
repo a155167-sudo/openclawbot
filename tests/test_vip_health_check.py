@@ -2374,6 +2374,61 @@ def test_redeem_activation_identity_does_not_collide_when_sqlite_rowid_is_reused
     assert rows[0][1] != rows[1][1]
 
 
+def test_refresh_user_case_is_noop_without_an_open_case(conn):
+    from vip_health_check import (
+        ensure_vip_health_check_schema,
+        refresh_user_health_check_case,
+    )
+
+    _create_minimal_food_ledger(conn)
+    ensure_vip_health_check_schema(conn)
+
+    result = refresh_user_health_check_case(
+        conn,
+        user_id="U1",
+        evaluated_at=datetime(2026, 9, 3, 12, 0, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    assert result is None
+    assert conn.execute("SELECT COUNT(*) FROM vip_health_check_source_refs").fetchone()[0] == 0
+
+
+def test_refresh_user_case_projects_new_confirmed_meals(conn):
+    from vip_health_check import (
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+        refresh_user_health_check_case,
+    )
+
+    _create_minimal_food_ledger(conn)
+    ensure_vip_health_check_schema(conn)
+    started_at = datetime(2026, 9, 3, 7, 0, tzinfo=timezone(timedelta(hours=8)))
+    case = create_first_vip_health_check_case(
+        conn,
+        user_id="U1",
+        first_vip_activation_id="activation-live-1",
+        activation_event_key="event-live-1",
+        activated_at=started_at,
+    )
+    _insert_log(conn, "live-breakfast", "2026-09-03T08:00:00+08:00", "早餐")
+    _insert_log(conn, "live-lunch", "2026-09-03T12:00:00+08:00", "午餐")
+
+    result = refresh_user_health_check_case(
+        conn,
+        user_id="U1",
+        evaluated_at=datetime(2026, 9, 3, 12, 1, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    assert result is not None
+    assert result["case_id"] == case["case_id"]
+    assert result["source_count"] == 2
+    assert result["valid_day_count"] == 1
+    assert tuple(conn.execute(
+        "SELECT status,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
+        (case["case_id"],),
+    ).fetchone()) == ("collecting", 1)
+
+
 def test_refresh_rejects_unregistered_or_mismatched_day_rule_before_db_access(conn):
     from vip_health_check import refresh_case_source_manifest
 

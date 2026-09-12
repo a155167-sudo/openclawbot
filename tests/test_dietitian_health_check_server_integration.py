@@ -49,10 +49,15 @@ def test_server_import_defaults_dietitian_routes_dark_in_isolated_data_dir(tmp_p
 paths={r.path for r in server.app.routes if hasattr(r,'path')}
 print(json.dumps({'enabled':server.DIETITIAN_HEALTH_CHECK_CONFIG.enabled,
  'list':'/api/dietitian/health-checks' in paths,
- 'detail':'/api/dietitian/health-checks/{case_id}' in paths}))""",
+ 'detail':'/api/dietitian/health-checks/{case_id}' in paths,
+ 'page':'/dietitian-health-check' in paths,
+ 'script':'/dietitian-health-check/app.js' in paths}))""",
     )
     assert result.returncode == 0, result.stderr
-    assert _last_json(result.stdout) == {"enabled": False, "list": False, "detail": False}
+    assert _last_json(result.stdout) == {
+        "enabled": False, "list": False, "detail": False,
+        "page": False, "script": False,
+    }
     assert (data_dir / "user_quota.db").exists()
 
 
@@ -75,6 +80,8 @@ from fastapi.testclient import TestClient
 client=TestClient(server.app)
 list_status=client.get('/api/dietitian/health-checks').status_code
 detail_status=client.get('/api/dietitian/health-checks/case-1').status_code
+page_status=client.get('/dietitian-health-check').status_code
+script_status=client.get('/dietitian-health-check/app.js').status_code
 missing=pathlib.Path(server.DB_DIR)/'missing-read-only.db'
 server.DB_PATH=str(missing)
 errors=[]
@@ -86,6 +93,8 @@ for call in (
  except sqlite3.Error: errors.append(True)
 print(json.dumps({'list':list_status != 404,
  'detail':detail_status != 404,
+ 'page':page_status,
+ 'script':script_status,
  'errors':len(errors),'missing_exists':missing.exists()}))""",
         DIETITIAN_HEALTH_CHECK_READ_ENABLED="true",
         DIETITIAN_HEALTH_CHECK_LIFF_ID=CHANNEL + "-dietitianCheck",
@@ -96,7 +105,8 @@ print(json.dumps({'list':list_status != 404,
     )
     assert result.returncode == 0, result.stderr
     assert _last_json(result.stdout) == {
-        "list": True, "detail": True, "errors": 2, "missing_exists": False,
+        "list": True, "detail": True, "page": 200, "script": 200,
+        "errors": 2, "missing_exists": False,
     }
 
 
