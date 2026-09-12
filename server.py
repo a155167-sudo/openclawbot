@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import os
 import json
+import math
 import sqlite3
 from datetime import date, datetime, timedelta
 import secrets
@@ -105,6 +106,11 @@ from meal_photo_system import (
     next_meal_photo_step,
     normalize_meal_photo_payload,
     save_meal_photo_draft,
+)
+from subscription_meal_plan import (
+    dish_matches_restrictions,
+    ensure_light_bento_coverage,
+    get_subscription_form_value,
 )
 from customer_health_check_liff import attach_customer_health_check_routes
 from vip_health_check import (
@@ -3326,13 +3332,26 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         data = await request.json()
         print(f"📦 [表單測試] 收到 Google 傳來的大禮包：{data}")
         
-        def get_val(keyword):
-            for k, v in data.items():
-                if keyword in k and v: 
-                    return ",".join([str(i) for i in v]) if isinstance(v, list) else str(v)
-            return ""
+        def get_val(
+            *keywords,
+            excluded_fragments=(),
+            allow_fuzzy=True,
+            reject_ambiguous=False,
+        ):
+            return get_subscription_form_value(
+                data,
+                *keywords,
+                excluded_fragments=excluded_fragments,
+                allow_fuzzy=allow_fuzzy,
+                reject_ambiguous=reject_ambiguous,
+            )
         
-        user_id = get_val("UID")
+        try:
+            user_id = get_val(
+                "LINE UID", "UID", allow_fuzzy=False, reject_ambiguous=True
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="UID 欄位不明確") from exc
         print(f"🔍 [表單測試] 抓到的 UID 是：'{user_id}'")
         print(f"🔑 [DEBUG] 表單所有欄位 keys：{list(data.keys())}")
         print(f"📝 [DEBUG] 稱呼欄位比對結果：{ {k: v for k, v in data.items() if '稱呼' in str(k)} }")
@@ -3340,70 +3359,80 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         if not user_id or user_id == "UID_REPLACE_ME": 
             print("❌ [表單拒絕] 找不到有效的 UID，這張表單我直接丟掉！")
             return {"status": "ignored"}
-        if user_id in user_memory: del user_memory[user_id]
 
-        name, goal, restrictions = get_val("稱呼"), get_val("目標"), get_val("禁忌")
+        # 在查地圖、改狀態或推播前，先確認表單確實能形成安全排餐。
+        _early_week_answers = [
+            get_val("第一週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第二週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第三週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第四週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+        ]
+        _early_date_str = ",".join(
+            item.strip()
+            for answer in _early_week_answers
+            for item in answer.split(",")
+            if item.strip()
+        )
+        if not _early_date_str:
+            _early_date_str = get_val(
+                "取餐日期", "希望取餐日期", "希望取餐日", "用餐日期", "取餐日", "勾選", "取餐",
+                excluded_fragments=("取餐方式", "配送方式", "不取餐", "原因", "備註"),
+            )
+        if not re.search(r"(?:週|星期)[一二三四五六日]", _early_date_str or ""):
+            raise HTTPException(status_code=422, detail="至少需要一個有效取餐日期")
+
+        try:
+            _early_restrictions = get_val("禁忌", reject_ambiguous=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="飲食禁忌欄位不明確") from exc
+        _early_safe_menu = [
+            dish for dish in MAIN_DISHES
+            if dish.get("category") == "main"
+            and any(keyword in str(dish.get("name") or "") for keyword in MEAL_PLAN_KEYWORDS)
+            and not dish_matches_restrictions(dish, _early_restrictions)
+        ]
+        if not _early_safe_menu:
+            raise HTTPException(status_code=422, detail="沒有符合飲食禁忌的可排餐點")
+        _early_pref_staple = get_val(
+            "您的主食選擇（可複選）", "主食選擇", "您的主食偏好是？(可複選)",
+            "主食偏好", "偏好的主食",
+            excluded_fragments=("不喜歡", "避免", "備註", "原因"),
+        )
+        if (
+            "都不挑食" in _early_pref_staple
+            and any("食蔬" in str(dish.get("name") or "") for dish in _early_safe_menu)
+            and not any("食蔬" not in str(dish.get("name") or "") for dish in _early_safe_menu)
+        ):
+            raise HTTPException(status_code=422, detail="安全菜單不足以安排每日兩種餐點")
+
+        name, goal, restrictions = get_val("稱呼"), get_val("目標"), _early_restrictions
         pickup_method = get_val("本期取餐方式") or get_val("取餐方式") or get_val("配送方式") or ""
         address = get_val("本期外送地址") or get_val("地址") or get_val("外送地址") or get_val("收件地址") or ""
         is_delivery = ("外送" in pickup_method) or (not pickup_method and bool(address))
-        delivery_info = calculate_delivery_quote(address) if (is_delivery and address) else {
-            "success": False,
-            "address": address,
-            "distance_text": "",
-            "distance_meters": 0,
-            "duration_text": "",
-            "delivery_fee": 0,
-            "delivery_fee_text": "自取或未提供地址",
-            "hub_name": "",
-            "route_group": "OTHER",
-            "delivery_zone": "SELF_PICKUP" if not is_delivery else "未分類",
-            "carpool_hint": "",
-        }
-        update_subscription_delivery_block(
-            user_id,
-            delivery_info.get("delivery_available") if is_delivery else True,
-        )
-        if is_delivery and not delivery_info.get("success"):
-            manual_review_text = (
-                "⚠️ 包月資料已收到，但地圖系統暫時無法完成測距。\n\n"
-                f"📍 外送地址：{address}\n"
-                "🛵 運費待客服確認\n\n"
-                "這次不會以未確認的運費建立訂單；您的表單資料已保留，"
-                "客服會確認距離與最終金額，您不需要重新填寫表單。"
-            )
+        def validated_number(label, default, minimum, maximum):
+            raw_value = get_val(label)
             try:
-                line_bot_api.push_message(
-                    user_id, TextSendMessage(text=manual_review_text)
+                value = float(raw_value or default)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422, detail=f"{label}必須是有效數字"
+                ) from exc
+            if not math.isfinite(value) or not minimum <= value <= maximum:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}必須介於 {minimum:g} 與 {maximum:g} 之間",
                 )
-            except Exception as push_error:
-                print(
-                    f"⚠️ 推播測距失敗人工確認通知失敗 uid={user_id[:8]}...: {push_error}"
-                )
-            return {
-                "status": "pending_manual_delivery_review",
-                "reason": "delivery_quote_failed",
-            }
-        if is_delivery and delivery_info.get("delivery_available") is False:
-            rejection_text = (
-                "🚫 此地址暫不提供外送\n\n"
-                f"📍 {address}\n"
-                f"📏 距本店距離：{delivery_info.get('distance_text', '超過 3 公里')}\n\n"
-                "目前外送範圍為門市 3 公里內。\n"
-                "這次沒有建立包月訂單，請改選自取或找客服協助。"
-            )
-            try:
-                line_bot_api.push_message(user_id, TextSendMessage(text=rejection_text))
-            except Exception as push_error:
-                print(f"⚠️ 推播超距表單拒絕通知失敗 uid={user_id[:8]}...: {push_error}")
-            return {
-                "status": "rejected",
-                "reason": "delivery_out_of_range",
-                "distance": delivery_info.get("distance_text", ""),
-            }
-        weight, height, age, gender = float(get_val("體重") or 70), float(get_val("身高") or 170), float(get_val("年齡") or 30), get_val("性別")
-        # 🔥 身高防呆：如果客人填 1.76 公尺，自動轉成 176 公分
+            return value
+
+        weight = validated_number("體重", 70, 20, 500)
+        height = validated_number("身高", 170, 0.8, 250)
+        age = validated_number("年齡", 30, 1, 120)
+        gender = get_val("性別")
+        # 身高若以公尺填寫，自動轉換為公分後再驗證合理範圍。
         if height < 3.0:
             height *= 100
+        if not 80 <= height <= 250:
+            raise HTTPException(status_code=422, detail="身高必須介於 80 與 250 公分之間")
         activity = get_val("活動量")  
         # 雙開關骨架：安排課表 / 啟用碳循環
         coaching_raw = get_val("規律運動") or get_val("安排課表") or ""
@@ -3506,26 +3535,43 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         week_dict = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7}
         
         # 1. 抓取表單中的關鍵資訊
-        # 表單有四個分週欄位，全部合併成一串（week_tracker 自動分週）
-        _w1 = get_val("第一週") or ""
-        _w2 = get_val("第二週") or ""
-        _w3 = get_val("第三週") or ""
-        _w4 = get_val("第四週") or ""
-        _weeks_combined = [d.strip() for w in [_w1, _w2, _w3, _w4] for d in w.split(',') if d.strip()]
+        # 表單有四個分週欄位；保留各欄的週別，同時建立舊輸出用合併字串。
+        _week_answers = [
+            get_val("第一週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第二週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第三週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第四週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+        ]
+        _weeks_combined = [
+            day.strip()
+            for week_answer in _week_answers
+            for day in week_answer.split(',')
+            if day.strip()
+        ]
         date_str = ','.join(_weeks_combined) if _weeks_combined else ""
         print(f"📅 [DEBUG] 四週取餐日期合併：{date_str}")
         # Fallback: 單週表單
         if not date_str:
-            date_str = get_val("取餐") or get_val("勾選")
+            date_str = get_val(
+                "取餐日期", "希望取餐日期", "希望取餐日", "用餐日期", "取餐日", "勾選", "取餐",
+                excluded_fragments=("取餐方式", "配送方式", "不取餐", "原因", "備註"),
+            )
             if not date_str:
-                _raw_ds = get_val("日期")
+                _raw_ds = get_val("日期", excluded_fragments=("取餐方式", "配送方式"))
                 if _raw_ds and any(c in _raw_ds for c in ["週", "星期"]):
                     date_str = _raw_ds
         user_restrictions = restrictions.lower() # 顧客禁忌 (小寫化方便比對)
         
         # 2. 抓取顧客喜好標籤
-        pref_staple = get_val("您的主食偏好是？(可複選)") or get_val("主食偏好") or ""
-        pref_protein = get_val("您最喜歡的蛋白質是") or get_val("蛋白質") or ""
+        pref_staple = get_val(
+            "您的主食選擇（可複選）", "主食選擇", "您的主食偏好是？(可複選)",
+            "主食偏好", "偏好的主食",
+            excluded_fragments=("不喜歡", "避免", "備註", "原因"),
+        )
+        pref_protein = get_val(
+            "您最喜歡的蛋白質是", "蛋白質偏好", "偏好的蛋白質", "蛋白質",
+            excluded_fragments=("不喜歡", "避免", "備註", "原因"),
+        )
         
         # 🔥 定義真正喜歡的關鍵字 (解決「沒有飯」卻抓到「飯」的 Bug)
         liked_staples = []
@@ -3546,26 +3592,13 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         
         # 3. 建立「絕對安全菜單池」 (先過濾掉禁忌，且只挑主餐)
         safe_menu = []
-        # 🔥 修正：說「不要海鮮」時，擴展過濾所有魚蝦蟹相關關鍵字
-        seafood_sub_words = ["魚", "蝦", "蟹", "花枝", "透抽", "章魚", "牡蠣", "鮭", "鱸", "鮪", "鯖"]
         for dish in MAIN_DISHES:
             if dish.get('category') != 'main':
                 continue
             # 只允許可配餐的六大主餐類（便當/食蔬/低碳/沙拉/番茄麵/青蔬麵）
             if not any(kw in dish['name'] for kw in MEAL_PLAN_KEYWORDS):
                 continue
-            dish_name = dish['name'].lower()
-            is_safe = True
-            forbidden_keywords = ["牛", "豬", "雞", "魚", "海鮮", "蝦", "蟹"]
-            for word in forbidden_keywords:
-                if word in user_restrictions and word in dish_name:
-                    is_safe = False
-                    break
-            # 特殊處理：用戶寫「海鮮」禁忌時，同步過濾菜名含魚蝦蟹字樣的餐點
-            if is_safe and "海鮮" in user_restrictions:
-                if any(sw in dish_name for sw in seafood_sub_words):
-                    is_safe = False
-            if is_safe:
+            if not dish_matches_restrictions(dish, user_restrictions):
                 safe_menu.append(dish)
 
         # 🔥 Phase 3: 計算起始日、訓練週期、4 週課表（移至此處供配餐使用）
@@ -3592,16 +3625,36 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                 "星期五": 5, "週五": 5, "星期六": 6, "週六": 6, "星期日": 7, "週日": 7
             }
             days = [d.strip() for d in date_str.split(',')]
-            active_days_list = [] 
-            week_tracker = {1:0, 2:0, 3:0, 4:0, 5:0, 6:0, 7:0}
-            
-            for d in days:
+            active_days_list = []
+            selected_week_days = []
+            if any(_week_answers):
+                for week_number, week_answer in enumerate(_week_answers, start=1):
+                    seen_day_numbers = set()
+                    for day in (
+                        item.strip() for item in week_answer.split(',') if item.strip()
+                    ):
+                        day_number = next(
+                            (number for zh, number in week_dict.items() if zh in day), 99
+                        )
+                        if day_number == 99 or day_number in seen_day_numbers:
+                            continue
+                        seen_day_numbers.add(day_number)
+                        selected_week_days.append((week_number, day))
+            else:
+                # 舊單週欄位沒有週別；保留既有「同星期第幾次即第幾週」相容行為。
+                week_tracker = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
+                for day in days:
+                    day_number = next(
+                        (number for zh, number in week_dict.items() if zh in day), 99
+                    )
+                    if day_number == 99:
+                        continue
+                    week_tracker[day_number] += 1
+                    selected_week_days.append((week_tracker[day_number], day))
+
+            for w_num, d in selected_week_days:
                 d_num = next((num for zh, num in week_dict.items() if zh in d), 99)
                 if d_num != 99:
-                    active_days_list.append(d)
-                    week_tracker[d_num] += 1
-                    w_num = week_tracker[d_num]
-                    
                     # 🔥 終極主食地雷過濾系統 (漏掉的就是這裡！)
                     unliked_staples = []
                     if "都不挑食" not in pref_staple:
@@ -3676,17 +3729,95 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                     # 隨機抽 2 道菜
                     if len(pool) >= 2:
                         daily_pick = random.sample(pool, 2)
-                    elif len(pool) == 1:
-                        daily_pick = [pool[0], pool[0]]
                     else:
-                        continue 
+                        raise HTTPException(
+                            status_code=422,
+                            detail="每個取餐日需要至少兩道不同的安全餐點",
+                        )
                     
                     plan_requests.append((w_num, d_num, f"第{w_num}週", d, daily_pick[0], daily_pick[1]))
+                    active_days_list.append(d)
                     # 💡 累加餐點總價
                     total_price += (daily_pick[0]['price'] + daily_pick[1]['price'])
 
         # 排序確保顯示順序正確
         plan_requests.sort(key=lambda x: (x[0], x[1]))
+        try:
+            plan_requests = ensure_light_bento_coverage(
+                plan_requests,
+                safe_menu=safe_menu,
+                pref_staple=pref_staple,
+                liked_proteins=liked_proteins,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="沒有符合偏好且可安全搭配的輕便當餐點",
+            ) from exc
+        if not plan_requests:
+            raise HTTPException(
+                status_code=422,
+                detail="沒有符合取餐日期與飲食禁忌的可排餐點",
+            )
+        total_price = sum(
+            lunch["price"] + dinner["price"]
+            for _, _, _, _, lunch, dinner in plan_requests
+        )
+
+        delivery_info = calculate_delivery_quote(address) if (is_delivery and address) else {
+            "success": False,
+            "address": address,
+            "distance_text": "",
+            "distance_meters": 0,
+            "duration_text": "",
+            "delivery_fee": 0,
+            "delivery_fee_text": "自取或未提供地址",
+            "hub_name": "",
+            "route_group": "OTHER",
+            "delivery_zone": "SELF_PICKUP" if not is_delivery else "未分類",
+            "carpool_hint": "",
+        }
+        if is_delivery and not delivery_info.get("success"):
+            update_subscription_delivery_block(
+                user_id, delivery_info.get("delivery_available")
+            )
+            manual_review_text = (
+                "⚠️ 包月資料已收到，但地圖系統暫時無法完成測距。\n\n"
+                f"📍 外送地址：{address}\n"
+                "🛵 運費待客服確認\n\n"
+                "這次不會以未確認的運費建立訂單；您的表單資料已保留，"
+                "客服會確認距離與最終金額，您不需要重新填寫表單。"
+            )
+            try:
+                line_bot_api.push_message(
+                    user_id, TextSendMessage(text=manual_review_text)
+                )
+            except Exception as push_error:
+                print(
+                    f"⚠️ 推播測距失敗人工確認通知失敗 uid={user_id[:8]}...: {push_error}"
+                )
+            return {
+                "status": "pending_manual_delivery_review",
+                "reason": "delivery_quote_failed",
+            }
+        if is_delivery and delivery_info.get("delivery_available") is False:
+            update_subscription_delivery_block(user_id, False)
+            rejection_text = (
+                "🚫 此地址暫不提供外送\n\n"
+                f"📍 {address}\n"
+                f"📏 距本店距離：{delivery_info.get('distance_text', '超過 3 公里')}\n\n"
+                "目前外送範圍為門市 3 公里內。\n"
+                "這次沒有建立包月訂單，請改選自取或找客服協助。"
+            )
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(text=rejection_text))
+            except Exception as push_error:
+                print(f"⚠️ 推播超距表單拒絕通知失敗 uid={user_id[:8]}...: {push_error}")
+            return {
+                "status": "rejected",
+                "reason": "delivery_out_of_range",
+                "distance": delivery_info.get("distance_text", ""),
+            }
 
         # ==========================================
         # 5. 生成預覽文字與試算表資料 (🔥 升級版：自動推算日期與雙重表單)
@@ -3785,6 +3916,12 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "raw_form_data": data,
         }
         order_id = create_pending_subscription_form_order(form_snapshot)
+        update_subscription_delivery_block(
+            user_id,
+            delivery_info.get("delivery_available") if is_delivery else True,
+        )
+        if user_id in user_memory:
+            del user_memory[user_id]
 
         pickup_line = f"\n📦 取餐方式：{pickup_method}" if pickup_method else ""
         address_line = f"\n📍 外送地址：{address}" if (is_delivery and address) else ""
@@ -3978,9 +4115,11 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             print(f"⚠️ 推播包月表單完成通知給管理員失敗: {_admin_push_e}")
         return {"status": "success"}
 
-    except Exception as e: 
+    except HTTPException:
+        raise
+    except Exception as e:
         print(f"💥 [表單崩潰致命錯誤]: {str(e)}")
-        return {"status": "error", "msg": str(e)}
+        raise HTTPException(status_code=500, detail="包月表單處理失敗") from e
 # ==========================================
 # 🔥 滿意度問卷接收器 (自動發放不重複點數)
 # ==========================================

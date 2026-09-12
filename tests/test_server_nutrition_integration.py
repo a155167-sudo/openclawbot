@@ -1981,6 +1981,7 @@ def test_form_data_routes_delivery_quote_failure_to_manual_review(monkeypatch):
             "稱呼": "測試客戶",
             "本期取餐方式": "外送",
             "本期外送地址": "台北市測試路1號",
+            "取餐日期": ["週一"],
         }
 
     monkeypatch.setattr(
@@ -2028,6 +2029,286 @@ def test_form_data_routes_delivery_quote_failure_to_manual_review(monkeypatch):
     assert "$0" not in pushed[0][1]
 
 
+def test_form_data_rejects_missing_dates_before_delivery_side_effects(monkeypatch):
+    quote_calls = []
+    delivery_block_calls = []
+    pushed = []
+
+    async def request_json():
+        return {
+            "UID": "U_NO_SCHEDULE",
+            "稱呼": "無日期",
+            "本期取餐方式": "外送",
+            "本期外送地址": "台北市測試路1號",
+        }
+
+    monkeypatch.setattr(
+        server, "calculate_delivery_quote", lambda address: quote_calls.append(address)
+    )
+    monkeypatch.setattr(
+        server, "update_subscription_delivery_block",
+        lambda *args: delivery_block_calls.append(args),
+    )
+    monkeypatch.setattr(
+        server.line_bot_api, "push_message", lambda *args: pushed.append(args)
+    )
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=request_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert exc_info.value.status_code == 422
+    assert quote_calls == []
+    assert delivery_block_calls == []
+    assert pushed == []
+
+    async def invalid_number_json():
+        return {
+            "UID": "U_BAD_FORM_NUMBER",
+            "稱呼": "非法數值",
+            "本期取餐方式": "外送",
+            "本期外送地址": "台北市測試路1號",
+            "取餐": ["週一"],
+            "體重": "not-a-number",
+        }
+
+    server.user_memory["U_BAD_FORM_NUMBER"] = [{"role": "user", "content": "keep"}]
+    with pytest.raises(server.HTTPException) as number_exc:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=invalid_number_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert number_exc.value.status_code == 422
+    assert quote_calls == []
+    assert delivery_block_calls == []
+    assert pushed == []
+    assert "U_BAD_FORM_NUMBER" in server.user_memory
+
+    for index, (label, value) in enumerate(
+        (
+            ("體重", -1), ("體重", 9999),
+            ("身高", -1), ("身高", 9999),
+            ("年齡", -1), ("年齡", 9999),
+        )
+    ):
+        uid = f"U_BAD_RANGE_{index}"
+
+        async def invalid_range_json(label=label, value=value, uid=uid):
+            return {
+                "UID": uid,
+                "本期取餐方式": "外送",
+                "本期外送地址": "台北市測試路1號",
+                "取餐": ["週一"],
+                label: value,
+            }
+
+        server.user_memory[uid] = [{"role": "user", "content": "keep"}]
+        with pytest.raises(server.HTTPException) as range_exc:
+            asyncio.run(server.receive_form_data(
+                cast(Any, SimpleNamespace(json=invalid_range_json)),
+                cast(Any, SimpleNamespace()),
+            ))
+        assert range_exc.value.status_code == 422
+        assert uid in server.user_memory
+    assert quote_calls == []
+    assert delivery_block_calls == []
+    assert pushed == []
+
+
+def test_form_data_accepts_new_preference_columns_and_covers_light_bentos(monkeypatch):
+    captured = []
+    pushed = []
+
+    def dish(name, price=180, ingredients=None):
+        return {
+            "name": name, "cal": 400, "pro": 30, "price": price,
+            "ingredients": ingredients or name,
+            "category": "main", "carb_type": "高碳",
+        }
+
+    async def request_json():
+        return {
+            "UID": "U_NEW_FORM_COLUMNS",
+            "稱呼": "新版表單客戶",
+            "本期取餐方式": "自取",
+            "禁忌": "豆腐,羊肉,起司",
+            "您不喜歡的蛋白質（可複選）": ["牛肉"],
+            "您偏好的蛋白質種類（可複選）": ["雞肉", "豆腐"],
+            "主食偏好": ["飯食派"],
+            "您的主食選擇（可複選）": ["都不挑食"],
+            "第一週想取餐的日期（可複選）": ["週一", "星期一"],
+            "第二週想取餐的日期（可複選）": ["週二"],
+            "第三週想取餐的日期（可複選）": ["週三"],
+            "第四週想取餐的日期（可複選）": ["週四"],
+        }
+
+    monkeypatch.setattr(server, "MAIN_DISHES", [
+        dish("豆腐食蔬", 155), dish("雞肉香料食蔬", 160, "雞肉,豆腐"),
+        dish("香料便當", 100, "孜然羊肉"),
+        dish("雞肉起司食蔬", 165, "雞肉,起司"),
+        dish("雞肉便當", 180),
+        dish("雞肉低碳", 190), dish("雞肉食蔬", 170),
+    ])
+    monkeypatch.setattr(server.random, "sample", lambda population, count: population[:count])
+    monkeypatch.setattr(
+        server,
+        "create_pending_subscription_form_order",
+        lambda snapshot: captured.append(snapshot) or 986,
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "push_message",
+        lambda uid, message: pushed.append((uid, message.text)),
+    )
+    monkeypatch.setattr(
+        server, "get_line_display_name_safe", lambda _uid: "新版表單客戶"
+    )
+
+    result = asyncio.run(server.receive_form_data(
+        cast(Any, SimpleNamespace(json=request_json)),
+        cast(Any, SimpleNamespace()),
+    ))
+
+    assert result["status"] == "pending"
+    assert len(captured) == 1
+    snapshot = captured[0]
+    assert snapshot["pref_staple"] == "都不挑食"
+    assert snapshot["pref_protein"] == "雞肉,豆腐"
+    rows = snapshot["schedule_sheet_rows"][1:]
+    assert len(rows) == 4
+    assert snapshot["total_price"] == 1440
+    for week_number in range(1, 5):
+        week_rows = [row for row in rows if row[1].startswith(f"第{week_number}週-")]
+        assert len(week_rows) == 1
+        assert sum("食蔬" in meal for row in week_rows for meal in (row[2], row[5])) == 1
+        assert all("牛肉" not in meal for row in week_rows for meal in (row[2], row[5]))
+        assert all(
+            forbidden not in meal
+            for row in week_rows
+            for meal in (row[2], row[5])
+            for forbidden in ("豆腐", "雞肉香料食蔬", "香料便當", "雞肉起司食蔬")
+        )
+    assert pushed and pushed[0][0] == "U_NEW_FORM_COLUMNS"
+
+    async def legacy_request_json():
+        return {
+            "UID": "U_LEGACY_FORM_COLUMNS",
+            "稱呼": "舊版表單客戶",
+            "本期取餐方式": "自取",
+            "取餐": ["週一", "週一", "週二", "週二"],
+        }
+
+    legacy_result = asyncio.run(server.receive_form_data(
+        cast(Any, SimpleNamespace(json=legacy_request_json)),
+        cast(Any, SimpleNamespace()),
+    ))
+    assert legacy_result["status"] == "pending"
+    legacy_rows = captured[1]["schedule_sheet_rows"][1:]
+    assert len(legacy_rows) == 4
+    assert {row[1] for row in legacy_rows} == {
+        "第1週-週一", "第2週-週一", "第1週-週二", "第2週-週二",
+    }
+
+    async def fully_restricted_request_json():
+        return {
+            "UID": "U_FULLY_RESTRICTED",
+            "稱呼": "無安全餐客戶",
+            "本期取餐方式": "自取",
+            "禁忌": "豆腐和羊肉",
+            "取餐日期": ["週一"],
+        }
+
+    delivery_block_calls = []
+    monkeypatch.setattr(
+        server, "update_subscription_delivery_block",
+        lambda *args: delivery_block_calls.append(args),
+    )
+    monkeypatch.setattr(server, "MAIN_DISHES", [
+        dish("豆腐食蔬", 155), dish("香料羊肉便當", 180),
+    ])
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=fully_restricted_request_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert exc_info.value.status_code == 422
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+    async def no_preferred_light_json():
+        return {
+            "UID": "U_NO_PREFERRED_LIGHT",
+            "稱呼": "無偏好輕便當",
+            "本期取餐方式": "自取",
+            "您的主食選擇（可複選）": ["都不挑食"],
+            "您最喜歡的蛋白質是？（可複選）": ["雞肉"],
+            "取餐": ["週一"],
+        }
+
+    monkeypatch.setattr(server, "MAIN_DISHES", [
+        dish("雞肉便當", 180), dish("雞肉低碳", 190), dish("鱸魚食蔬", 170),
+    ])
+    with pytest.raises(server.HTTPException) as light_exc:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=no_preferred_light_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert light_exc.value.status_code == 422
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+    async def ambiguous_restrictions_json():
+        return {
+            "UID": "U_AMBIGUOUS_RESTRICTIONS",
+            "本期取餐方式": "自取",
+            "取餐": ["週一"],
+            "飲食禁忌補充": "牛肉",
+            "過敏禁忌項目": "豬肉",
+        }
+
+    with pytest.raises(server.HTTPException) as restriction_exc:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=ambiguous_restrictions_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert restriction_exc.value.status_code == 422
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+    async def fake_uid_note_json():
+        return {
+            "UID補充備考": "U_VICTIM",
+            "本期取餐方式": "自取",
+            "取餐": ["週一"],
+        }
+
+    assert asyncio.run(server.receive_form_data(
+        cast(Any, SimpleNamespace(json=fake_uid_note_json)),
+        cast(Any, SimpleNamespace()),
+    )) == {"status": "ignored"}
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+    async def one_dish_json():
+        return {
+            "UID": "U_ONE_SAFE_DISH",
+            "本期取餐方式": "自取",
+            "您的主食選擇（可複選）": ["飯食派"],
+            "取餐": ["週一"],
+        }
+
+    monkeypatch.setattr(server, "MAIN_DISHES", [dish("雞肉便當", 180)])
+    with pytest.raises(server.HTTPException) as one_dish_exc:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=one_dish_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert one_dish_exc.value.status_code == 422
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+
 def test_form_data_rejects_over_three_kilometer_delivery_before_pending_order(monkeypatch):
     created = []
     pushed = []
@@ -2038,6 +2319,7 @@ def test_form_data_rejects_over_three_kilometer_delivery_before_pending_order(mo
             "稱呼": "測試客戶",
             "本期取餐方式": "外送",
             "本期外送地址": "台北市測試路1號",
+            "取餐日期": ["週一"],
         }
 
     monkeypatch.setattr(
