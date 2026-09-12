@@ -171,20 +171,67 @@ async function api(path){{
   if(!response.ok)throw new Error(response.status===403?'此LINE帳號未獲營養師唯讀權限':response.status===401?'LINE身分驗證失敗':`讀取失敗（${{response.status}}）`);
   return response.json();
 }}
+function isNonnegativeInteger(value){{
+  return Number.isInteger(value)&&value>=0;
+}}
+function validatedValidDays(detail){{
+  const days=detail&&detail.valid_days;
+  if(!Array.isArray(days))return null;
+  const dates=new Set();
+  for(const day of days){{
+    if(!day||typeof day!=='object'||Array.isArray(day))return null;
+    if(typeof day.local_date!=='string'||!/^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$/.test(day.local_date))return null;
+    if(dates.has(day.local_date))return null;
+    dates.add(day.local_date);
+    if(typeof day.rule_version!=='string'||day.rule_version.length===0||day.rule_version.length>100)return null;
+    if(!isNonnegativeInteger(day.qualifying_meal_count)||day.qualifying_meal_count>100)return null;
+    if(day.completeness_status!=='qualified'&&day.completeness_status!=='incomplete')return null;
+    if(typeof day.evaluated_at!=='string'||day.evaluated_at.length===0)return null;
+  }}
+  return days;
+}}
+function validatedValidDayCount(item,detail,validDays){{
+  const listCount=item&&item.valid_day_count;
+  const detailCount=detail&&detail.valid_day_count;
+  if(!isNonnegativeInteger(listCount)||!isNonnegativeInteger(detailCount)||validDays===null)return null;
+  const qualifiedCount=validDays.filter(day=>day.completeness_status==='qualified').length;
+  if(listCount!==detailCount||detailCount!==qualifiedCount)return null;
+  return detailCount;
+}}
+function validatedSourceCounts(detail,sourceLogs){{
+  if(!Array.isArray(sourceLogs))return null;
+  const integrity=detail&&detail.source_integrity;
+  if(!integrity||typeof integrity!=='object'||Array.isArray(integrity))return null;
+  const referenced=integrity.referenced_count;
+  const available=integrity.available_snapshot_count;
+  const complete=integrity.all_snapshots_available;
+  if(!isNonnegativeInteger(referenced)||!isNonnegativeInteger(available))return null;
+  if(available>referenced||available!==sourceLogs.length)return null;
+  if(typeof complete!=='boolean'||complete!==(referenced===available))return null;
+  return {{referenced,available}};
+}}
 function renderCase(item,detail){{
   const card=node('article',undefined,'case');
-  card.append(node('h2',`${{statusLabels[item.status]||item.status}}｜有效日 ${{item.valid_day_count}} / 3`));
+  card.append(node('h2',statusLabels[item.status]||item.status));
+  const validDays=validatedValidDays(detail);
+  const validDayCount=validatedValidDayCount(item,detail,validDays);
+  card.append(node('div',validDayCount===null?'有效日：資料不可用':`有效日：${{validDayCount}} / 3`,'meta'));
   card.append(node('div',`收集期間：${{item.window_started_at}} ～ ${{item.window_ends_at}}`,'meta'));
   const days=node('ul',undefined,'days');
-  const validDays=(detail&&detail.valid_days)||[];
-  if(validDays.length===0)days.append(node('li','目前尚無可列入的日期'));
-  for(const day of validDays)days.append(node('li',`${{day.local_date}}｜${{day.qualifying_meal_count}} 餐｜${{day.completeness_status}}`));
+  if(validDays===null)days.append(node('li','有效日期：資料不可用'));
+  else if(validDays.length===0)days.append(node('li','目前尚無可列入的日期'));
+  for(const day of validDays||[])days.append(node('li',`${{day.local_date}}｜${{day.qualifying_meal_count}} 餐｜${{day.completeness_status}}`));
   card.append(days);
   const disclosure=node('details');
-  disclosure.append(node('summary','查看去識別化來源與營養快照'));
+  disclosure.append(node('summary','查看來源參照與可驗證營養快照'));
   const sources=node('ul',undefined,'days');
-  const sourceLogs=(detail&&detail.source_logs)||[];
-  if(sourceLogs.length===0)sources.append(node('li','目前沒有可驗證來源快照'));
+  const rawSourceLogs=detail&&detail.source_logs;
+  const sourceLogs=Array.isArray(rawSourceLogs)?rawSourceLogs:[];
+  const sourceCounts=validatedSourceCounts(detail,rawSourceLogs);
+  sources.append(node('li',sourceCounts===null?'保留來源參照：資料不可用':`保留來源參照：${{sourceCounts.referenced}} 筆`));
+  sources.append(node('li',sourceCounts===null?'目前可驗證快照：資料不可用':`目前可驗證快照：${{sourceCounts.available}} 筆`));
+  if(sourceCounts===null&&sourceLogs.length===0)sources.append(node('li','來源快照清單資料不可用'));
+  else if(sourceCounts&&sourceCounts.available===0)sources.append(node('li','目前無可顯示的來源快照；不代表沒有飲食紀錄'));
   for(const log of sourceLogs)sources.append(renderSource(item.case_id,log));
   disclosure.append(sources);
   card.append(disclosure);

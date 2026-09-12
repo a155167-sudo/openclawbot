@@ -542,6 +542,25 @@ def test_terminal_cases_do_not_depend_on_mutable_canonical_source_rows(tmp_path)
             )
 
 
+def test_delivered_detail_keeps_three_days_and_six_references_when_no_snapshot_is_available(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+
+    path = _populated_db(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE vip_health_check_cases SET status='delivered'")
+        conn.execute("UPDATE food_logs SET version=version+1")
+        detail = load_health_check_detail(conn, case_id="case-1")
+
+    assert detail is not None
+    assert detail["valid_day_count"] == 3
+    assert detail["source_logs"] == []
+    assert detail["source_integrity"] == {
+        "referenced_count": 6,
+        "available_snapshot_count": 0,
+        "all_snapshots_available": False,
+    }
+
+
 def test_valid_day_completeness_must_match_registered_producer_rule(tmp_path):
     from dietitian_health_check_api import load_health_check_detail, load_health_check_list
 

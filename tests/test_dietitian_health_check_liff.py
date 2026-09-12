@@ -74,6 +74,11 @@ def test_liff_script_reads_live_collecting_and_ready_cases_without_persisting_to
     assert "顧客確認・AI估算" in script
     assert "NA" in script
     assert "JSON.stringify((detail&&detail.source_logs)" not in script
+    assert "有效日：" in script
+    assert "保留來源參照：" in script
+    assert "目前可驗證快照：" in script
+    assert "目前無可顯示的來源快照；不代表沒有飲食紀錄" in script
+    assert "資料不可用" in script
 
 
 def test_liff_photo_behavior_runs_in_real_javascript(tmp_path):

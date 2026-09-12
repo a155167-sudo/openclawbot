@@ -29,6 +29,7 @@ function walk(root) {
   return [root, ...root.children.flatMap(child => child instanceof Element ? walk(child) : [])];
 }
 function find(root, predicate) { return walk(root).find(predicate); }
+function renderedText(root) { return walk(root).map(element => element.textContent).join('\n'); }
 function deferred() {
   let resolve;
   const promise = new Promise(r => { resolve = r; });
@@ -46,7 +47,21 @@ function imageResponse(status = 200) {
 
 const script = fs.readFileSync(process.argv[2], 'utf8');
 const listing = {items: [{case_id: 'case/A', status: 'ready_for_review', valid_day_count: 3, window_started_at: 'start', window_ends_at: 'end'}]};
-const detail = {valid_days: [], source_logs: [{log_id: 'log B', trust_type: 'user_confirmed_ai_estimate', estimate: {}}]};
+function validDay(localDate, completenessStatus = 'qualified', qualifyingMealCount = 2) {
+  return {
+    local_date: localDate,
+    rule_version: 'draft-confirmed-meals-v1',
+    qualifying_meal_count: qualifyingMealCount,
+    completeness_status: completenessStatus,
+    evaluated_at: `${localDate}T12:00:00+08:00`,
+  };
+}
+const threeQualifiedDays = [validDay('2026-09-02'), validDay('2026-09-03'), validDay('2026-09-04')];
+const detail = {
+  valid_day_count: 3,
+  valid_days: threeQualifiedDays,
+  source_logs: [{log_id: 'log B', trust_type: 'user_confirmed_ai_estimate', estimate: {}}],
+};
 
 async function createApp(fetchImpl) {
   const status = new Element('p');
@@ -157,7 +172,7 @@ async function switchingCasesRevokesPriorCasePhotos() {
     if (path.includes('/sources/')) return imageResponse();
     if (path.includes('?')) return jsonResponse(twoCases);
     const caseId = path.endsWith('/case-A') ? 'A' : 'B';
-    return jsonResponse({valid_days: [], source_logs: [{log_id: `log-${caseId}`, trust_type: 'user_confirmed_ai_estimate', estimate: {}}]});
+    return jsonResponse({valid_day_count: 3, valid_days: threeQualifiedDays, source_logs: [{log_id: `log-${caseId}`, trust_type: 'user_confirmed_ai_estimate', estimate: {}}]});
   });
   const views = walk(app.cases).filter(el => el.tagName === 'BUTTON' && el.textContent === '查看照片');
   assert.equal(views.length, 2);
@@ -185,7 +200,7 @@ async function latePriorCaseResponseCannotAttach() {
     if (path.includes('/case-B/sources/')) return Promise.resolve(imageResponse());
     if (path.includes('?')) return Promise.resolve(jsonResponse(twoCases));
     const caseId = path.endsWith('/case-A') ? 'A' : 'B';
-    return Promise.resolve(jsonResponse({valid_days: [], source_logs: [{log_id: `log-${caseId}`, trust_type: 'user_confirmed_ai_estimate', estimate: {}}]}));
+    return Promise.resolve(jsonResponse({valid_day_count: 3, valid_days: threeQualifiedDays, source_logs: [{log_id: `log-${caseId}`, trust_type: 'user_confirmed_ai_estimate', estimate: {}}]}));
   });
   const views = walk(app.cases).filter(el => el.tagName === 'BUTTON' && el.textContent === '查看照片');
   const clickA = views[0].dispatch('click');
@@ -223,7 +238,7 @@ async function cancelledCaseRequestCanRetryWithoutOldFinallyUnlockingIt() {
     if (path.includes('/case-B/sources/')) return Promise.resolve(imageResponse());
     if (path.includes('?')) return Promise.resolve(jsonResponse(twoCases));
     const caseId = path.endsWith('/case-A') ? 'A' : 'B';
-    return Promise.resolve(jsonResponse({valid_days: [], source_logs: [{log_id: `log-${caseId}`, trust_type: 'user_confirmed_ai_estimate', estimate: {}}]}));
+    return Promise.resolve(jsonResponse({valid_day_count: 3, valid_days: threeQualifiedDays, source_logs: [{log_id: `log-${caseId}`, trust_type: 'user_confirmed_ai_estimate', estimate: {}}]}));
   });
   const views = walk(app.cases).filter(el => el.tagName === 'BUTTON' && el.textContent === '查看照片');
 
@@ -300,6 +315,153 @@ async function errorControls() {
   assert.ok(find(app.cases, el => el.textContent === 'LINE身分驗證失敗'));
 }
 
+function sourceLogs(count) {
+  return Array.from({length: count}, (_, index) => ({
+    log_id: `source-${index + 1}`,
+    trust_type: 'verified_snapshot',
+    nutrition_snapshot: {},
+  }));
+}
+
+async function sourceIntegrityCopy() {
+  const cases = [
+    {
+      name: 'complete',
+      itemCount: 3,
+      detail: {valid_day_count: 3, valid_days: threeQualifiedDays, source_logs: sourceLogs(6), source_integrity: {referenced_count: 6, available_snapshot_count: 6, all_snapshots_available: true}},
+      present: ['有效日：3 / 3', '保留來源參照：6 筆', '目前可驗證快照：6 筆'],
+    },
+    {
+      name: 'partial',
+      itemCount: 3,
+      detail: {valid_day_count: 3, valid_days: threeQualifiedDays, source_logs: sourceLogs(5), source_integrity: {referenced_count: 6, available_snapshot_count: 5, all_snapshots_available: false}},
+      present: ['有效日：3 / 3', '保留來源參照：6 筆', '目前可驗證快照：5 筆'],
+    },
+    {
+      name: 'none currently available',
+      itemCount: 3,
+      detail: {valid_day_count: 3, valid_days: threeQualifiedDays, source_logs: [], source_integrity: {referenced_count: 6, available_snapshot_count: 0, all_snapshots_available: false}},
+      present: ['有效日：3 / 3', '保留來源參照：6 筆', '目前可驗證快照：0 筆', '目前無可顯示的來源快照；不代表沒有飲食紀錄'],
+      absent: ['目前沒有可驗證來源快照'],
+    },
+  ];
+  for (const scenario of cases) {
+    const caseListing = {items: [{...listing.items[0], valid_day_count: scenario.itemCount}]};
+    const app = await createApp(async path => path.includes('?') ? jsonResponse(caseListing) : jsonResponse(scenario.detail));
+    const text = renderedText(app.cases);
+    for (const expected of scenario.present) assert.ok(text.includes(expected), `${scenario.name}: ${expected}`);
+    for (const forbidden of scenario.absent || []) assert.ok(!text.includes(forbidden), `${scenario.name}: ${forbidden}`);
+  }
+}
+
+async function invalidSourceLogsNeverMasqueradeAsZeroRecords() {
+  const invalidSourceLogs = [
+    ['missing source logs', undefined],
+    ['null source logs', null],
+    ['object source logs', {}],
+    ['string source logs', ''],
+  ];
+  for (const [name, sourceLogsValue] of invalidSourceLogs) {
+    const body = {valid_day_count: 3, valid_days: threeQualifiedDays, source_integrity: {referenced_count: 0, available_snapshot_count: 0, all_snapshots_available: true}};
+    if (sourceLogsValue !== undefined) body.source_logs = sourceLogsValue;
+    const app = await createApp(async path => path.includes('?') ? jsonResponse(listing) : jsonResponse(body));
+    const text = renderedText(app.cases);
+    assert.ok(text.includes('保留來源參照：資料不可用'), name);
+    assert.ok(text.includes('目前可驗證快照：資料不可用'), name);
+    assert.ok(text.includes('來源快照清單資料不可用'), name);
+    assert.ok(!text.includes('保留來源參照：0 筆'), `${name}: malformed records must not prove zero references`);
+    assert.ok(!text.includes('目前可驗證快照：0 筆'), `${name}: malformed records must not prove zero snapshots`);
+  }
+
+  {
+    const body = {valid_day_count: 3, valid_days: threeQualifiedDays, source_logs: [], source_integrity: {referenced_count: 0, available_snapshot_count: 0, all_snapshots_available: true}};
+    const app = await createApp(async path => path.includes('?') ? jsonResponse(listing) : jsonResponse(body));
+    const text = renderedText(app.cases);
+    assert.ok(text.includes('保留來源參照：0 筆'));
+    assert.ok(text.includes('目前可驗證快照：0 筆'));
+    assert.ok(!text.includes('來源快照清單資料不可用'));
+  }
+
+  {
+    const body = {valid_day_count: 3, valid_days: threeQualifiedDays, source_logs: null, source_integrity: {referenced_count: 6, available_snapshot_count: 0, all_snapshots_available: false}};
+    const app = await createApp(async path => path.includes('?') ? jsonResponse(listing) : jsonResponse(body));
+    const text = renderedText(app.cases);
+    assert.ok(text.includes('保留來源參照：資料不可用'));
+    assert.ok(text.includes('目前可驗證快照：資料不可用'));
+    assert.ok(text.includes('來源快照清單資料不可用'));
+    assert.ok(!text.includes('保留來源參照：6 筆'));
+  }
+}
+
+async function invalidSourceCountsNeverFallBackToRenderedLogLength() {
+  const invalidDetails = [
+    ['missing referenced count', {available_snapshot_count: 1, all_snapshots_available: false}],
+    ['missing available count', {referenced_count: 6, all_snapshots_available: false}],
+    ['wrong referenced count type', {referenced_count: '6', available_snapshot_count: 1, all_snapshots_available: false}],
+    ['wrong available count type', {referenced_count: 6, available_snapshot_count: '1', all_snapshots_available: false}],
+    ['negative count', {referenced_count: 6, available_snapshot_count: -1, all_snapshots_available: false}],
+    ['noninteger count', {referenced_count: 6, available_snapshot_count: 0.5, all_snapshots_available: false}],
+    ['available exceeds referenced', {referenced_count: 0, available_snapshot_count: 1, all_snapshots_available: false}],
+    ['count differs from snapshots', {referenced_count: 6, available_snapshot_count: 2, all_snapshots_available: false}],
+    ['completeness boolean inconsistent', {referenced_count: 1, available_snapshot_count: 1, all_snapshots_available: false}],
+  ];
+  for (const [name, integrity] of invalidDetails) {
+    const body = {valid_day_count: 3, valid_days: threeQualifiedDays, source_logs: sourceLogs(1), source_integrity: integrity};
+    const app = await createApp(async path => path.includes('?') ? jsonResponse(listing) : jsonResponse(body));
+    const text = renderedText(app.cases);
+    assert.ok(text.includes('保留來源參照：資料不可用'), name);
+    assert.ok(text.includes('目前可驗證快照：資料不可用'), name);
+    assert.ok(!text.includes('目前可驗證快照：1 筆'), `${name}: must not use source_logs.length`);
+  }
+
+  for (const [name, itemCount, detailCount] of [
+    ['missing detail count', 3, undefined],
+    ['wrong detail count type', 3, '3'],
+    ['negative detail count', 3, -1],
+    ['noninteger detail count', 3, 2.5],
+    ['list/detail mismatch', 2, 3],
+  ]) {
+    const caseListing = {items: [{...listing.items[0], valid_day_count: itemCount}]};
+    const body = {valid_day_count: detailCount, valid_days: threeQualifiedDays, source_logs: [], source_integrity: {referenced_count: 0, available_snapshot_count: 0, all_snapshots_available: true}};
+    const app = await createApp(async path => path.includes('?') ? jsonResponse(caseListing) : jsonResponse(body));
+    const text = renderedText(app.cases);
+    assert.ok(text.includes('有效日：資料不可用'), name);
+    assert.ok(!text.includes('有效日：3 / 3'), `${name}: must not trust list fallback`);
+  }
+}
+
+async function validDayCountRequiresConsistentDayRecords() {
+  const validCases = [
+    ['three qualified days', 3, threeQualifiedDays, ['有效日：3 / 3', '2026-09-02｜2 餐｜qualified', '2026-09-04｜2 餐｜qualified']],
+    ['zero days', 0, [], ['有效日：0 / 3', '目前尚無可列入的日期']],
+    ['incomplete day does not count', 0, [validDay('2026-09-02', 'incomplete', 1)], ['有效日：0 / 3', '2026-09-02｜1 餐｜incomplete']],
+  ];
+  for (const [name, count, validDays, expectedTexts] of validCases) {
+    const caseListing = {items: [{...listing.items[0], valid_day_count: count}]};
+    const body = {valid_day_count: count, valid_days: validDays, source_logs: []};
+    const app = await createApp(async path => path.includes('?') ? jsonResponse(caseListing) : jsonResponse(body));
+    const text = renderedText(app.cases);
+    for (const expected of expectedTexts) assert.ok(text.includes(expected), `${name}: ${expected}`);
+  }
+
+  const invalidCases = [
+    ['count three with empty days', 3, []],
+    ['missing days', 3, undefined],
+    ['wrong days type', 3, {}],
+    ['count differs from qualified days', 2, threeQualifiedDays],
+    ['malformed day record', 1, [{local_date: '2026-09-02', completeness_status: 'qualified'}]],
+  ];
+  for (const [name, count, validDays] of invalidCases) {
+    const caseListing = {items: [{...listing.items[0], valid_day_count: count}]};
+    const body = {valid_day_count: count, source_logs: []};
+    if (validDays !== undefined) body.valid_days = validDays;
+    const app = await createApp(async path => path.includes('?') ? jsonResponse(caseListing) : jsonResponse(body));
+    const text = renderedText(app.cases);
+    assert.ok(text.includes('有效日：資料不可用'), name);
+    assert.ok(!text.includes(`有效日：${count} / 3`), `${name}: contradictory count must not render`);
+  }
+}
+
 (async () => {
   await happyPath();
   await staleRequestCannotAttach();
@@ -309,6 +471,10 @@ async function errorControls() {
   await cancelledCaseRequestCanRetryWithoutOldFinallyUnlockingIt();
   await pagehideRevokes();
   await errorControls();
+  await sourceIntegrityCopy();
+  await invalidSourceLogsNeverMasqueradeAsZeroRecords();
+  await invalidSourceCountsNeverFallBackToRenderedLogLength();
+  await validDayCountRequiresConsistentDayRecords();
   console.log('dietitian LIFF photo behavior: PASS');
 })().catch(error => {
   console.error(error);
