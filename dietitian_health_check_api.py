@@ -15,14 +15,16 @@ from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import requests
 
 from health_check_rules import HEALTH_CHECK_DAY_RULE_MINIMUM_MEALS
 from nutrition_system import (
     meal_photo_estimate_snapshot_is_valid,
+    user_confirmed_meal_photo_estimate_is_valid,
     user_confirmed_meal_photo_trust_projection,
 )
+from protected_health_check_image import ImagePreview, ImageUnavailable, read_bounded_preview
 
 
 LINE_ID_TOKEN_VERIFY_URL = "https://api.line.me/oauth2/v2.1/verify"
@@ -71,6 +73,9 @@ THREE_DAY_REQUIRED_STATUSES = frozenset(
 )
 REFRESHABLE_CASE_STATUSES = frozenset(
     {"collecting", "ready_for_review", "needs_more_info"}
+)
+IMAGE_VIEWABLE_CASE_STATUSES = frozenset(
+    {"ready_for_review", "needs_more_info", "approved_pending_delivery", "delivery_failed"}
 )
 
 NO_STORE_HEADERS = {
@@ -902,6 +907,79 @@ def load_health_check_detail(
     return result
 
 
+def load_health_check_image(
+    conn: sqlite3.Connection, *, case_id: str, log_id: str, image_root: str,
+) -> ImagePreview | None:
+    """Resolve one private image through its canonical case/log/draft chain."""
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT c.user_id AS case_user_id,c.status AS case_status,
+                      sr.food_log_id,sr.food_log_version,sr.source_hash,
+                      fl.log_id,fl.user_id AS log_user_id,fl.version,
+                      fl.nutrition_snapshot_json,fl.source_image_ref,
+                      fl.confirmation_status,fl.deleted_at,fl.trust_type,fl.trust_hash,
+                      fl.exchange_snapshot_json,
+                      fc.owner_user_id AS catalog_owner_user_id,
+                      fc.source_type AS catalog_source_type,
+                      fc.original_image_ref AS catalog_image_ref,
+                      d.token AS draft_token,d.user_id AS draft_user_id,
+                      d.source_image_ref AS draft_image_ref,d.status AS draft_status,
+                      d.version AS draft_version,d.workflow_version,
+                      d.confirmed_log_id,d.approved_log_id,d.confirmed_by
+               FROM vip_health_check_cases c
+               JOIN vip_health_check_source_refs sr ON sr.case_id=c.case_id
+               JOIN food_logs fl ON fl.log_id=sr.food_log_id
+               JOIN food_catalog fc ON fc.food_id=fl.food_id
+               JOIN pending_meal_photo_drafts d
+                 ON d.user_id=c.user_id AND d.source_image_ref=fl.source_image_ref
+                AND (d.confirmed_log_id=fl.log_id OR d.approved_log_id=fl.log_id)
+               WHERE c.case_id=? AND sr.food_log_id=?""",
+            (case_id, log_id),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        if (
+            row["case_status"] not in IMAGE_VIEWABLE_CASE_STATUSES
+            or row["case_user_id"] != row["log_user_id"]
+            or row["case_user_id"] != row["draft_user_id"]
+            or row["case_user_id"] != row["catalog_owner_user_id"]
+            or row["catalog_source_type"] != "user_meal_photo"
+            or row["food_log_id"] != row["log_id"]
+            or row["food_log_version"] != row["version"]
+            or row["confirmation_status"] != "confirmed"
+            or str(row["deleted_at"] or "")
+            or not str(row["source_image_ref"] or "")
+            or row["source_image_ref"] != row["draft_image_ref"]
+            or row["source_image_ref"] != row["catalog_image_ref"]
+            or not _source_hash_matches(conn, row)
+        ):
+            return None
+        workflow = row["workflow_version"]
+        if workflow == "user_confirmed_ai_estimate_v1":
+            if (
+                row["draft_status"] != "user_confirmed"
+                or row["confirmed_log_id"] != log_id
+                or row["confirmed_by"] != row["case_user_id"]
+                or not user_confirmed_meal_photo_estimate_is_valid(
+                    conn, log_id,
+                    expected_user_id=row["case_user_id"],
+                    expected_draft_token=row["draft_token"],
+                    expected_draft_version=row["draft_version"],
+                )
+            ):
+                return None
+        elif workflow == "expert_review_v1":
+            if row["draft_status"] != "approved" or row["approved_log_id"] != log_id:
+                return None
+        else:
+            return None
+        return read_bounded_preview(image_root, row["source_image_ref"])
+    except (sqlite3.Error, TypeError, ValueError, ImageUnavailable):
+        return None
+
+
 def _response(detail: str, status_code: int) -> JSONResponse:
     return JSONResponse({"detail": detail}, status_code=status_code, headers=NO_STORE_HEADERS)
 
@@ -912,6 +990,8 @@ def create_dietitian_health_check_router(
     allowed_uids: frozenset[str],
     list_loader: Callable[..., Mapping[str, object]],
     detail_loader: Callable[[str], Mapping[str, object] | None],
+    image_loader: Callable[[str, str], ImagePreview | None] | None = None,
+    allowed_uid_loader: Callable[[], frozenset[str]] | None = None,
     token_verifier: Callable[..., str] = verify_line_id_token,
 ) -> APIRouter:
     if not CHANNEL_ID_PATTERN.fullmatch(channel_id):
@@ -932,7 +1012,11 @@ def create_dietitian_health_check_router(
             return _response("authentication unavailable", 503)
         except Exception:
             return _response("authentication unavailable", 503)
-        if subject not in allowed_uids:
+        try:
+            current_allowed = allowed_uids if allowed_uid_loader is None else allowed_uid_loader()
+        except Exception:
+            return _response("authorization unavailable", 503)
+        if subject not in current_allowed:
             return _response("forbidden", 403)
         return None
 
@@ -984,6 +1068,33 @@ def create_dietitian_health_check_router(
         except Exception:
             return _response("health-check data unavailable", 503)
 
+    if image_loader is not None:
+        @router.get(
+            "/api/dietitian/health-checks/{case_id}/sources/{log_id}/image",
+            response_class=Response,
+        )
+        def source_image(
+            case_id: str,
+            log_id: str,
+            authorization: Any = Header(default=None),
+        ) -> Response:
+            denied = authorize(authorization)
+            if denied is not None:
+                return denied
+            if not CASE_ID_PATTERN.fullmatch(case_id) or not CASE_ID_PATTERN.fullmatch(log_id):
+                return _response("image not found", 404)
+            try:
+                preview = image_loader(case_id, log_id)
+            except Exception:
+                preview = None
+            if preview is None:
+                return _response("image not found", 404)
+            return Response(
+                content=preview.data,
+                media_type=preview.media_type,
+                headers=NO_STORE_HEADERS,
+            )
+
     def method_not_allowed() -> JSONResponse:
         return JSONResponse(
             {"detail": "method not allowed"},
@@ -1016,6 +1127,8 @@ def attach_dietitian_health_check_routes(
     config: DietitianHealthCheckConfig,
     list_loader: Callable[..., Mapping[str, object]],
     detail_loader: Callable[[str], Mapping[str, object] | None],
+    image_loader: Callable[[str, str], ImagePreview | None] | None = None,
+    allowed_uid_loader: Callable[[], frozenset[str]] | None = None,
     token_verifier: Callable[..., str] = verify_line_id_token,
 ) -> bool:
     if not config.enabled:
@@ -1041,6 +1154,8 @@ def attach_dietitian_health_check_routes(
             allowed_uids=config.allowed_uids,
             list_loader=list_loader,
             detail_loader=detail_loader,
+            image_loader=image_loader,
+            allowed_uid_loader=allowed_uid_loader,
             token_verifier=token_verifier,
         )
     )

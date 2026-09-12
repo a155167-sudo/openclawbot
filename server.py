@@ -120,6 +120,7 @@ from dietitian_health_check_api import (
     attach_dietitian_health_check_routes,
     load_dietitian_health_check_config,
     load_health_check_detail,
+    load_health_check_image,
     load_health_check_list,
 )
 from dietitian_health_check_liff import attach_dietitian_health_check_liff_routes
@@ -3212,6 +3213,21 @@ def get_dietitian_health_check(case_id: str):
         return load_health_check_detail(conn, case_id=case_id)
 
 
+def get_dietitian_health_check_image(case_id: str, log_id: str):
+    """Return a bounded preview selected only by canonical server-side bindings."""
+    with closing(_open_read_only_database()) as conn:
+        return load_health_check_image(
+            conn,
+            case_id=case_id,
+            log_id=log_id,
+            image_root=os.path.join(DB_DIR, "nutrition_images"),
+        )
+
+
+def _current_dietitian_health_check_allowed_uids():
+    return load_dietitian_health_check_config(os.environ).allowed_uids
+
+
 def register_customer_health_check_liff(target_app=app):
     return attach_customer_health_check_routes(
         target_app,
@@ -3230,6 +3246,8 @@ def register_dietitian_health_check_api(target_app=app):
         config=DIETITIAN_HEALTH_CHECK_CONFIG,
         list_loader=list_dietitian_health_checks,
         detail_loader=get_dietitian_health_check,
+        image_loader=get_dietitian_health_check_image,
+        allowed_uid_loader=_current_dietitian_health_check_allowed_uids,
     )
     attach_dietitian_health_check_liff_routes(
         target_app, DIETITIAN_HEALTH_CHECK_CONFIG
