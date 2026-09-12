@@ -43,6 +43,49 @@ class FakeWorksheet:
         return self._records
 
 
+def test_nutrition_ws_appends_only_missing_known_trailing_headers(monkeypatch):
+    expected = server.nutrition_sheet_specs()["飲食紀錄"]["headers"]
+
+    class ExistingSheet:
+        def __init__(self):
+            self.headers = expected[:-2]
+            self.updates = []
+
+        def row_values(self, row):
+            assert row == 1
+            return list(self.headers)
+
+        def update(self, *, values, range_name, value_input_option):
+            self.updates.append((values, range_name, value_input_option))
+            self.headers.extend(values[0])
+
+    ws = ExistingSheet()
+    monkeypatch.setattr(server, "sh", SimpleNamespace(worksheet=lambda title: ws))
+
+    assert server._nutrition_ws("飲食紀錄") is ws
+    assert ws.updates == [([["信任類型", "估算Schema版本"]], "AD1:AE1", "RAW")]
+    assert server._nutrition_ws("飲食紀錄") is ws
+    assert len(ws.updates) == 1
+
+
+def test_nutrition_ws_rejects_nonempty_conflicting_trailing_header(monkeypatch):
+    expected = server.nutrition_sheet_specs()["飲食紀錄"]["headers"]
+
+    class ConflictingSheet:
+        def row_values(self, _row):
+            return expected[:-2] + ["人工既有欄位"]
+
+        def update(self, **_kwargs):
+            raise AssertionError("conflicting header must not be overwritten")
+
+    monkeypatch.setattr(
+        server, "sh", SimpleNamespace(worksheet=lambda title: ConflictingSheet())
+    )
+
+    with pytest.raises(RuntimeError, match="欄位標題衝突"):
+        server._nutrition_ws("飲食紀錄")
+
+
 @pytest.mark.parametrize(
     ("distance_meters", "expected_fee"),
     [
@@ -611,6 +654,319 @@ def _daily_ledger_db(tmp_path, monkeypatch, name="daily-ledger.db"):
     return db
 
 
+def test_daily_food_log_refreshes_open_health_check_case(tmp_path, monkeypatch):
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+    )
+
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-refresh.db")
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    started_at = server.tw_now() - server.timedelta(minutes=5)
+    with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        case = create_first_vip_health_check_case(
+            conn,
+            user_id="U1",
+            first_vip_activation_id="activation-live-refresh",
+            activation_event_key="event-live-refresh",
+            activated_at=started_at,
+        )
+        server.create_daily_food_log(
+            conn,
+            user_id="U1",
+            product_name="測試早餐",
+            meal_slot="早餐",
+            consumed_at=server.tw_now().isoformat(timespec="seconds"),
+            servings=1,
+            nutrition={"calories_kcal": 300, "protein_g": 15},
+            source_type="user_private_food",
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()[0] == 1
+
+
+def test_daily_food_log_survives_best_effort_health_check_refresh_failure(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-refresh-failure.db")
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    calls = []
+
+    def fail_refresh(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise sqlite3.OperationalError("refresh unavailable")
+
+    monkeypatch.setattr(
+        server, "refresh_user_health_check_case", fail_refresh, raising=False
+    )
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn,
+            user_id="U1",
+            product_name="仍要保留的餐",
+            meal_slot="午餐",
+            consumed_at=server.tw_now().isoformat(timespec="seconds"),
+            servings=1,
+            nutrition={"calories_kcal": 500, "protein_g": 25},
+            source_type="user_private_food",
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM food_logs WHERE user_id='U1'"
+        ).fetchone()[0] == 1
+    assert len(calls) == 1
+
+
+def _seed_ready_health_check_case(db, monkeypatch):
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+    )
+
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    now = server.tw_now()
+    log_ids = []
+    with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        case = create_first_vip_health_check_case(
+            conn,
+            user_id="U1",
+            first_vip_activation_id="activation-edit-refresh",
+            activation_event_key="event-edit-refresh",
+            activated_at=now - server.timedelta(days=3),
+        )
+        for day_offset in (2, 1, 0):
+            day = server.tw_today() - server.timedelta(days=day_offset)
+            for hour, slot in ((8, "早餐"), (12, "午餐")):
+                result = server.create_daily_food_log(
+                    conn,
+                    user_id="U1",
+                    product_name=f"{day.isoformat()}-{slot}",
+                    meal_slot=slot,
+                    consumed_at=f"{day.isoformat()}T{hour:02d}:00:00+08:00",
+                    servings=1,
+                    nutrition={"calories_kcal": 300, "protein_g": 15},
+                    source_type="user_private_food",
+                    operation_key=f"seed:{day.isoformat()}:{slot}",
+                )
+                log_ids.append(result["log_id"])
+        conn.commit()
+        state = conn.execute(
+            "SELECT status,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()
+        assert state == ("ready_for_review", 3)
+    return case["case_id"], log_ids
+
+
+def test_food_log_edit_refreshes_manifest_and_delete_downgrades_case(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-edit-refresh.db")
+    case_id, log_ids = _seed_ready_health_check_case(db, monkeypatch)
+    edited_log = log_ids[0]
+    with sqlite3.connect(db) as conn:
+        before = conn.execute(
+            "SELECT food_log_version,source_hash FROM vip_health_check_source_refs "
+            "WHERE case_id=? AND food_log_id=?",
+            (case_id, edited_log),
+        ).fetchone()
+
+    server.apply_daily_food_log_edit(
+        user_id="U1", log_id=edited_log, expected_version=1,
+        event_id="edit-health-check-1", action="correct_nutrition",
+        field="calories_kcal", value=321,
+    )
+    with sqlite3.connect(db) as conn:
+        after = conn.execute(
+            "SELECT food_log_version,source_hash FROM vip_health_check_source_refs "
+            "WHERE case_id=? AND food_log_id=?",
+            (case_id, edited_log),
+        ).fetchone()
+        assert after[0] == 2
+        assert after[1] != before[1]
+
+    server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log_ids[1], expected_version=1,
+        event_id="delete-health-check-1", action="delete",
+    )
+    with sqlite3.connect(db) as conn:
+        state = conn.execute(
+            "SELECT status,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
+            (case_id,),
+        ).fetchone()
+        refs = conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case_id,),
+        ).fetchone()[0]
+    assert state == ("collecting", 2)
+    assert refs == 5
+
+
+def test_clear_daily_food_ledger_refreshes_and_downgrades_case(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-clear-refresh.db")
+    case_id, _log_ids = _seed_ready_health_check_case(db, monkeypatch)
+
+    server.clear_daily_food_ledger("U1", event_id="clear-health-check-1")
+
+    with sqlite3.connect(db) as conn:
+        state = conn.execute(
+            "SELECT status,valid_day_count FROM vip_health_check_cases WHERE case_id=?",
+            (case_id,),
+        ).fetchone()
+        refs = conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case_id,),
+        ).fetchone()[0]
+    assert state == ("collecting", 2)
+    assert refs == 4
+
+
+def test_operation_key_replay_repairs_a_failed_health_check_refresh(tmp_path, monkeypatch):
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+        refresh_user_health_check_case as real_refresh,
+    )
+
+    db = _daily_ledger_db(tmp_path, monkeypatch, "health-check-replay-repair.db")
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        case = create_first_vip_health_check_case(
+            conn, user_id="U1", first_vip_activation_id="activation-repair",
+            activation_event_key="event-repair",
+            activated_at=server.tw_now() - server.timedelta(minutes=5),
+        )
+        monkeypatch.setattr(
+            server, "refresh_user_health_check_case",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sqlite3.OperationalError("temporary refresh failure")
+            ),
+        )
+        first = server.create_daily_food_log(
+            conn, user_id="U1", product_name="可修復早餐", meal_slot="早餐",
+            consumed_at=server.tw_now().isoformat(timespec="seconds"), servings=1,
+            nutrition={"calories_kcal": 250, "protein_g": 12},
+            source_type="user_private_food", operation_key="repair-op-1",
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()[0] == 0
+        monkeypatch.setattr(server, "refresh_user_health_check_case", real_refresh)
+        replay = server.create_daily_food_log(
+            conn, user_id="U1", product_name="可修復早餐", meal_slot="早餐",
+            consumed_at=server.tw_now().isoformat(timespec="seconds"), servings=1,
+            nutrition={"calories_kcal": 250, "protein_g": 12},
+            source_type="user_private_food", operation_key="repair-op-1",
+        )
+        conn.commit()
+        assert replay["replayed"] is True
+        assert replay["log_id"] == first["log_id"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("operation", ["edit", "delete", "clear", "quick", "breakfast", "label"])
+@pytest.mark.parametrize("fail_first_refresh", [False, True])
+def test_food_entry_manifest_replay_and_failure_isolation(
+    tmp_path, monkeypatch, operation, fail_first_refresh,
+):
+    """Real SQLite projection repair must not duplicate committed ledger/outbox events."""
+    db = _daily_ledger_db(tmp_path, monkeypatch, f"manifest-{operation}.db")
+    case_id, log_ids = _seed_ready_health_check_case(db, monkeypatch)
+    token = ""
+    with sqlite3.connect(db) as conn:
+        food_ids = [row[0] for row in conn.execute(
+            "SELECT food_id FROM food_logs ORDER BY log_id"
+        )]
+        if operation == "breakfast":
+            for food_id, (name, _servings) in zip(food_ids, server.BREAKFAST_COMBOS["早餐1"]):
+                conn.execute("UPDATE food_catalog SET product_name=? WHERE food_id=?", (name, food_id))
+        if operation == "label":
+            token = save_pending_label(conn, user_id="U1", payload=valid_label())
+        before = conn.execute(
+            "SELECT source_manifest_hash FROM vip_health_check_cases WHERE case_id=?", (case_id,)
+        ).fetchone()[0]
+        before_refs = conn.execute(
+            "SELECT * FROM vip_health_check_source_refs WHERE case_id=? ORDER BY food_log_id", (case_id,)
+        ).fetchall()
+        if fail_first_refresh:
+            conn.execute("""CREATE TRIGGER reject_manifest_update
+                BEFORE UPDATE ON vip_health_check_cases
+                BEGIN SELECT RAISE(ABORT, 'temporary refresh update failure'); END""")
+
+    monkeypatch.setattr(server, "get_active_nutrition_target", lambda *_: None)
+    monkeypatch.setattr(server, "sync_confirmed_nutrition_to_sheet", lambda *_: None)
+    monkeypatch.setattr(server, "apply_confirmed_nutrition_to_legacy_dashboard", lambda *_: None)
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
+
+    def run():
+        if operation in {"edit", "delete"}:
+            return server.apply_daily_food_log_edit(
+                user_id="U1", log_id=log_ids[0], expected_version=1,
+                event_id="manifest-mutation", action="delete" if operation == "delete" else "correct_nutrition",
+                **({} if operation == "delete" else {"field": "calories_kcal", "value": 321}),
+            )
+        if operation == "clear":
+            return server.clear_daily_food_ledger("U1", event_id="manifest-clear")
+        if operation == "quick":
+            return server._quick_log_catalog_card_once(
+                user_id="U1", food_id=food_ids[0], servings=1,
+                meal_slot="晚餐", event_ref="manifest-quick", display_quantity="1份",
+            )
+        if operation == "breakfast":
+            return server._build_breakfast_combo_reply_once("U1", "早餐1", "manifest-breakfast")
+        # Re-delivery gets through the transient in-memory duplicate cache.
+        server.processed_messages.clear()
+        return server._handle_message_impl(_text_event(
+            "manifest-label", f"確認營養紀錄:{token}", user_id="U1",
+        ))
+
+    run()
+    with sqlite3.connect(db) as conn:
+        after = conn.execute(
+            "SELECT source_manifest_hash FROM vip_health_check_cases WHERE case_id=?", (case_id,)
+        ).fetchone()[0]
+        assert (after == before) is fail_first_refresh
+        if fail_first_refresh:
+            assert conn.execute(
+                "SELECT * FROM vip_health_check_source_refs WHERE case_id=? ORDER BY food_log_id", (case_id,)
+            ).fetchall() == before_refs
+            conn.execute("DROP TRIGGER reject_manifest_update")
+        # Capture authoritative data, not just counts, before replay repairs the projection.
+        tables = ["food_logs", "nutrition_sheet_outbox", "daily_food_log_events", "health_profile"]
+        if operation == "breakfast":
+            tables += ["combo_log_events", "frequent_foods"]
+        committed = {table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in tables}
+    run()
+    with sqlite3.connect(db) as conn:
+        repaired = conn.execute(
+            "SELECT source_manifest_hash FROM vip_health_check_cases WHERE case_id=?", (case_id,)
+        ).fetchone()[0]
+        assert repaired != before
+        assert {table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in tables} == committed
+        refs = conn.execute(
+            "SELECT food_log_id,food_log_version FROM vip_health_check_source_refs WHERE case_id=? ORDER BY food_log_id", (case_id,)
+        ).fetchall()
+        expected = conn.execute(
+            "SELECT log_id,version FROM food_logs WHERE user_id='U1' AND confirmation_status='confirmed' "
+            "AND COALESCE(deleted_at,'')='' ORDER BY log_id"
+        ).fetchall()
+        assert refs == expected
+
+
 def test_daily_food_ledger_separates_today_and_yesterday_and_keeps_unknown_na(tmp_path, monkeypatch):
     db = _daily_ledger_db(tmp_path, monkeypatch)
     today = server.tw_today()
@@ -646,6 +1002,82 @@ def test_daily_food_ledger_separates_today_and_yesterday_and_keeps_unknown_na(tm
     assert "NA" in rendered
     assert "調整份量" in rendered
     assert "修正營養" in rendered
+
+
+def test_daily_food_trust_tamper_is_explicit_in_ledger_ui_and_health_report(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-trust-projection.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-TRUST-UI",
+            payload=meal_photo_payload(), consumed_at=f"{today}T12:10:00+08:00",
+            meal_slot="午餐",
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "one_bowl"), ("vegetable_portion", "one_bowl"),
+            ("cooking_oil", "unknown"), ("sauce_level", "unknown"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"TRUST-UI-ANSWER-{index}", user_id="U1",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+        confirmed = apply_meal_photo_action(
+            conn, event_id="TRUST-UI-CONFIRM", user_id="U1", token=token,
+            expected_version=9, action="confirm_estimate",
+        )
+        log_id = confirmed["result"]["log_id"]
+        server.create_daily_food_log(
+            conn, user_id="U1", product_name="文字估算", meal_slot="點心",
+            consumed_at=f"{today}T15:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 120, "protein_g": 6},
+            source_type="ai_text_estimate",
+        )
+        server.create_daily_food_log(
+            conn, user_id="U1", product_name="部署前合計（無逐筆明細）", meal_slot="",
+            consumed_at=f"{today}T00:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 80, "protein_g": 4},
+            source_type="legacy_daily_carryover",
+        )
+        conn.commit()
+
+    valid = server.get_daily_food_ledger("U1", today)
+    confirmed_item = next(item for item in valid["items"] if item["log_id"] == log_id)
+    assert confirmed_item["trust_type"] == "user_confirmed_ai_estimate"
+    assert "顧客確認・AI估算" in json.dumps(
+        server._daily_food_item_bubble(confirmed_item), ensure_ascii=False
+    )
+    controls = {
+        item["product_name"]: json.dumps(server._daily_food_item_bubble(item), ensure_ascii=False)
+        for item in valid["items"] if item["log_id"] != log_id
+    }
+    assert "來源：AI 預估" in controls["文字估算"]
+    assert "資料完整性驗證未通過" not in controls["文字估算"]
+    assert "資料完整性驗證未通過" not in controls["部署前合計（無逐筆明細）"]
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE food_logs SET trust_type='' WHERE log_id=?", (log_id,))
+        conn.commit()
+
+    ledger = server.get_daily_food_ledger("U1", today)
+    tampered = next(item for item in ledger["items"] if item["log_id"] == log_id)
+    assert tampered["trust_type"] == "untrusted_user_confirmed_ai_estimate"
+    assert tampered["trust_integrity_status"] == "integrity_verification_failed"
+    assert all(tampered["nutrition"].get(field) is None for field in server.DAILY_FOOD_NUTRIENT_FIELDS)
+    rendered = json.dumps(server._daily_food_item_bubble(tampered), ensure_ascii=False)
+    assert "資料完整性驗證未通過，營養資料暫不可用" in rendered
+    assert "🔥 NA" in rendered and "🥩 NA" in rendered
+    assert "🔥 0" not in rendered and "🥩 0" not in rendered
+
+    monkeypatch.setattr(server, "ADMIN_UID", "U1")
+    monkeypatch.setattr(server, "fetch_daily_intervals_summary", lambda *_: None)
+    monkeypatch.setattr(server, "get_daily_nutrition_target", lambda *_: None)
+    report = server.build_jason_daily_health_report("U1", today)
+    assert "資料完整性驗證未通過，營養資料暫不可用" in report
+    tampered_line = next(line for line in report.splitlines() if "餐點照片" in line)
+    assert "NA kcal｜蛋白質NAg" in tampered_line
+    assert "0 kcal｜蛋白質0g" not in tampered_line
 
 
 def test_daily_food_nutrition_correction_is_field_only_idempotent_and_recalculates_today(tmp_path, monkeypatch):
@@ -1463,21 +1895,60 @@ def test_failed_image_delete_keeps_reference_for_retry(tmp_path, monkeypatch):
         token = save_pending_label(conn, user_id="U1", payload=valid_label(), source_image_ref=ref)
         conn.execute("UPDATE pending_nutrition_logs SET expires_at='2000-01-01T00:00:00+08:00' WHERE token=?", (token,))
         conn.commit()
-    original_remove = server.os.remove
+    original_unlink = server.safe_unlink_nutrition_image
 
-    def fail_remove(_):
+    def fail_unlink(_root, _ref):
         raise OSError("busy")
 
-    monkeypatch.setattr(server.os, "remove", fail_remove)
+    monkeypatch.setattr(server, "safe_unlink_nutrition_image", fail_unlink)
     server.cleanup_nutrition_images()
     with sqlite3.connect(db) as conn:
         retained = conn.execute("SELECT source_image_ref FROM pending_nutrition_logs WHERE token=?", (token,)).fetchone()[0]
     assert retained == ref
-    monkeypatch.setattr(server.os, "remove", original_remove)
+    monkeypatch.setattr(server, "safe_unlink_nutrition_image", original_unlink)
     server.cleanup_nutrition_images()
     with sqlite3.connect(db) as conn:
         cleared = conn.execute("SELECT source_image_ref FROM pending_nutrition_logs WHERE token=?", (token,)).fetchone()[0]
     assert cleared == ""
+
+
+@pytest.mark.parametrize(
+    ("root_state", "leaf_state", "expected"),
+    [
+        ("missing", "missing", False),
+        ("directory", "regular", True),
+        ("directory", "missing", True),
+        ("directory", "symlink", False),
+        ("symlink", "regular", False),
+    ],
+)
+def test_delete_nutrition_image_uses_no_follow_root_and_leaf_semantics(
+    tmp_path, monkeypatch, root_state, leaf_state, expected
+):
+    root = tmp_path / "nutrition_images"
+    external = tmp_path / "external"
+    external.mkdir()
+    ref = "nutrition-image:" + "a" * 32 + ".jpg"
+    filename = ref.removeprefix("nutrition-image:")
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"outside")
+    if root_state == "directory":
+        root.mkdir()
+        if leaf_state == "regular":
+            (root / filename).write_bytes(b"inside")
+        elif leaf_state == "symlink":
+            (root / filename).symlink_to(outside)
+    elif root_state == "symlink":
+        (external / filename).write_bytes(b"external")
+        root.symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+
+    assert server._delete_nutrition_image(ref) is expected
+    assert outside.read_bytes() == b"outside"
+    if root_state == "symlink":
+        assert (external / filename).read_bytes() == b"external"
+    if leaf_state == "symlink":
+        assert (root / filename).is_symlink()
 
 
 def test_awaiting_identity_expiration_deletes_stored_back_image(tmp_path, monkeypatch):
@@ -1624,7 +2095,7 @@ def test_nutrition_cleanup_is_registered_hourly():
     )]
 
 
-def test_confirmed_image_cleanup_requeues_sheet_updates(tmp_path, monkeypatch):
+def test_confirmed_label_reference_protects_90_day_image_cleanup(tmp_path, monkeypatch):
     db = tmp_path / "confirmed-cleanup.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
@@ -1641,8 +2112,8 @@ def test_confirmed_image_cleanup_requeues_sheet_updates(tmp_path, monkeypatch):
         log_ref = conn.execute("SELECT source_image_ref FROM food_logs").fetchone()[0]
         food_ref = conn.execute("SELECT original_image_ref FROM food_catalog").fetchone()[0]
         states = dict(conn.execute("SELECT entity_type,status FROM nutrition_sheet_outbox"))
-    assert log_ref == food_ref == ""
-    assert states == {"food": "pending", "food_log": "pending"}
+    assert log_ref == food_ref == ref
+    assert states["food"] == states["food_log"] == "synced"
 
 
 def test_plan_link_failure_is_retried(tmp_path, monkeypatch):
@@ -1981,6 +2452,7 @@ def test_form_data_routes_delivery_quote_failure_to_manual_review(monkeypatch):
             "稱呼": "測試客戶",
             "本期取餐方式": "外送",
             "本期外送地址": "台北市測試路1號",
+            "取餐日期": ["週一"],
         }
 
     monkeypatch.setattr(
@@ -2028,6 +2500,286 @@ def test_form_data_routes_delivery_quote_failure_to_manual_review(monkeypatch):
     assert "$0" not in pushed[0][1]
 
 
+def test_form_data_rejects_missing_dates_before_delivery_side_effects(monkeypatch):
+    quote_calls = []
+    delivery_block_calls = []
+    pushed = []
+
+    async def request_json():
+        return {
+            "UID": "U_NO_SCHEDULE",
+            "稱呼": "無日期",
+            "本期取餐方式": "外送",
+            "本期外送地址": "台北市測試路1號",
+        }
+
+    monkeypatch.setattr(
+        server, "calculate_delivery_quote", lambda address: quote_calls.append(address)
+    )
+    monkeypatch.setattr(
+        server, "update_subscription_delivery_block",
+        lambda *args: delivery_block_calls.append(args),
+    )
+    monkeypatch.setattr(
+        server.line_bot_api, "push_message", lambda *args: pushed.append(args)
+    )
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=request_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert exc_info.value.status_code == 422
+    assert quote_calls == []
+    assert delivery_block_calls == []
+    assert pushed == []
+
+    async def invalid_number_json():
+        return {
+            "UID": "U_BAD_FORM_NUMBER",
+            "稱呼": "非法數值",
+            "本期取餐方式": "外送",
+            "本期外送地址": "台北市測試路1號",
+            "取餐": ["週一"],
+            "體重": "not-a-number",
+        }
+
+    server.user_memory["U_BAD_FORM_NUMBER"] = [{"role": "user", "content": "keep"}]
+    with pytest.raises(server.HTTPException) as number_exc:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=invalid_number_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert number_exc.value.status_code == 422
+    assert quote_calls == []
+    assert delivery_block_calls == []
+    assert pushed == []
+    assert "U_BAD_FORM_NUMBER" in server.user_memory
+
+    for index, (label, value) in enumerate(
+        (
+            ("體重", -1), ("體重", 9999),
+            ("身高", -1), ("身高", 9999),
+            ("年齡", -1), ("年齡", 9999),
+        )
+    ):
+        uid = f"U_BAD_RANGE_{index}"
+
+        async def invalid_range_json(label=label, value=value, uid=uid):
+            return {
+                "UID": uid,
+                "本期取餐方式": "外送",
+                "本期外送地址": "台北市測試路1號",
+                "取餐": ["週一"],
+                label: value,
+            }
+
+        server.user_memory[uid] = [{"role": "user", "content": "keep"}]
+        with pytest.raises(server.HTTPException) as range_exc:
+            asyncio.run(server.receive_form_data(
+                cast(Any, SimpleNamespace(json=invalid_range_json)),
+                cast(Any, SimpleNamespace()),
+            ))
+        assert range_exc.value.status_code == 422
+        assert uid in server.user_memory
+    assert quote_calls == []
+    assert delivery_block_calls == []
+    assert pushed == []
+
+
+def test_form_data_accepts_new_preference_columns_and_covers_light_bentos(monkeypatch):
+    captured = []
+    pushed = []
+
+    def dish(name, price=180, ingredients=None):
+        return {
+            "name": name, "cal": 400, "pro": 30, "price": price,
+            "ingredients": ingredients or name,
+            "category": "main", "carb_type": "高碳",
+        }
+
+    async def request_json():
+        return {
+            "UID": "U_NEW_FORM_COLUMNS",
+            "稱呼": "新版表單客戶",
+            "本期取餐方式": "自取",
+            "禁忌": "豆腐,羊肉,起司",
+            "您不喜歡的蛋白質（可複選）": ["牛肉"],
+            "您偏好的蛋白質種類（可複選）": ["雞肉", "豆腐"],
+            "主食偏好": ["飯食派"],
+            "您的主食選擇（可複選）": ["都不挑食"],
+            "第一週想取餐的日期（可複選）": ["週一", "星期一"],
+            "第二週想取餐的日期（可複選）": ["週二"],
+            "第三週想取餐的日期（可複選）": ["週三"],
+            "第四週想取餐的日期（可複選）": ["週四"],
+        }
+
+    monkeypatch.setattr(server, "MAIN_DISHES", [
+        dish("豆腐食蔬", 155), dish("雞肉香料食蔬", 160, "雞肉,豆腐"),
+        dish("香料便當", 100, "孜然羊肉"),
+        dish("雞肉起司食蔬", 165, "雞肉,起司"),
+        dish("雞肉便當", 180),
+        dish("雞肉低碳", 190), dish("雞肉食蔬", 170),
+    ])
+    monkeypatch.setattr(server.random, "sample", lambda population, count: population[:count])
+    monkeypatch.setattr(
+        server,
+        "create_pending_subscription_form_order",
+        lambda snapshot: captured.append(snapshot) or 986,
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "push_message",
+        lambda uid, message: pushed.append((uid, message.text)),
+    )
+    monkeypatch.setattr(
+        server, "get_line_display_name_safe", lambda _uid: "新版表單客戶"
+    )
+
+    result = asyncio.run(server.receive_form_data(
+        cast(Any, SimpleNamespace(json=request_json)),
+        cast(Any, SimpleNamespace()),
+    ))
+
+    assert result["status"] == "pending"
+    assert len(captured) == 1
+    snapshot = captured[0]
+    assert snapshot["pref_staple"] == "都不挑食"
+    assert snapshot["pref_protein"] == "雞肉,豆腐"
+    rows = snapshot["schedule_sheet_rows"][1:]
+    assert len(rows) == 4
+    assert snapshot["total_price"] == 1440
+    for week_number in range(1, 5):
+        week_rows = [row for row in rows if row[1].startswith(f"第{week_number}週-")]
+        assert len(week_rows) == 1
+        assert sum("食蔬" in meal for row in week_rows for meal in (row[2], row[5])) == 1
+        assert all("牛肉" not in meal for row in week_rows for meal in (row[2], row[5]))
+        assert all(
+            forbidden not in meal
+            for row in week_rows
+            for meal in (row[2], row[5])
+            for forbidden in ("豆腐", "雞肉香料食蔬", "香料便當", "雞肉起司食蔬")
+        )
+    assert pushed and pushed[0][0] == "U_NEW_FORM_COLUMNS"
+
+    async def legacy_request_json():
+        return {
+            "UID": "U_LEGACY_FORM_COLUMNS",
+            "稱呼": "舊版表單客戶",
+            "本期取餐方式": "自取",
+            "取餐": ["週一", "週一", "週二", "週二"],
+        }
+
+    legacy_result = asyncio.run(server.receive_form_data(
+        cast(Any, SimpleNamespace(json=legacy_request_json)),
+        cast(Any, SimpleNamespace()),
+    ))
+    assert legacy_result["status"] == "pending"
+    legacy_rows = captured[1]["schedule_sheet_rows"][1:]
+    assert len(legacy_rows) == 4
+    assert {row[1] for row in legacy_rows} == {
+        "第1週-週一", "第2週-週一", "第1週-週二", "第2週-週二",
+    }
+
+    async def fully_restricted_request_json():
+        return {
+            "UID": "U_FULLY_RESTRICTED",
+            "稱呼": "無安全餐客戶",
+            "本期取餐方式": "自取",
+            "禁忌": "豆腐和羊肉",
+            "取餐日期": ["週一"],
+        }
+
+    delivery_block_calls = []
+    monkeypatch.setattr(
+        server, "update_subscription_delivery_block",
+        lambda *args: delivery_block_calls.append(args),
+    )
+    monkeypatch.setattr(server, "MAIN_DISHES", [
+        dish("豆腐食蔬", 155), dish("香料羊肉便當", 180),
+    ])
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=fully_restricted_request_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert exc_info.value.status_code == 422
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+    async def no_preferred_light_json():
+        return {
+            "UID": "U_NO_PREFERRED_LIGHT",
+            "稱呼": "無偏好輕便當",
+            "本期取餐方式": "自取",
+            "您的主食選擇（可複選）": ["都不挑食"],
+            "您最喜歡的蛋白質是？（可複選）": ["雞肉"],
+            "取餐": ["週一"],
+        }
+
+    monkeypatch.setattr(server, "MAIN_DISHES", [
+        dish("雞肉便當", 180), dish("雞肉低碳", 190), dish("鱸魚食蔬", 170),
+    ])
+    with pytest.raises(server.HTTPException) as light_exc:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=no_preferred_light_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert light_exc.value.status_code == 422
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+    async def ambiguous_restrictions_json():
+        return {
+            "UID": "U_AMBIGUOUS_RESTRICTIONS",
+            "本期取餐方式": "自取",
+            "取餐": ["週一"],
+            "飲食禁忌補充": "牛肉",
+            "過敏禁忌項目": "豬肉",
+        }
+
+    with pytest.raises(server.HTTPException) as restriction_exc:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=ambiguous_restrictions_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert restriction_exc.value.status_code == 422
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+    async def fake_uid_note_json():
+        return {
+            "UID補充備考": "U_VICTIM",
+            "本期取餐方式": "自取",
+            "取餐": ["週一"],
+        }
+
+    assert asyncio.run(server.receive_form_data(
+        cast(Any, SimpleNamespace(json=fake_uid_note_json)),
+        cast(Any, SimpleNamespace()),
+    )) == {"status": "ignored"}
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+    async def one_dish_json():
+        return {
+            "UID": "U_ONE_SAFE_DISH",
+            "本期取餐方式": "自取",
+            "您的主食選擇（可複選）": ["飯食派"],
+            "取餐": ["週一"],
+        }
+
+    monkeypatch.setattr(server, "MAIN_DISHES", [dish("雞肉便當", 180)])
+    with pytest.raises(server.HTTPException) as one_dish_exc:
+        asyncio.run(server.receive_form_data(
+            cast(Any, SimpleNamespace(json=one_dish_json)),
+            cast(Any, SimpleNamespace()),
+        ))
+    assert one_dish_exc.value.status_code == 422
+    assert len(captured) == 2
+    assert delivery_block_calls == []
+
+
 def test_form_data_rejects_over_three_kilometer_delivery_before_pending_order(monkeypatch):
     created = []
     pushed = []
@@ -2038,6 +2790,7 @@ def test_form_data_rejects_over_three_kilometer_delivery_before_pending_order(mo
             "稱呼": "測試客戶",
             "本期取餐方式": "外送",
             "本期外送地址": "台北市測試路1號",
+            "取餐日期": ["週一"],
         }
 
     monkeypatch.setattr(
@@ -2444,6 +3197,274 @@ def test_non_vip_text_gate_only_permits_valid_activation_or_authorized_commands(
     assert server.is_text_command_allowed_without_vip("U_ADMIN", "#教練") is False
     assert server.is_text_command_allowed_without_vip("U_ADMIN", "碳循環") is False
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "包月方案") is False
+
+
+def test_non_vip_allowlisted_dietitian_can_open_health_check_without_ai_or_quota(monkeypatch):
+    dietitian_uid = "U1234567890abcdef1234567890abcdef"
+    liff_id = "2011528194-EsxeCZ2a"
+    replies = []
+    ai_calls = []
+    quota_calls = []
+    monkeypatch.setattr(server, "ADMIN_UID", "U_OTHER_ADMIN")
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_CONFIG", SimpleNamespace(enabled=True)
+    )
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS",
+        frozenset({dietitian_uid}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID", liff_id, raising=False
+    )
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("dietitian command must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server, "get_ai_response_with_memory", lambda *_args, **_kwargs: ai_calls.append(True)
+    )
+    monkeypatch.setattr(
+        server, "check_permission_and_quota", lambda *_args: quota_calls.append(True)
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message),
+    )
+    event = _text_event(
+        "DIETITIAN-COMMAND-ALLOWLISTED",
+        "#營養師健檢",
+        dietitian_uid,
+    )
+    server.processed_messages.discard(event.message.id)
+
+    server.handle_message(event)
+
+    assert len(replies) == 1
+    rendered = json.loads(replies[0].as_json_string())
+    assert rendered["altText"] == "開啟營養師三日健檢"
+    assert f"https://liff.line.me/{liff_id}" in json.dumps(
+        rendered, ensure_ascii=False
+    )
+    assert ai_calls == []
+    assert quota_calls == []
+
+
+def test_allowlisted_dietitian_command_is_silent_when_read_feature_is_disabled(monkeypatch):
+    dietitian_uid = "U1234567890abcdef1234567890abcdef"
+    dispatched = []
+    replies = []
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_CONFIG", SimpleNamespace(enabled=False)
+    )
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS",
+        frozenset({dietitian_uid}),
+    )
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID", "2011528194-EsxeCZ2a"
+    )
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: dispatched.append(event.message.text)
+    )
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("disabled reserved command must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda *_args: replies.append(True)
+    )
+    event = _text_event(
+        "DIETITIAN-COMMAND-DISABLED", "#營養師健檢", dietitian_uid
+    )
+    server.processed_messages.discard(event.message.id)
+
+    server.handle_message(event)
+
+    assert dispatched == []
+    assert replies == []
+
+
+def test_unauthorized_dietitian_commands_are_silent_before_vip_db_gate(monkeypatch):
+    dispatched = []
+    replies = []
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS",
+        frozenset({"U1234567890abcdef1234567890abcdef"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID",
+        "2011528194-EsxeCZ2a",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("reserved command must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: dispatched.append(event.message.text)
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda *_args: replies.append(True),
+    )
+
+    for index, message in enumerate(
+        (
+            "#營養師健檢",
+            " #營養師健檢",
+            "#營養師健檢 ",
+            "\t#營養師健檢\n",
+            "＃營養師健檢",
+            "# 營養師健檢",
+            "#營養師 健檢",
+            "#營養師\u200b健檢",
+            "#營養師\u034f健檢",
+            "#營養師\ufe0f健檢",
+            "#營養師\U000e0100健檢",
+            "#營養師健檢現在",
+            "#養師健檢",
+            "#榮養師健檢",
+            "#營養師健撿現在請處理",
+            "#養師健檢現在請處理",
+            "#生活#營養師健檢",
+            "正常文字#營養師健檢",
+            "#今天跑步#營養師健檢",
+            "#營ﬃ養師健檢",
+            "#營養#師健檢",
+            "#營養﹟師健檢",
+            "#營養＃師健檢",
+        )
+    ):
+        event = _text_event(f"DIETITIAN-DENY-{index}", message, "U_ADMIN")
+        server.processed_messages.discard(event.message.id)
+        server.handle_message(event)
+
+    assert dispatched == []
+    assert replies == []
+
+
+def test_active_vip_normal_dietitian_health_hashtags_reach_regular_handler(monkeypatch):
+    dispatched = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
+    monkeypatch.setattr(server, "is_valid_vip_activation_command", lambda *_args: False)
+    monkeypatch.setattr(
+        server, "is_authorized_privileged_text_command", lambda *_args: False
+    )
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: dispatched.append(event.message.text)
+    )
+
+    expected = [
+        "#營養師健康資訊",
+        "#營養師健康飲食",
+        "#今天跑步心得" + ("很棒" * 100),
+        "#營養師建議",
+        "#營養師健身",
+        "#營養師料理",
+        "#營養師營養建議",
+        "#今天跑步" + (" " * 128),
+        "#今天跑步" + (" " * 129),
+        "#今天跑步" + ("\t" * 128),
+        "#今天跑步" + ("\n" * 128),
+        "#今天跑步" + ("\r" * 128),
+    ]
+    for index, message in enumerate(expected):
+        event = _text_event(f"DIETITIAN-NORMAL-{index}", message, "U_CUSTOMER")
+        server.processed_messages.discard(event.message.id)
+        server.handle_message(event)
+
+    assert dispatched == expected
+
+
+def test_shared_privileged_classifier_delegates_dietitian_namespace_without_hiding_other_admin_commands():
+    for message in (
+        "#營養師建議",
+        "#營養師健身",
+        "#營養師料理",
+        "#營養師營養建議",
+    ):
+        assert server.is_privileged_command_intent(message) is False
+    assert server.is_privileged_command_intent("#營養師健身#點數庫存") is True
+    assert server.is_privileged_command_intent("#營養師健康飲食#點數庫存") is True
+
+
+def test_public_dietitian_hashtag_cannot_hide_later_admin_command_before_vip_gate(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("admin intent must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_handle_message_impl",
+        lambda _event: (_ for _ in ()).throw(
+            AssertionError("admin intent must not reach regular handler")
+        ),
+    )
+    event = _text_event(
+        "DIETITIAN-PUBLIC-THEN-ADMIN",
+        "#營養師健康飲食#點數庫存",
+        "U_CUSTOMER",
+    )
+    server.processed_messages.discard(event.message.id)
+    server.handle_message(event)
+
+
+def test_dietitian_command_is_silent_when_liff_is_not_configured(monkeypatch):
+    dispatched = []
+    replies = []
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS",
+        frozenset({"U_ADMIN"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID", "", raising=False
+    )
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("disabled command must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: dispatched.append(event.message.text)
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda *_args: replies.append(True),
+    )
+
+    event = _text_event("DIETITIAN-NO-CONFIG", "#營養師健檢", "U_ADMIN")
+    server.processed_messages.discard(event.message.id)
+    server.handle_message(event)
+
+    assert dispatched == []
+    assert replies == []
 
 
 def test_vip_activation_precheck_missing_db_fails_closed_without_creating_file(
@@ -3460,6 +4481,12 @@ def test_committed_confirmation_reply_failure_is_retriable(tmp_path, monkeypatch
     monkeypatch.setattr(server, "get_active_nutrition_target", lambda *_: None)
     monkeypatch.setattr(server, "sync_confirmed_nutrition_to_sheet", lambda *_: None)
     monkeypatch.setattr(server, "apply_confirmed_nutrition_to_legacy_dashboard", lambda *_: None)
+    refresh_users = []
+    monkeypatch.setattr(
+        server,
+        "_refresh_health_check_after_food_log",
+        lambda _conn, *, user_id: refresh_users.append(user_id),
+    )
 
     def fail_reply(*_):
         raise RuntimeError("LINE unavailable")
@@ -3484,6 +4511,7 @@ def test_committed_confirmation_reply_failure_is_retriable(tmp_path, monkeypatch
     assert "低脂蛋白 2.71份" in reply_text
     assert "主食 0.53份" in reply_text
     assert "尚未扣入個人計畫" in reply_text
+    assert refresh_users == ["U_CONFIRM_REPLY", "U_CONFIRM_REPLY"]
 
 
 def test_exchange_review_admin_commands_list_approve_and_replay(tmp_path, monkeypatch):
@@ -4044,11 +5072,13 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     with sqlite3.connect(db) as conn:
         ensure_meal_photo_schema(conn)
         token = save_meal_photo_draft(
-            conn, user_id="U_MEAL", source_message_id="M1", payload=meal_photo_payload()
+            conn, user_id="U_MEAL", source_message_id="M1", payload=meal_photo_payload(),
+            workflow_version="expert_review_v1",
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
         ), start=1):
             apply_meal_photo_action(
@@ -4058,7 +5088,7 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     replies = []
     monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
     event = SimpleNamespace(
-        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        postback=SimpleNamespace(data=f"mp:v1:{token}:8:answer:sauce_level:half"),
         source=SimpleNamespace(user_id="U_MEAL"), reply_token="reply-final",
         webhook_event_id="WEBHOOK-FINAL", timestamp=1784740620000,
     )
@@ -4069,7 +5099,7 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     estimate_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
     assert "照片估算" in estimate_text
     assert "審核並加入" in estimate_text
-    assert f"mpr:v1:{token}:8:start" in estimate_text
+    assert f"mpr:v1:{token}:9:start" in estimate_text
     with sqlite3.connect(db) as conn:
         draft = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
     assert draft["status"] == "estimated"
@@ -4087,10 +5117,12 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
             conn, user_id="U_CUSTOMER", source_message_id="M_CUSTOMER",
             payload=meal_photo_payload(),
             source_image_ref="nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg",
+            workflow_version="expert_review_v1",
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
         ), start=1):
             apply_meal_photo_action(
@@ -4115,13 +5147,14 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
         ),
     )
     event = SimpleNamespace(
-        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        postback=SimpleNamespace(data=f"mp:v1:{token}:8:answer:sauce_level:half"),
         source=SimpleNamespace(user_id="U_CUSTOMER"), reply_token="reply-customer-final",
         webhook_event_id="WEBHOOK-CUSTOMER-FINAL", timestamp=1784740620000,
     )
 
     server.handle_meal_photo_postback(event)
 
+    assert replies[0].alt_text == "餐點照片估算完成，等待營養師審核"
     customer_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
     assert "審核並加入" not in customer_text
     assert len(pushes) == 2
@@ -4137,7 +5170,47 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
         [json.loads(str(message)) for message in admin_payload], ensure_ascii=False
     )
     assert "新的餐點審核需求" in admin_text
-    assert f"mpr:v1:{token}:8:start" in admin_text
+    assert f"mpr:v1:{token}:9:start" in admin_text
+
+
+def test_new_customer_estimate_alt_text_still_prompts_confirmation(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-new-customer-alt-text.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_NEW_CUSTOMER", source_message_id="M_NEW_CUSTOMER",
+            payload=meal_photo_payload(),
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
+            ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"NEW-CUSTOMER-PREP-{index}", user_id="U_NEW_CUSTOMER",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+    replies = []
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(
+            reply_message=lambda _token, message: replies.append(message),
+            push_message=lambda *_args, **_kwargs: pytest.fail("new workflow must not push review"),
+        ),
+    )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:8:answer:sauce_level:half"),
+        source=SimpleNamespace(user_id="U_NEW_CUSTOMER"), reply_token="reply-new-customer-final",
+        webhook_event_id="WEBHOOK-NEW-CUSTOMER-FINAL", timestamp=1784740620000,
+    )
+
+    server.handle_meal_photo_postback(event)
+
+    assert replies[0].alt_text == "餐點照片估算完成，請確認記錄"
+    customer_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
+    assert "確認記錄" in customer_text
 
 
 def test_meal_photo_review_photo_failure_falls_back_to_text_and_card(monkeypatch):
@@ -4612,6 +5685,87 @@ def test_bound_admin_authorization_fails_closed_on_database_error(tmp_path, monk
         server.get_bound_admin_uid_for_authorization()
 
 
+def test_customer_meal_photo_confirm_postback_records_without_review_push(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-customer-confirm.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    refresh_users, replies = [], []
+    monkeypatch.setattr(server, "_prepare_health_check_refresh_connection", lambda _conn: True)
+    monkeypatch.setattr(
+        server, "_refresh_health_check_after_food_log",
+        lambda _conn, *, user_id: refresh_users.append(user_id),
+    )
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(
+            reply_message=lambda _token, message: replies.append(message),
+            push_message=lambda *_args, **_kwargs: pytest.fail("customer confirmation must not push review"),
+        ),
+    )
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M-CUSTOMER-CONFIRM",
+            payload=meal_photo_payload(), consumed_at="2026-09-12T12:10:00+08:00",
+            meal_slot="午餐",
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "one_bowl"), ("vegetable_portion", "one_bowl"),
+            ("cooking_oil", "unknown"), ("sauce_level", "unknown"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"CUSTOMER-CONFIRM-PREP-{index}", user_id="U_CUSTOMER",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:9:confirm_estimate"),
+        source=SimpleNamespace(user_id="U_CUSTOMER"), reply_token="reply-customer-confirm",
+        webhook_event_id="CUSTOMER-CONFIRM-EVENT", timestamp=1784740620000,
+    )
+    server.handle_meal_photo_postback(event)
+    assert replies[-1].alt_text == "✅ 已記錄｜顧客確認・AI估算"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM food_exchange_approvals").fetchone()[0] == 0
+        food_id, log_id = conn.execute("SELECT food_id,log_id FROM food_logs").fetchone()
+    sheet_rows = {}
+    class _Sheet:
+        def __init__(self, title):
+            self.title = title
+        def find(self, *_args, **_kwargs):
+            return None
+        def append_row(self, values, **_kwargs):
+            sheet_rows[self.title] = values
+    monkeypatch.setattr(server, "_nutrition_ws", lambda title: _Sheet(title))
+    server._sync_food_outbox(food_id)
+    server._sync_food_log_outbox(log_id)
+    assert sheet_rows["食品資料庫"][10:25] == [""] * 15
+    assert sheet_rows["飲食紀錄"][9:24] == [""] * 15
+    assert sheet_rows["飲食紀錄"][29:] == [
+        "user_confirmed_ai_estimate", "meal-photo-user-confirmation-v1",
+    ]
+    server.handle_meal_photo_postback(event)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+    assert refresh_users == ["U_CUSTOMER", "U_CUSTOMER"]
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE food_logs SET trust_hash='tampered' WHERE log_id=?", (log_id,))
+        conn.commit()
+        summary_item = server.daily_food_summary(
+            conn, user_id="U_CUSTOMER", date_iso="2026-09-12"
+        )["foods"][0]
+    server._sync_food_outbox(food_id)
+    server._sync_food_log_outbox(log_id)
+    assert sheet_rows["食品資料庫"][10:25] == [""] * 15
+    assert sheet_rows["食品資料庫"][25] == "untrusted_user_confirmed_ai_estimate"
+    assert sheet_rows["飲食紀錄"][9:24] == [""] * 15
+    assert sheet_rows["飲食紀錄"][29:] == [
+        "untrusted_user_confirmed_ai_estimate", "",
+    ]
+    assert summary_item["trust_type"] == sheet_rows["飲食紀錄"][29]
+
+
 def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-pending-command.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
@@ -4621,10 +5775,12 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
         token = save_meal_photo_draft(
             conn, user_id="U_CUSTOMER", source_message_id="M_PENDING",
             payload=meal_photo_payload(),
+            workflow_version="expert_review_v1",
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         ), start=1):
@@ -4639,7 +5795,7 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
     assert "待審餐點（1筆" in message.text
     assert "U_CUSTOMER"[-8:] in message.text
     actions = [item.action.data for item in message.quick_reply.items]
-    assert actions == [f"mpr:v1:{token}:8:start"]
+    assert actions == [f"mpr:v1:{token}:9:start"]
     with sqlite3.connect(db) as conn:
         conn.execute(
             """UPDATE pending_meal_photo_drafts
@@ -4652,10 +5808,42 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
     assert resumed.quick_reply.items[0].action.data == f"mpr:v1:{token}:9:resume"
 
 
-def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeypatch):
+@pytest.mark.parametrize("refresh_mode", ["spy", "live", "repair"])
+def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeypatch, refresh_mode):
     db = tmp_path / "meal-photo-admin-review.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    refresh_users = []
+    case = {}
+    if refresh_mode == "spy":
+        monkeypatch.setattr(server, "_prepare_health_check_refresh_connection", lambda _conn: True)
+        monkeypatch.setattr(
+            server,
+            "_refresh_health_check_after_food_log",
+            lambda _conn, *, user_id: refresh_users.append(user_id),
+        )
+    else:
+        from vip_health_check import (
+            configure_vip_health_check_connection,
+            create_first_vip_health_check_case,
+            ensure_vip_health_check_schema,
+        )
+
+        monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+        with sqlite3.connect(db) as conn:
+            server.ensure_daily_food_ledger_schema(conn)
+            configure_vip_health_check_connection(conn)
+            ensure_vip_health_check_schema(conn)
+            case = create_first_vip_health_check_case(
+                conn, user_id="U_CUSTOMER",
+                first_vip_activation_id="approval-activation",
+                activation_event_key="approval-activation-event",
+                activated_at=datetime(2026, 7, 23, 7, tzinfo=server.TW_TZ),
+            )
+            if refresh_mode == "repair":
+                conn.execute("""CREATE TRIGGER reject_health_check_source
+                    BEFORE INSERT ON vip_health_check_source_refs
+                    BEGIN SELECT RAISE(ABORT, 'temporary manifest failure'); END""")
     monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
     monkeypatch.setattr(server, "get_bound_admin_uid_for_authorization", lambda: "U_ADMIN")
     with sqlite3.connect(db) as conn:
@@ -4665,7 +5853,8 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "one_half_bowl"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "one_half_bowl"),
             ("vegetable_portion", "none"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         ), start=1):
@@ -4690,22 +5879,22 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
         server.handle_meal_photo_postback(event)
         return replies[-1]
 
-    first = send(f"mpr:v1:{token}:8:start", "ADMIN-START")
+    first = send(f"mpr:v1:{token}:9:start", "ADMIN-START")
     assert "蛋白質分類" in first.text
-    assert any(":9:set:protein_class:medium" in item.action.data for item in first.quick_reply.items)
-    resumed_step = send(f"mpr:v1:{token}:9:resume", "ADMIN-RESUME")
+    assert any(":10:set:protein_class:medium" in item.action.data for item in first.quick_reply.items)
+    resumed_step = send(f"mpr:v1:{token}:10:resume", "ADMIN-RESUME")
     assert "蛋白質分類" in resumed_step.text
-    assert any(":9:set:protein_class:medium" in item.action.data for item in resumed_step.quick_reply.items)
-    send(f"mpr:v1:{token}:9:set:protein_class:medium", "ADMIN-CLASS")
-    send(f"mpr:v1:{token}:10:set:protein_exchange:2.5", "ADMIN-PROTEIN")
-    send(f"mpr:v1:{token}:11:set:starch_exchange:6", "ADMIN-STARCH")
-    send(f"mpr:v1:{token}:12:set:milk_exchange:0", "ADMIN-MILK")
-    ready = send(f"mpr:v1:{token}:13:set:fruit_exchange:0", "ADMIN-FRUIT")
+    assert any(":10:set:protein_class:medium" in item.action.data for item in resumed_step.quick_reply.items)
+    send(f"mpr:v1:{token}:10:set:protein_class:medium", "ADMIN-CLASS")
+    send(f"mpr:v1:{token}:11:set:protein_exchange:2.5", "ADMIN-PROTEIN")
+    send(f"mpr:v1:{token}:12:set:starch_exchange:6", "ADMIN-STARCH")
+    send(f"mpr:v1:{token}:13:set:milk_exchange:0", "ADMIN-MILK")
+    ready = send(f"mpr:v1:{token}:14:set:fruit_exchange:0", "ADMIN-FRUIT")
     ready_text = json.dumps(json.loads(str(ready.contents)), ensure_ascii=False)
     assert "最終核准份量" in ready_text
-    assert f"mpr:v1:{token}:14:approve" in ready_text
+    assert f"mpr:v1:{token}:15:approve" in ready_text
 
-    done = send(f"mpr:v1:{token}:14:approve", "ADMIN-APPROVE")
+    done = send(f"mpr:v1:{token}:15:approve", "ADMIN-APPROVE")
     done_text = json.dumps(json.loads(str(done.contents)), ensure_ascii=False)
     assert "已核准｜已計入正式份量" in done_text
     assert '"主食"' in done_text and '"6份"' in done_text
@@ -4719,15 +5908,80 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     assert pushes and pushes[-1][0] == "U_CUSTOMER"
     assert "已由營養師核准" in pushes[-1][1].text
     push_count = len(pushes)
-    replayed_done = send(f"mpr:v1:{token}:14:approve", "ADMIN-APPROVE")
+    if refresh_mode != "spy":
+        with sqlite3.connect(db) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
+                (case["case_id"],),
+            ).fetchone()[0] == (0 if refresh_mode == "repair" else 1)
+            assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+            if refresh_mode == "repair":
+                conn.execute("DROP TRIGGER reject_health_check_source")
+    replayed_done = send(f"mpr:v1:{token}:15:approve", "ADMIN-APPROVE")
     assert "已核准｜已計入正式份量" in json.dumps(
         json.loads(str(replayed_done.contents)), ensure_ascii=False
     )
     assert len(pushes) == push_count
+    if refresh_mode == "spy":
+        assert refresh_users == ["U_CUSTOMER", "U_CUSTOMER"]
+    else:
+        with sqlite3.connect(db) as conn:
+            refs = conn.execute(
+                "SELECT food_log_id,food_log_version,source_hash "
+                "FROM vip_health_check_source_refs WHERE case_id=?",
+                (case["case_id"],),
+            ).fetchall()
+            assert len(refs) == 1
+            log = conn.execute(
+                "SELECT log_id,version,nutrition_snapshot_json FROM food_logs"
+            ).fetchall()
+            assert len(log) == 1
+            assert refs[0][:2] == log[0][:2]
+            canonical = json.dumps(json.loads(log[0][2]), ensure_ascii=False,
+                                   sort_keys=True, separators=(",", ":"))
+            import hashlib
+            assert refs[0][2] == hashlib.sha256(
+                f"{log[0][0]}:{log[0][1]}:{canonical}".encode()
+            ).hexdigest()
+            assert conn.execute("SELECT COUNT(*) FROM food_exchange_approvals").fetchone()[0] == 1
     with sqlite3.connect(db) as conn:
         assert daily_consumed_totals(
             conn, user_id="U_CUSTOMER", date_iso="2026-07-23"
         )["starch_exchange"] == 6.0
+        food_id, log_id, approval_id = conn.execute(
+            "SELECT food_id,log_id,exchange_approval_id FROM food_logs "
+            "WHERE user_id='U_CUSTOMER'"
+        ).fetchone()
+        conn.execute(
+            "UPDATE food_exchange_approvals SET approved_exchange_json='[]' WHERE approval_id=?",
+            (approval_id,),
+        )
+        conn.commit()
+
+    with sqlite3.connect(db) as conn:
+        server.ensure_daily_food_ledger_schema(conn)
+        ledger_item = server._ledger_item_from_row(
+            conn, server._daily_food_rows(conn, "U_CUSTOMER", "2026-07-23")[0]
+        )
+    assert ledger_item["nutrition"] == {}
+
+    sheet_rows = {}
+
+    class IntegritySheet:
+        def __init__(self, title):
+            self.title = title
+
+        def find(self, *_args, **_kwargs):
+            return None
+
+        def append_row(self, values, **_kwargs):
+            sheet_rows[self.title] = values
+
+    monkeypatch.setattr(server, "_nutrition_ws", lambda title: IntegritySheet(title))
+    server._sync_food_outbox(food_id)
+    server._sync_food_log_outbox(log_id)
+    assert sheet_rows["食品資料庫"][25] == "pending_review"
+    assert sheet_rows["飲食紀錄"][16:24] == [0] * 8
 
 
 def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(tmp_path, monkeypatch):
@@ -4742,7 +5996,8 @@ def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(t
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         ), start=1):
@@ -4759,12 +6014,12 @@ def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(t
         ),
     )
     server.handle_meal_photo_postback(SimpleNamespace(
-        postback=SimpleNamespace(data=f"mpr:v1:{token}:8:start"),
+        postback=SimpleNamespace(data=f"mpr:v1:{token}:9:start"),
         source=SimpleNamespace(user_id="U_ADMIN"), reply_token="reject-start",
         webhook_event_id="REJECT-START", timestamp=1784740620000,
     ))
     server.handle_meal_photo_postback(SimpleNamespace(
-        postback=SimpleNamespace(data=f"mpr:v1:{token}:9:reject"),
+        postback=SimpleNamespace(data=f"mpr:v1:{token}:10:reject"),
         source=SimpleNamespace(user_id="U_ADMIN"), reply_token="reject-final",
         webhook_event_id="REJECT-FINAL", timestamp=1784740620001,
     ))
@@ -5221,6 +6476,12 @@ def test_natural_food_log_not_found_or_incompatible_unit_never_silently_logs(
 
 def test_quick_log_uses_one_timestamp_across_midnight(tmp_path, monkeypatch):
     db = _daily_ledger_db(tmp_path, monkeypatch, "natural-midnight.db")
+    refresh_users = []
+    monkeypatch.setattr(
+        server,
+        "_refresh_health_check_after_food_log",
+        lambda _conn, *, user_id: refresh_users.append(user_id),
+    )
     logged_at = datetime(2026, 8, 10, 23, 59, 59, tzinfo=server.TW_TZ)
     monkeypatch.setattr(server, "tw_now", lambda: logged_at)
     monkeypatch.setattr(
@@ -5254,6 +6515,7 @@ def test_quick_log_uses_one_timestamp_across_midnight(tmp_path, monkeypatch):
     assert consumed_at.startswith("2026-08-10T23:59:59")
     assert profile[:2] == pytest.approx((200.0, 10.0))
     assert profile[2] == "2026-08-10"
+    assert refresh_users == ["U1"]
 
 
 def test_natural_exact_filters_unit_before_private_priority(tmp_path, monkeypatch):
@@ -5772,6 +7034,12 @@ def test_search_no_results_shows_guidance(tmp_path, monkeypatch):
 def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
     db = tmp_path / "combo.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    refresh_users = []
+    monkeypatch.setattr(
+        server,
+        "_refresh_health_check_after_food_log",
+        lambda _conn, *, user_id: refresh_users.append(user_id),
+    )
     now = utcish_now()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
@@ -5813,6 +7081,7 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
         ).fetchall()
         assert len(rows) == 3
         assert all(r[0] == "早餐" for r in rows)
+    assert refresh_users == ["U1"]
 
 
 def test_dashboard_uses_food_ledger_without_creating_placeholder_health_profile(tmp_path, monkeypatch):
@@ -6108,6 +7377,131 @@ def test_dashboard_counts_approved_meal_photo_estimates_once_including_legacy_na
     replayed_dashboard = server.get_dashboard_data("U1")
     assert replayed_dashboard["extra_cal"] == 293.0
     assert replayed_dashboard["extra_pro"] == 24.0
+
+    with sqlite3.connect(db) as conn:
+        log_id, approval_id, food_fingerprint, approved_json = conn.execute(
+            """SELECT fl.log_id,a.approval_id,a.food_fingerprint,a.approved_exchange_json
+               FROM food_logs fl JOIN food_exchange_approvals a
+                 ON a.approval_id=fl.exchange_approval_id
+               WHERE fl.source_image_ref='photo.jpg'"""
+        ).fetchone()
+        v2_hash = server.exchange_approval_hash(
+            food_fingerprint, "meal-photo-admin-v2", json.loads(approved_json)
+        )
+        restored_nutrition = server.estimate_nutrition_from_exchanges(
+            json.loads(approved_json)
+        )
+        conn.execute(
+            """UPDATE food_exchange_approvals
+               SET suggestion_rule_version='meal-photo-admin-v2',approved_exchange_hash=?
+               WHERE approval_id=?""",
+            (v2_hash, approval_id),
+        )
+        conn.execute(
+            "UPDATE food_logs SET nutrition_snapshot_json=? WHERE log_id=?",
+            (json.dumps(restored_nutrition, ensure_ascii=False), log_id),
+        )
+        conn.commit()
+
+    serving_edit = server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log_id, expected_version=1,
+        event_id="photo-serving-2", action="set_servings", value=2,
+    )
+    assert serving_edit["servings"] == 2
+    assert serving_edit["nutrition"]["_estimate_type"] == "approved_exchange_estimate"
+    assert serving_edit["nutrition"]["_rule_version"] == "tw-exchange-macros-v1"
+    with sqlite3.connect(db) as conn:
+        applied = json.loads(conn.execute(
+            "SELECT approved_exchange_json FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0])
+    assert applied["protein_medium_exchange"] == 4.0
+    assert applied["starch_exchange"] == 2.0
+    assert applied["vegetable_exchange"] == 2.0
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE food_logs SET nutrition_snapshot_json=? WHERE log_id=?""",
+            (json.dumps({"calories_kcal": 999999, "protein_g": 888888}), log_id),
+        )
+        conn.commit()
+        totals = daily_consumed_totals(
+            conn, user_id="U1", date_iso=server.tw_today().isoformat()
+        )
+        summary = server.daily_food_summary(
+            conn, user_id="U1", date_iso=server.tw_today().isoformat()
+        )
+    assert totals["calories_kcal"] == 531.0
+    assert totals["protein_g"] == 41.0
+    assert totals["protein_medium_exchange"] == 4.0
+    assert totals["starch_exchange"] == 2.0
+    assert totals["vegetable_exchange"] == 2.0
+    assert summary["pending_reviews"] == 0
+    summary_item = next(
+        item for item in summary["foods"] if item["name"] == "餐點照片：雞胸肉、青花菜"
+    )
+    assert summary_item["calories_kcal"] == 476.0
+    assert summary_item["protein_g"] == 34.0
+    ledger = server.get_daily_food_ledger("U1", server.tw_today().isoformat())
+    edited_item = next(item for item in ledger["items"] if item["log_id"] == log_id)
+    assert edited_item["servings"] == 2.0
+    assert edited_item["nutrition"]["calories_kcal"] == 476.0
+    assert edited_item["nutrition"]["protein_g"] == 34.0
+
+    class _Rows:
+        def __init__(self):
+            self.data = []
+
+        def find(self, _entity_id, in_column=None):
+            return None
+
+        def append_row(self, values, value_input_option=None):
+            self.data.append(values)
+
+    outbox_rows = _Rows()
+    monkeypatch.setattr(server, "_nutrition_ws", lambda _title: outbox_rows)
+    server._sync_food_log_outbox(log_id)
+    assert outbox_rows.data[0][9] == 476.0
+    assert outbox_rows.data[0][10] == 34.0
+    assert outbox_rows.data[0][18] == 4.0
+    assert outbox_rows.data[0][20] == 2.0
+    assert outbox_rows.data[0][21] == 2.0
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE food_logs SET nutrition_snapshot_json='{' WHERE log_id=?", (log_id,)
+        )
+        conn.commit()
+    malformed_ledger = server.get_daily_food_ledger(
+        "U1", server.tw_today().isoformat()
+    )
+    malformed_item = next(
+        item for item in malformed_ledger["items"] if item["log_id"] == log_id
+    )
+    assert malformed_item["nutrition"]["calories_kcal"] == 476.0
+    outbox_rows.data.clear()
+    server._sync_food_log_outbox(log_id)
+    assert outbox_rows.data[0][9] == 476.0
+    assert outbox_rows.data[0][10] == 34.0
+    assert outbox_rows.data[0][18] == 4.0
+
+    doubled_dashboard = server.get_dashboard_data("U1")
+    assert set(doubled_dashboard["food_list"]) == {
+        "餐點照片：雞胸肉、青花菜",
+        "餐點照片：UTC跨日雞胸",
+    }
+    assert doubled_dashboard["recorded_count"] == 2
+    assert doubled_dashboard["extra_cal"] == 531.0
+    assert doubled_dashboard["extra_pro"] == 41.0
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE food_logs SET approved_exchange_json='[]' WHERE source_image_ref='photo.jpg'"
+        )
+        conn.commit()
+    tampered_dashboard = server.get_dashboard_data("U1")
+    assert tampered_dashboard["food_list"] == ["餐點照片：UTC跨日雞胸"]
+    assert tampered_dashboard["recorded_count"] == 1
+    assert tampered_dashboard["extra_cal"] == 55.0
+    assert tampered_dashboard["extra_pro"] == 7.0
 
 
 def test_dashboard_without_profile_excludes_deleted_confirmed_photo(tmp_path, monkeypatch):

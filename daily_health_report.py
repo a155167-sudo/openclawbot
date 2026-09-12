@@ -370,6 +370,8 @@ def format_daily_health_report(
                 f"{_fmt_number(item.get('calories_kcal'))} kcal｜"
                 f"蛋白質{_fmt_number(item.get('protein_g'))}g"
             )
+            if item.get("trust_integrity_status") == "integrity_verification_failed":
+                lines.append("⚠️ 資料完整性驗證未通過，營養資料暫不可用")
         if len(foods) > 20:
             lines.append(f"另有{len(foods) - 20}筆，請至飲食紀錄查看")
     else:

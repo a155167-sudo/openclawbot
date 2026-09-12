@@ -16,6 +16,9 @@ from datetime import datetime, timedelta
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
+from health_check_rules import HEALTH_CHECK_DAY_RULE_MINIMUM_MEALS
+from nutrition_system import user_confirmed_meal_photo_trust_projection
+
 
 BENEFIT_KEY = "first_vip_baseline_check"
 FEATURE_FLAG = "VIP_HEALTH_CHECK_ENABLED"
@@ -1476,6 +1479,40 @@ _TAIPEI = ZoneInfo("Asia/Taipei")
 _REFRESHABLE_CASE_STATUSES = {"collecting", "ready_for_review", "needs_more_info"}
 
 
+def refresh_user_health_check_case(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    evaluated_at: datetime,
+    minimum_meals_per_day: int = 2,
+    rule_version: str = "draft-confirmed-meals-v1",
+) -> dict[str, object] | None:
+    """Refresh the one open baseline case for a user, or no-op when none exists."""
+    require_vip_health_check_connection(conn)
+    principal = str(user_id or "").strip()
+    if not principal:
+        raise ValueError("user_id 不可空白")
+    statuses = sorted(_REFRESHABLE_CASE_STATUSES)
+    placeholders = ",".join("?" for _ in statuses)
+    rows = conn.execute(
+        f"""SELECT case_id FROM vip_health_check_cases
+            WHERE user_id=? AND status IN ({placeholders})
+            ORDER BY created_at,case_id LIMIT 2""",
+        (principal, *statuses),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise sqlite3.IntegrityError("multiple refreshable health-check cases")
+    return refresh_case_source_manifest(
+        conn,
+        case_id=str(rows[0][0]),
+        evaluated_at=evaluated_at,
+        minimum_meals_per_day=minimum_meals_per_day,
+        rule_version=rule_version,
+    )
+
+
 def _parse_ledger_time(value: str) -> datetime:
     text = str(value or "").strip()
     if text.endswith(("Z", "z")):
@@ -1510,11 +1547,20 @@ def refresh_case_source_manifest(
     驗收後可更換 rule version。函式刻意不查 `planned_meal_checks`，避免已轉成
     food_log 的一日樂食餐點被投影表重複計算。
     """
-    if not isinstance(minimum_meals_per_day, int) or not 1 <= minimum_meals_per_day <= 10:
+    if (
+        isinstance(minimum_meals_per_day, bool)
+        or not isinstance(minimum_meals_per_day, int)
+        or not 1 <= minimum_meals_per_day <= 10
+    ):
         raise ValueError("minimum_meals_per_day 必須介於 1～10")
     rule_version = str(rule_version or "").strip()
     if not rule_version:
         raise ValueError("rule_version 不可空白")
+    registered_minimum = HEALTH_CHECK_DAY_RULE_MINIMUM_MEALS.get(rule_version)
+    if registered_minimum is None:
+        raise ValueError("不支援的健檢有效日 rule_version")
+    if minimum_meals_per_day != registered_minimum:
+        raise ValueError("minimum_meals_per_day 與 rule_version 不匹配")
     evaluated_text = _iso_seconds(evaluated_at)
 
     conn.execute("SAVEPOINT refresh_case_source_manifest")
@@ -1532,8 +1578,14 @@ def refresh_case_source_manifest(
 
         window_start = _parse_ledger_time(window_start_text)
         window_end = _parse_ledger_time(window_end_text)
+        food_log_columns = {
+            str(column[1]) for column in conn.execute("PRAGMA table_info(food_logs)")
+        }
+        trust_type_sql = "trust_type" if "trust_type" in food_log_columns else "''"
+        trust_hash_sql = "trust_hash" if "trust_hash" in food_log_columns else "''"
         rows = conn.execute(
-            """SELECT log_id,consumed_at,meal_slot,nutrition_snapshot_json,version
+            f"""SELECT log_id,consumed_at,meal_slot,nutrition_snapshot_json,version,
+                       {trust_type_sql} AS trust_type,{trust_hash_sql} AS trust_hash
                FROM food_logs
                WHERE user_id=? AND confirmation_status='confirmed'
                  AND COALESCE(deleted_at,'')=''""",
@@ -1542,7 +1594,15 @@ def refresh_case_source_manifest(
 
         included: list[dict[str, object]] = []
         by_date: dict[str, list[dict[str, object]]] = defaultdict(list)
-        for log_id, consumed_at, meal_slot, nutrition_snapshot_json, version in rows:
+        for (
+            log_id, consumed_at, meal_slot, nutrition_snapshot_json, version,
+            trust_type, trust_hash,
+        ) in rows:
+            trust = user_confirmed_meal_photo_trust_projection(
+                conn, str(log_id or ""), str(trust_type or "")
+            )
+            if trust["integrity_status"] == "integrity_verification_failed":
+                continue
             local_time = _parse_ledger_time(consumed_at)
             if not window_start <= local_time < window_end:
                 continue
@@ -1552,6 +1612,8 @@ def refresh_case_source_manifest(
                 f"{log_id}:{version}:"
                 f"{_canonical_json_text(nutrition_snapshot_json)}"
             )
+            if trust["integrity_status"] == "verified":
+                source_material += f":user_confirmed_ai_estimate:{trust_hash}"
             item = {
                 "food_log_id": log_id,
                 "version": version,

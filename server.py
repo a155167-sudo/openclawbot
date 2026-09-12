@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import os
 import json
+import math
 import sqlite3
 from datetime import date, datetime, timedelta
 import secrets
@@ -60,6 +61,8 @@ from nutrition_system import (
     ensure_nutrition_schema,
     estimate_nutrition_from_exchanges,
     exchange_approval_hash,
+    exchange_applied_payload_matches_approval_hash,
+    exchange_approval_payload_is_valid,
     get_nutrition_input_state,
     normalize_garmin_payload,
     normalize_label_payload,
@@ -75,6 +78,8 @@ from nutrition_system import (
     set_nutrition_input_state,
     clear_nutrition_input_state,
     update_pending_consumption,
+    user_confirmed_meal_photo_trust_projection,
+    user_confirmed_meal_photo_food_trust_projection,
 )
 from daily_health_report import (
     claim_daily_delivery,
@@ -90,6 +95,7 @@ from meal_photo_system import (
     apply_meal_photo_action,
     build_meal_photo_confirmation_bubble,
     build_meal_photo_estimate_bubble,
+    build_meal_photo_recorded_bubble,
     clear_meal_photo_image_ref,
     daily_pending_meal_photo_count,
     ensure_meal_photo_schema,
@@ -104,13 +110,42 @@ from meal_photo_system import (
     normalize_meal_photo_payload,
     save_meal_photo_draft,
 )
+from subscription_meal_plan import (
+    dish_matches_restrictions,
+    ensure_light_bento_coverage,
+    get_subscription_form_value,
+)
 from customer_health_check_liff import attach_customer_health_check_routes
+from dietitian_health_check_api import (
+    attach_dietitian_health_check_routes,
+    load_dietitian_health_check_config,
+    load_health_check_detail,
+    load_health_check_image,
+    load_health_check_list,
+)
+from health_check_image_cleanup import (
+    CleanupBlocked,
+    cleanup_delivered_health_check_images,
+    cleanup_stale_nutrition_image_temps,
+    nutrition_image_reference_is_protected,
+    safe_unlink_nutrition_image,
+)
+from dietitian_health_check_liff import attach_dietitian_health_check_liff_routes
+from dietitian_health_check_command import (
+    COMMAND_TEXT as DIETITIAN_HEALTH_CHECK_COMMAND_TEXT,
+    build_dietitian_health_check_flex,
+    is_authorized_dietitian_health_check_command,
+    is_dietitian_health_check_command_intent,
+    load_dietitian_health_check_command_allowed_uids,
+    load_dietitian_health_check_command_liff_id,
+)
 from vip_health_check import (
     configure_vip_health_check_connection,
     create_first_vip_health_check_case,
     ensure_vip_health_check_schema,
     get_customer_health_check_state,
     is_vip_health_check_enabled,
+    refresh_user_health_check_case,
     record_vip_activation_event,
 )
 
@@ -126,6 +161,33 @@ SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
 SURVEY_REWARD_LINK_COUNT = APP_SETTINGS.survey_reward_link_count
 SURVEY_REWARD_POINTS_PER_LINK = APP_SETTINGS.survey_reward_points_per_link
 VIP_HEALTH_CHECK_ENABLED = is_vip_health_check_enabled()
+DIETITIAN_HEALTH_CHECK_CONFIG = load_dietitian_health_check_config(os.environ)
+DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID = (
+    load_dietitian_health_check_command_liff_id(os.environ)
+)
+DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS = (
+    load_dietitian_health_check_command_allowed_uids(os.environ)
+)
+
+
+def _validate_dietitian_health_check_command_identity() -> None:
+    """Fail closed when the LINE command points outside the enabled read boundary."""
+    config = DIETITIAN_HEALTH_CHECK_CONFIG
+    if not config.enabled:
+        return
+    if DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID != config.liff_id:
+        raise RuntimeError(
+            "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID must match "
+            "DIETITIAN_HEALTH_CHECK_LIFF_ID when read access is enabled"
+        )
+    if frozenset(DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS) != config.allowed_uids:
+        raise RuntimeError(
+            "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS must match "
+            "DIETITIAN_HEALTH_CHECK_ALLOWED_UIDS when read access is enabled"
+        )
+
+
+_validate_dietitian_health_check_command_identity()
 
 
 def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
@@ -151,6 +213,33 @@ def tw_today():
 
 def tw_now():
     return datetime.now(TW_TZ)
+
+
+def _prepare_health_check_refresh_connection(conn: sqlite3.Connection) -> bool:
+    """Best-effort FK preparation; authoritative food logging must remain available."""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return False
+    try:
+        configure_vip_health_check_connection(conn)
+        return True
+    except Exception as exc:
+        print(f"⚠️ 三日健檢連線準備失敗，保留飲食主帳本：{exc}")
+        return False
+
+
+def _refresh_health_check_after_food_log(
+    conn: sqlite3.Connection, *, user_id: str
+):
+    """Refresh derived health-check state without making food logging depend on it."""
+    if not VIP_HEALTH_CHECK_ENABLED:
+        return None
+    try:
+        return refresh_user_health_check_case(
+            conn, user_id=user_id, evaluated_at=tw_now()
+        )
+    except Exception as exc:
+        print(f"⚠️ 三日健檢來源刷新失敗，飲食紀錄仍保留：{exc}")
+        return None
 
 
 DAILY_FOOD_NUTRIENT_FIELDS = (
@@ -247,17 +336,20 @@ def create_daily_food_log(
     nutrition: dict, source_type: str, operation_key: str = "",
 ) -> dict:
     """建立可編輯逐筆飲食紀錄；營養快照保留未知 None。"""
+    _prepare_health_check_refresh_connection(conn)
     if not conn.in_transaction:
         ensure_daily_food_ledger_schema(conn)
+    user_id = str(user_id or "").strip()
     operation_key = str(operation_key or "").strip()[:180]
     if operation_key:
         existing_log = conn.execute(
             """SELECT fl.log_id,fl.food_id,fc.product_name,fl.meal_slot,fl.consumed_at,
                       fl.consumed_servings,fl.nutrition_snapshot_json,fl.version
                FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
-               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, str(user_id or "").strip()),
+               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, user_id),
         ).fetchone()
         if existing_log:
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
             return {
                 "log_id": existing_log[0], "food_id": existing_log[1],
                 "product_name": existing_log[2], "meal_slot": existing_log[3] or "",
@@ -265,7 +357,6 @@ def create_daily_food_log(
                 "nutrition": json.loads(existing_log[6] or "{}"),
                 "version": int(existing_log[7] or 1), "replayed": True,
             }
-    user_id = str(user_id or "").strip()
     product_name = str(product_name or "").strip()[:120]
     source_type = str(source_type or "user_private_food").strip()[:60]
     meal_slot = str(meal_slot or "").strip()
@@ -337,9 +428,10 @@ def create_daily_food_log(
             """SELECT fl.log_id,fl.food_id,fc.product_name,fl.meal_slot,fl.consumed_at,
                       fl.consumed_servings,fl.nutrition_snapshot_json,fl.version
                FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
-               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, str(user_id or "").strip()),
+               WHERE fl.operation_key=? AND fl.user_id=?""", (operation_key, user_id),
         ).fetchone()
         if existing_log:
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
             return {
                 "log_id": existing_log[0], "food_id": existing_log[1],
                 "product_name": existing_log[2], "meal_slot": existing_log[3] or "",
@@ -357,6 +449,7 @@ def create_daily_food_log(
         )
     except sqlite3.OperationalError:
         pass
+    _refresh_health_check_after_food_log(conn, user_id=user_id)
     return {
         "log_id": log_id, "food_id": food_id, "product_name": product_name,
         "meal_slot": meal_slot, "consumed_at": consumed_at,
@@ -387,7 +480,7 @@ def migrate_current_day_legacy_totals_to_ledger(conn: sqlite3.Connection) -> int
         rows = _daily_food_rows(conn, user_id, today)
         ledger_cal = ledger_pro = 0.0
         for row in rows:
-            nutrition = _ledger_item_from_row(row)["nutrition"]
+            nutrition = _ledger_item_from_row(conn, row)["nutrition"]
             if nutrition.get("calories_kcal") is not None:
                 ledger_cal += float(nutrition["calories_kcal"])
             if nutrition.get("protein_g") is not None:
@@ -424,7 +517,8 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
                   fl.meal_slot,fl.consumed_servings,fl.consumed_amount,fl.consumed_unit,
                   fl.nutrition_snapshot_json,fl.nutrient_sources_json,fl.version,
                   fl.approved_exchange_json,fc.fingerprint,a.food_fingerprint,
-                  a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id
+                  a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id,
+                  a.approved_exchange_json,fl.trust_type
            FROM food_logs fl
            JOIN food_catalog fc ON fc.food_id=fl.food_id
            LEFT JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
@@ -435,16 +529,45 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
     ).fetchall()
 
 
-def _ledger_item_from_row(row) -> dict:
-    nutrition = json.loads(row[9] or "{}")
-    # 已核准餐點照片以驗證過的交換份估算；未核准/無值維持 NA。
-    if not nutrition and row[12] and row[13] and row[14] == row[13]:
+def _safe_json_object(value):
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _ledger_item_from_row(conn: sqlite3.Connection, row) -> dict:
+    nutrition = _safe_json_object(row[9])
+    trust = user_confirmed_meal_photo_trust_projection(conn, row[0], str(row[19] or ""))
+    # 餐點照片必須先驗證核准快照；完整性失效時即使營養快照存在也維持 NA。
+    if row[3] == "user_meal_photo":
+        verified_approval = False
         try:
             approved = json.loads(row[12] or "{}")
-            expected = exchange_approval_hash(row[14], row[15], approved)
-            if secrets.compare_digest(str(row[16] or ""), expected):
+            approved_definition = json.loads(row[18] or "{}")
+            if (
+                isinstance(approved, dict)
+                and isinstance(approved_definition, dict)
+                and row[17]
+                and row[13]
+                and row[14] == row[13]
+                and exchange_approval_payload_is_valid(row[15], approved)
+                and exchange_approval_payload_is_valid(row[15], approved_definition)
+                and exchange_applied_payload_matches_approval_hash(
+                    row[14], row[15], approved, row[6], row[16]
+                )
+                and secrets.compare_digest(
+                    str(row[16] or ""),
+                    exchange_approval_hash(row[14], row[15], approved_definition),
+                )
+            ):
+                verified_approval = True
+            if verified_approval:
                 nutrition = estimate_nutrition_from_exchanges(approved)
         except (TypeError, ValueError, json.JSONDecodeError):
+            verified_approval = False
+        if not verified_approval:
             nutrition = {}
     return {
         "log_id": row[0], "food_id": row[1], "product_name": row[2],
@@ -452,6 +575,8 @@ def _ledger_item_from_row(row) -> dict:
         "servings": float(row[6] or 0), "consumed_amount": float(row[7] or 0),
         "consumed_unit": row[8] or "", "nutrition": nutrition,
         "nutrient_sources": json.loads(row[10] or "{}"), "version": int(row[11] or 1),
+        "trust_type": trust["trust_type"],
+        "trust_integrity_status": trust["integrity_status"],
     }
 
 
@@ -464,7 +589,7 @@ def get_daily_food_ledger(user_id: str, date_text: str) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         ensure_daily_food_ledger_schema(conn)
         rows = _daily_food_rows(conn, user_id, date_text)
-        items = [_ledger_item_from_row(row) for row in rows]
+        items = [_ledger_item_from_row(conn, row) for row in rows]
         hp = conn.execute(
             "SELECT tdee,protein FROM health_profile WHERE user_id=?", (user_id,)
         ).fetchone()
@@ -506,7 +631,7 @@ def _sync_health_profile_from_ledger_conn(
         return
     if not conn.execute("SELECT 1 FROM health_profile WHERE user_id=?", (user_id,)).fetchone():
         return
-    items = [_ledger_item_from_row(row) for row in _daily_food_rows(conn, user_id, date_text)]
+    items = [_ledger_item_from_row(conn, row) for row in _daily_food_rows(conn, user_id, date_text)]
     cal = pro = 0.0
     names = []
     for item in items:
@@ -534,6 +659,7 @@ def apply_daily_food_log_edit(
         raise ValueError("缺少操作事件識別碼")
     with sqlite3.connect(DB_PATH) as conn:
         ensure_daily_food_ledger_schema(conn)
+        _prepare_health_check_refresh_connection(conn)
         conn.execute("BEGIN IMMEDIATE")
         previous = conn.execute(
             "SELECT result_json FROM daily_food_log_events WHERE event_id=? AND user_id=?",
@@ -542,12 +668,13 @@ def apply_daily_food_log_edit(
         if previous:
             result = json.loads(previous[0])
             result["replayed"] = True
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
             conn.commit()
             return result
         row = conn.execute(
             """SELECT fl.version,fl.consumed_servings,fl.nutrition_snapshot_json,
                       fl.nutrient_sources_json,fl.consumed_at,fc.product_name,
-                      fl.food_id,fc.source_type
+                      fl.food_id,fc.source_type,fl.approved_exchange_json
                FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
                WHERE fl.log_id=? AND fl.user_id=? AND fl.confirmation_status='confirmed'
                  AND COALESCE(fl.deleted_at,'')=''""",
@@ -560,6 +687,9 @@ def apply_daily_food_log_edit(
             raise ValueError("這筆紀錄已更新，請重新開啟最新卡片")
         nutrition = json.loads(row[2] or "{}")
         sources = json.loads(row[3] or "{}")
+        approved_exchanges = json.loads(row[8] or "{}")
+        if not isinstance(nutrition, dict) or not isinstance(approved_exchanges, dict):
+            raise ValueError("飲食紀錄資料格式錯誤")
         new_servings = old_servings
         new_name = ""
         if action == "correct_nutrition":
@@ -581,9 +711,24 @@ def apply_daily_food_log_edit(
                 raise ValueError("份量需介於 0.1～100 份")
             ratio = new_servings / old_servings
             nutrition = {
-                key: (None if nutrient is None else round(float(nutrient) * ratio, 4))
+                key: (
+                    None if nutrient is None
+                    else round(float(nutrient) * ratio, 4)
+                ) if key in DAILY_FOOD_NUTRIENT_FIELDS else nutrient
                 for key, nutrient in nutrition.items()
             }
+            for key in (
+                "milk_exchange", "protein_low_exchange", "protein_medium_exchange",
+                "protein_high_exchange", "starch_exchange", "vegetable_exchange",
+                "fruit_exchange", "fat_exchange",
+            ):
+                if key in approved_exchanges:
+                    exchange_value = _ledger_number(
+                        approved_exchanges[key], allow_none=False
+                    )
+                    if exchange_value is None:
+                        raise ValueError("核准交換份資料格式錯誤")
+                    approved_exchanges[key] = round(exchange_value * ratio, 4)
         elif action == "set_meal_slot":
             if str(value) not in {"早餐", "午餐", "晚餐", "點心"}:
                 raise ValueError("餐別不支援")
@@ -657,12 +802,14 @@ def apply_daily_food_log_edit(
         else:
             conn.execute(
                 """UPDATE food_logs SET consumed_servings=?,consumed_amount=?,
-                   nutrition_snapshot_json=?,nutrient_sources_json=?,version=?,updated_at=?
+                   nutrition_snapshot_json=?,nutrient_sources_json=?,approved_exchange_json=?,
+                   version=?,updated_at=?
                    WHERE log_id=?""",
                 (
                     new_servings, new_servings,
                     json.dumps(nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False),
                     json.dumps(sources, ensure_ascii=False, sort_keys=True),
+                    json.dumps(approved_exchanges, ensure_ascii=False, sort_keys=True, allow_nan=False),
                     new_version, now, log_id,
                 ),
             )
@@ -714,6 +861,7 @@ def apply_daily_food_log_edit(
             )
         except sqlite3.OperationalError:
             pass
+        _refresh_health_check_after_food_log(conn, user_id=user_id)
         conn.commit()
         return result
 
@@ -727,6 +875,7 @@ def clear_daily_food_ledger(user_id: str, *, event_id: str) -> dict:
     today = tw_today().isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         ensure_daily_food_ledger_schema(conn)
+        _prepare_health_check_refresh_connection(conn)
         conn.execute("BEGIN IMMEDIATE")
         previous = conn.execute(
             "SELECT result_json FROM daily_food_log_events WHERE event_id=? AND user_id=?",
@@ -735,6 +884,7 @@ def clear_daily_food_ledger(user_id: str, *, event_id: str) -> dict:
         if previous:
             result = json.loads(previous[0])
             result["replayed"] = True
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
             conn.commit()
             return result
         log_ids = [row[0] for row in conn.execute(
@@ -779,6 +929,7 @@ def clear_daily_food_ledger(user_id: str, *, event_id: str) -> dict:
                 json.dumps(result, ensure_ascii=False, sort_keys=True), now,
             ),
         )
+        _refresh_health_check_after_food_log(conn, user_id=user_id)
         conn.commit()
         return result
 
@@ -843,6 +994,13 @@ def _daily_food_item_bubble(item: dict) -> dict:
         "user_correction": "使用者修正", "user_meal_photo": "餐點照片",
         "menu_csv": "一日樂食菜單", "legacy_daily_carryover": "部署前合計",
     }
+    trust_type = item.get("trust_type") or ""
+    integrity_failed = item.get("trust_integrity_status") == "integrity_verification_failed"
+    source_text = (
+        "顧客確認・AI估算"
+        if trust_type == "user_confirmed_ai_estimate"
+        else source_labels.get(item["source_type"], item["source_type"] or "未標示")
+    )
     consumed_at = str(item["consumed_at"] or "")
     try:
         parsed_time = datetime.fromisoformat(consumed_at.replace("Z", "+00:00"))
@@ -873,19 +1031,25 @@ def _daily_food_item_bubble(item: dict) -> dict:
                 "data": f"foodlog:v1:{log_id}:{version}:more", "displayText": "更多飲食紀錄操作",
             }},
         ]
+    body_contents = [
+        {"type": "text", "text": f"份量：{item['servings']:g} 份", "size": "sm"},
+        {"type": "text", "text": f"🔥 {val('calories_kcal', 'kcal')}", "size": "sm"},
+        {"type": "text", "text": f"🥩 {val('protein_g', 'g')}", "size": "sm"},
+        {"type": "text", "text": f"🍚 {val('carbohydrate_g', 'g')}｜🥑 {val('fat_g', 'g')}", "size": "xs", "wrap": True},
+        {"type": "text", "text": f"來源：{source_text}", "size": "xs", "color": "#777777", "wrap": True},
+    ]
+    if integrity_failed:
+        body_contents.append({
+            "type": "text", "text": "資料完整性驗證未通過，營養資料暫不可用",
+            "size": "xs", "color": "#B91C1C", "weight": "bold", "wrap": True,
+        })
     return {
         "type": "bubble", "size": "kilo",
         "header": {"type": "box", "layout": "vertical", "backgroundColor": "#ECFDF5", "contents": [
             {"type": "text", "text": item["product_name"][:60], "weight": "bold", "size": "md", "wrap": True, "color": "#065F46"},
             {"type": "text", "text": f"{time_text}｜{item['meal_slot'] or '未分類'}", "size": "xs", "color": "#555555", "margin": "xs"},
         ]},
-        "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": [
-            {"type": "text", "text": f"份量：{item['servings']:g} 份", "size": "sm"},
-            {"type": "text", "text": f"🔥 {val('calories_kcal', 'kcal')}", "size": "sm"},
-            {"type": "text", "text": f"🥩 {val('protein_g', 'g')}", "size": "sm"},
-            {"type": "text", "text": f"🍚 {val('carbohydrate_g', 'g')}｜🥑 {val('fat_g', 'g')}", "size": "xs", "wrap": True},
-            {"type": "text", "text": f"來源：{source_labels.get(item['source_type'], item['source_type'] or '未標示')}", "size": "xs", "color": "#777777", "wrap": True},
-        ]},
+        "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body_contents},
         "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": footer_contents},
     }
 
@@ -1391,7 +1555,7 @@ ADMIN_ONLY_PREFIXES = (
 
 # 未授權者即使是有效 VIP，也不得讓管理／教練指令或近似拼法落入一般 AI。
 PRIVILEGED_COMMAND_STEMS = (
-    "#教練", "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成",
+    "#教練", "#營養師健檢", "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成",
     "#發送明日提醒", "#測試週報", "#測試晚報", "#延餐清單",
     "#待核訂單", "#清空熱量", "#刪除檔案", "#重置", "重置本週",
     "檢查數據", "#待審營養份量", "#待審餐點", "@靜音", "@解除靜音",
@@ -1539,6 +1703,8 @@ def is_privileged_command_intent(msg: str) -> bool:
             return True
 
     for raw_stem in PRIVILEGED_COMMAND_STEMS:
+        if raw_stem == DIETITIAN_HEALTH_CHECK_COMMAND_TEXT:
+            continue
         stem = "".join(
             char for char in unicodedata.normalize("NFKC", raw_stem)
             if not char.isspace()
@@ -3035,6 +3201,40 @@ def get_vip_health_check_state_for_user(user_id: str):
         return get_customer_health_check_state(conn, user_id=user_id)
 
 
+def _open_read_only_database():
+    database_uri = Path(DB_PATH).resolve().as_uri() + "?mode=ro"
+    return sqlite3.connect(database_uri, uri=True)
+
+
+def list_dietitian_health_checks(*, statuses, limit: int, offset: int):
+    """Read the canonical dietitian queue without migrations or file creation."""
+    with closing(_open_read_only_database()) as conn:
+        return load_health_check_list(
+            conn, statuses=statuses, limit=limit, offset=offset
+        )
+
+
+def get_dietitian_health_check(case_id: str):
+    """Read one canonical health-check case without mutating its database."""
+    with closing(_open_read_only_database()) as conn:
+        return load_health_check_detail(conn, case_id=case_id)
+
+
+def get_dietitian_health_check_image(case_id: str, log_id: str):
+    """Return a bounded preview selected only by canonical server-side bindings."""
+    with closing(_open_read_only_database()) as conn:
+        return load_health_check_image(
+            conn,
+            case_id=case_id,
+            log_id=log_id,
+            image_root=os.path.join(DB_DIR, "nutrition_images"),
+        )
+
+
+def _current_dietitian_health_check_allowed_uids():
+    return load_dietitian_health_check_config(os.environ).allowed_uids
+
+
 def register_customer_health_check_liff(target_app=app):
     return attach_customer_health_check_routes(
         target_app,
@@ -3045,6 +3245,24 @@ def register_customer_health_check_liff(target_app=app):
 
 
 register_customer_health_check_liff()
+
+
+def register_dietitian_health_check_api(target_app=app):
+    attached = attach_dietitian_health_check_routes(
+        target_app,
+        config=DIETITIAN_HEALTH_CHECK_CONFIG,
+        list_loader=list_dietitian_health_checks,
+        detail_loader=get_dietitian_health_check,
+        image_loader=get_dietitian_health_check_image,
+        allowed_uid_loader=_current_dietitian_health_check_allowed_uids,
+    )
+    attach_dietitian_health_check_liff_routes(
+        target_app, DIETITIAN_HEALTH_CHECK_CONFIG
+    )
+    return attached
+
+
+register_dietitian_health_check_api()
 
 
 def init_db():
@@ -3275,13 +3493,26 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         data = await request.json()
         print(f"📦 [表單測試] 收到 Google 傳來的大禮包：{data}")
         
-        def get_val(keyword):
-            for k, v in data.items():
-                if keyword in k and v: 
-                    return ",".join([str(i) for i in v]) if isinstance(v, list) else str(v)
-            return ""
+        def get_val(
+            *keywords,
+            excluded_fragments=(),
+            allow_fuzzy=True,
+            reject_ambiguous=False,
+        ):
+            return get_subscription_form_value(
+                data,
+                *keywords,
+                excluded_fragments=excluded_fragments,
+                allow_fuzzy=allow_fuzzy,
+                reject_ambiguous=reject_ambiguous,
+            )
         
-        user_id = get_val("UID")
+        try:
+            user_id = get_val(
+                "LINE UID", "UID", allow_fuzzy=False, reject_ambiguous=True
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="UID 欄位不明確") from exc
         print(f"🔍 [表單測試] 抓到的 UID 是：'{user_id}'")
         print(f"🔑 [DEBUG] 表單所有欄位 keys：{list(data.keys())}")
         print(f"📝 [DEBUG] 稱呼欄位比對結果：{ {k: v for k, v in data.items() if '稱呼' in str(k)} }")
@@ -3289,70 +3520,80 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         if not user_id or user_id == "UID_REPLACE_ME": 
             print("❌ [表單拒絕] 找不到有效的 UID，這張表單我直接丟掉！")
             return {"status": "ignored"}
-        if user_id in user_memory: del user_memory[user_id]
 
-        name, goal, restrictions = get_val("稱呼"), get_val("目標"), get_val("禁忌")
+        # 在查地圖、改狀態或推播前，先確認表單確實能形成安全排餐。
+        _early_week_answers = [
+            get_val("第一週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第二週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第三週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第四週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+        ]
+        _early_date_str = ",".join(
+            item.strip()
+            for answer in _early_week_answers
+            for item in answer.split(",")
+            if item.strip()
+        )
+        if not _early_date_str:
+            _early_date_str = get_val(
+                "取餐日期", "希望取餐日期", "希望取餐日", "用餐日期", "取餐日", "勾選", "取餐",
+                excluded_fragments=("取餐方式", "配送方式", "不取餐", "原因", "備註"),
+            )
+        if not re.search(r"(?:週|星期)[一二三四五六日]", _early_date_str or ""):
+            raise HTTPException(status_code=422, detail="至少需要一個有效取餐日期")
+
+        try:
+            _early_restrictions = get_val("禁忌", reject_ambiguous=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="飲食禁忌欄位不明確") from exc
+        _early_safe_menu = [
+            dish for dish in MAIN_DISHES
+            if dish.get("category") == "main"
+            and any(keyword in str(dish.get("name") or "") for keyword in MEAL_PLAN_KEYWORDS)
+            and not dish_matches_restrictions(dish, _early_restrictions)
+        ]
+        if not _early_safe_menu:
+            raise HTTPException(status_code=422, detail="沒有符合飲食禁忌的可排餐點")
+        _early_pref_staple = get_val(
+            "您的主食選擇（可複選）", "主食選擇", "您的主食偏好是？(可複選)",
+            "主食偏好", "偏好的主食",
+            excluded_fragments=("不喜歡", "避免", "備註", "原因"),
+        )
+        if (
+            "都不挑食" in _early_pref_staple
+            and any("食蔬" in str(dish.get("name") or "") for dish in _early_safe_menu)
+            and not any("食蔬" not in str(dish.get("name") or "") for dish in _early_safe_menu)
+        ):
+            raise HTTPException(status_code=422, detail="安全菜單不足以安排每日兩種餐點")
+
+        name, goal, restrictions = get_val("稱呼"), get_val("目標"), _early_restrictions
         pickup_method = get_val("本期取餐方式") or get_val("取餐方式") or get_val("配送方式") or ""
         address = get_val("本期外送地址") or get_val("地址") or get_val("外送地址") or get_val("收件地址") or ""
         is_delivery = ("外送" in pickup_method) or (not pickup_method and bool(address))
-        delivery_info = calculate_delivery_quote(address) if (is_delivery and address) else {
-            "success": False,
-            "address": address,
-            "distance_text": "",
-            "distance_meters": 0,
-            "duration_text": "",
-            "delivery_fee": 0,
-            "delivery_fee_text": "自取或未提供地址",
-            "hub_name": "",
-            "route_group": "OTHER",
-            "delivery_zone": "SELF_PICKUP" if not is_delivery else "未分類",
-            "carpool_hint": "",
-        }
-        update_subscription_delivery_block(
-            user_id,
-            delivery_info.get("delivery_available") if is_delivery else True,
-        )
-        if is_delivery and not delivery_info.get("success"):
-            manual_review_text = (
-                "⚠️ 包月資料已收到，但地圖系統暫時無法完成測距。\n\n"
-                f"📍 外送地址：{address}\n"
-                "🛵 運費待客服確認\n\n"
-                "這次不會以未確認的運費建立訂單；您的表單資料已保留，"
-                "客服會確認距離與最終金額，您不需要重新填寫表單。"
-            )
+        def validated_number(label, default, minimum, maximum):
+            raw_value = get_val(label)
             try:
-                line_bot_api.push_message(
-                    user_id, TextSendMessage(text=manual_review_text)
+                value = float(raw_value or default)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422, detail=f"{label}必須是有效數字"
+                ) from exc
+            if not math.isfinite(value) or not minimum <= value <= maximum:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}必須介於 {minimum:g} 與 {maximum:g} 之間",
                 )
-            except Exception as push_error:
-                print(
-                    f"⚠️ 推播測距失敗人工確認通知失敗 uid={user_id[:8]}...: {push_error}"
-                )
-            return {
-                "status": "pending_manual_delivery_review",
-                "reason": "delivery_quote_failed",
-            }
-        if is_delivery and delivery_info.get("delivery_available") is False:
-            rejection_text = (
-                "🚫 此地址暫不提供外送\n\n"
-                f"📍 {address}\n"
-                f"📏 距本店距離：{delivery_info.get('distance_text', '超過 3 公里')}\n\n"
-                "目前外送範圍為門市 3 公里內。\n"
-                "這次沒有建立包月訂單，請改選自取或找客服協助。"
-            )
-            try:
-                line_bot_api.push_message(user_id, TextSendMessage(text=rejection_text))
-            except Exception as push_error:
-                print(f"⚠️ 推播超距表單拒絕通知失敗 uid={user_id[:8]}...: {push_error}")
-            return {
-                "status": "rejected",
-                "reason": "delivery_out_of_range",
-                "distance": delivery_info.get("distance_text", ""),
-            }
-        weight, height, age, gender = float(get_val("體重") or 70), float(get_val("身高") or 170), float(get_val("年齡") or 30), get_val("性別")
-        # 🔥 身高防呆：如果客人填 1.76 公尺，自動轉成 176 公分
+            return value
+
+        weight = validated_number("體重", 70, 20, 500)
+        height = validated_number("身高", 170, 0.8, 250)
+        age = validated_number("年齡", 30, 1, 120)
+        gender = get_val("性別")
+        # 身高若以公尺填寫，自動轉換為公分後再驗證合理範圍。
         if height < 3.0:
             height *= 100
+        if not 80 <= height <= 250:
+            raise HTTPException(status_code=422, detail="身高必須介於 80 與 250 公分之間")
         activity = get_val("活動量")  
         # 雙開關骨架：安排課表 / 啟用碳循環
         coaching_raw = get_val("規律運動") or get_val("安排課表") or ""
@@ -3455,26 +3696,43 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         week_dict = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7}
         
         # 1. 抓取表單中的關鍵資訊
-        # 表單有四個分週欄位，全部合併成一串（week_tracker 自動分週）
-        _w1 = get_val("第一週") or ""
-        _w2 = get_val("第二週") or ""
-        _w3 = get_val("第三週") or ""
-        _w4 = get_val("第四週") or ""
-        _weeks_combined = [d.strip() for w in [_w1, _w2, _w3, _w4] for d in w.split(',') if d.strip()]
+        # 表單有四個分週欄位；保留各欄的週別，同時建立舊輸出用合併字串。
+        _week_answers = [
+            get_val("第一週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第二週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第三週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+            get_val("第四週", excluded_fragments=("不取餐", "原因", "備註")) or "",
+        ]
+        _weeks_combined = [
+            day.strip()
+            for week_answer in _week_answers
+            for day in week_answer.split(',')
+            if day.strip()
+        ]
         date_str = ','.join(_weeks_combined) if _weeks_combined else ""
         print(f"📅 [DEBUG] 四週取餐日期合併：{date_str}")
         # Fallback: 單週表單
         if not date_str:
-            date_str = get_val("取餐") or get_val("勾選")
+            date_str = get_val(
+                "取餐日期", "希望取餐日期", "希望取餐日", "用餐日期", "取餐日", "勾選", "取餐",
+                excluded_fragments=("取餐方式", "配送方式", "不取餐", "原因", "備註"),
+            )
             if not date_str:
-                _raw_ds = get_val("日期")
+                _raw_ds = get_val("日期", excluded_fragments=("取餐方式", "配送方式"))
                 if _raw_ds and any(c in _raw_ds for c in ["週", "星期"]):
                     date_str = _raw_ds
         user_restrictions = restrictions.lower() # 顧客禁忌 (小寫化方便比對)
         
         # 2. 抓取顧客喜好標籤
-        pref_staple = get_val("您的主食偏好是？(可複選)") or get_val("主食偏好") or ""
-        pref_protein = get_val("您最喜歡的蛋白質是") or get_val("蛋白質") or ""
+        pref_staple = get_val(
+            "您的主食選擇（可複選）", "主食選擇", "您的主食偏好是？(可複選)",
+            "主食偏好", "偏好的主食",
+            excluded_fragments=("不喜歡", "避免", "備註", "原因"),
+        )
+        pref_protein = get_val(
+            "您最喜歡的蛋白質是", "蛋白質偏好", "偏好的蛋白質", "蛋白質",
+            excluded_fragments=("不喜歡", "避免", "備註", "原因"),
+        )
         
         # 🔥 定義真正喜歡的關鍵字 (解決「沒有飯」卻抓到「飯」的 Bug)
         liked_staples = []
@@ -3495,26 +3753,13 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         
         # 3. 建立「絕對安全菜單池」 (先過濾掉禁忌，且只挑主餐)
         safe_menu = []
-        # 🔥 修正：說「不要海鮮」時，擴展過濾所有魚蝦蟹相關關鍵字
-        seafood_sub_words = ["魚", "蝦", "蟹", "花枝", "透抽", "章魚", "牡蠣", "鮭", "鱸", "鮪", "鯖"]
         for dish in MAIN_DISHES:
             if dish.get('category') != 'main':
                 continue
             # 只允許可配餐的六大主餐類（便當/食蔬/低碳/沙拉/番茄麵/青蔬麵）
             if not any(kw in dish['name'] for kw in MEAL_PLAN_KEYWORDS):
                 continue
-            dish_name = dish['name'].lower()
-            is_safe = True
-            forbidden_keywords = ["牛", "豬", "雞", "魚", "海鮮", "蝦", "蟹"]
-            for word in forbidden_keywords:
-                if word in user_restrictions and word in dish_name:
-                    is_safe = False
-                    break
-            # 特殊處理：用戶寫「海鮮」禁忌時，同步過濾菜名含魚蝦蟹字樣的餐點
-            if is_safe and "海鮮" in user_restrictions:
-                if any(sw in dish_name for sw in seafood_sub_words):
-                    is_safe = False
-            if is_safe:
+            if not dish_matches_restrictions(dish, user_restrictions):
                 safe_menu.append(dish)
 
         # 🔥 Phase 3: 計算起始日、訓練週期、4 週課表（移至此處供配餐使用）
@@ -3541,16 +3786,36 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                 "星期五": 5, "週五": 5, "星期六": 6, "週六": 6, "星期日": 7, "週日": 7
             }
             days = [d.strip() for d in date_str.split(',')]
-            active_days_list = [] 
-            week_tracker = {1:0, 2:0, 3:0, 4:0, 5:0, 6:0, 7:0}
-            
-            for d in days:
+            active_days_list = []
+            selected_week_days = []
+            if any(_week_answers):
+                for week_number, week_answer in enumerate(_week_answers, start=1):
+                    seen_day_numbers = set()
+                    for day in (
+                        item.strip() for item in week_answer.split(',') if item.strip()
+                    ):
+                        day_number = next(
+                            (number for zh, number in week_dict.items() if zh in day), 99
+                        )
+                        if day_number == 99 or day_number in seen_day_numbers:
+                            continue
+                        seen_day_numbers.add(day_number)
+                        selected_week_days.append((week_number, day))
+            else:
+                # 舊單週欄位沒有週別；保留既有「同星期第幾次即第幾週」相容行為。
+                week_tracker = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
+                for day in days:
+                    day_number = next(
+                        (number for zh, number in week_dict.items() if zh in day), 99
+                    )
+                    if day_number == 99:
+                        continue
+                    week_tracker[day_number] += 1
+                    selected_week_days.append((week_tracker[day_number], day))
+
+            for w_num, d in selected_week_days:
                 d_num = next((num for zh, num in week_dict.items() if zh in d), 99)
                 if d_num != 99:
-                    active_days_list.append(d)
-                    week_tracker[d_num] += 1
-                    w_num = week_tracker[d_num]
-                    
                     # 🔥 終極主食地雷過濾系統 (漏掉的就是這裡！)
                     unliked_staples = []
                     if "都不挑食" not in pref_staple:
@@ -3625,17 +3890,95 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                     # 隨機抽 2 道菜
                     if len(pool) >= 2:
                         daily_pick = random.sample(pool, 2)
-                    elif len(pool) == 1:
-                        daily_pick = [pool[0], pool[0]]
                     else:
-                        continue 
+                        raise HTTPException(
+                            status_code=422,
+                            detail="每個取餐日需要至少兩道不同的安全餐點",
+                        )
                     
                     plan_requests.append((w_num, d_num, f"第{w_num}週", d, daily_pick[0], daily_pick[1]))
+                    active_days_list.append(d)
                     # 💡 累加餐點總價
                     total_price += (daily_pick[0]['price'] + daily_pick[1]['price'])
 
         # 排序確保顯示順序正確
         plan_requests.sort(key=lambda x: (x[0], x[1]))
+        try:
+            plan_requests = ensure_light_bento_coverage(
+                plan_requests,
+                safe_menu=safe_menu,
+                pref_staple=pref_staple,
+                liked_proteins=liked_proteins,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="沒有符合偏好且可安全搭配的輕便當餐點",
+            ) from exc
+        if not plan_requests:
+            raise HTTPException(
+                status_code=422,
+                detail="沒有符合取餐日期與飲食禁忌的可排餐點",
+            )
+        total_price = sum(
+            lunch["price"] + dinner["price"]
+            for _, _, _, _, lunch, dinner in plan_requests
+        )
+
+        delivery_info = calculate_delivery_quote(address) if (is_delivery and address) else {
+            "success": False,
+            "address": address,
+            "distance_text": "",
+            "distance_meters": 0,
+            "duration_text": "",
+            "delivery_fee": 0,
+            "delivery_fee_text": "自取或未提供地址",
+            "hub_name": "",
+            "route_group": "OTHER",
+            "delivery_zone": "SELF_PICKUP" if not is_delivery else "未分類",
+            "carpool_hint": "",
+        }
+        if is_delivery and not delivery_info.get("success"):
+            update_subscription_delivery_block(
+                user_id, delivery_info.get("delivery_available")
+            )
+            manual_review_text = (
+                "⚠️ 包月資料已收到，但地圖系統暫時無法完成測距。\n\n"
+                f"📍 外送地址：{address}\n"
+                "🛵 運費待客服確認\n\n"
+                "這次不會以未確認的運費建立訂單；您的表單資料已保留，"
+                "客服會確認距離與最終金額，您不需要重新填寫表單。"
+            )
+            try:
+                line_bot_api.push_message(
+                    user_id, TextSendMessage(text=manual_review_text)
+                )
+            except Exception as push_error:
+                print(
+                    f"⚠️ 推播測距失敗人工確認通知失敗 uid={user_id[:8]}...: {push_error}"
+                )
+            return {
+                "status": "pending_manual_delivery_review",
+                "reason": "delivery_quote_failed",
+            }
+        if is_delivery and delivery_info.get("delivery_available") is False:
+            update_subscription_delivery_block(user_id, False)
+            rejection_text = (
+                "🚫 此地址暫不提供外送\n\n"
+                f"📍 {address}\n"
+                f"📏 距本店距離：{delivery_info.get('distance_text', '超過 3 公里')}\n\n"
+                "目前外送範圍為門市 3 公里內。\n"
+                "這次沒有建立包月訂單，請改選自取或找客服協助。"
+            )
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(text=rejection_text))
+            except Exception as push_error:
+                print(f"⚠️ 推播超距表單拒絕通知失敗 uid={user_id[:8]}...: {push_error}")
+            return {
+                "status": "rejected",
+                "reason": "delivery_out_of_range",
+                "distance": delivery_info.get("distance_text", ""),
+            }
 
         # ==========================================
         # 5. 生成預覽文字與試算表資料 (🔥 升級版：自動推算日期與雙重表單)
@@ -3734,6 +4077,12 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "raw_form_data": data,
         }
         order_id = create_pending_subscription_form_order(form_snapshot)
+        update_subscription_delivery_block(
+            user_id,
+            delivery_info.get("delivery_available") if is_delivery else True,
+        )
+        if user_id in user_memory:
+            del user_memory[user_id]
 
         pickup_line = f"\n📦 取餐方式：{pickup_method}" if pickup_method else ""
         address_line = f"\n📍 外送地址：{address}" if (is_delivery and address) else ""
@@ -3927,9 +4276,11 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             print(f"⚠️ 推播包月表單完成通知給管理員失敗: {_admin_push_e}")
         return {"status": "success"}
 
-    except Exception as e: 
+    except HTTPException:
+        raise
+    except Exception as e:
         print(f"💥 [表單崩潰致命錯誤]: {str(e)}")
-        return {"status": "error", "msg": str(e)}
+        raise HTTPException(status_code=500, detail="包月表單處理失敗") from e
 # ==========================================
 # 🔥 滿意度問卷接收器 (自動發放不重複點數)
 # ==========================================
@@ -5575,7 +5926,7 @@ def get_dashboard_data(user_id: str) -> dict:
 
         ledger_rows = _daily_food_rows(conn, user_id, today_str)
         ledger_items = [
-            _ledger_item_from_row(row) for row in ledger_rows
+            _ledger_item_from_row(conn, row) for row in ledger_rows
         ]
         ordinary_ledger_items = [
             item for row, item in zip(ledger_rows, ledger_items)
@@ -5626,7 +5977,8 @@ def get_dashboard_data(user_id: str) -> dict:
                 c.execute(
                     """SELECT fc.product_name,fc.fingerprint,a.food_fingerprint,
                               a.suggestion_rule_version,a.approved_exchange_json,
-                              a.approved_exchange_hash
+                              a.approved_exchange_hash,fl.approved_exchange_json,
+                              fl.consumed_servings
                        FROM food_logs fl
                        JOIN food_catalog fc ON fc.food_id=fl.food_id
                        JOIN food_exchange_approvals a
@@ -5643,10 +5995,37 @@ def get_dashboard_data(user_id: str) -> dict:
                         if str(row[2] or "") != str(row[1] or ""):
                             continue
                         approved_exchange = json.loads(row[4] or "{}")
+                        applied_exchange = json.loads(row[6] or "{}")
                         expected_hash = exchange_approval_hash(row[2], row[3], approved_exchange)
-                        if not secrets.compare_digest(str(row[5] or ""), expected_hash):
+                        if (
+                            not exchange_approval_payload_is_valid(row[3], approved_exchange)
+                            or not exchange_approval_payload_is_valid(row[3], applied_exchange)
+                            or not secrets.compare_digest(str(row[5] or ""), expected_hash)
+                        ):
                             continue
-                        estimated = estimate_nutrition_from_exchanges(approved_exchange)
+                        if not exchange_applied_payload_matches_approval_hash(
+                            row[2], row[3], applied_exchange, row[7], row[5]
+                        ):
+                            continue
+                        expected_applied = {
+                            key: round(
+                                float(approved_exchange.get(key, 0) or 0)
+                                * float(row[7] or 0),
+                                4,
+                            )
+                            for key in (
+                                "milk_exchange", "protein_low_exchange",
+                                "protein_medium_exchange", "protein_high_exchange",
+                                "starch_exchange", "vegetable_exchange",
+                                "fruit_exchange", "fat_exchange",
+                            )
+                        }
+                        if not all(
+                            abs(float(applied_exchange.get(key, 0) or 0) - value) <= 0.0001
+                            for key, value in expected_applied.items()
+                        ):
+                            continue
+                        estimated = estimate_nutrition_from_exchanges(applied_exchange)
                     except (TypeError, ValueError, json.JSONDecodeError):
                         continue
                     product_name = str(row[0] or "").strip()
@@ -7061,6 +7440,13 @@ def is_jason_only_command(message):
 
 def is_authorized_privileged_text_command(user_id, message):
     """active VIP 的保留文字指令仍須符合 ADMIN／COACH 身分。"""
+    if message == DIETITIAN_HEALTH_CHECK_COMMAND_TEXT:
+        return is_authorized_dietitian_health_check_command(
+            user_id,
+            message,
+            allowed_uids=DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS,
+            liff_id=DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID,
+        )
     if message == "#教練":
         return user_id in COACH_UIDS
     if is_jason_only_command(message):
@@ -8730,6 +9116,20 @@ def _nutrition_ws(title):
         for row in spec.get("seed_rows", []):
             ws.append_row(row)
         ws.freeze(rows=1)
+        return ws
+    expected_headers = list(specs[title]["headers"])
+    actual_headers = list(ws.row_values(1))
+    if actual_headers != expected_headers:
+        if actual_headers != expected_headers[:len(actual_headers)]:
+            raise RuntimeError(f"{title} 欄位標題衝突，拒絕覆寫既有欄位")
+        missing_headers = expected_headers[len(actual_headers):]
+        if missing_headers:
+            start = gspread.utils.rowcol_to_a1(1, len(actual_headers) + 1)
+            end = gspread.utils.rowcol_to_a1(1, len(expected_headers))
+            ws.update(
+                values=[missing_headers], range_name=f"{start}:{end}",
+                value_input_option="RAW",
+            )
     return ws
 
 
@@ -8764,25 +9164,45 @@ def _sync_food_outbox(entity_id):
             )
             WHERE f.food_id=?
         """, (entity_id,)).fetchone()
+        food_trust = user_confirmed_meal_photo_food_trust_projection(conn, entity_id)
     if not food:
         raise RuntimeError("food outbox entity missing")
-    per = json.loads(food[10] or "{}")
-    exch = {}
-    if food[12] == "approved" and food[20] and food[20] == food[16]:
+    try:
+        per = json.loads(food[10] or "{}")
         candidate = json.loads(food[19] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        per, candidate = {}, {}
+    if not isinstance(per, dict):
+        per = {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+    exch = {}
+    approval_valid = False
+    if food[12] == "approved" and food[20] and food[20] == food[16]:
         expected_hash = exchange_approval_hash(food[20], food[21], candidate)
-        if secrets.compare_digest(str(food[22] or ""), expected_hash):
+        approval_valid = (
+            exchange_approval_payload_is_valid(food[21], candidate)
+            and secrets.compare_digest(str(food[22] or ""), expected_hash)
+        )
+        if approval_valid:
             exch = candidate
+    review_status = (
+        "pending_review" if food[12] == "approved" and not approval_valid else food[12]
+    )
+    if food_trust["trust_type"]:
+        per, exch = {}, {}
+        review_status = food_trust["trust_type"]
+    unknown_value = "" if food_trust["trust_type"] else 0
     ws = _nutrition_ws("食品資料庫")
     row_values = [
         food[0], food[1], food[2], food[3], food[4], food[5], food[6],
-        food[7], food[8], food[9], per.get("calories_kcal", 0), per.get("protein_g", 0),
-        per.get("fat_g", 0), per.get("carbohydrate_g", 0), per.get("sugar_g", 0),
-        per.get("fiber_g", 0), per.get("sodium_mg", 0), exch.get("milk_exchange", 0),
-        exch.get("protein_low_exchange", 0), exch.get("protein_medium_exchange", 0),
-        exch.get("protein_high_exchange", 0), exch.get("starch_exchange", 0),
-        exch.get("vegetable_exchange", 0), exch.get("fruit_exchange", 0),
-        exch.get("fat_exchange", 0), food[12], food[13], food[14], food[15],
+        food[7], food[8], food[9], per.get("calories_kcal", unknown_value), per.get("protein_g", unknown_value),
+        per.get("fat_g", unknown_value), per.get("carbohydrate_g", unknown_value), per.get("sugar_g", unknown_value),
+        per.get("fiber_g", unknown_value), per.get("sodium_mg", unknown_value), exch.get("milk_exchange", unknown_value),
+        exch.get("protein_low_exchange", unknown_value), exch.get("protein_medium_exchange", unknown_value),
+        exch.get("protein_high_exchange", unknown_value), exch.get("starch_exchange", unknown_value),
+        exch.get("vegetable_exchange", unknown_value), exch.get("fruit_exchange", unknown_value),
+        exch.get("fat_exchange", unknown_value), review_status, food[13], food[14], food[15],
         food[16], food[17], food[18]
     ]
     _upsert_raw_sheet_row(ws, entity_id, row_values)
@@ -8796,20 +9216,29 @@ def _sync_food_log_outbox(entity_id):
                    l.nutrition_snapshot_json, l.approved_exchange_json, l.source_image_ref,
                    l.plan_id, l.confirmation_status, l.created_at, l.updated_at,
                    l.exchange_approval_id, a.food_fingerprint, a.suggestion_rule_version,
-                   a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint
+                   a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint,
+                   f.source_type,l.trust_type,l.exchange_snapshot_json
             FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
             LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
             WHERE l.log_id=?
         """, (entity_id,)).fetchone()
     if not log:
         raise RuntimeError("food log outbox entity missing")
-    nutrition = json.loads(log[9] or "{}")
-    exch = json.loads(log[10] or "{}")
-    approval_values = json.loads(log[19] or "{}")
+    nutrition = _safe_json_object(log[9])
+    exch = _safe_json_object(log[10])
+    approval_values = _safe_json_object(log[19])
     approval_valid = bool(log[16] and log[17] and log[17] == log[21])
     if approval_valid:
         expected_hash = exchange_approval_hash(log[17], log[18], approval_values)
-        approval_valid = secrets.compare_digest(str(log[20] or ""), expected_hash)
+        approval_valid = (
+            exchange_approval_payload_is_valid(log[18], approval_values)
+            and exchange_approval_payload_is_valid(log[18], exch)
+            and secrets.compare_digest(str(log[20] or ""), expected_hash)
+        )
+    if approval_valid:
+        approval_valid = exchange_applied_payload_matches_approval_hash(
+            log[17], log[18], exch, log[6], log[20]
+        )
     if approval_valid:
         expected_applied = {
             key: round(float(approval_values.get(key, 0) or 0) * float(log[6] or 0), 4)
@@ -8825,16 +9254,24 @@ def _sync_food_log_outbox(entity_id):
         )
     if not approval_valid:
         exch = {}
+    with sqlite3.connect(DB_PATH) as trust_conn:
+        trust = user_confirmed_meal_photo_trust_projection(
+            trust_conn, str(log[0] or ""), str(log[23] or "")
+        )
+    if log[22] == "user_meal_photo" or trust["trust_type"]:
+        nutrition = estimate_nutrition_from_exchanges(exch) if approval_valid else {}
+    unknown_value = "" if trust["trust_type"] else 0
     ws = _nutrition_ws("飲食紀錄")
     row_values = [
         log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7], log[8],
-        nutrition.get("calories_kcal", 0), nutrition.get("protein_g", 0), nutrition.get("fat_g", 0),
-        nutrition.get("carbohydrate_g", 0), nutrition.get("sugar_g", 0), nutrition.get("fiber_g", 0),
-        nutrition.get("sodium_mg", 0), exch.get("milk_exchange", 0),
-        exch.get("protein_low_exchange", 0), exch.get("protein_medium_exchange", 0),
-        exch.get("protein_high_exchange", 0), exch.get("starch_exchange", 0),
-        exch.get("vegetable_exchange", 0), exch.get("fruit_exchange", 0),
-        exch.get("fat_exchange", 0), log[11], log[12], log[13], log[14], log[15]
+        nutrition.get("calories_kcal", unknown_value), nutrition.get("protein_g", unknown_value), nutrition.get("fat_g", unknown_value),
+        nutrition.get("carbohydrate_g", unknown_value), nutrition.get("sugar_g", unknown_value), nutrition.get("fiber_g", unknown_value),
+        nutrition.get("sodium_mg", unknown_value), exch.get("milk_exchange", unknown_value),
+        exch.get("protein_low_exchange", unknown_value), exch.get("protein_medium_exchange", unknown_value),
+        exch.get("protein_high_exchange", unknown_value), exch.get("starch_exchange", unknown_value),
+        exch.get("vegetable_exchange", unknown_value), exch.get("fruit_exchange", unknown_value),
+        exch.get("fat_exchange", unknown_value), log[11], log[12], log[13], log[14], log[15],
+        trust["trust_type"], trust["schema_version"],
     ]
     _upsert_raw_sheet_row(ws, entity_id, row_values)
 
@@ -9930,13 +10367,14 @@ def _store_nutrition_image(image_bytes, extension, image_ref=""):
 
 
 def _delete_nutrition_image(image_ref):
-    path = _nutrition_image_path(image_ref)
-    if not path or not os.path.exists(path):
-        return True
     try:
-        os.remove(path)
+        outcome = safe_unlink_nutrition_image(
+            os.path.join(DB_DIR, "nutrition_images"), image_ref
+        )
+        if outcome not in {"deleted", "missing"}:
+            return False
         return True
-    except OSError as exc:
+    except (CleanupBlocked, OSError) as exc:
         print(f"⚠️ 刪除營養圖片失敗，保留參照供下次重試：{exc}")
         return False
 
@@ -9958,21 +10396,17 @@ def _queue_nutrition_outbox(conn, entity_type, entity_id):
     )
 
 
-def cleanup_nutrition_images():
-    """刪除成功後才清除參照；失敗的檔案會在下一輪再次嘗試。"""
+def cleanup_nutrition_images(*, _before_candidate_lock=None):
+    """鎖內重新驗證每個候選；刪除成功後才以 exact CAS 清除參照。"""
     image_root = os.path.join(DB_DIR, "nutrition_images")
-    if os.path.isdir(image_root):
-        for filename in os.listdir(image_root):
-            temp_path = os.path.join(image_root, filename)
-            if not filename.endswith(".tmp") or not os.path.isfile(temp_path):
-                continue
-            try:
-                if tw_now().timestamp() - os.path.getmtime(temp_path) > 3600:
-                    os.remove(temp_path)
-            except OSError:
-                pass
     now_dt = tw_now()
+    now_text = now_dt.isoformat(timespec="seconds")
     cutoff = (now_dt - timedelta(days=90)).isoformat(timespec="seconds")
+    before_lock = _before_candidate_lock or (lambda _lane, _key: None)
+    cleanup_stale_nutrition_image_temps(
+        image_root, now_timestamp=now_dt.timestamp()
+    )
+    cleanup_delivered_health_check_images(DB_PATH, image_root)
 
     def is_before(value, reference):
         if not value:
@@ -9986,88 +10420,103 @@ def cleanup_nutrition_images():
 
     with sqlite3.connect(DB_PATH) as conn:
         ensure_nutrition_schema(conn)
-        candidates = conn.execute(
-            """SELECT token,source_image_ref,status,expires_at,retired_at
+        ensure_meal_photo_schema(conn)
+        pending_rows = conn.execute(
+            """SELECT token,user_id,source_image_ref,status,expires_at,created_at
                FROM pending_nutrition_logs
                WHERE status IN ('pending','awaiting_identity','expired','cancelled')"""
         ).fetchall()
-        pending_rows = []
-        now_text = now_dt.isoformat(timespec="seconds")
-        for token, source_image_ref, status, expires_at, retired_at in candidates:
-            should_retire = status in {"expired", "cancelled"}
-            if status in {"pending", "awaiting_identity"} and is_before(expires_at, now_dt):
-                status = "expired"
-                should_retire = True
-            if not should_retire:
-                continue
-            conn.execute(
-                """UPDATE pending_nutrition_logs
-                   SET status=?,label_payload_json='{}',
-                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
-                   WHERE token=?""",
-                (status, now_text, token),
-            )
-            conn.execute("DELETE FROM nutrition_input_states WHERE token=?", (token,))
-            if source_image_ref:
-                pending_rows.append((token, source_image_ref))
-        input_states = conn.execute(
-            "SELECT user_id,expires_at FROM nutrition_input_states"
-        ).fetchall()
+        input_states = conn.execute("SELECT user_id,expires_at FROM nutrition_input_states").fetchall()
         for state_user_id, state_expires_at in input_states:
             if is_before(state_expires_at, now_dt):
-                conn.execute(
-                    "DELETE FROM nutrition_input_states WHERE user_id=?", (state_user_id,)
-                )
-        conn.execute(
-            """DELETE FROM nutrition_input_states
-               WHERE token IN (
-                 SELECT token FROM pending_nutrition_logs
-                 WHERE status NOT IN ('pending','awaiting_identity')
-               )"""
-        )
+                conn.execute("DELETE FROM nutrition_input_states WHERE user_id=?", (state_user_id,))
         conn.commit()
-    for token, ref in pending_rows:
-        if _delete_nutrition_image(ref):
-            with sqlite3.connect(DB_PATH) as conn:
+    for expected in pending_rows:
+        token, user_id, ref, expected_status, expires_at, created_at = expected
+        eligible = expected_status in {"expired", "cancelled"} or (
+            expected_status in {"pending", "awaiting_identity"} and is_before(expires_at, now_dt)
+        )
+        if not eligible:
+            continue
+        before_lock("label", token)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """SELECT token,user_id,source_image_ref,status,expires_at,created_at
+                   FROM pending_nutrition_logs WHERE token=?""", (token,)
+            ).fetchone()
+            if current != expected:
+                conn.rollback()
+                continue
+            status = "expired" if expected_status in {"pending", "awaiting_identity"} else expected_status
+            conn.execute(
+                """UPDATE pending_nutrition_logs SET status=?,label_payload_json='{}',
+                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END
+                   WHERE token=? AND user_id=? AND source_image_ref=? AND status=?
+                     AND expires_at IS ? AND created_at IS ?""",
+                (status, now_text, token, user_id, ref, expected_status, expires_at, created_at),
+            )
+            conn.execute("DELETE FROM nutrition_input_states WHERE token=?", (token,))
+            if not ref or nutrition_image_reference_is_protected(conn, ref, nutrition_token=token):
+                conn.commit()
+                continue
+            if _delete_nutrition_image(ref):
                 conn.execute(
-                    "UPDATE pending_nutrition_logs SET source_image_ref='' WHERE token=? AND source_image_ref=?",
-                    (token, ref),
+                    """UPDATE pending_nutrition_logs SET source_image_ref=''
+                       WHERE token=? AND user_id=? AND source_image_ref=? AND status=?""",
+                    (token, user_id, ref, status),
                 )
                 conn.commit()
+            else:
+                # Retirement/scrubbing is authoritative even when file I/O is retryable.
+                conn.commit()
 
-    # 無標示餐點草稿同樣遵守24小時到期與delete-first/reference-clear-second。
-    meal_photo_rows = []
+    # 無標示餐點草稿同樣在逐候選 write lock 內重新驗證狀態、期限、owner、ref、version。
     with sqlite3.connect(DB_PATH) as conn:
         ensure_meal_photo_schema(conn)
-        now_text = now_dt.isoformat(timespec="seconds")
-        candidates = conn.execute(
-            """SELECT token,user_id,source_image_ref,status,expires_at
+        meal_photo_rows = conn.execute(
+            """SELECT token,user_id,source_image_ref,status,expires_at,created_at,version
                FROM pending_meal_photo_drafts
                WHERE status IN ('awaiting_confirmation','confirming','estimated','expired','cancelled')"""
         ).fetchall()
-        for token, user_id, ref, status, expires_at in candidates:
-            should_retire = status in {"expired", "cancelled"}
-            if status in {"awaiting_confirmation", "confirming", "estimated"} and is_before(expires_at, now_dt):
-                status = "expired"
-                should_retire = True
-            if not should_retire:
+    for expected in meal_photo_rows:
+        token, user_id, ref, expected_status, expires_at, created_at, version = expected
+        eligible = expected_status in {"expired", "cancelled"} or (
+            expected_status in {"awaiting_confirmation", "confirming", "estimated"}
+            and is_before(expires_at, now_dt)
+        )
+        if not eligible:
+            continue
+        before_lock("meal", token)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """SELECT token,user_id,source_image_ref,status,expires_at,created_at,version
+                   FROM pending_meal_photo_drafts WHERE token=?""", (token,)
+            ).fetchone()
+            if current != expected:
+                conn.rollback()
                 continue
+            status = "expired" if expected_status in {"awaiting_confirmation", "confirming", "estimated"} else expected_status
             conn.execute(
                 """UPDATE pending_meal_photo_drafts
                    SET status=?,observed_payload_json='{}',answers_json='{}',estimate_json='{}',
-                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END,
-                       updated_at=? WHERE token=? AND user_id=?""",
-                (status, now_text, now_text, token, user_id),
+                       retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END,updated_at=?
+                   WHERE token=? AND user_id=? AND source_image_ref=? AND status=?
+                     AND expires_at IS ? AND created_at IS ? AND version=?""",
+                (status, now_text, now_text, token, user_id, ref, expected_status,
+                 expires_at, created_at, version),
             )
-            if ref:
-                meal_photo_rows.append((token, user_id, ref))
-        conn.commit()
-    for token, user_id, ref in meal_photo_rows:
-        if _delete_nutrition_image(ref):
-            with sqlite3.connect(DB_PATH) as conn:
+            if not ref or nutrition_image_reference_is_protected(conn, ref, meal_token=token):
+                conn.commit()
+                continue
+            if _delete_nutrition_image(ref):
                 clear_meal_photo_image_ref(
                     conn, user_id=user_id, token=token, expected_ref=ref
                 )
+            else:
+                # Keep the ref for retry, but retain the locked expiry transition/scrub.
+                conn.commit()
 
     meal_tombstone_cutoff = now_dt - timedelta(days=30)
     with sqlite3.connect(DB_PATH) as conn:
@@ -10127,23 +10576,66 @@ def cleanup_nutrition_images():
         conn.commit()
 
     with sqlite3.connect(DB_PATH) as conn:
+        log_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_logs)")}
+        version_expr = "fl.version" if "version" in log_columns else "NULL"
         old_logs = conn.execute(
-            """SELECT log_id, food_id, source_image_ref FROM food_logs
-               WHERE created_at<? AND source_image_ref<>''""",
+            f"""SELECT fl.log_id,fl.user_id,fl.food_id,{version_expr} AS version,
+                       fl.created_at,fl.source_image_ref,
+                       fc.owner_user_id,fc.visibility,fc.original_image_ref
+                FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+                WHERE fl.created_at<? AND fl.source_image_ref<>''""",
             (cutoff,),
         ).fetchall()
-    for log_id, food_id, ref in old_logs:
-        if not _delete_nutrition_image(ref):
-            continue
+    for expected in old_logs:
+        (
+            log_id, owner_id, food_id, version, created_at, ref,
+            catalog_owner, catalog_visibility, catalog_ref,
+        ) = expected
+        before_lock("90day", log_id)
         with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "UPDATE food_logs SET source_image_ref='' WHERE log_id=? AND source_image_ref=?",
-                (log_id, ref),
-            )
-            conn.execute(
-                "UPDATE food_catalog SET original_image_ref='' WHERE food_id=? AND original_image_ref=?",
-                (food_id, ref),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            version_expr = "fl.version" if version is not None else "NULL"
+            current = conn.execute(
+                f"""SELECT fl.log_id,fl.user_id,fl.food_id,{version_expr} AS version,
+                            fl.created_at,fl.source_image_ref,
+                            fc.owner_user_id,fc.visibility,fc.original_image_ref
+                     FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+                     WHERE fl.log_id=?""", (log_id,)
+            ).fetchone()
+            if current != expected or not is_before(current[4] if current else "", now_dt - timedelta(days=90)):
+                conn.rollback()
+                continue
+            if owner_id != catalog_owner or catalog_visibility != "private":
+                conn.rollback()
+                continue
+            if ref != catalog_ref:
+                conn.rollback()
+                continue
+            if nutrition_image_reference_is_protected(
+                conn, ref, food_log_id=log_id, food_id=food_id,
+                food_owner_id=owner_id,
+            ):
+                conn.rollback()
+                continue
+            if not _delete_nutrition_image(ref):
+                conn.rollback()
+                continue
+            version_clause = " AND version=?" if version is not None else ""
+            log_params = (log_id, owner_id, food_id, created_at, ref) + ((version,) if version is not None else ())
+            changed_log = conn.execute(
+                """UPDATE food_logs SET source_image_ref=''
+                   WHERE log_id=? AND user_id=? AND food_id=? AND created_at IS ?
+                     AND source_image_ref=?""" + version_clause,
+                log_params,
+            ).rowcount
+            changed_food = conn.execute(
+                """UPDATE food_catalog SET original_image_ref=''
+                   WHERE food_id=? AND owner_user_id=? AND original_image_ref=?""",
+                (food_id, catalog_owner, ref),
+            ).rowcount
+            if (changed_log, changed_food) != (1, 1):
+                conn.rollback()
+                continue
             _queue_nutrition_outbox(conn, "food", food_id)
             _queue_nutrition_outbox(conn, "food_log", log_id)
             conn.commit()
@@ -10482,6 +10974,9 @@ MEAL_PHOTO_STEP_QUESTIONS = {
     "scope": "這餐是否還有照片外、未入鏡的食物或飲料？",
     "protein_type": "主要蛋白質食物是哪一類？若看不出來請選『不確定』。",
     "protein_portion": "蛋白質食物大約有幾個手掌大？",
+    "protein_more": "這餐還有其他蛋白質食物嗎？",
+    "protein_extra_type": "請選擇另一種蛋白質食物：",
+    "protein_extra_portion": "這一種蛋白質大約有幾個手掌大？",
     "starch_portion": "這餐主食大約多少？照片沒拍到但有吃，也請照實選擇。",
     "vegetable_portion": "蔬菜大約有幾碗？",
     "cooking_oil": "這餐的烹調用油大約如何？照片看不出來請選『不確定』。",
@@ -10639,6 +11134,7 @@ def _quick_log_catalog_card_once(
     with sqlite3.connect(DB_PATH) as conn:
         ensure_nutrition_schema(conn)
         ensure_daily_food_ledger_schema(conn)
+        _prepare_health_check_refresh_connection(conn)
         conn.execute("BEGIN IMMEDIATE")
         previous = conn.execute(
             """SELECT result_json FROM daily_food_log_events
@@ -10695,7 +11191,7 @@ def _quick_log_catalog_card_once(
                 rows = _daily_food_rows(conn, user_id, today)
                 daily_cal = daily_pro = 0.0
                 for row in rows:
-                    snapshot = _ledger_item_from_row(row)["nutrition"]
+                    snapshot = _ledger_item_from_row(conn, row)["nutrition"]
                     daily_cal += float(snapshot.get("calories_kcal") or 0)
                     daily_pro += float(snapshot.get("protein_g") or 0)
                 tdee, protein_goal = 2000, 100
@@ -10725,6 +11221,7 @@ def _quick_log_catalog_card_once(
                     logged_at.isoformat(timespec="seconds"),
                 ),
             )
+        _refresh_health_check_after_food_log(conn, user_id=user_id)
         conn.commit()
     return build_meal_log_flex(
         card_state["logged_name"], card_state.get("logged_cal"),
@@ -11548,6 +12045,9 @@ def handle_meal_photo_postback(event):
 
     start = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):start", data)
     cancel = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):cancel", data)
+    confirm_estimate = re.fullmatch(
+        r"mp:v1:([0-9a-f]{12}):(\d+):confirm_estimate", data
+    )
     answer = re.fullmatch(
         r"mp:v1:([0-9a-f]{12}):(\d+):answer:([a-z_]+):([a-z_]+)", data
     )
@@ -11571,11 +12071,11 @@ def handle_meal_photo_postback(event):
     review_cancel = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):cancel_review", data)
     review_reject = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):reject", data)
     review_approve = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):approve", data)
-    if not (start or cancel or answer or remove_item or request_add or cancel_add or add_category or review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
+    if not (start or cancel or confirm_estimate or answer or remove_item or request_add or cancel_add or add_category or review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
         return
     uid = event.source.user_id
     if not (review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
-        matched = start or cancel or answer or remove_item or request_add or cancel_add or add_category
+        matched = start or cancel or confirm_estimate or answer or remove_item or request_add or cancel_add or add_category
         assert matched is not None
         token, version = matched.group(1), int(matched.group(2))
     event_id = str(getattr(event, "webhook_event_id", "") or "").strip()
@@ -11641,6 +12141,7 @@ def handle_meal_photo_postback(event):
                     required_admin_user_id=configured_admin_uid,
                 )
                 owner_uid = admin_draft["user_id"]
+                _prepare_health_check_refresh_connection(conn)
                 applied = apply_meal_photo_review_action(
                     conn, event_id=event_id, user_id=owner_uid, admin_user_id=uid,
                     required_admin_user_id=configured_admin_uid,
@@ -11648,6 +12149,9 @@ def handle_meal_photo_postback(event):
                     field=field, value=value,
                 )
                 draft, result = applied["draft"], applied["result"]
+                if result["kind"] == "approved":
+                    # Approval commits its own ledger transaction; refresh on replay too.
+                    _refresh_health_check_after_food_log(conn, user_id=owner_uid)
             kind = result["kind"]
             if kind == "review_question":
                 reply = build_meal_photo_review_step_message(
@@ -11705,6 +12209,14 @@ def handle_meal_photo_postback(event):
                         "kind": "question", "step": next_meal_photo_step(draft),
                         "version": draft["version"],
                     }
+            elif confirm_estimate:
+                _prepare_health_check_refresh_connection(conn)
+                applied = apply_meal_photo_action(
+                    conn, event_id=event_id, user_id=uid, token=token,
+                    expected_version=version, action="confirm_estimate",
+                )
+                draft, result = applied["draft"], applied["result"]
+                _refresh_health_check_after_food_log(conn, user_id=uid)
             elif cancel:
                 applied = apply_meal_photo_action(
                     conn, event_id=event_id, user_id=uid, token=token,
@@ -11764,13 +12276,28 @@ def handle_meal_photo_postback(event):
             from linebot.models import FlexSendMessage
             configured_admin_uid = str(get_admin_notify_uid() or "").strip()
             is_admin_owner = bool(configured_admin_uid and uid == configured_admin_uid)
-            if not is_admin_owner and applied is not None and not applied.get("replayed"):
+            if (
+                draft.get("workflow_version") == "expert_review_v1"
+                and not is_admin_owner
+                and applied is not None
+                and not applied.get("replayed")
+            ):
                 push_meal_photo_review_request(draft)
             reply = FlexSendMessage(
-                alt_text="餐點照片估算完成，待營養師審核",
+                alt_text=(
+                    "餐點照片估算完成，等待營養師審核"
+                    if draft.get("workflow_version") == "expert_review_v1"
+                    else "餐點照片估算完成，請確認記錄"
+                ),
                 contents=build_meal_photo_estimate_bubble(
                     draft, allow_admin_review=is_admin_owner
                 ),
+            )
+        elif kind == "recorded":
+            from linebot.models import FlexSendMessage
+            reply = FlexSendMessage(
+                alt_text="✅ 已記錄｜顧客確認・AI估算",
+                contents=build_meal_photo_recorded_bubble(draft),
             )
         elif kind == "cancel":
             image_ref = str(result.get("source_image_ref") or "")
@@ -11833,6 +12360,7 @@ def _build_breakfast_combo_reply_once(
     ).hexdigest()
     with sqlite3.connect(DB_PATH) as conn:
         ensure_nutrition_schema(conn)
+        _prepare_health_check_refresh_connection(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
             stored = conn.execute(
@@ -11944,7 +12472,8 @@ def _build_breakfast_combo_reply_once(
                         json.dumps(payload, ensure_ascii=False, sort_keys=True), now_tw,
                     ),
                 )
-                conn.commit()
+            _refresh_health_check_after_food_log(conn, user_id=user_id)
+            conn.commit()
         except Exception:
             if conn.in_transaction:
                 conn.rollback()
@@ -12006,7 +12535,22 @@ def _handle_message_impl(event):
         processed_messages.clear()
     processed_messages.add(msg_id)
 
-    msg, uid = event.message.text.strip(), event.source.user_id
+    raw_msg = event.message.text
+    msg, uid = raw_msg.strip(), event.source.user_id
+
+    if is_authorized_dietitian_health_check_command(
+        uid,
+        raw_msg,
+        allowed_uids=DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS,
+        liff_id=DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID,
+    ):
+        line_bot_api.reply_message(
+            event.reply_token,
+            build_dietitian_health_check_flex(
+                DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID
+            ),
+        )
+        return
 
     # 飲食帳本編輯的文字輸入（營養數值、修改品項、私人食品名稱）優先於 AI 對話。
     ledger_state = get_daily_food_edit_state(uid)
@@ -12485,12 +13029,14 @@ def _handle_message_impl(event):
                     print(f"⚠️ 飲食紀錄連結營養計畫失敗，將由排程重試：{plan_exc}")
             with sqlite3.connect(DB_PATH) as conn:
                 ensure_nutrition_schema(conn)
+                _prepare_health_check_refresh_connection(conn)
                 result = confirm_pending_label(
                     conn, token=token, user_id=uid, plan_id=plan_id,
                     plan_link_status=plan_link_status,
                 )
                 confirmation_committed = True
                 clear_nutrition_input_state(conn, user_id=uid)
+                _refresh_health_check_after_food_log(conn, user_id=uid)
             sync_confirmed_nutrition_to_sheet(result)
             dashboard_flex = apply_confirmed_nutrition_to_legacy_dashboard(uid, result)
             if dashboard_flex:
@@ -14169,17 +14715,34 @@ def _handle_message_impl(event):
 def handle_message(event):
     message_id = str(event.message.id)
     try:
-        message = event.message.text.strip()
+        raw_message = event.message.text
         user_id = event.source.user_id
-        has_vip = has_active_vip_access(user_id)
-        if not has_vip and not is_text_command_allowed_without_vip(user_id, message):
+        if is_dietitian_health_check_command_intent(raw_message):
+            if not DIETITIAN_HEALTH_CHECK_CONFIG.enabled:
+                return
+            if is_authorized_dietitian_health_check_command(
+                user_id,
+                raw_message,
+                allowed_uids=DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS,
+                liff_id=DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID,
+            ):
+                return _handle_message_impl(event)
             return
-        if (
-            has_vip
-            and not is_valid_vip_activation_command(user_id, message)
-            and is_privileged_command_intent(message)
-            and not is_authorized_privileged_text_command(user_id, message)
-        ):
+        message = raw_message.strip()
+        vip_activation_candidate = bool(
+            re.fullmatch(r"#(?:VIP24|VIP48|VIPORDER)-[A-Z0-9]{6}", message)
+        )
+        valid_vip_activation = vip_activation_candidate and is_valid_vip_activation_command(
+            user_id, message
+        )
+        privileged_intent = is_privileged_command_intent(message)
+        privileged_authorized = privileged_intent and is_authorized_privileged_text_command(
+            user_id, message
+        )
+        if privileged_intent and not privileged_authorized and not valid_vip_activation:
+            return
+        has_vip = has_active_vip_access(user_id)
+        if not has_vip and not (valid_vip_activation or privileged_authorized):
             return
         return _handle_message_impl(event)
     except Exception:
