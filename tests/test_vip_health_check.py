@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -1306,6 +1307,106 @@ def _insert_log(conn, log_id, consumed_at, meal_slot, *, status="confirmed", del
            VALUES (?,?,?,?,?,?,1,?)""",
         (log_id, "U1", consumed_at, meal_slot, '{"calories_kcal":500}', status, deleted_at),
     )
+
+
+def test_manifest_accepts_only_integrity_valid_user_confirmed_ai_estimates(conn):
+    from nutrition_system import ensure_nutrition_schema, insert_user_confirmed_meal_photo_log
+    from meal_photo_system import save_meal_photo_draft
+    from vip_health_check import (
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+        refresh_case_source_manifest,
+    )
+
+    ensure_nutrition_schema(conn)
+    conn.execute("ALTER TABLE food_logs ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+    conn.execute("ALTER TABLE food_logs ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''")
+    conn.execute("""CREATE TABLE health_profile (
+        user_id TEXT PRIMARY KEY,name TEXT,tdee REAL,protein REAL,goal TEXT,
+        restrictions TEXT,active_days TEXT)""")
+    ensure_vip_health_check_schema(conn)
+    case = create_first_vip_health_check_case(
+        conn, user_id="U1", first_vip_activation_id="activation-ai",
+        activation_event_key="event-ai",
+        activated_at=datetime(2026, 9, 3, 7, 0, tzinfo=timezone(timedelta(hours=8))),
+    )
+    estimate = {
+        "calories_kcal": None, "protein_g": None, "fat_g": None,
+        "carbohydrate_g": None,
+        "protein_total_exchange": {"min": 2.0, "max": 3.0, "basis": "hand_portion_range_v1"},
+        "starch_exchange": {"min": 0.0, "max": 0.0, "basis": "user_confirmed_none"},
+        "vegetable_exchange": {"min": 1.0, "max": 2.0, "basis": "bowl_range_v1"},
+        "cooking_oil_confirmation": "unknown", "sauce_confirmation": "unknown",
+        "formal_status": "pending_review_not_counted", "rule_version": "hand-portion-range-v1",
+    }
+    log_ids = []
+    for suffix, slot, hour in (("a", "早餐", 8), ("b", "午餐", 12)):
+        source_message_id = f"message-{suffix}"
+        confirmation_event_id = f"confirm-{suffix}"
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id=source_message_id,
+            payload={
+                "status": "success", "image_type": "food_photo",
+                "visible_items": [{"name": "雞肉", "category": "protein", "confidence": 0.9}],
+                "uncertain_items": [], "starch_visibility": "not_visible",
+                "oil_sauce_status": "unknown",
+            },
+        )
+        result = insert_user_confirmed_meal_photo_log(
+            conn, token=token, user_id="U1", source_message_id=source_message_id,
+            confirmation_event_id=confirmation_event_id,
+            consumed_at=f"2026-09-03T{hour:02d}:00:00+08:00", meal_slot=slot,
+            source_image_ref=f"nutrition-image:{suffix}.jpg",
+            observed_payload={"visible_items": [{"name": "雞肉"}]},
+            answers={}, estimate=estimate,
+        )
+        log_ids.append(result["log_id"])
+        conn.execute(
+            """UPDATE pending_meal_photo_drafts
+               SET status='user_confirmed',version=2,confirmed_log_id=?,confirmed_by='U1',
+                   original_confirmation_event_id=?
+               WHERE token=? AND user_id='U1'""",
+            (result["log_id"], confirmation_event_id, token),
+        )
+        request = {
+            "user_id": "U1", "token": token, "expected_version": 1,
+            "action": "confirm_estimate", "field": "", "value": "",
+        }
+        request_hash = hashlib.sha256(json.dumps(
+            request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        event_result = {"kind": "recorded", "version": 2, "log_id": result["log_id"]}
+        conn.execute(
+            """INSERT INTO meal_photo_events
+               (event_id,user_id,token,action,request_payload_hash,result_json,created_at)
+               VALUES(?, 'U1', ?, 'confirm_estimate', ?, ?, ?)""",
+            (confirmation_event_id, token, request_hash,
+             json.dumps(event_result, ensure_ascii=False, sort_keys=True),
+             "2026-09-03T13:00:00+08:00"),
+        )
+    conn.commit()
+
+    first = refresh_case_source_manifest(
+        conn, case_id=case["case_id"],
+        evaluated_at=datetime(2026, 9, 3, 13, 0, tzinfo=timezone(timedelta(hours=8))),
+    )
+    assert first["source_count"] == 2
+    from dietitian_health_check_api import load_health_check_detail
+    detail = load_health_check_detail(conn, case_id=str(case["case_id"]))
+    assert detail is not None
+    assert {item["trust_label"] for item in detail["source_logs"]} == {"顧客確認・AI估算"}
+    assert all(item["nutrition_snapshot"] == {} for item in detail["source_logs"])
+    assert all(item["estimate"]["calories_kcal"] is None for item in detail["source_logs"])
+    conn.execute("UPDATE food_logs SET trust_type='' WHERE log_id=?", (log_ids[1],))
+    second = refresh_case_source_manifest(
+        conn, case_id=case["case_id"],
+        evaluated_at=datetime(2026, 9, 3, 13, 1, tzinfo=timezone(timedelta(hours=8))),
+    )
+    assert second["source_count"] == 1
+    assert second["valid_day_count"] == 0
+    assert [row[0] for row in conn.execute(
+        "SELECT food_log_id FROM vip_health_check_source_refs"
+    )] == [log_ids[0]]
 
 
 def test_manifest_uses_canonical_logs_keeps_same_day_meals_and_ignores_planned_projection(conn):

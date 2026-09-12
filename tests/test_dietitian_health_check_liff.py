@@ -65,3 +65,6 @@ def test_liff_script_reads_live_collecting_and_ready_cases_without_persisting_to
     assert "U-AUTHORIZED" not in script
     assert "Authorization" in script
     assert "liff.getIDToken" in script
+    assert "顧客確認・AI估算" in script
+    assert "NA" in script
+    assert "JSON.stringify((detail&&detail.source_logs)" not in script

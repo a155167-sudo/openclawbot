@@ -16,6 +16,8 @@ from nutrition_system import (
     _confirmed_result,
     ensure_nutrition_schema,
     insert_approved_meal_photo_log,
+    insert_user_confirmed_meal_photo_log,
+    user_confirmed_meal_photo_estimate_is_valid,
 )
 
 
@@ -144,7 +146,12 @@ def ensure_meal_photo_schema(conn: sqlite3.Connection) -> None:
             review_json TEXT NOT NULL DEFAULT '{}',
             approved_log_id TEXT NOT NULL DEFAULT '',
             approved_at TEXT NOT NULL DEFAULT '',
-            approved_by TEXT NOT NULL DEFAULT ''
+            approved_by TEXT NOT NULL DEFAULT '',
+            workflow_version TEXT NOT NULL DEFAULT 'expert_review_v1',
+            confirmed_log_id TEXT NOT NULL DEFAULT '',
+            confirmed_at TEXT NOT NULL DEFAULT '',
+            confirmed_by TEXT NOT NULL DEFAULT '',
+            original_confirmation_event_id TEXT NOT NULL DEFAULT ''
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_meal_photo_source_event
             ON pending_meal_photo_drafts(user_id, source_message_id)
@@ -208,10 +215,30 @@ def ensure_meal_photo_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE pending_meal_photo_drafts ADD COLUMN approved_by TEXT NOT NULL DEFAULT ''"
         )
+    if "workflow_version" not in columns:
+        conn.execute(
+            "ALTER TABLE pending_meal_photo_drafts ADD COLUMN workflow_version TEXT NOT NULL DEFAULT 'expert_review_v1'"
+        )
+    if "confirmed_log_id" not in columns:
+        conn.execute(
+            "ALTER TABLE pending_meal_photo_drafts ADD COLUMN confirmed_log_id TEXT NOT NULL DEFAULT ''"
+        )
+    if "confirmed_at" not in columns:
+        conn.execute(
+            "ALTER TABLE pending_meal_photo_drafts ADD COLUMN confirmed_at TEXT NOT NULL DEFAULT ''"
+        )
+    if "confirmed_by" not in columns:
+        conn.execute(
+            "ALTER TABLE pending_meal_photo_drafts ADD COLUMN confirmed_by TEXT NOT NULL DEFAULT ''"
+        )
+    if "original_confirmation_event_id" not in columns:
+        conn.execute(
+            "ALTER TABLE pending_meal_photo_drafts ADD COLUMN original_confirmation_event_id TEXT NOT NULL DEFAULT ''"
+        )
     now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
     conn.execute(
         """INSERT INTO meal_photo_schema_versions(component,version,updated_at)
-           VALUES('meal_photo_system',5,?)
+           VALUES('meal_photo_system',7,?)
            ON CONFLICT(component) DO UPDATE SET
              version=MAX(version,excluded.version),updated_at=excluded.updated_at""",
         (now,),
@@ -244,6 +271,7 @@ def save_meal_photo_draft(
     meal_slot: str = "",
     consumed_at: str = "",
     consumed_time_source: str = "line_timestamp",
+    workflow_version: str = "user_confirmed_ai_estimate_v1",
 ) -> str:
     ensure_meal_photo_schema(conn)
     user_id = _short_text(user_id, "user_id", maximum=120)
@@ -252,6 +280,8 @@ def save_meal_photo_draft(
     )
     if consumed_time_source not in {"photo_timestamp", "line_timestamp", "manual"}:
         raise ValueError("consumed_time_source 不支援")
+    if workflow_version not in {"expert_review_v1", "user_confirmed_ai_estimate_v1"}:
+        raise ValueError("workflow_version 不支援")
     normalized = normalize_meal_photo_payload(payload)
     if source_message_id:
         row = conn.execute(
@@ -269,8 +299,8 @@ def save_meal_photo_draft(
             """INSERT INTO pending_meal_photo_drafts
                (token,user_id,source_message_id,source_image_ref,observed_payload_json,
                 answers_json,estimate_json,meal_slot,consumed_at,consumed_time_source,
-                status,created_at,updated_at,expires_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,'awaiting_confirmation',?,?,?)""",
+                status,created_at,updated_at,expires_at,workflow_version)
+               VALUES(?,?,?,?,?,?,?,?,?,?,'awaiting_confirmation',?,?,?,?)""",
             (
                 token,
                 user_id,
@@ -285,6 +315,7 @@ def save_meal_photo_draft(
                 now,
                 now,
                 (now_dt + timedelta(hours=24)).isoformat(timespec="seconds"),
+                workflow_version,
             ),
         )
         conn.commit()
@@ -309,7 +340,7 @@ def get_meal_photo_draft(
         """SELECT source_message_id,source_image_ref,observed_payload_json,answers_json,
                   estimate_json,meal_slot,consumed_at,consumed_time_source,status,
                   created_at,updated_at,expires_at,version,review_json,approved_log_id,
-                  approved_at,approved_by
+                  approved_at,approved_by,workflow_version,confirmed_log_id,confirmed_at,confirmed_by
            FROM pending_meal_photo_drafts WHERE token=? AND user_id=?""",
         (token, user_id),
     ).fetchone()
@@ -348,6 +379,10 @@ def get_meal_photo_draft(
         "approved_log_id": row[14] or "",
         "approved_at": row[15] or "",
         "approved_by": row[16] or "",
+        "workflow_version": row[17] or "expert_review_v1",
+        "confirmed_log_id": row[18] or "",
+        "confirmed_at": row[19] or "",
+        "confirmed_by": row[20] or "",
     }
 
 
@@ -384,7 +419,8 @@ def list_pending_meal_photo_reviews(
     now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
     rows = conn.execute(
         """SELECT token,user_id FROM pending_meal_photo_drafts
-           WHERE status IN ('estimated','reviewing','review_ready') AND expires_at>?
+           WHERE workflow_version='expert_review_v1'
+             AND status IN ('estimated','reviewing','review_ready') AND expires_at>?
            ORDER BY created_at ASC LIMIT ?""",
         (now, limit),
     ).fetchall()
@@ -746,6 +782,7 @@ def apply_meal_photo_action(
 ) -> dict[str, Any]:
     """以durable event與版本鎖原子套用LINE Postback；重送回傳原result。"""
     ensure_meal_photo_schema(conn)
+    ensure_nutrition_schema(conn)
     event_id = _short_text(event_id, "event_id", maximum=180)
     user_id = _short_text(user_id, "user_id", maximum=120)
     if not re.fullmatch(r"[0-9a-f]{12}", str(token or "")):
@@ -756,7 +793,7 @@ def apply_meal_photo_action(
         value = str(value or "").strip()
         if value not in ANSWER_VALUES[field]:
             raise ValueError("餐點回答選項不支援")
-    elif action == "cancel":
+    elif action in {"cancel", "confirm_estimate"}:
         field = ""
         value = ""
     elif action == "remove_item":
@@ -799,6 +836,11 @@ def apply_meal_photo_action(
             ):
                 raise ValueError("餐點事件識別碼衝突")
             result = json.loads(existing[4])
+            if action == "confirm_estimate" and not user_confirmed_meal_photo_estimate_is_valid(
+                conn, str(result.get("log_id") or ""), expected_user_id=user_id,
+                expected_draft_token=token, expected_draft_version=expected_version + 1,
+            ):
+                raise ValueError("已記錄餐點完整性驗證失敗")
             conn.commit()
             return {
                 "replayed": True,
@@ -807,7 +849,8 @@ def apply_meal_photo_action(
             }
         row = conn.execute(
             """SELECT answers_json,status,expires_at,version,source_image_ref,
-                      observed_payload_json
+                      observed_payload_json,estimate_json,meal_slot,consumed_at,
+                      source_message_id,workflow_version,confirmed_log_id
                FROM pending_meal_photo_drafts WHERE token=? AND user_id=?""",
             (token, user_id),
         ).fetchone()
@@ -815,10 +858,33 @@ def apply_meal_photo_action(
             raise ValueError("找不到這筆餐點照片草稿")
         answers = {**_blank_answers(), **json.loads(row[0] or "{}")}
         status, expires_at, current_version = row[1], row[2], int(row[3])
+        if action == "confirm_estimate" and status == "user_confirmed":
+            confirmed_log_id = str(row[11] or "")
+            if (
+                current_version - 1 != expected_version
+                or not user_confirmed_meal_photo_estimate_is_valid(
+                    conn, confirmed_log_id, expected_user_id=user_id,
+                    expected_draft_token=token, expected_draft_version=current_version,
+                )
+            ):
+                raise ValueError("已記錄餐點完整性驗證失敗")
+            now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
+            result = {"kind": "recorded", "version": current_version, "log_id": confirmed_log_id}
+            conn.execute(
+                """INSERT INTO meal_photo_events
+                   (event_id,user_id,token,action,request_payload_hash,result_json,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (event_id, user_id, token, action, request_hash,
+                 json.dumps(result, ensure_ascii=False, sort_keys=True), now),
+            )
+            conn.commit()
+            return {"replayed": True, "result": result,
+                    "draft": get_meal_photo_draft(conn, user_id=user_id, token=token)}
         if _expired(expires_at):
             raise ValueError("這筆餐點照片草稿已逾時")
         allowed_statuses = (
             {"awaiting_item_name"} if action in {"add_item", "cancel_add"}
+            else {"estimated"} if action == "confirm_estimate"
             else {"awaiting_confirmation", "confirming"}
         )
         if status not in allowed_statuses:
@@ -827,7 +893,31 @@ def apply_meal_photo_action(
             raise ValueError("餐點確認畫面已更新，請使用最新按鈕")
         next_version = current_version + 1
         now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
-        if action == "cancel":
+        if action == "confirm_estimate":
+            if row[10] != "user_confirmed_ai_estimate_v1":
+                raise ValueError("舊版待審草稿不能由顧客直接記錄")
+            observed = normalize_meal_photo_payload(json.loads(row[5] or "{}"))
+            stored_estimate = json.loads(row[6] or "{}")
+            if stored_estimate != _estimate_from_answers(answers):
+                raise ValueError("餐點照片估算完整性驗證失敗")
+            formal_result = insert_user_confirmed_meal_photo_log(
+                conn, token=token, user_id=user_id, source_message_id=str(row[9] or ""),
+                confirmation_event_id=event_id, consumed_at=str(row[8] or ""),
+                meal_slot=str(row[7] or ""), source_image_ref=str(row[4] or ""),
+                observed_payload=observed, answers=answers, estimate=stored_estimate,
+            )
+            result = {"kind": "recorded", "version": next_version,
+                      "log_id": formal_result["log_id"]}
+            changed = conn.execute(
+                """UPDATE pending_meal_photo_drafts
+                   SET status='user_confirmed',confirmed_log_id=?,confirmed_at=?,confirmed_by=?,
+                       original_confirmation_event_id=?,updated_at=?,version=?
+                   WHERE token=? AND user_id=? AND version=? AND status='estimated'
+                     AND workflow_version='user_confirmed_ai_estimate_v1'""",
+                (formal_result["log_id"], now, user_id, event_id, now, next_version,
+                 token, user_id, current_version),
+            ).rowcount
+        elif action == "cancel":
             result = {
                 "kind": "cancel", "version": next_version, "source_image_ref": row[4],
             }
@@ -1354,22 +1444,52 @@ def build_meal_photo_estimate_bubble(
             ],
         },
     }
-    if allow_admin_review:
-        token = str(draft.get("token") or "")
-        version = int(draft.get("version") or 0)
-        if not re.fullmatch(r"[0-9a-f]{12}", token) or version < 1:
-            raise ValueError("餐點審核資料無效")
+    token = str(draft.get("token") or "")
+    version = int(draft.get("version") or 0)
+    if not re.fullmatch(r"[0-9a-f]{12}", token) or version < 1:
+        raise ValueError("餐點確認資料無效")
+    if draft.get("workflow_version") == "expert_review_v1":
+        if allow_admin_review:
+            bubble["footer"] = {
+                "type": "box", "layout": "vertical", "spacing": "sm",
+                "contents": [{
+                    "type": "button", "style": "primary", "color": "#0F766E",
+                    "action": {
+                        "type": "postback", "label": "審核並加入",
+                        "data": f"mpr:v1:{token}:{version}:start",
+                        "displayText": "審核這筆餐點照片份量",
+                    },
+                }],
+            }
+    else:
+        bubble["header"]["contents"][0]["text"] = "📊 照片估算｜確認後正式記錄"
+        bubble["body"]["contents"][-2]["text"] = (
+            "確認後會記入飲食紀錄；AI估算不會冒充營養師核准值。"
+        )
         bubble["footer"] = {
             "type": "box", "layout": "vertical", "spacing": "sm",
             "contents": [{
                 "type": "button", "style": "primary", "color": "#0F766E",
                 "action": {
-                    "type": "postback", "label": "審核並加入",
-                    "data": f"mpr:v1:{token}:{version}:start",
-                    "displayText": "審核這筆餐點照片份量",
+                    "type": "postback", "label": "確認記錄",
+                    "data": f"mp:v1:{token}:{version}:confirm_estimate",
+                    "displayText": "確認照片並記錄這餐",
                 },
             }],
         }
+    return bubble
+
+
+def build_meal_photo_recorded_bubble(draft: Mapping[str, Any]) -> dict[str, Any]:
+    """Render the persisted occurrence without implying expert approval."""
+    source = dict(draft)
+    source["status"] = "estimated"
+    bubble = build_meal_photo_estimate_bubble(source)
+    bubble["header"]["contents"][0]["text"] = "✅ 已記錄｜顧客確認・AI估算"
+    bubble["body"]["contents"][-2]["text"] = (
+        "這餐已記入飲食紀錄；估算區間未當成營養師核准值。"
+    )
+    bubble.pop("footer", None)
     return bubble
 
 

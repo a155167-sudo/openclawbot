@@ -43,6 +43,49 @@ class FakeWorksheet:
         return self._records
 
 
+def test_nutrition_ws_appends_only_missing_known_trailing_headers(monkeypatch):
+    expected = server.nutrition_sheet_specs()["飲食紀錄"]["headers"]
+
+    class ExistingSheet:
+        def __init__(self):
+            self.headers = expected[:-2]
+            self.updates = []
+
+        def row_values(self, row):
+            assert row == 1
+            return list(self.headers)
+
+        def update(self, *, values, range_name, value_input_option):
+            self.updates.append((values, range_name, value_input_option))
+            self.headers.extend(values[0])
+
+    ws = ExistingSheet()
+    monkeypatch.setattr(server, "sh", SimpleNamespace(worksheet=lambda title: ws))
+
+    assert server._nutrition_ws("飲食紀錄") is ws
+    assert ws.updates == [([["信任類型", "估算Schema版本"]], "AD1:AE1", "RAW")]
+    assert server._nutrition_ws("飲食紀錄") is ws
+    assert len(ws.updates) == 1
+
+
+def test_nutrition_ws_rejects_nonempty_conflicting_trailing_header(monkeypatch):
+    expected = server.nutrition_sheet_specs()["飲食紀錄"]["headers"]
+
+    class ConflictingSheet:
+        def row_values(self, _row):
+            return expected[:-2] + ["人工既有欄位"]
+
+        def update(self, **_kwargs):
+            raise AssertionError("conflicting header must not be overwritten")
+
+    monkeypatch.setattr(
+        server, "sh", SimpleNamespace(worksheet=lambda title: ConflictingSheet())
+    )
+
+    with pytest.raises(RuntimeError, match="欄位標題衝突"):
+        server._nutrition_ws("飲食紀錄")
+
+
 @pytest.mark.parametrize(
     ("distance_meters", "expected_fee"),
     [
@@ -959,6 +1002,82 @@ def test_daily_food_ledger_separates_today_and_yesterday_and_keeps_unknown_na(tm
     assert "NA" in rendered
     assert "調整份量" in rendered
     assert "修正營養" in rendered
+
+
+def test_daily_food_trust_tamper_is_explicit_in_ledger_ui_and_health_report(tmp_path, monkeypatch):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "daily-trust-projection.db")
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-TRUST-UI",
+            payload=meal_photo_payload(), consumed_at=f"{today}T12:10:00+08:00",
+            meal_slot="午餐",
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "one_bowl"), ("vegetable_portion", "one_bowl"),
+            ("cooking_oil", "unknown"), ("sauce_level", "unknown"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"TRUST-UI-ANSWER-{index}", user_id="U1",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+        confirmed = apply_meal_photo_action(
+            conn, event_id="TRUST-UI-CONFIRM", user_id="U1", token=token,
+            expected_version=9, action="confirm_estimate",
+        )
+        log_id = confirmed["result"]["log_id"]
+        server.create_daily_food_log(
+            conn, user_id="U1", product_name="文字估算", meal_slot="點心",
+            consumed_at=f"{today}T15:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 120, "protein_g": 6},
+            source_type="ai_text_estimate",
+        )
+        server.create_daily_food_log(
+            conn, user_id="U1", product_name="部署前合計（無逐筆明細）", meal_slot="",
+            consumed_at=f"{today}T00:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 80, "protein_g": 4},
+            source_type="legacy_daily_carryover",
+        )
+        conn.commit()
+
+    valid = server.get_daily_food_ledger("U1", today)
+    confirmed_item = next(item for item in valid["items"] if item["log_id"] == log_id)
+    assert confirmed_item["trust_type"] == "user_confirmed_ai_estimate"
+    assert "顧客確認・AI估算" in json.dumps(
+        server._daily_food_item_bubble(confirmed_item), ensure_ascii=False
+    )
+    controls = {
+        item["product_name"]: json.dumps(server._daily_food_item_bubble(item), ensure_ascii=False)
+        for item in valid["items"] if item["log_id"] != log_id
+    }
+    assert "來源：AI 預估" in controls["文字估算"]
+    assert "資料完整性驗證未通過" not in controls["文字估算"]
+    assert "資料完整性驗證未通過" not in controls["部署前合計（無逐筆明細）"]
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE food_logs SET trust_type='' WHERE log_id=?", (log_id,))
+        conn.commit()
+
+    ledger = server.get_daily_food_ledger("U1", today)
+    tampered = next(item for item in ledger["items"] if item["log_id"] == log_id)
+    assert tampered["trust_type"] == "untrusted_user_confirmed_ai_estimate"
+    assert tampered["trust_integrity_status"] == "integrity_verification_failed"
+    assert all(tampered["nutrition"].get(field) is None for field in server.DAILY_FOOD_NUTRIENT_FIELDS)
+    rendered = json.dumps(server._daily_food_item_bubble(tampered), ensure_ascii=False)
+    assert "資料完整性驗證未通過，營養資料暫不可用" in rendered
+    assert "🔥 NA" in rendered and "🥩 NA" in rendered
+    assert "🔥 0" not in rendered and "🥩 0" not in rendered
+
+    monkeypatch.setattr(server, "ADMIN_UID", "U1")
+    monkeypatch.setattr(server, "fetch_daily_intervals_summary", lambda *_: None)
+    monkeypatch.setattr(server, "get_daily_nutrition_target", lambda *_: None)
+    report = server.build_jason_daily_health_report("U1", today)
+    assert "資料完整性驗證未通過，營養資料暫不可用" in report
+    tampered_line = next(line for line in report.splitlines() if "餐點照片" in line)
+    assert "NA kcal｜蛋白質NAg" in tampered_line
+    assert "0 kcal｜蛋白質0g" not in tampered_line
 
 
 def test_daily_food_nutrition_correction_is_field_only_idempotent_and_recalculates_today(tmp_path, monkeypatch):
@@ -4914,7 +5033,8 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     with sqlite3.connect(db) as conn:
         ensure_meal_photo_schema(conn)
         token = save_meal_photo_draft(
-            conn, user_id="U_MEAL", source_message_id="M1", payload=meal_photo_payload()
+            conn, user_id="U_MEAL", source_message_id="M1", payload=meal_photo_payload(),
+            workflow_version="expert_review_v1",
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
@@ -4958,6 +5078,7 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
             conn, user_id="U_CUSTOMER", source_message_id="M_CUSTOMER",
             payload=meal_photo_payload(),
             source_image_ref="nutrition-image:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg",
+            workflow_version="expert_review_v1",
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
@@ -4994,6 +5115,7 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
 
     server.handle_meal_photo_postback(event)
 
+    assert replies[0].alt_text == "餐點照片估算完成，等待營養師審核"
     customer_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
     assert "審核並加入" not in customer_text
     assert len(pushes) == 2
@@ -5010,6 +5132,46 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
     )
     assert "新的餐點審核需求" in admin_text
     assert f"mpr:v1:{token}:9:start" in admin_text
+
+
+def test_new_customer_estimate_alt_text_still_prompts_confirmation(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-new-customer-alt-text.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "get_admin_notify_uid", lambda: "U_ADMIN")
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_NEW_CUSTOMER", source_message_id="M_NEW_CUSTOMER",
+            payload=meal_photo_payload(),
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
+            ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"NEW-CUSTOMER-PREP-{index}", user_id="U_NEW_CUSTOMER",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+    replies = []
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(
+            reply_message=lambda _token, message: replies.append(message),
+            push_message=lambda *_args, **_kwargs: pytest.fail("new workflow must not push review"),
+        ),
+    )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:8:answer:sauce_level:half"),
+        source=SimpleNamespace(user_id="U_NEW_CUSTOMER"), reply_token="reply-new-customer-final",
+        webhook_event_id="WEBHOOK-NEW-CUSTOMER-FINAL", timestamp=1784740620000,
+    )
+
+    server.handle_meal_photo_postback(event)
+
+    assert replies[0].alt_text == "餐點照片估算完成，請確認記錄"
+    customer_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
+    assert "確認記錄" in customer_text
 
 
 def test_meal_photo_review_photo_failure_falls_back_to_text_and_card(monkeypatch):
@@ -5484,6 +5646,87 @@ def test_bound_admin_authorization_fails_closed_on_database_error(tmp_path, monk
         server.get_bound_admin_uid_for_authorization()
 
 
+def test_customer_meal_photo_confirm_postback_records_without_review_push(tmp_path, monkeypatch):
+    db = tmp_path / "meal-photo-customer-confirm.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    refresh_users, replies = [], []
+    monkeypatch.setattr(server, "_prepare_health_check_refresh_connection", lambda _conn: True)
+    monkeypatch.setattr(
+        server, "_refresh_health_check_after_food_log",
+        lambda _conn, *, user_id: refresh_users.append(user_id),
+    )
+    monkeypatch.setattr(
+        server, "line_bot_api",
+        SimpleNamespace(
+            reply_message=lambda _token, message: replies.append(message),
+            push_message=lambda *_args, **_kwargs: pytest.fail("customer confirmation must not push review"),
+        ),
+    )
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U_CUSTOMER", source_message_id="M-CUSTOMER-CONFIRM",
+            payload=meal_photo_payload(), consumed_at="2026-09-12T12:10:00+08:00",
+            meal_slot="午餐",
+        )
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "one_bowl"), ("vegetable_portion", "one_bowl"),
+            ("cooking_oil", "unknown"), ("sauce_level", "unknown"),
+        ), start=1):
+            apply_meal_photo_action(
+                conn, event_id=f"CUSTOMER-CONFIRM-PREP-{index}", user_id="U_CUSTOMER",
+                token=token, expected_version=index, action="answer", field=field, value=value,
+            )
+    event = SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:9:confirm_estimate"),
+        source=SimpleNamespace(user_id="U_CUSTOMER"), reply_token="reply-customer-confirm",
+        webhook_event_id="CUSTOMER-CONFIRM-EVENT", timestamp=1784740620000,
+    )
+    server.handle_meal_photo_postback(event)
+    assert replies[-1].alt_text == "✅ 已記錄｜顧客確認・AI估算"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM food_exchange_approvals").fetchone()[0] == 0
+        food_id, log_id = conn.execute("SELECT food_id,log_id FROM food_logs").fetchone()
+    sheet_rows = {}
+    class _Sheet:
+        def __init__(self, title):
+            self.title = title
+        def find(self, *_args, **_kwargs):
+            return None
+        def append_row(self, values, **_kwargs):
+            sheet_rows[self.title] = values
+    monkeypatch.setattr(server, "_nutrition_ws", lambda title: _Sheet(title))
+    server._sync_food_outbox(food_id)
+    server._sync_food_log_outbox(log_id)
+    assert sheet_rows["食品資料庫"][10:25] == [""] * 15
+    assert sheet_rows["飲食紀錄"][9:24] == [""] * 15
+    assert sheet_rows["飲食紀錄"][29:] == [
+        "user_confirmed_ai_estimate", "meal-photo-user-confirmation-v1",
+    ]
+    server.handle_meal_photo_postback(event)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+    assert refresh_users == ["U_CUSTOMER", "U_CUSTOMER"]
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE food_logs SET trust_hash='tampered' WHERE log_id=?", (log_id,))
+        conn.commit()
+        summary_item = server.daily_food_summary(
+            conn, user_id="U_CUSTOMER", date_iso="2026-09-12"
+        )["foods"][0]
+    server._sync_food_outbox(food_id)
+    server._sync_food_log_outbox(log_id)
+    assert sheet_rows["食品資料庫"][10:25] == [""] * 15
+    assert sheet_rows["食品資料庫"][25] == "untrusted_user_confirmed_ai_estimate"
+    assert sheet_rows["飲食紀錄"][9:24] == [""] * 15
+    assert sheet_rows["飲食紀錄"][29:] == [
+        "untrusted_user_confirmed_ai_estimate", "",
+    ]
+    assert summary_item["trust_type"] == sheet_rows["飲食紀錄"][29]
+
+
 def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-pending-command.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
@@ -5493,6 +5736,7 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
         token = save_meal_photo_draft(
             conn, user_id="U_CUSTOMER", source_message_id="M_PENDING",
             payload=meal_photo_payload(),
+            workflow_version="expert_review_v1",
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
@@ -5678,7 +5922,7 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     with sqlite3.connect(db) as conn:
         server.ensure_daily_food_ledger_schema(conn)
         ledger_item = server._ledger_item_from_row(
-            server._daily_food_rows(conn, "U_CUSTOMER", "2026-07-23")[0]
+            conn, server._daily_food_rows(conn, "U_CUSTOMER", "2026-07-23")[0]
         )
     assert ledger_item["nutrition"] == {}
 

@@ -17,6 +17,7 @@ from typing import Mapping
 from zoneinfo import ZoneInfo
 
 from health_check_rules import HEALTH_CHECK_DAY_RULE_MINIMUM_MEALS
+from nutrition_system import user_confirmed_meal_photo_trust_projection
 
 
 BENEFIT_KEY = "first_vip_baseline_check"
@@ -1577,8 +1578,14 @@ def refresh_case_source_manifest(
 
         window_start = _parse_ledger_time(window_start_text)
         window_end = _parse_ledger_time(window_end_text)
+        food_log_columns = {
+            str(column[1]) for column in conn.execute("PRAGMA table_info(food_logs)")
+        }
+        trust_type_sql = "trust_type" if "trust_type" in food_log_columns else "''"
+        trust_hash_sql = "trust_hash" if "trust_hash" in food_log_columns else "''"
         rows = conn.execute(
-            """SELECT log_id,consumed_at,meal_slot,nutrition_snapshot_json,version
+            f"""SELECT log_id,consumed_at,meal_slot,nutrition_snapshot_json,version,
+                       {trust_type_sql} AS trust_type,{trust_hash_sql} AS trust_hash
                FROM food_logs
                WHERE user_id=? AND confirmation_status='confirmed'
                  AND COALESCE(deleted_at,'')=''""",
@@ -1587,7 +1594,15 @@ def refresh_case_source_manifest(
 
         included: list[dict[str, object]] = []
         by_date: dict[str, list[dict[str, object]]] = defaultdict(list)
-        for log_id, consumed_at, meal_slot, nutrition_snapshot_json, version in rows:
+        for (
+            log_id, consumed_at, meal_slot, nutrition_snapshot_json, version,
+            trust_type, trust_hash,
+        ) in rows:
+            trust = user_confirmed_meal_photo_trust_projection(
+                conn, str(log_id or ""), str(trust_type or "")
+            )
+            if trust["integrity_status"] == "integrity_verification_failed":
+                continue
             local_time = _parse_ledger_time(consumed_at)
             if not window_start <= local_time < window_end:
                 continue
@@ -1597,6 +1612,8 @@ def refresh_case_source_manifest(
                 f"{log_id}:{version}:"
                 f"{_canonical_json_text(nutrition_snapshot_json)}"
             )
+            if trust["integrity_status"] == "verified":
+                source_material += f":user_confirmed_ai_estimate:{trust_hash}"
             item = {
                 "food_log_id": log_id,
                 "version": version,

@@ -78,6 +78,8 @@ from nutrition_system import (
     set_nutrition_input_state,
     clear_nutrition_input_state,
     update_pending_consumption,
+    user_confirmed_meal_photo_trust_projection,
+    user_confirmed_meal_photo_food_trust_projection,
 )
 from daily_health_report import (
     claim_daily_delivery,
@@ -93,6 +95,7 @@ from meal_photo_system import (
     apply_meal_photo_action,
     build_meal_photo_confirmation_bubble,
     build_meal_photo_estimate_bubble,
+    build_meal_photo_recorded_bubble,
     clear_meal_photo_image_ref,
     daily_pending_meal_photo_count,
     ensure_meal_photo_schema,
@@ -469,7 +472,7 @@ def migrate_current_day_legacy_totals_to_ledger(conn: sqlite3.Connection) -> int
         rows = _daily_food_rows(conn, user_id, today)
         ledger_cal = ledger_pro = 0.0
         for row in rows:
-            nutrition = _ledger_item_from_row(row)["nutrition"]
+            nutrition = _ledger_item_from_row(conn, row)["nutrition"]
             if nutrition.get("calories_kcal") is not None:
                 ledger_cal += float(nutrition["calories_kcal"])
             if nutrition.get("protein_g") is not None:
@@ -507,7 +510,7 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
                   fl.nutrition_snapshot_json,fl.nutrient_sources_json,fl.version,
                   fl.approved_exchange_json,fc.fingerprint,a.food_fingerprint,
                   a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id,
-                  a.approved_exchange_json
+                  a.approved_exchange_json,fl.trust_type
            FROM food_logs fl
            JOIN food_catalog fc ON fc.food_id=fl.food_id
            LEFT JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
@@ -526,8 +529,9 @@ def _safe_json_object(value):
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _ledger_item_from_row(row) -> dict:
+def _ledger_item_from_row(conn: sqlite3.Connection, row) -> dict:
     nutrition = _safe_json_object(row[9])
+    trust = user_confirmed_meal_photo_trust_projection(conn, row[0], str(row[19] or ""))
     # 餐點照片必須先驗證核准快照；完整性失效時即使營養快照存在也維持 NA。
     if row[3] == "user_meal_photo":
         verified_approval = False
@@ -563,6 +567,8 @@ def _ledger_item_from_row(row) -> dict:
         "servings": float(row[6] or 0), "consumed_amount": float(row[7] or 0),
         "consumed_unit": row[8] or "", "nutrition": nutrition,
         "nutrient_sources": json.loads(row[10] or "{}"), "version": int(row[11] or 1),
+        "trust_type": trust["trust_type"],
+        "trust_integrity_status": trust["integrity_status"],
     }
 
 
@@ -575,7 +581,7 @@ def get_daily_food_ledger(user_id: str, date_text: str) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         ensure_daily_food_ledger_schema(conn)
         rows = _daily_food_rows(conn, user_id, date_text)
-        items = [_ledger_item_from_row(row) for row in rows]
+        items = [_ledger_item_from_row(conn, row) for row in rows]
         hp = conn.execute(
             "SELECT tdee,protein FROM health_profile WHERE user_id=?", (user_id,)
         ).fetchone()
@@ -617,7 +623,7 @@ def _sync_health_profile_from_ledger_conn(
         return
     if not conn.execute("SELECT 1 FROM health_profile WHERE user_id=?", (user_id,)).fetchone():
         return
-    items = [_ledger_item_from_row(row) for row in _daily_food_rows(conn, user_id, date_text)]
+    items = [_ledger_item_from_row(conn, row) for row in _daily_food_rows(conn, user_id, date_text)]
     cal = pro = 0.0
     names = []
     for item in items:
@@ -980,6 +986,13 @@ def _daily_food_item_bubble(item: dict) -> dict:
         "user_correction": "使用者修正", "user_meal_photo": "餐點照片",
         "menu_csv": "一日樂食菜單", "legacy_daily_carryover": "部署前合計",
     }
+    trust_type = item.get("trust_type") or ""
+    integrity_failed = item.get("trust_integrity_status") == "integrity_verification_failed"
+    source_text = (
+        "顧客確認・AI估算"
+        if trust_type == "user_confirmed_ai_estimate"
+        else source_labels.get(item["source_type"], item["source_type"] or "未標示")
+    )
     consumed_at = str(item["consumed_at"] or "")
     try:
         parsed_time = datetime.fromisoformat(consumed_at.replace("Z", "+00:00"))
@@ -1010,19 +1023,25 @@ def _daily_food_item_bubble(item: dict) -> dict:
                 "data": f"foodlog:v1:{log_id}:{version}:more", "displayText": "更多飲食紀錄操作",
             }},
         ]
+    body_contents = [
+        {"type": "text", "text": f"份量：{item['servings']:g} 份", "size": "sm"},
+        {"type": "text", "text": f"🔥 {val('calories_kcal', 'kcal')}", "size": "sm"},
+        {"type": "text", "text": f"🥩 {val('protein_g', 'g')}", "size": "sm"},
+        {"type": "text", "text": f"🍚 {val('carbohydrate_g', 'g')}｜🥑 {val('fat_g', 'g')}", "size": "xs", "wrap": True},
+        {"type": "text", "text": f"來源：{source_text}", "size": "xs", "color": "#777777", "wrap": True},
+    ]
+    if integrity_failed:
+        body_contents.append({
+            "type": "text", "text": "資料完整性驗證未通過，營養資料暫不可用",
+            "size": "xs", "color": "#B91C1C", "weight": "bold", "wrap": True,
+        })
     return {
         "type": "bubble", "size": "kilo",
         "header": {"type": "box", "layout": "vertical", "backgroundColor": "#ECFDF5", "contents": [
             {"type": "text", "text": item["product_name"][:60], "weight": "bold", "size": "md", "wrap": True, "color": "#065F46"},
             {"type": "text", "text": f"{time_text}｜{item['meal_slot'] or '未分類'}", "size": "xs", "color": "#555555", "margin": "xs"},
         ]},
-        "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": [
-            {"type": "text", "text": f"份量：{item['servings']:g} 份", "size": "sm"},
-            {"type": "text", "text": f"🔥 {val('calories_kcal', 'kcal')}", "size": "sm"},
-            {"type": "text", "text": f"🥩 {val('protein_g', 'g')}", "size": "sm"},
-            {"type": "text", "text": f"🍚 {val('carbohydrate_g', 'g')}｜🥑 {val('fat_g', 'g')}", "size": "xs", "wrap": True},
-            {"type": "text", "text": f"來源：{source_labels.get(item['source_type'], item['source_type'] or '未標示')}", "size": "xs", "color": "#777777", "wrap": True},
-        ]},
+        "body": {"type": "box", "layout": "vertical", "spacing": "xs", "contents": body_contents},
         "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": footer_contents},
     }
 
@@ -5882,7 +5901,7 @@ def get_dashboard_data(user_id: str) -> dict:
 
         ledger_rows = _daily_food_rows(conn, user_id, today_str)
         ledger_items = [
-            _ledger_item_from_row(row) for row in ledger_rows
+            _ledger_item_from_row(conn, row) for row in ledger_rows
         ]
         ordinary_ledger_items = [
             item for row, item in zip(ledger_rows, ledger_items)
@@ -9072,6 +9091,20 @@ def _nutrition_ws(title):
         for row in spec.get("seed_rows", []):
             ws.append_row(row)
         ws.freeze(rows=1)
+        return ws
+    expected_headers = list(specs[title]["headers"])
+    actual_headers = list(ws.row_values(1))
+    if actual_headers != expected_headers:
+        if actual_headers != expected_headers[:len(actual_headers)]:
+            raise RuntimeError(f"{title} 欄位標題衝突，拒絕覆寫既有欄位")
+        missing_headers = expected_headers[len(actual_headers):]
+        if missing_headers:
+            start = gspread.utils.rowcol_to_a1(1, len(actual_headers) + 1)
+            end = gspread.utils.rowcol_to_a1(1, len(expected_headers))
+            ws.update(
+                values=[missing_headers], range_name=f"{start}:{end}",
+                value_input_option="RAW",
+            )
     return ws
 
 
@@ -9106,6 +9139,7 @@ def _sync_food_outbox(entity_id):
             )
             WHERE f.food_id=?
         """, (entity_id,)).fetchone()
+        food_trust = user_confirmed_meal_photo_food_trust_projection(conn, entity_id)
     if not food:
         raise RuntimeError("food outbox entity missing")
     try:
@@ -9130,16 +9164,20 @@ def _sync_food_outbox(entity_id):
     review_status = (
         "pending_review" if food[12] == "approved" and not approval_valid else food[12]
     )
+    if food_trust["trust_type"]:
+        per, exch = {}, {}
+        review_status = food_trust["trust_type"]
+    unknown_value = "" if food_trust["trust_type"] else 0
     ws = _nutrition_ws("食品資料庫")
     row_values = [
         food[0], food[1], food[2], food[3], food[4], food[5], food[6],
-        food[7], food[8], food[9], per.get("calories_kcal", 0), per.get("protein_g", 0),
-        per.get("fat_g", 0), per.get("carbohydrate_g", 0), per.get("sugar_g", 0),
-        per.get("fiber_g", 0), per.get("sodium_mg", 0), exch.get("milk_exchange", 0),
-        exch.get("protein_low_exchange", 0), exch.get("protein_medium_exchange", 0),
-        exch.get("protein_high_exchange", 0), exch.get("starch_exchange", 0),
-        exch.get("vegetable_exchange", 0), exch.get("fruit_exchange", 0),
-        exch.get("fat_exchange", 0), review_status, food[13], food[14], food[15],
+        food[7], food[8], food[9], per.get("calories_kcal", unknown_value), per.get("protein_g", unknown_value),
+        per.get("fat_g", unknown_value), per.get("carbohydrate_g", unknown_value), per.get("sugar_g", unknown_value),
+        per.get("fiber_g", unknown_value), per.get("sodium_mg", unknown_value), exch.get("milk_exchange", unknown_value),
+        exch.get("protein_low_exchange", unknown_value), exch.get("protein_medium_exchange", unknown_value),
+        exch.get("protein_high_exchange", unknown_value), exch.get("starch_exchange", unknown_value),
+        exch.get("vegetable_exchange", unknown_value), exch.get("fruit_exchange", unknown_value),
+        exch.get("fat_exchange", unknown_value), review_status, food[13], food[14], food[15],
         food[16], food[17], food[18]
     ]
     _upsert_raw_sheet_row(ws, entity_id, row_values)
@@ -9154,7 +9192,7 @@ def _sync_food_log_outbox(entity_id):
                    l.plan_id, l.confirmation_status, l.created_at, l.updated_at,
                    l.exchange_approval_id, a.food_fingerprint, a.suggestion_rule_version,
                    a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint,
-                   f.source_type
+                   f.source_type,l.trust_type,l.exchange_snapshot_json
             FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
             LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
             WHERE l.log_id=?
@@ -9191,18 +9229,24 @@ def _sync_food_log_outbox(entity_id):
         )
     if not approval_valid:
         exch = {}
-    if log[22] == "user_meal_photo":
+    with sqlite3.connect(DB_PATH) as trust_conn:
+        trust = user_confirmed_meal_photo_trust_projection(
+            trust_conn, str(log[0] or ""), str(log[23] or "")
+        )
+    if log[22] == "user_meal_photo" or trust["trust_type"]:
         nutrition = estimate_nutrition_from_exchanges(exch) if approval_valid else {}
+    unknown_value = "" if trust["trust_type"] else 0
     ws = _nutrition_ws("飲食紀錄")
     row_values = [
         log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7], log[8],
-        nutrition.get("calories_kcal", 0), nutrition.get("protein_g", 0), nutrition.get("fat_g", 0),
-        nutrition.get("carbohydrate_g", 0), nutrition.get("sugar_g", 0), nutrition.get("fiber_g", 0),
-        nutrition.get("sodium_mg", 0), exch.get("milk_exchange", 0),
-        exch.get("protein_low_exchange", 0), exch.get("protein_medium_exchange", 0),
-        exch.get("protein_high_exchange", 0), exch.get("starch_exchange", 0),
-        exch.get("vegetable_exchange", 0), exch.get("fruit_exchange", 0),
-        exch.get("fat_exchange", 0), log[11], log[12], log[13], log[14], log[15]
+        nutrition.get("calories_kcal", unknown_value), nutrition.get("protein_g", unknown_value), nutrition.get("fat_g", unknown_value),
+        nutrition.get("carbohydrate_g", unknown_value), nutrition.get("sugar_g", unknown_value), nutrition.get("fiber_g", unknown_value),
+        nutrition.get("sodium_mg", unknown_value), exch.get("milk_exchange", unknown_value),
+        exch.get("protein_low_exchange", unknown_value), exch.get("protein_medium_exchange", unknown_value),
+        exch.get("protein_high_exchange", unknown_value), exch.get("starch_exchange", unknown_value),
+        exch.get("vegetable_exchange", unknown_value), exch.get("fruit_exchange", unknown_value),
+        exch.get("fat_exchange", unknown_value), log[11], log[12], log[13], log[14], log[15],
+        trust["trust_type"], trust["schema_version"],
     ]
     _upsert_raw_sheet_row(ws, entity_id, row_values)
 
@@ -11067,7 +11111,7 @@ def _quick_log_catalog_card_once(
                 rows = _daily_food_rows(conn, user_id, today)
                 daily_cal = daily_pro = 0.0
                 for row in rows:
-                    snapshot = _ledger_item_from_row(row)["nutrition"]
+                    snapshot = _ledger_item_from_row(conn, row)["nutrition"]
                     daily_cal += float(snapshot.get("calories_kcal") or 0)
                     daily_pro += float(snapshot.get("protein_g") or 0)
                 tdee, protein_goal = 2000, 100
@@ -11921,6 +11965,9 @@ def handle_meal_photo_postback(event):
 
     start = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):start", data)
     cancel = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):cancel", data)
+    confirm_estimate = re.fullmatch(
+        r"mp:v1:([0-9a-f]{12}):(\d+):confirm_estimate", data
+    )
     answer = re.fullmatch(
         r"mp:v1:([0-9a-f]{12}):(\d+):answer:([a-z_]+):([a-z_]+)", data
     )
@@ -11944,11 +11991,11 @@ def handle_meal_photo_postback(event):
     review_cancel = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):cancel_review", data)
     review_reject = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):reject", data)
     review_approve = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):approve", data)
-    if not (start or cancel or answer or remove_item or request_add or cancel_add or add_category or review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
+    if not (start or cancel or confirm_estimate or answer or remove_item or request_add or cancel_add or add_category or review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
         return
     uid = event.source.user_id
     if not (review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
-        matched = start or cancel or answer or remove_item or request_add or cancel_add or add_category
+        matched = start or cancel or confirm_estimate or answer or remove_item or request_add or cancel_add or add_category
         assert matched is not None
         token, version = matched.group(1), int(matched.group(2))
     event_id = str(getattr(event, "webhook_event_id", "") or "").strip()
@@ -12082,6 +12129,14 @@ def handle_meal_photo_postback(event):
                         "kind": "question", "step": next_meal_photo_step(draft),
                         "version": draft["version"],
                     }
+            elif confirm_estimate:
+                _prepare_health_check_refresh_connection(conn)
+                applied = apply_meal_photo_action(
+                    conn, event_id=event_id, user_id=uid, token=token,
+                    expected_version=version, action="confirm_estimate",
+                )
+                draft, result = applied["draft"], applied["result"]
+                _refresh_health_check_after_food_log(conn, user_id=uid)
             elif cancel:
                 applied = apply_meal_photo_action(
                     conn, event_id=event_id, user_id=uid, token=token,
@@ -12141,13 +12196,28 @@ def handle_meal_photo_postback(event):
             from linebot.models import FlexSendMessage
             configured_admin_uid = str(get_admin_notify_uid() or "").strip()
             is_admin_owner = bool(configured_admin_uid and uid == configured_admin_uid)
-            if not is_admin_owner and applied is not None and not applied.get("replayed"):
+            if (
+                draft.get("workflow_version") == "expert_review_v1"
+                and not is_admin_owner
+                and applied is not None
+                and not applied.get("replayed")
+            ):
                 push_meal_photo_review_request(draft)
             reply = FlexSendMessage(
-                alt_text="餐點照片估算完成，待營養師審核",
+                alt_text=(
+                    "餐點照片估算完成，等待營養師審核"
+                    if draft.get("workflow_version") == "expert_review_v1"
+                    else "餐點照片估算完成，請確認記錄"
+                ),
                 contents=build_meal_photo_estimate_bubble(
                     draft, allow_admin_review=is_admin_owner
                 ),
+            )
+        elif kind == "recorded":
+            from linebot.models import FlexSendMessage
+            reply = FlexSendMessage(
+                alt_text="✅ 已記錄｜顧客確認・AI估算",
+                contents=build_meal_photo_recorded_bubble(draft),
             )
         elif kind == "cancel":
             image_ref = str(result.get("source_image_ref") or "")

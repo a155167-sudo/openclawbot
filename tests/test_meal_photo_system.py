@@ -12,6 +12,9 @@ from nutrition_system import (
     exchange_approval_hash,
     exchange_approval_payload_is_valid,
     insert_approved_meal_photo_log,
+    user_confirmed_meal_photo_estimate_is_valid,
+    user_confirmed_meal_photo_food_trust_projection,
+    user_confirmed_meal_photo_trust_projection,
 )
 from meal_photo_system import (
     build_meal_photo_confirmation_bubble,
@@ -221,10 +224,10 @@ def test_meal_photo_draft_is_durable_idempotent_and_user_owned(tmp_path):
             get_meal_photo_draft(conn, user_id="U2", token=token)
 
 
-def _apply_answer(conn, token, field, value, *, event_id):
-    draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+def _apply_answer(conn, token, field, value, *, event_id, user_id="U1"):
+    draft = get_meal_photo_draft(conn, user_id=user_id, token=token)
     return apply_meal_photo_action(
-        conn, event_id=event_id, user_id="U1", token=token,
+        conn, event_id=event_id, user_id=user_id, token=token,
         expected_version=draft["version"], action="answer", field=field, value=value,
     )["draft"]
 
@@ -288,7 +291,7 @@ def test_cancelling_meal_photo_scrubs_payload_and_preserves_retryable_image_ref(
         assert replay["replayed"] is True
 
 
-def _answer_all(conn, token, *, unknown=False):
+def _answer_all(conn, token, *, unknown=False, user_id="U1"):
     values = {
         "scope": "visible_only",
         "protein_type": "unknown" if unknown else "chicken",
@@ -299,12 +302,364 @@ def _answer_all(conn, token, *, unknown=False):
         "cooking_oil": "unknown" if unknown else "light",
         "sauce_level": "unknown" if unknown else "half",
     }
-    draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+    draft = get_meal_photo_draft(conn, user_id=user_id, token=token)
     for index, (field, value) in enumerate(values.items(), start=1):
         draft = _apply_answer(
-            conn, token, field, value, event_id=f"ANSWER-{index}-{token}"
+            conn, token, field, value, event_id=f"ANSWER-{index}-{token}", user_id=user_id,
         )
     return draft
+
+
+def test_customer_final_confirmation_creates_one_canonical_unapproved_log(tmp_path):
+    with sqlite3.connect(tmp_path / "customer-confirmed-photo.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-CONFIRM-1",
+            payload=sample_payload(), source_image_ref="nutrition-image:kept.jpg",
+            meal_slot="午餐", consumed_at="2026-09-12T12:00:00+08:00",
+        )
+        estimated = _answer_all(conn, token)
+        assert estimated["status"] == "estimated"
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+        card = build_meal_photo_estimate_bubble(estimated)
+        assert any(
+            item.get("action", {}).get("data") ==
+            f"mp:v1:{token}:{estimated['version']}:confirm_estimate"
+            for item in card["footer"]["contents"]
+        )
+
+        confirmed = apply_meal_photo_action(
+            conn, event_id="CONFIRM-EVENT-1", user_id="U1", token=token,
+            expected_version=estimated["version"], action="confirm_estimate",
+        )
+        log_id = confirmed["result"]["log_id"]
+        assert confirmed["result"]["kind"] == "recorded"
+        assert confirmed["draft"]["status"] == "user_confirmed"
+        assert confirmed["draft"]["confirmed_log_id"] == log_id
+        assert conn.execute("SELECT COUNT(*) FROM food_catalog").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM food_exchange_approvals").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM nutrition_sheet_outbox").fetchone()[0] == 2
+        row = conn.execute(
+            """SELECT approved_exchange_json,exchange_approval_id,nutrition_snapshot_json,
+                      trust_type,source_image_ref FROM food_logs WHERE log_id=?""", (log_id,)
+        ).fetchone()
+        assert row == ("{}", "", "{}", "user_confirmed_ai_estimate", "nutrition-image:kept.jpg")
+        assert user_confirmed_meal_photo_estimate_is_valid(conn, log_id)
+        replay_projection = _confirmed_result(conn, log_id, already_confirmed=True)
+        assert replay_projection["log"]["exchange_review_status"] == "user_confirmed_ai_estimate"
+        assert replay_projection["log"]["trust_type"] == "user_confirmed_ai_estimate"
+        assert replay_projection["log"]["approved_exchange"] == {}
+        assert replay_projection["log"]["nutrition"] == {}
+        assert daily_consumed_totals(
+            conn, user_id="U1", date_iso="2026-09-12"
+        )["starch_exchange"] == 0
+        summary = daily_food_summary(conn, user_id="U1", date_iso="2026-09-12")
+        assert summary["pending_reviews"] == 0
+        assert summary["foods"][0]["calories_kcal"] is None
+        assert summary["foods"][0]["trust_type"] == "user_confirmed_ai_estimate"
+        assert list_pending_meal_photo_reviews(conn) == []
+        assert daily_pending_meal_photo_count(conn, user_id="U1", date_iso="2026-09-12") == 0
+
+
+def test_customer_confirmation_replays_same_log_for_same_or_new_event(tmp_path):
+    with sqlite3.connect(tmp_path / "customer-confirm-replay.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-REPLAY", payload=sample_payload()
+        )
+        estimated = _answer_all(conn, token)
+        kwargs = dict(
+            user_id="U1", token=token, expected_version=estimated["version"],
+            action="confirm_estimate",
+        )
+        first = apply_meal_photo_action(conn, event_id="CONFIRM-REPLAY-1", **kwargs)
+        same = apply_meal_photo_action(conn, event_id="CONFIRM-REPLAY-1", **kwargs)
+        second_button = apply_meal_photo_action(conn, event_id="CONFIRM-REPLAY-2", **kwargs)
+        assert same["replayed"] is True
+        assert first["result"]["log_id"] == same["result"]["log_id"] == second_button["result"]["log_id"]
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM nutrition_sheet_outbox").fetchone()[0] == 2
+
+
+
+def test_user_confirmed_validator_rejects_replay_event_substituted_into_trust_payload(tmp_path):
+    with sqlite3.connect(tmp_path / "original-confirmation-anchor.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-ORIGINAL-EVENT", payload=sample_payload()
+        )
+        estimated = _answer_all(conn, token)
+        kwargs = dict(
+            user_id="U1", token=token, expected_version=estimated["version"],
+            action="confirm_estimate",
+        )
+        first = apply_meal_photo_action(conn, event_id="CONFIRM-ORIGINAL", **kwargs)
+        replay = apply_meal_photo_action(conn, event_id="CONFIRM-REPEAT", **kwargs)
+        log_id = first["result"]["log_id"]
+        assert replay["result"]["log_id"] == log_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM meal_photo_events WHERE token=? AND action='confirm_estimate'",
+            (token,),
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT original_confirmation_event_id FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()[0] == "CONFIRM-ORIGINAL"
+        assert user_confirmed_meal_photo_estimate_is_valid(conn, log_id)
+
+        payload = json.loads(conn.execute(
+            "SELECT trust_payload_json FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0])
+        payload["confirmation_event_id"] = "CONFIRM-REPEAT"
+        from nutrition_system import _canonical_json_hash
+        conn.execute(
+            "UPDATE food_logs SET trust_payload_json=?,trust_hash=? WHERE log_id=?",
+            (json.dumps(payload, ensure_ascii=False, sort_keys=True),
+             _canonical_json_hash(payload), log_id),
+        )
+        conn.commit()
+
+        assert not user_confirmed_meal_photo_estimate_is_valid(conn, log_id)
+
+        payload["confirmation_event_id"] = "CONFIRM-ORIGINAL"
+        conn.execute(
+            "UPDATE food_logs SET trust_payload_json=?,trust_hash=? WHERE log_id=?",
+            (json.dumps(payload, ensure_ascii=False, sort_keys=True),
+             _canonical_json_hash(payload), log_id),
+        )
+        conn.execute(
+            "ALTER TABLE pending_meal_photo_drafts DROP COLUMN original_confirmation_event_id"
+        )
+        conn.commit()
+        assert not user_confirmed_meal_photo_estimate_is_valid(conn, log_id)
+        assert user_confirmed_meal_photo_trust_projection(
+            conn, log_id, "user_confirmed_ai_estimate"
+        )["trust_type"] == "untrusted_user_confirmed_ai_estimate"
+
+
+@pytest.mark.parametrize("anchor", ["", "CONFIRM-WRONG"])
+def test_user_confirmed_validator_requires_nonempty_matching_original_event_anchor(tmp_path, anchor):
+    with sqlite3.connect(tmp_path / f"original-anchor-{anchor or 'empty'}.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-ANCHOR", payload=sample_payload()
+        )
+        estimated = _answer_all(conn, token)
+        result = apply_meal_photo_action(
+            conn, event_id="CONFIRM-ANCHOR", user_id="U1", token=token,
+            expected_version=estimated["version"], action="confirm_estimate",
+        )
+        log_id = result["result"]["log_id"]
+        assert user_confirmed_meal_photo_estimate_is_valid(conn, log_id)
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET original_confirmation_event_id=? WHERE token=?",
+            (anchor, token),
+        )
+        conn.commit()
+        assert not user_confirmed_meal_photo_estimate_is_valid(conn, log_id)
+        assert user_confirmed_meal_photo_trust_projection(
+            conn, log_id, "user_confirmed_ai_estimate"
+        )["trust_type"] == "untrusted_user_confirmed_ai_estimate"
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "value"),
+    [
+        ("food_logs", "trust_type", ""),
+        ("food_logs", "trust_type", "forged"),
+        ("food_logs", "trust_payload_json", "{}"),
+        ("food_logs", "trust_hash", ""),
+        ("food_catalog", "source_type", "custom"),
+        ("food_catalog", "exchange_review_status", "pending_review"),
+        ("food_catalog", "verification_status", "approved"),
+    ],
+)
+def test_new_lane_single_field_tamper_stays_untrusted_in_all_local_consumers(
+    tmp_path, table, column, value
+):
+    with sqlite3.connect(tmp_path / f"new-lane-{table}-{column}.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-LANE",
+            payload=sample_payload(), consumed_at="2026-09-12T12:00:00+08:00",
+        )
+        estimated = _answer_all(conn, token)
+        result = apply_meal_photo_action(
+            conn, event_id="CONFIRM-LANE", user_id="U1", token=token,
+            expected_version=estimated["version"], action="confirm_estimate",
+        )
+        log_id = result["result"]["log_id"]
+        food_id = conn.execute(
+            "SELECT food_id FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0]
+        key = log_id if table == "food_logs" else food_id
+        id_column = "log_id" if table == "food_logs" else "food_id"
+        conn.execute(f"UPDATE {table} SET {column}=? WHERE {id_column}=?", (value, key))
+        conn.commit()
+
+        trust = user_confirmed_meal_photo_trust_projection(conn, log_id, value if column == "trust_type" else "user_confirmed_ai_estimate")
+        assert trust["trust_type"] == "untrusted_user_confirmed_ai_estimate"
+        replay = _confirmed_result(conn, log_id, already_confirmed=True)["log"]
+        assert replay["trust_type"] == "untrusted_user_confirmed_ai_estimate"
+        assert replay["suggested_exchange"] == {}
+        summary = daily_food_summary(conn, user_id="U1", date_iso="2026-09-12")
+        assert summary["pending_reviews"] == 0
+        assert summary["foods"][0]["calories_kcal"] is None
+        assert summary["foods"][0]["protein_g"] is None
+
+
+def test_catalog_trust_ignores_unrelated_cross_owner_log_when_owner_log_is_valid(tmp_path):
+    with sqlite3.connect(tmp_path / "catalog-cross-owner.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-CATALOG", payload=sample_payload()
+        )
+        estimated = _answer_all(conn, token)
+        result = apply_meal_photo_action(
+            conn, event_id="CONFIRM-CATALOG", user_id="U1", token=token,
+            expected_version=estimated["version"], action="confirm_estimate",
+        )
+        log_id = result["result"]["log_id"]
+        food_id = conn.execute(
+            "SELECT food_id FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0]
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(food_logs)") if row[1] != "log_id"]
+        column_sql = ",".join(columns)
+        conn.execute(
+            f"INSERT INTO food_logs(log_id,{column_sql}) "
+            f"SELECT ?,{column_sql} FROM food_logs WHERE log_id=?",
+            ("cross-owner-log", log_id),
+        )
+        conn.execute(
+            "UPDATE food_logs SET user_id='U2',trust_hash='tampered' WHERE log_id='cross-owner-log'"
+        )
+        conn.commit()
+        assert user_confirmed_meal_photo_food_trust_projection(conn, food_id)["integrity_status"] == "verified"
+
+        conn.execute("UPDATE food_logs SET trust_hash='tampered' WHERE log_id=?", (log_id,))
+        conn.commit()
+        assert user_confirmed_meal_photo_food_trust_projection(conn, food_id)["trust_type"] == (
+            "untrusted_user_confirmed_ai_estimate"
+        )
+
+
+@pytest.mark.parametrize("tamper", ["cross_owner", "cross_draft"])
+def test_customer_confirmation_replay_rejects_log_from_another_draft(tmp_path, tamper):
+    with sqlite3.connect(tmp_path / f"customer-confirm-{tamper}.db") as conn:
+        owners = ("U1", "U2") if tamper == "cross_owner" else ("U1", "U1")
+        confirmed = []
+        for index, owner in enumerate(owners, start=1):
+            token = save_meal_photo_draft(
+                conn, user_id=owner, source_message_id=f"PHOTO-{tamper}-{index}",
+                payload=sample_payload(),
+            )
+            estimated = _answer_all(conn, token, user_id=owner)
+            result = apply_meal_photo_action(
+                conn, event_id=f"CONFIRM-{tamper}-{index}", user_id=owner,
+                token=token, expected_version=estimated["version"], action="confirm_estimate",
+            )
+            confirmed.append((token, estimated["version"], result["result"]["log_id"]))
+
+        token, old_version, _own_log = confirmed[1]
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET confirmed_log_id=? WHERE token=? AND user_id=?",
+            (confirmed[0][2], token, owners[1]),
+        )
+        conn.commit()
+
+        with pytest.raises(ValueError, match="完整性驗證失敗"):
+            apply_meal_photo_action(
+                conn, event_id=f"REPLAY-{tamper}", user_id=owners[1], token=token,
+                expected_version=old_version, action="confirm_estimate",
+            )
+
+
+@pytest.mark.parametrize("tamper", ["draft_token", "confirmation_event_id", "log_version"])
+def test_user_confirmed_log_validator_binds_draft_event_and_version(tmp_path, tamper):
+    with sqlite3.connect(tmp_path / f"confirmation-binding-{tamper}.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id=f"PHOTO-BIND-{tamper}", payload=sample_payload()
+        )
+        estimated = _answer_all(conn, token)
+        result = apply_meal_photo_action(
+            conn, event_id=f"CONFIRM-BIND-{tamper}", user_id="U1", token=token,
+            expected_version=estimated["version"], action="confirm_estimate",
+        )
+        log_id = result["result"]["log_id"]
+        assert user_confirmed_meal_photo_estimate_is_valid(conn, log_id)
+
+        if tamper == "log_version":
+            conn.execute("ALTER TABLE food_logs ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+            conn.execute("UPDATE food_logs SET version=version+1 WHERE log_id=?", (log_id,))
+        else:
+            payload = json.loads(conn.execute(
+                "SELECT trust_payload_json FROM food_logs WHERE log_id=?", (log_id,)
+            ).fetchone()[0])
+            payload[tamper] = "forged-binding"
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            from nutrition_system import _canonical_json_hash
+            conn.execute(
+                "UPDATE food_logs SET trust_payload_json=?,trust_hash=? WHERE log_id=?",
+                (encoded, _canonical_json_hash(payload), log_id),
+            )
+        conn.commit()
+
+        assert not user_confirmed_meal_photo_estimate_is_valid(conn, log_id)
+
+
+def test_daily_summary_keeps_tampered_user_estimate_nutrition_na(tmp_path):
+    with sqlite3.connect(tmp_path / "tampered-summary-na.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-SUMMARY-TAMPER",
+            payload=sample_payload(), consumed_at="2026-09-12T12:00:00+08:00",
+        )
+        estimated = _answer_all(conn, token)
+        result = apply_meal_photo_action(
+            conn, event_id="CONFIRM-SUMMARY-TAMPER", user_id="U1", token=token,
+            expected_version=estimated["version"], action="confirm_estimate",
+        )
+        conn.execute(
+            "UPDATE food_logs SET trust_hash='tampered' WHERE log_id=?",
+            (result["result"]["log_id"],),
+        )
+        conn.commit()
+
+        summary = daily_food_summary(conn, user_id="U1", date_iso="2026-09-12")
+        food = summary["foods"][0]
+        assert summary["pending_reviews"] == 0
+        assert food["calories_kcal"] is None
+        assert food["protein_g"] is None
+        assert food["trust_type"] == "untrusted_user_confirmed_ai_estimate"
+        assert food["trust_integrity_status"] == "integrity_verification_failed"
+        projection = _confirmed_result(conn, result["result"]["log_id"], already_confirmed=True)
+        assert projection["log"]["exchange_review_status"] == "untrusted_user_confirmed_ai_estimate"
+        assert projection["log"]["trust_type"] == "untrusted_user_confirmed_ai_estimate"
+        assert projection["log"]["trust_integrity_status"] == "integrity_verification_failed"
+        assert projection["log"]["trust_schema_version"] == ""
+        assert projection["log"]["suggested_exchange"] == {}
+        assert projection["log"]["exchange"] == {}
+
+
+def test_customer_confirmation_fails_closed_on_owner_or_estimate_tamper(tmp_path):
+    with sqlite3.connect(tmp_path / "customer-confirm-tamper.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-TAMPER", payload=sample_payload()
+        )
+        estimated = _answer_all(conn, token)
+        with pytest.raises(ValueError, match="找不到"):
+            apply_meal_photo_action(
+                conn, event_id="CROSS-USER", user_id="U2", token=token,
+                expected_version=estimated["version"], action="confirm_estimate",
+            )
+        estimate = dict(estimated["estimate"])
+        estimate["starch_exchange"] = {"min": 99, "max": 99, "basis": "forged"}
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET estimate_json=? WHERE token=?",
+            (json.dumps(estimate), token),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match="估算完整性"):
+            apply_meal_photo_action(
+                conn, event_id="TAMPERED-CONFIRM", user_id="U1", token=token,
+                expected_version=estimated["version"], action="confirm_estimate",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM meal_photo_events WHERE event_id='TAMPERED-CONFIRM'").fetchone()[0] == 0
 
 
 def test_optional_second_protein_is_explicitly_added_summed_and_persisted(tmp_path):
@@ -1135,27 +1490,74 @@ def test_estimate_uses_ranges_and_keeps_unknown_as_na(tmp_path):
 
         bubble = build_meal_photo_estimate_bubble(result)
         text = "\n".join(flatten_text(bubble))
-        assert "照片估算｜尚未計入正式份量" in text
+        assert "照片估算｜確認後正式記錄" in text
         assert "熱量：NA" in text
         assert "主食：0份（使用者確認沒有）" in text
-        assert "待營養師審核" in text
+        assert "不會冒充營養師核准值" in text
 
 
-def test_estimate_card_shows_review_start_only_to_authorized_admin(tmp_path):
+@pytest.mark.parametrize(
+    ("workflow_version", "allow_admin_review", "expected_heading", "expected_action"),
+    [
+        ("expert_review_v1", False, "照片估算｜尚未計入正式份量", None),
+        ("expert_review_v1", True, "照片估算｜尚未計入正式份量", "start"),
+        ("user_confirmed_ai_estimate_v1", False, "照片估算｜確認後正式記錄", "confirm_estimate"),
+        ("user_confirmed_ai_estimate_v1", True, "照片估算｜確認後正式記錄", "confirm_estimate"),
+    ],
+)
+def test_estimate_card_actions_match_workflow_and_viewer(
+    tmp_path, workflow_version, allow_admin_review, expected_heading, expected_action
+):
     with sqlite3.connect(tmp_path / "meal-photo.db") as conn:
         token = save_meal_photo_draft(
-            conn, user_id="U1", source_message_id="M1", payload=sample_payload()
+            conn, user_id="U1", source_message_id="M1", payload=sample_payload(),
+            workflow_version=workflow_version,
         )
         draft = _answer_all(conn, token)
 
-    regular = json.dumps(build_meal_photo_estimate_bubble(draft), ensure_ascii=False)
-    admin = json.dumps(
-        build_meal_photo_estimate_bubble(draft, allow_admin_review=True), ensure_ascii=False
+    card = build_meal_photo_estimate_bubble(
+        draft, allow_admin_review=allow_admin_review
+    )
+    text = "\n".join(flatten_text(card))
+    actions = [
+        item.get("action", {}).get("data")
+        for item in card.get("footer", {}).get("contents", [])
+    ]
+
+    assert expected_heading in text
+    if workflow_version == "expert_review_v1":
+        assert "待營養師審核，尚未扣入個人營養計畫" in text
+        assert "確認後會記入飲食紀錄" not in text
+    else:
+        assert "確認後會記入飲食紀錄" in text
+        assert "待營養師審核" not in text
+    if expected_action == "start":
+        assert actions == [f"mpr:v1:{token}:{draft['version']}:start"]
+    elif expected_action == "confirm_estimate":
+        assert actions == [f"mp:v1:{token}:{draft['version']}:confirm_estimate"]
+    else:
+        assert actions == []
+    assert not any("confirm_estimate" in (action or "") for action in actions) or (
+        workflow_version == "user_confirmed_ai_estimate_v1"
     )
 
-    assert "審核並加入" not in regular
-    assert "審核並加入" in admin
-    assert f"mpr:v1:{token}:{draft['version']}:start" in admin
+
+def test_legacy_customer_card_matches_backend_confirm_rejection(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="M1", payload=sample_payload(),
+            workflow_version="expert_review_v1",
+        )
+        draft = _answer_all(conn, token)
+        card = build_meal_photo_estimate_bubble(draft)
+
+        assert "footer" not in card
+        with pytest.raises(ValueError, match="舊版待審草稿不能由顧客直接記錄"):
+            apply_meal_photo_action(
+                conn, event_id="LEGACY-CONFIRM", user_id="U1", token=token,
+                expected_version=draft["version"], action="confirm_estimate",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
 
 
 def test_unknown_answers_render_na_and_never_zero(tmp_path):
@@ -1470,9 +1872,12 @@ def test_schema_v1_migrates_to_versioned_events_without_dropping_drafts(tmp_path
                WHERE type='table' AND name='meal_photo_notification_claims'"""
         ).fetchone()
     assert "version" in columns
-    for col in ("review_json", "approved_log_id", "approved_at", "approved_by"):
+    for col in (
+        "review_json", "approved_log_id", "approved_at", "approved_by",
+        "original_confirmation_event_id",
+    ):
         assert col in columns, f"migration should add {col}"
-    assert version == 5
+    assert version == 7
     assert draft == ("U1", "M1", 1)
     assert event_table == ("meal_photo_events",)
     assert notification_table == ("meal_photo_notification_events",)
@@ -1557,7 +1962,8 @@ def test_configured_admin_can_review_another_users_meal_and_log_stays_with_owner
 def test_pending_review_list_includes_estimated_and_in_progress_drafts(tmp_path):
     with sqlite3.connect(tmp_path / "pending-review-list.db") as conn:
         first = save_meal_photo_draft(
-            conn, user_id="U1", source_message_id="M1", payload=sample_payload()
+            conn, user_id="U1", source_message_id="M1", payload=sample_payload(),
+            workflow_version="expert_review_v1",
         )
         _answer_all(conn, first)
         waiting = save_meal_photo_draft(

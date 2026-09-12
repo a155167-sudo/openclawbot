@@ -19,6 +19,10 @@ from fastapi.responses import JSONResponse
 import requests
 
 from health_check_rules import HEALTH_CHECK_DAY_RULE_MINIMUM_MEALS
+from nutrition_system import (
+    meal_photo_estimate_snapshot_is_valid,
+    user_confirmed_meal_photo_trust_projection,
+)
 
 
 LINE_ID_TOKEN_VERIFY_URL = "https://api.line.me/oauth2/v2.1/verify"
@@ -382,7 +386,7 @@ def _local_date_text(value: object, field: str) -> str:
     return text
 
 
-def _source_hash_matches(log: sqlite3.Row) -> bool:
+def _source_hash_matches(conn: sqlite3.Connection, log: sqlite3.Row) -> bool:
     expected = log["source_hash"]
     version = log["food_log_version"]
     log_id = log["log_id"]
@@ -407,8 +411,20 @@ def _source_hash_matches(log: sqlite3.Row) -> bool:
         )
     except (TypeError, ValueError, json.JSONDecodeError):
         canonical = raw_nutrition
+    trust = user_confirmed_meal_photo_trust_projection(
+        conn, log_id, str(log["trust_type"] or "") if "trust_type" in log.keys() else ""
+    )
+    if trust["integrity_status"] == "integrity_verification_failed":
+        return False
     actual = hashlib.sha256(
-        f"{log_id}:{version}:{canonical}".encode("utf-8")
+        (
+            f"{log_id}:{version}:{canonical}"
+            + (
+                f":user_confirmed_ai_estimate:{log['trust_hash']}"
+                if trust["integrity_status"] == "verified"
+                else ""
+            )
+        ).encode("utf-8")
     ).hexdigest()
     return hmac.compare_digest(actual, expected)
 
@@ -548,11 +564,17 @@ def _validate_case_source_semantics(
     case: Mapping[str, object],
     validated_days: Sequence[Mapping[str, object]],
 ) -> None:
+    food_log_columns = {str(item[1]) for item in conn.execute("PRAGMA table_info(food_logs)")}
+    trust_columns = (
+        ",fl.trust_type,fl.trust_hash,fl.exchange_snapshot_json"
+        if {"trust_type", "trust_hash", "exchange_snapshot_json"}.issubset(food_log_columns)
+        else ",'' AS trust_type,'' AS trust_hash,'{}' AS exchange_snapshot_json"
+    )
     rows = conn.execute(
-        """SELECT sr.food_log_id,sr.food_log_id AS log_id,
+        f"""SELECT sr.food_log_id,sr.food_log_id AS log_id,
                   sr.food_log_version,sr.local_date,sr.source_hash,
                   fl.log_id AS canonical_log_id,fl.consumed_at,fl.meal_slot,
-                  fl.nutrition_snapshot_json
+                  fl.nutrition_snapshot_json{trust_columns}
            FROM vip_health_check_source_refs sr
            JOIN vip_health_check_cases c ON c.case_id=sr.case_id
            LEFT JOIN food_logs fl
@@ -584,7 +606,7 @@ def _validate_case_source_semantics(
             or CANONICAL_SHA256_PATTERN.fullmatch(source_hash) is None
             or canonical_log_id != food_log_id
             or ref_date not in day_by_date
-            or not _source_hash_matches(row)
+            or not _source_hash_matches(conn, row)
             or _project_typed_json_object(
                 row["nutrition_snapshot_json"], numeric_fields=NUTRITION_FIELDS
             ) is None
@@ -747,9 +769,15 @@ def load_health_check_detail(
         )
 
     referenced_count = len(source_refs)
+    food_log_columns = {str(item[1]) for item in conn.execute("PRAGMA table_info(food_logs)")}
+    trust_columns = (
+        ",fl.trust_type,fl.trust_hash,fl.exchange_snapshot_json"
+        if {"trust_type", "trust_hash", "exchange_snapshot_json"}.issubset(food_log_columns)
+        else ",'' AS trust_type,'' AS trust_hash,'{}' AS exchange_snapshot_json"
+    )
     logs = conn.execute(
-        """SELECT fl.log_id,sr.food_log_version,sr.source_hash,
-                  fl.nutrition_snapshot_json
+        f"""SELECT fl.log_id,sr.food_log_version,sr.source_hash,
+                  fl.nutrition_snapshot_json{trust_columns}
            FROM vip_health_check_source_refs sr
            JOIN vip_health_check_cases c ON c.case_id=sr.case_id
            JOIN food_logs fl ON fl.log_id=sr.food_log_id AND fl.user_id=c.user_id
@@ -761,7 +789,7 @@ def load_health_check_detail(
     ).fetchall()
     source_logs = []
     for log in logs:
-        if not _source_hash_matches(log):
+        if not _source_hash_matches(conn, log):
             continue
         version = log["food_log_version"]
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
@@ -771,13 +799,28 @@ def load_health_check_detail(
         )
         if nutrition_snapshot is None:
             continue
-        source_logs.append(
-            {
-                "log_id": _required_text(log["log_id"], "source_log.log_id", maximum=128),
-                "food_log_version": version,
-                "nutrition_snapshot": nutrition_snapshot,
-            }
+        source = {
+            "log_id": _required_text(log["log_id"], "source_log.log_id", maximum=128),
+            "food_log_version": version,
+            "nutrition_snapshot": nutrition_snapshot,
+        }
+        trust = user_confirmed_meal_photo_trust_projection(
+            conn, log["log_id"], str(log["trust_type"] or "")
         )
+        if trust["integrity_status"] == "verified":
+            try:
+                estimate = json.loads(log["exchange_snapshot_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not meal_photo_estimate_snapshot_is_valid(estimate):
+                continue
+            source.update({
+                "trust_type": "user_confirmed_ai_estimate",
+                "trust_label": "顧客確認・AI估算",
+                "estimate_schema_version": "meal-photo-user-confirmation-v1",
+                "estimate": estimate,
+            })
+        source_logs.append(source)
     result["source_logs"] = source_logs
     result["source_integrity"] = {
         "referenced_count": referenced_count,

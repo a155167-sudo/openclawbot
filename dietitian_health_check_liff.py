@@ -62,6 +62,21 @@ const refreshButton=document.getElementById('refresh');
 let idToken='';
 const statusLabels={{collecting:'收集中',ready_for_review:'可審核',needs_more_info:'需補資料',approved_pending_delivery:'已核准待發送',delivery_failed:'發送失敗',delivered:'已送達',expired:'已過期',cancelled:'已取消'}};
 function node(tag,text,klass){{const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(klass)el.className=klass;return el;}}
+function rangeText(value){{
+  if(value===null||value===undefined)return 'NA';
+  if(typeof value==='object'&&Number.isFinite(value.min)&&Number.isFinite(value.max))return `${{value.min}}～${{value.max}}份`;
+  return 'NA';
+}}
+function renderSource(log){{
+  const item=node('li');
+  const label=log.trust_type==='user_confirmed_ai_estimate'?'顧客確認・AI估算':'已驗證營養快照';
+  item.append(node('strong',`${{label}}｜紀錄 ${{log.log_id}}`));
+  if(log.trust_type==='user_confirmed_ai_estimate'){{
+    const estimate=log.estimate||{{}};
+    item.append(node('div',`熱量：NA｜蛋白質：${{rangeText(estimate.protein_total_exchange)}}｜主食：${{rangeText(estimate.starch_exchange)}}｜蔬菜：${{rangeText(estimate.vegetable_exchange)}}`,'meta'));
+  }}else item.append(node('pre',JSON.stringify(log.nutrition_snapshot||{{}},null,2)));
+  return item;
+}}
 async function api(path){{
   const response=await fetch(path,{{method:'GET',headers:{{Authorization:`Bearer ${{idToken}}`}},cache:'no-store',credentials:'omit'}});
   if(!response.ok)throw new Error(response.status===403?'此LINE帳號未獲營養師唯讀權限':response.status===401?'LINE身分驗證失敗':`讀取失敗（${{response.status}}）`);
@@ -78,7 +93,11 @@ function renderCase(item,detail){{
   card.append(days);
   const disclosure=node('details');
   disclosure.append(node('summary','查看去識別化來源與營養快照'));
-  disclosure.append(node('pre',JSON.stringify((detail&&detail.source_logs)||[],null,2)));
+  const sources=node('ul',undefined,'days');
+  const sourceLogs=(detail&&detail.source_logs)||[];
+  if(sourceLogs.length===0)sources.append(node('li','目前沒有可驗證來源快照'));
+  for(const log of sourceLogs)sources.append(renderSource(log));
+  disclosure.append(sources);
   card.append(disclosure);
   return card;
 }}
