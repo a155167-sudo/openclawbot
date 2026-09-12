@@ -16,6 +16,8 @@ from datetime import datetime, timedelta
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
+from health_check_rules import HEALTH_CHECK_DAY_RULE_MINIMUM_MEALS
+
 
 BENEFIT_KEY = "first_vip_baseline_check"
 FEATURE_FLAG = "VIP_HEALTH_CHECK_ENABLED"
@@ -1510,11 +1512,20 @@ def refresh_case_source_manifest(
     驗收後可更換 rule version。函式刻意不查 `planned_meal_checks`，避免已轉成
     food_log 的一日樂食餐點被投影表重複計算。
     """
-    if not isinstance(minimum_meals_per_day, int) or not 1 <= minimum_meals_per_day <= 10:
+    if (
+        isinstance(minimum_meals_per_day, bool)
+        or not isinstance(minimum_meals_per_day, int)
+        or not 1 <= minimum_meals_per_day <= 10
+    ):
         raise ValueError("minimum_meals_per_day 必須介於 1～10")
     rule_version = str(rule_version or "").strip()
     if not rule_version:
         raise ValueError("rule_version 不可空白")
+    registered_minimum = HEALTH_CHECK_DAY_RULE_MINIMUM_MEALS.get(rule_version)
+    if registered_minimum is None:
+        raise ValueError("不支援的健檢有效日 rule_version")
+    if minimum_meals_per_day != registered_minimum:
+        raise ValueError("minimum_meals_per_day 與 rule_version 不匹配")
     evaluated_text = _iso_seconds(evaluated_at)
 
     conn.execute("SAVEPOINT refresh_case_source_manifest")

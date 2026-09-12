@@ -2728,6 +2728,274 @@ def test_non_vip_text_gate_only_permits_valid_activation_or_authorized_commands(
     assert server.is_text_command_allowed_without_vip("U_CUSTOMER", "包月方案") is False
 
 
+def test_non_vip_allowlisted_dietitian_can_open_health_check_without_ai_or_quota(monkeypatch):
+    dietitian_uid = "U1234567890abcdef1234567890abcdef"
+    liff_id = "2011528194-EsxeCZ2a"
+    replies = []
+    ai_calls = []
+    quota_calls = []
+    monkeypatch.setattr(server, "ADMIN_UID", "U_OTHER_ADMIN")
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_CONFIG", SimpleNamespace(enabled=True)
+    )
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS",
+        frozenset({dietitian_uid}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID", liff_id, raising=False
+    )
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("dietitian command must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server, "get_ai_response_with_memory", lambda *_args, **_kwargs: ai_calls.append(True)
+    )
+    monkeypatch.setattr(
+        server, "check_permission_and_quota", lambda *_args: quota_calls.append(True)
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda _token, message: replies.append(message),
+    )
+    event = _text_event(
+        "DIETITIAN-COMMAND-ALLOWLISTED",
+        "#營養師健檢",
+        dietitian_uid,
+    )
+    server.processed_messages.discard(event.message.id)
+
+    server.handle_message(event)
+
+    assert len(replies) == 1
+    rendered = json.loads(replies[0].as_json_string())
+    assert rendered["altText"] == "開啟營養師三日健檢"
+    assert f"https://liff.line.me/{liff_id}" in json.dumps(
+        rendered, ensure_ascii=False
+    )
+    assert ai_calls == []
+    assert quota_calls == []
+
+
+def test_allowlisted_dietitian_command_is_silent_when_read_feature_is_disabled(monkeypatch):
+    dietitian_uid = "U1234567890abcdef1234567890abcdef"
+    dispatched = []
+    replies = []
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_CONFIG", SimpleNamespace(enabled=False)
+    )
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS",
+        frozenset({dietitian_uid}),
+    )
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID", "2011528194-EsxeCZ2a"
+    )
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: dispatched.append(event.message.text)
+    )
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("disabled reserved command must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda *_args: replies.append(True)
+    )
+    event = _text_event(
+        "DIETITIAN-COMMAND-DISABLED", "#營養師健檢", dietitian_uid
+    )
+    server.processed_messages.discard(event.message.id)
+
+    server.handle_message(event)
+
+    assert dispatched == []
+    assert replies == []
+
+
+def test_unauthorized_dietitian_commands_are_silent_before_vip_db_gate(monkeypatch):
+    dispatched = []
+    replies = []
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS",
+        frozenset({"U1234567890abcdef1234567890abcdef"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID",
+        "2011528194-EsxeCZ2a",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("reserved command must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: dispatched.append(event.message.text)
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda *_args: replies.append(True),
+    )
+
+    for index, message in enumerate(
+        (
+            "#營養師健檢",
+            " #營養師健檢",
+            "#營養師健檢 ",
+            "\t#營養師健檢\n",
+            "＃營養師健檢",
+            "# 營養師健檢",
+            "#營養師 健檢",
+            "#營養師\u200b健檢",
+            "#營養師\u034f健檢",
+            "#營養師\ufe0f健檢",
+            "#營養師\U000e0100健檢",
+            "#營養師健檢現在",
+            "#養師健檢",
+            "#榮養師健檢",
+            "#營養師健撿現在請處理",
+            "#養師健檢現在請處理",
+            "#生活#營養師健檢",
+            "正常文字#營養師健檢",
+            "#今天跑步#營養師健檢",
+            "#營ﬃ養師健檢",
+            "#營養#師健檢",
+            "#營養﹟師健檢",
+            "#營養＃師健檢",
+        )
+    ):
+        event = _text_event(f"DIETITIAN-DENY-{index}", message, "U_ADMIN")
+        server.processed_messages.discard(event.message.id)
+        server.handle_message(event)
+
+    assert dispatched == []
+    assert replies == []
+
+
+def test_active_vip_normal_dietitian_health_hashtags_reach_regular_handler(monkeypatch):
+    dispatched = []
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
+    monkeypatch.setattr(server, "is_valid_vip_activation_command", lambda *_args: False)
+    monkeypatch.setattr(
+        server, "is_authorized_privileged_text_command", lambda *_args: False
+    )
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: dispatched.append(event.message.text)
+    )
+
+    expected = [
+        "#營養師健康資訊",
+        "#營養師健康飲食",
+        "#今天跑步心得" + ("很棒" * 100),
+        "#營養師建議",
+        "#營養師健身",
+        "#營養師料理",
+        "#營養師營養建議",
+        "#今天跑步" + (" " * 128),
+        "#今天跑步" + (" " * 129),
+        "#今天跑步" + ("\t" * 128),
+        "#今天跑步" + ("\n" * 128),
+        "#今天跑步" + ("\r" * 128),
+    ]
+    for index, message in enumerate(expected):
+        event = _text_event(f"DIETITIAN-NORMAL-{index}", message, "U_CUSTOMER")
+        server.processed_messages.discard(event.message.id)
+        server.handle_message(event)
+
+    assert dispatched == expected
+
+
+def test_shared_privileged_classifier_delegates_dietitian_namespace_without_hiding_other_admin_commands():
+    for message in (
+        "#營養師建議",
+        "#營養師健身",
+        "#營養師料理",
+        "#營養師營養建議",
+    ):
+        assert server.is_privileged_command_intent(message) is False
+    assert server.is_privileged_command_intent("#營養師健身#點數庫存") is True
+    assert server.is_privileged_command_intent("#營養師健康飲食#點數庫存") is True
+
+
+def test_public_dietitian_hashtag_cannot_hide_later_admin_command_before_vip_gate(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("admin intent must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_handle_message_impl",
+        lambda _event: (_ for _ in ()).throw(
+            AssertionError("admin intent must not reach regular handler")
+        ),
+    )
+    event = _text_event(
+        "DIETITIAN-PUBLIC-THEN-ADMIN",
+        "#營養師健康飲食#點數庫存",
+        "U_CUSTOMER",
+    )
+    server.processed_messages.discard(event.message.id)
+    server.handle_message(event)
+
+
+def test_dietitian_command_is_silent_when_liff_is_not_configured(monkeypatch):
+    dispatched = []
+    replies = []
+    monkeypatch.setattr(server, "ADMIN_UID", "U_ADMIN")
+    monkeypatch.setattr(
+        server,
+        "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS",
+        frozenset({"U_ADMIN"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server, "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID", "", raising=False
+    )
+    monkeypatch.setattr(
+        server,
+        "has_active_vip_access",
+        lambda _uid: (_ for _ in ()).throw(
+            AssertionError("disabled command must return before VIP/DB gate")
+        ),
+    )
+    monkeypatch.setattr(
+        server, "_handle_message_impl", lambda event: dispatched.append(event.message.text)
+    )
+    monkeypatch.setattr(
+        server.line_bot_api,
+        "reply_message",
+        lambda *_args: replies.append(True),
+    )
+
+    event = _text_event("DIETITIAN-NO-CONFIG", "#營養師健檢", "U_ADMIN")
+    server.processed_messages.discard(event.message.id)
+    server.handle_message(event)
+
+    assert dispatched == []
+    assert replies == []
+
+
 def test_vip_activation_precheck_missing_db_fails_closed_without_creating_file(
     tmp_path, monkeypatch
 ):

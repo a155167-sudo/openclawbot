@@ -113,6 +113,20 @@ from subscription_meal_plan import (
     get_subscription_form_value,
 )
 from customer_health_check_liff import attach_customer_health_check_routes
+from dietitian_health_check_api import (
+    attach_dietitian_health_check_routes,
+    load_dietitian_health_check_config,
+    load_health_check_detail,
+    load_health_check_list,
+)
+from dietitian_health_check_command import (
+    COMMAND_TEXT as DIETITIAN_HEALTH_CHECK_COMMAND_TEXT,
+    build_dietitian_health_check_flex,
+    is_authorized_dietitian_health_check_command,
+    is_dietitian_health_check_command_intent,
+    load_dietitian_health_check_command_allowed_uids,
+    load_dietitian_health_check_command_liff_id,
+)
 from vip_health_check import (
     configure_vip_health_check_connection,
     create_first_vip_health_check_case,
@@ -134,6 +148,33 @@ SURVEY_WEBHOOK_SECRET = APP_SETTINGS.survey_webhook_secret
 SURVEY_REWARD_LINK_COUNT = APP_SETTINGS.survey_reward_link_count
 SURVEY_REWARD_POINTS_PER_LINK = APP_SETTINGS.survey_reward_points_per_link
 VIP_HEALTH_CHECK_ENABLED = is_vip_health_check_enabled()
+DIETITIAN_HEALTH_CHECK_CONFIG = load_dietitian_health_check_config(os.environ)
+DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID = (
+    load_dietitian_health_check_command_liff_id(os.environ)
+)
+DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS = (
+    load_dietitian_health_check_command_allowed_uids(os.environ)
+)
+
+
+def _validate_dietitian_health_check_command_identity() -> None:
+    """Fail closed when the LINE command points outside the enabled read boundary."""
+    config = DIETITIAN_HEALTH_CHECK_CONFIG
+    if not config.enabled:
+        return
+    if DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID != config.liff_id:
+        raise RuntimeError(
+            "DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID must match "
+            "DIETITIAN_HEALTH_CHECK_LIFF_ID when read access is enabled"
+        )
+    if frozenset(DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS) != config.allowed_uids:
+        raise RuntimeError(
+            "DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS must match "
+            "DIETITIAN_HEALTH_CHECK_ALLOWED_UIDS when read access is enabled"
+        )
+
+
+_validate_dietitian_health_check_command_identity()
 
 
 def require_webhook_secret(request, expected_secret: str, setting_name: str) -> None:
@@ -1448,7 +1489,7 @@ ADMIN_ONLY_PREFIXES = (
 
 # 未授權者即使是有效 VIP，也不得讓管理／教練指令或近似拼法落入一般 AI。
 PRIVILEGED_COMMAND_STEMS = (
-    "#教練", "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成",
+    "#教練", "#營養師健檢", "#綁定老闆", "#點數庫存", "#更新菜單", "#今日出餐完成",
     "#發送明日提醒", "#測試週報", "#測試晚報", "#延餐清單",
     "#待核訂單", "#清空熱量", "#刪除檔案", "#重置", "重置本週",
     "檢查數據", "#待審營養份量", "#待審餐點", "@靜音", "@解除靜音",
@@ -1596,6 +1637,8 @@ def is_privileged_command_intent(msg: str) -> bool:
             return True
 
     for raw_stem in PRIVILEGED_COMMAND_STEMS:
+        if raw_stem == DIETITIAN_HEALTH_CHECK_COMMAND_TEXT:
+            continue
         stem = "".join(
             char for char in unicodedata.normalize("NFKC", raw_stem)
             if not char.isspace()
@@ -3092,6 +3135,25 @@ def get_vip_health_check_state_for_user(user_id: str):
         return get_customer_health_check_state(conn, user_id=user_id)
 
 
+def _open_read_only_database():
+    database_uri = Path(DB_PATH).resolve().as_uri() + "?mode=ro"
+    return sqlite3.connect(database_uri, uri=True)
+
+
+def list_dietitian_health_checks(*, statuses, limit: int, offset: int):
+    """Read the canonical dietitian queue without migrations or file creation."""
+    with closing(_open_read_only_database()) as conn:
+        return load_health_check_list(
+            conn, statuses=statuses, limit=limit, offset=offset
+        )
+
+
+def get_dietitian_health_check(case_id: str):
+    """Read one canonical health-check case without mutating its database."""
+    with closing(_open_read_only_database()) as conn:
+        return load_health_check_detail(conn, case_id=case_id)
+
+
 def register_customer_health_check_liff(target_app=app):
     return attach_customer_health_check_routes(
         target_app,
@@ -3102,6 +3164,18 @@ def register_customer_health_check_liff(target_app=app):
 
 
 register_customer_health_check_liff()
+
+
+def register_dietitian_health_check_api(target_app=app):
+    return attach_dietitian_health_check_routes(
+        target_app,
+        config=DIETITIAN_HEALTH_CHECK_CONFIG,
+        list_loader=list_dietitian_health_checks,
+        detail_loader=get_dietitian_health_check,
+    )
+
+
+register_dietitian_health_check_api()
 
 
 def init_db():
@@ -7279,6 +7353,13 @@ def is_jason_only_command(message):
 
 def is_authorized_privileged_text_command(user_id, message):
     """active VIP 的保留文字指令仍須符合 ADMIN／COACH 身分。"""
+    if message == DIETITIAN_HEALTH_CHECK_COMMAND_TEXT:
+        return is_authorized_dietitian_health_check_command(
+            user_id,
+            message,
+            allowed_uids=DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS,
+            liff_id=DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID,
+        )
     if message == "#教練":
         return user_id in COACH_UIDS
     if is_jason_only_command(message):
@@ -12253,7 +12334,22 @@ def _handle_message_impl(event):
         processed_messages.clear()
     processed_messages.add(msg_id)
 
-    msg, uid = event.message.text.strip(), event.source.user_id
+    raw_msg = event.message.text
+    msg, uid = raw_msg.strip(), event.source.user_id
+
+    if is_authorized_dietitian_health_check_command(
+        uid,
+        raw_msg,
+        allowed_uids=DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS,
+        liff_id=DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID,
+    ):
+        line_bot_api.reply_message(
+            event.reply_token,
+            build_dietitian_health_check_flex(
+                DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID
+            ),
+        )
+        return
 
     # 飲食帳本編輯的文字輸入（營養數值、修改品項、私人食品名稱）優先於 AI 對話。
     ledger_state = get_daily_food_edit_state(uid)
@@ -14416,17 +14512,34 @@ def _handle_message_impl(event):
 def handle_message(event):
     message_id = str(event.message.id)
     try:
-        message = event.message.text.strip()
+        raw_message = event.message.text
         user_id = event.source.user_id
-        has_vip = has_active_vip_access(user_id)
-        if not has_vip and not is_text_command_allowed_without_vip(user_id, message):
+        if is_dietitian_health_check_command_intent(raw_message):
+            if not DIETITIAN_HEALTH_CHECK_CONFIG.enabled:
+                return
+            if is_authorized_dietitian_health_check_command(
+                user_id,
+                raw_message,
+                allowed_uids=DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS,
+                liff_id=DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID,
+            ):
+                return _handle_message_impl(event)
             return
-        if (
-            has_vip
-            and not is_valid_vip_activation_command(user_id, message)
-            and is_privileged_command_intent(message)
-            and not is_authorized_privileged_text_command(user_id, message)
-        ):
+        message = raw_message.strip()
+        vip_activation_candidate = bool(
+            re.fullmatch(r"#(?:VIP24|VIP48|VIPORDER)-[A-Z0-9]{6}", message)
+        )
+        valid_vip_activation = vip_activation_candidate and is_valid_vip_activation_command(
+            user_id, message
+        )
+        privileged_intent = is_privileged_command_intent(message)
+        privileged_authorized = privileged_intent and is_authorized_privileged_text_command(
+            user_id, message
+        )
+        if privileged_intent and not privileged_authorized and not valid_vip_activation:
+            return
+        has_vip = has_active_vip_access(user_id)
+        if not has_vip and not (valid_vip_activation or privileged_authorized):
             return
         return _handle_message_impl(event)
     except Exception:

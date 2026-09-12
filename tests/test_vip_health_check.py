@@ -2374,6 +2374,24 @@ def test_redeem_activation_identity_does_not_collide_when_sqlite_rowid_is_reused
     assert rows[0][1] != rows[1][1]
 
 
+def test_refresh_rejects_unregistered_or_mismatched_day_rule_before_db_access(conn):
+    from vip_health_check import refresh_case_source_manifest
+
+    evaluated_at = datetime(2026, 9, 6, tzinfo=timezone.utc)
+    for minimum, rule, expected_error in (
+        (1, "custom-minimum-one-v1", "不支援"),
+        (1, "draft-confirmed-meals-v1", "不匹配"),
+    ):
+        with pytest.raises(ValueError, match=expected_error):
+            refresh_case_source_manifest(
+                conn,
+                case_id="case-never-read",
+                evaluated_at=evaluated_at,
+                minimum_meals_per_day=minimum,
+                rule_version=rule,
+            )
+
+
 def test_refresh_cannot_regress_case_approved_before_savepoint(conn):
     from vip_health_check import refresh_case_source_manifest
 
