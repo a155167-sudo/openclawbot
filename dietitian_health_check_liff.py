@@ -13,7 +13,7 @@ _CSP = (
     "script-src 'self' https://static.line-scdn.net; "
     "connect-src 'self' https://api.line.me https://access.line.me "
     "https://liffsdk.line-scdn.net https://uts-front.line-apps.com; "
-    "img-src 'self' data:; "
+    "img-src 'self' data: blob:; "
     "style-src 'self' 'unsafe-inline'; "
     "base-uri 'none'; form-action 'none'; frame-ancestors 'self' https://*.line.me"
 )
@@ -39,6 +39,8 @@ def _html() -> str:
     .case h2{font-size:18px;margin:0 0 8px}.meta{line-height:1.65;font-size:14px}.days{margin:10px 0;padding-left:20px}
     details{margin-top:10px}pre{white-space:pre-wrap;word-break:break-word;background:#f6f8f6;padding:10px;border-radius:8px;font-size:12px}
     .empty,.error{background:#fff7e8;border-radius:12px;padding:14px}.error{color:#8a2d22;background:#fff0ee}
+    .photo-actions{margin-top:8px}.photo-actions button{margin-right:8px}.photo-preview{margin-top:8px}
+    .photo-preview img{display:block;max-width:100%;height:auto;border-radius:10px}.photo-message{margin:8px 0;color:#6a3d27}
   </style>
   <script src="https://static.line-scdn.net/liff/edge/2/sdk.js" defer></script>
   <script src="/dietitian-health-check/app.js" defer></script>
@@ -60,14 +62,94 @@ const statusNode=document.getElementById('status');
 const casesNode=document.getElementById('cases');
 const refreshButton=document.getElementById('refresh');
 let idToken='';
+let photoGeneration=0;
+let activePhotoCaseId=null;
+const photoControllers=new Set();
+const photoUrls=new Map();
+const photoPanels=new Set();
+const photoRequests=new Map();
 const statusLabels={{collecting:'收集中',ready_for_review:'可審核',needs_more_info:'需補資料',approved_pending_delivery:'已核准待發送',delivery_failed:'發送失敗',delivered:'已送達',expired:'已過期',cancelled:'已取消'}};
 function node(tag,text,klass){{const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(klass)el.className=klass;return el;}}
+function clearPhoto(panel){{
+  const request=photoRequests.get(panel);
+  if(request){{
+    request.controller.abort();
+    photoControllers.delete(request.controller);
+    photoRequests.delete(panel);
+    request.button.disabled=false;
+  }}
+  const url=photoUrls.get(panel);
+  if(url){{URL.revokeObjectURL(url);photoUrls.delete(panel);}}
+  panel.replaceChildren();
+}}
+function clearAllPhotos(){{
+  photoGeneration+=1;
+  activePhotoCaseId=null;
+  for(const controller of photoControllers)controller.abort();
+  photoControllers.clear();
+  for(const panel of photoPanels)clearPhoto(panel);
+  photoPanels.clear();
+}}
 function rangeText(value){{
   if(value===null||value===undefined)return 'NA';
   if(typeof value==='object'&&Number.isFinite(value.min)&&Number.isFinite(value.max))return `${{value.min}}～${{value.max}}份`;
   return 'NA';
 }}
-function renderSource(log){{
+function photoErrorMessage(status){{
+  if(status===401)return 'LINE身分驗證失敗';
+  if(status===403)return '此LINE帳號未獲營養師唯讀權限';
+  if(status===404)return '照片不可用';
+  if(status===503)return '照片暫時無法載入，請重試';
+  return `照片讀取失敗（${{status}}）`;
+}}
+async function loadPhoto(caseId,logId,button,panel){{
+  if(activePhotoCaseId!==null&&activePhotoCaseId!==caseId)clearAllPhotos();
+  activePhotoCaseId=caseId;
+  photoPanels.add(panel);
+  clearPhoto(panel);
+  const generation=photoGeneration;
+  const controller=new AbortController();
+  const request={{controller,button}};
+  photoControllers.add(controller);
+  photoRequests.set(panel,request);
+  button.disabled=true;
+  try{{
+    const path='/api/dietitian/health-checks/'+encodeURIComponent(caseId)+'/sources/'+encodeURIComponent(logId)+'/image';
+    const response=await fetch(path,{{method:'GET',headers:{{Authorization:'Bearer '+idToken}},cache:'no-store',credentials:'omit',signal:controller.signal}});
+    if(controller.signal.aborted||generation!==photoGeneration)return;
+    if(!response.ok){{
+      const message=photoErrorMessage(response.status);
+      if(response.status===401||response.status===403){{
+        clearAllPhotos();
+        photoPanels.add(panel);
+        panel.replaceChildren(node('p',message,'photo-message'));
+        button.disabled=false;
+      }}else panel.replaceChildren(node('p',message,'photo-message'));
+      return;
+    }}
+    const blob=await response.blob();
+    if(controller.signal.aborted||generation!==photoGeneration)return;
+    const url=URL.createObjectURL(blob);
+    if(controller.signal.aborted||generation!==photoGeneration){{URL.revokeObjectURL(url);return;}}
+    photoUrls.set(panel,url);
+    const image=node('img');
+    image.setAttribute('src',url);
+    image.setAttribute('alt','餐點照片');
+    const close=node('button','關閉照片');
+    close.setAttribute('type','button');
+    close.addEventListener('click',clearAllPhotos);
+    panel.replaceChildren(image,close);
+  }}catch(error){{
+    if(!controller.signal.aborted&&generation===photoGeneration)panel.replaceChildren(node('p','照片暫時無法載入，請重試','photo-message'));
+  }}finally{{
+    photoControllers.delete(controller);
+    if(photoRequests.get(panel)===request){{
+      photoRequests.delete(panel);
+      button.disabled=false;
+    }}
+  }}
+}}
+function renderSource(caseId,log){{
   const item=node('li');
   const label=log.trust_type==='user_confirmed_ai_estimate'?'顧客確認・AI估算':'已驗證營養快照';
   item.append(node('strong',`${{label}}｜紀錄 ${{log.log_id}}`));
@@ -75,6 +157,13 @@ function renderSource(log){{
     const estimate=log.estimate||{{}};
     item.append(node('div',`熱量：NA｜蛋白質：${{rangeText(estimate.protein_total_exchange)}}｜主食：${{rangeText(estimate.starch_exchange)}}｜蔬菜：${{rangeText(estimate.vegetable_exchange)}}`,'meta'));
   }}else item.append(node('pre',JSON.stringify(log.nutrition_snapshot||{{}},null,2)));
+  const actions=node('div',undefined,'photo-actions');
+  const view=node('button','查看照片');
+  view.setAttribute('type','button');
+  const panel=node('div',undefined,'photo-preview');
+  view.addEventListener('click',()=>loadPhoto(caseId,log.log_id,view,panel));
+  actions.append(view);
+  item.append(actions,panel);
   return item;
 }}
 async function api(path){{
@@ -96,12 +185,13 @@ function renderCase(item,detail){{
   const sources=node('ul',undefined,'days');
   const sourceLogs=(detail&&detail.source_logs)||[];
   if(sourceLogs.length===0)sources.append(node('li','目前沒有可驗證來源快照'));
-  for(const log of sourceLogs)sources.append(renderSource(log));
+  for(const log of sourceLogs)sources.append(renderSource(item.case_id,log));
   disclosure.append(sources);
   card.append(disclosure);
   return card;
 }}
 async function loadCases(){{
+  clearAllPhotos();
   refreshButton.disabled=true;casesNode.replaceChildren();statusNode.textContent='讀取Staging案件中…';
   try{{
     const listing=await api('/api/dietitian/health-checks?limit=25&offset=0');
@@ -125,6 +215,7 @@ async function boot(){{
   }}catch(error){{casesNode.replaceChildren(node('div',error.message||'初始化失敗','error'));statusNode.textContent='初始化失敗';}}
 }}
 refreshButton.addEventListener('click',loadCases);
+window.addEventListener('pagehide',clearAllPhotos);
 boot();
 """
 
