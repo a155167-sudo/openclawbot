@@ -1,11 +1,18 @@
 import json
 import math
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from nutrition_system import daily_consumed_totals
+from nutrition_system import (
+    _confirmed_result,
+    daily_consumed_totals,
+    daily_food_summary,
+    exchange_approval_hash,
+    exchange_approval_payload_is_valid,
+    insert_approved_meal_photo_log,
+)
 from meal_photo_system import (
     build_meal_photo_confirmation_bubble,
     ensure_meal_photo_schema,
@@ -286,6 +293,7 @@ def _answer_all(conn, token, *, unknown=False):
         "scope": "visible_only",
         "protein_type": "unknown" if unknown else "chicken",
         "protein_portion": "unknown" if unknown else "one_palm",
+        "protein_more": "done",
         "starch_portion": "unseen_unknown" if unknown else "none",
         "vegetable_portion": "unknown" if unknown else "two_bowl",
         "cooking_oil": "unknown" if unknown else "light",
@@ -299,6 +307,787 @@ def _answer_all(conn, token, *, unknown=False):
     return draft
 
 
+def test_optional_second_protein_is_explicitly_added_summed_and_persisted(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo-multi-protein.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="MULTI-PROTEIN-1",
+            payload=sample_payload(),
+        )
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"),
+            ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"),
+        ), start=1):
+            draft = _apply_answer(
+                conn, token, field, value, event_id=f"MP-BASE-{index}"
+            )
+
+        assert next_meal_photo_step(draft) == "protein_more"
+        assert [item["label"] for item in meal_photo_step_options(
+            token, "protein_more", version=draft["version"]
+        )] == ["就這一種", "＋還有其他蛋白質"]
+
+        for index, (field, value) in enumerate((
+            ("protein_more", "add"),
+            ("protein_extra_type", "fish"),
+            ("protein_extra_portion", "half_palm"),
+            ("protein_more", "done"),
+            ("starch_portion", "none"),
+            ("vegetable_portion", "two_bowl"),
+            ("cooking_oil", "light"),
+            ("sauce_level", "half"),
+        ), start=1):
+            draft = _apply_answer(
+                conn, token, field, value, event_id=f"MP-REST-{index}"
+            )
+
+        assert draft["estimate"]["protein_total_exchange"] == {
+            "min": 3.0, "max": 5.0,
+            "basis": "summed_hand_portion_ranges_v2",
+        }
+        assert [item["type"] for item in draft["estimate"]["protein_items"]] == [
+            "chicken", "fish",
+        ]
+        confirmation_text = "\n".join(flatten_text(build_meal_photo_estimate_bubble(draft)))
+        assert "雞肉：約2～3份" in confirmation_text
+        assert "魚類：約1～2份" in confirmation_text
+        assert "蛋白質食物合計：約3～5份" in confirmation_text
+
+        review = apply_meal_photo_review_action(
+            conn, event_id="MP-REVIEW", user_id="U1", admin_user_id="ADMIN",
+            required_admin_user_id="ADMIN", token=token,
+            expected_version=draft["version"], action="start",
+        )
+        review_values = {
+            "protein_class": "medium", "protein_exchange": "4",
+            "starch_exchange": "0", "vegetable_exchange": "3",
+            "milk_exchange": "0", "fruit_exchange": "0",
+        }
+        index = 0
+        while next_meal_photo_review_step(review["draft"]) != "complete":
+            index += 1
+            field = next_meal_photo_review_step(review["draft"])
+            review = apply_meal_photo_review_action(
+                conn, event_id=f"MP-REVIEW-{index}", user_id="U1",
+                admin_user_id="ADMIN", required_admin_user_id="ADMIN",
+                token=token, expected_version=review["draft"]["version"],
+                action="set", field=field, value=review_values[field],
+            )
+        approved = apply_meal_photo_review_action(
+            conn, event_id="MP-APPROVE", user_id="U1", admin_user_id="ADMIN",
+            required_admin_user_id="ADMIN", token=token,
+            expected_version=review["draft"]["version"], action="approve",
+        )
+        canonical = json.loads(conn.execute(
+            "SELECT exchange_snapshot_json FROM food_logs WHERE log_id=?",
+            (approved["result"]["log_id"],),
+        ).fetchone()[0])
+        assert [item["type"] for item in canonical["protein_items"]] == [
+            "chicken", "fish",
+        ]
+        assert canonical["protein_total_exchange"] == {
+            "min": 3.0, "max": 5.0,
+            "basis": "summed_hand_portion_ranges_v2",
+        }
+        assert canonical["protein_medium_exchange"] == 4.0
+
+        approval_id = approved["result"]["approval_id"]
+        log_id = approved["result"]["log_id"]
+        approval_json = conn.execute(
+            "SELECT approved_exchange_json FROM food_exchange_approvals WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()[0]
+        applied_json = conn.execute(
+            "SELECT approved_exchange_json FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0]
+        consumed_at = conn.execute(
+            "SELECT consumed_at FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0]
+        local_date = datetime.fromisoformat(consumed_at).astimezone(
+            timezone(timedelta(hours=8))
+        ).date().isoformat()
+        approved_totals = daily_consumed_totals(
+            conn, user_id="U1", date_iso=local_date
+        )
+        assert approved_totals["protein_medium_exchange"] == 4
+        applied_payload = json.loads(applied_json)
+        applied_payload["protein_items"][1]["exchange"]["min"] = "1.0"
+        conn.execute(
+            "UPDATE food_logs SET approved_exchange_json=? WHERE log_id=?",
+            (json.dumps(applied_payload, ensure_ascii=False, sort_keys=True), log_id),
+        )
+        conn.commit()
+        tampered_log = _confirmed_result(conn, log_id, already_confirmed=True)
+        assert tampered_log["log"]["exchange_review_status"] == "pending_review"
+        assert tampered_log["log"]["exchange_approval_id"] == ""
+        tampered_totals = daily_consumed_totals(
+            conn, user_id="U1", date_iso=local_date
+        )
+        assert tampered_totals["protein_medium_exchange"] == 0
+        tampered_summary = daily_food_summary(
+            conn, user_id="U1", date_iso=local_date
+        )
+        assert tampered_summary["pending_reviews"] == 1
+        conn.execute(
+            "UPDATE food_logs SET approved_exchange_json=? WHERE log_id=?",
+            (applied_json, log_id),
+        )
+        approval_payload = json.loads(approval_json)
+        approval_payload["protein_total_exchange"]["min"] = 99
+        conn.execute(
+            "UPDATE food_exchange_approvals SET approved_exchange_json=? WHERE approval_id=?",
+            (json.dumps(approval_payload, ensure_ascii=False, sort_keys=True), approval_id),
+        )
+        conn.commit()
+        tampered_approval = _confirmed_result(conn, log_id, already_confirmed=True)
+        assert tampered_approval["log"]["exchange_review_status"] == "pending_review"
+        assert tampered_approval["log"]["exchange_approval_id"] == ""
+
+        for table, column, original_json in (
+            ("food_exchange_approvals", "approval_id", approval_json),
+            ("food_logs", "log_id", applied_json),
+        ):
+            conn.execute(
+                f"UPDATE {table} SET approved_exchange_json=? WHERE {column}=?",
+                (original_json, approval_id if table == "food_exchange_approvals" else log_id),
+            )
+            conn.commit()
+            malformed_values = ["{", "[]", "null"]
+            wrong_scalar = json.loads(original_json)
+            wrong_scalar["protein_medium_exchange"] = "oops"
+            malformed_values.append(json.dumps(wrong_scalar, ensure_ascii=False, sort_keys=True))
+            for malformed in malformed_values:
+                conn.execute(
+                    f"UPDATE {table} SET approved_exchange_json=? WHERE {column}=?",
+                    (malformed, approval_id if table == "food_exchange_approvals" else log_id),
+                )
+                conn.commit()
+                failed_closed = _confirmed_result(conn, log_id, already_confirmed=True)
+                assert failed_closed["log"]["exchange_review_status"] == "pending_review"
+                assert daily_consumed_totals(
+                    conn, user_id="U1", date_iso=local_date
+                )["protein_medium_exchange"] == 0
+                assert daily_food_summary(
+                    conn, user_id="U1", date_iso=local_date
+                )["pending_reviews"] == 1
+            conn.execute(
+                f"UPDATE {table} SET approved_exchange_json=? WHERE {column}=?",
+                (original_json, approval_id if table == "food_exchange_approvals" else log_id),
+            )
+            conn.commit()
+
+        invalid_approval = json.loads(approval_json)
+        invalid_applied = json.loads(applied_json)
+        invalid_approval["protein_medium_exchange"] = "4.0"
+        invalid_applied["protein_medium_exchange"] = "4.0"
+        fingerprint = conn.execute(
+            "SELECT food_fingerprint FROM food_exchange_approvals WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()[0]
+        invalid_hash = exchange_approval_hash(
+            fingerprint, "meal-photo-admin-v2", invalid_approval
+        )
+        conn.execute(
+            "UPDATE food_exchange_approvals SET approved_exchange_json=?,approved_exchange_hash=? "
+            "WHERE approval_id=?",
+            (json.dumps(invalid_approval), invalid_hash, approval_id),
+        )
+        conn.execute(
+            "UPDATE food_logs SET approved_exchange_json=? WHERE log_id=?",
+            (json.dumps(invalid_applied), log_id),
+        )
+        conn.commit()
+        recomputed = _confirmed_result(conn, log_id, already_confirmed=True)
+        assert recomputed["log"]["exchange_review_status"] == "pending_review"
+        assert daily_consumed_totals(
+            conn, user_id="U1", date_iso=local_date
+        )["protein_medium_exchange"] == 0.0
+        assert daily_food_summary(
+            conn, user_id="U1", date_iso=local_date
+        )["pending_reviews"] == 1
+        with pytest.raises(ValueError, match="核准重播紀錄驗證失敗"):
+            apply_meal_photo_review_action(
+                conn,
+                event_id="MP-APPROVE",
+                user_id="U1",
+                admin_user_id="ADMIN",
+                required_admin_user_id="ADMIN",
+                token=token,
+                expected_version=review["draft"]["version"],
+                action="approve",
+            )
+
+
+def test_legacy_v1_approval_hash_remains_compatible_with_old_exchange_only_scope():
+    payload = {
+        "protein_medium_exchange": 4,
+        "protein_items": [{"type": "chicken", "portion": "one_palm"}],
+    }
+    original = exchange_approval_hash("fingerprint", "meal-photo-admin-v1", payload)
+    payload["protein_items"][0]["type"] = "fish"
+    payload["protein_total_exchange"] = {"min": 99, "max": 99, "basis": "tampered"}
+    assert exchange_approval_hash("fingerprint", "meal-photo-admin-v1", payload) == original
+
+    numeric_string = {"protein_medium_exchange": "4"}
+    assert exchange_approval_hash(
+        "fingerprint", "meal-photo-admin-v1", numeric_string
+    ) == original
+    assert exchange_approval_payload_is_valid("meal-photo-admin-v1", numeric_string)
+
+    malformed = {"protein_medium_exchange": "oops"}
+    assert exchange_approval_hash(
+        "fingerprint", "meal-photo-admin-v1", malformed
+    ) != original
+    assert not exchange_approval_payload_is_valid("meal-photo-admin-v1", malformed)
+    for invalid_value in (True, {}, []):
+        invalid = {"protein_medium_exchange": invalid_value}
+        assert exchange_approval_hash(
+            "fingerprint", "meal-photo-admin-v1", invalid
+        ) != original
+        assert not exchange_approval_payload_is_valid("meal-photo-admin-v1", invalid)
+
+
+def test_v2_approval_hash_rejects_numeric_strings_and_presence_changes():
+    payload: dict[str, object] = {
+        "milk_exchange": 0.0,
+        "protein_low_exchange": 0.0,
+        "protein_medium_exchange": 4.0,
+        "protein_high_exchange": 0.0,
+        "starch_exchange": 0.0,
+        "vegetable_exchange": 3.0,
+        "fruit_exchange": 0.0,
+        "fat_exchange": 0.0,
+    }
+    original = exchange_approval_hash("fingerprint", "meal-photo-admin-v2", payload)
+
+    numeric_string = dict(payload)
+    numeric_string["protein_medium_exchange"] = "4.0"
+    assert exchange_approval_hash(
+        "fingerprint", "meal-photo-admin-v2", numeric_string
+    ) != original
+
+    missing_zero = dict(payload)
+    del missing_zero["milk_exchange"]
+    assert exchange_approval_hash(
+        "fingerprint", "meal-photo-admin-v2", missing_zero
+    ) != original
+
+    explicit_null = dict(payload)
+    explicit_null["protein_total_exchange"] = None
+    assert exchange_approval_hash(
+        "fingerprint", "meal-photo-admin-v2", explicit_null
+    ) != original
+
+    for invalid_value in ("4.0", True, None, math.nan, math.inf):
+        invalid = dict(payload)
+        invalid["protein_medium_exchange"] = invalid_value
+        # Recomputing an unkeyed digest must not make malformed v2 data valid.
+        exchange_approval_hash("fingerprint", "meal-photo-admin-v2", invalid)
+        assert not exchange_approval_payload_is_valid("meal-photo-admin-v2", invalid)
+
+
+def test_v2_approval_hash_distinguishes_nested_absent_from_null():
+    payload = {
+        "milk_exchange": 0.0,
+        "protein_low_exchange": 0.0,
+        "protein_medium_exchange": 4.0,
+        "protein_high_exchange": 0.0,
+        "starch_exchange": 0.0,
+        "vegetable_exchange": 3.0,
+        "fruit_exchange": 0.0,
+        "fat_exchange": 0.0,
+        "protein_items": [
+            {
+                "type": "chicken",
+                "portion": "one_palm",
+                "exchange": {"min": 2.0, "max": 3.0, "basis": "hand_portion_range_v1"},
+            },
+            {
+                "type": "fish",
+                "portion": "half_palm",
+                "exchange": {"min": 1.0, "max": 2.0, "basis": "hand_portion_range_v1"},
+            },
+        ],
+        "protein_total_exchange": {
+            "min": 3.0, "max": 5.0, "basis": "summed_hand_portion_ranges_v2",
+        },
+    }
+    paths = [
+        ("protein_items", 0, "type"),
+        ("protein_items", 0, "portion"),
+        ("protein_items", 0, "exchange", "min"),
+        ("protein_items", 0, "exchange", "max"),
+        ("protein_items", 0, "exchange", "basis"),
+        ("protein_total_exchange", "min"),
+        ("protein_total_exchange", "max"),
+        ("protein_total_exchange", "basis"),
+    ]
+    for path in paths:
+        missing = json.loads(json.dumps(payload))
+        explicit_null = json.loads(json.dumps(payload))
+        missing_parent = missing
+        null_parent = explicit_null
+        for part in path[:-1]:
+            missing_parent = missing_parent[part]
+            null_parent = null_parent[part]
+        missing_parent.pop(path[-1])
+        null_parent[path[-1]] = None
+        assert exchange_approval_hash(
+            "fingerprint", "meal-photo-admin-v2", missing
+        ) != exchange_approval_hash(
+            "fingerprint", "meal-photo-admin-v2", explicit_null
+        )
+
+
+@pytest.mark.parametrize("protein_type", ["chicken", "unknown"])
+def test_duplicate_additional_protein_is_rejected_without_mutating_draft(
+    tmp_path, protein_type
+):
+    with sqlite3.connect(tmp_path / f"meal-photo-duplicate-{protein_type}.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id=f"DUPLICATE-{protein_type}",
+            payload=sample_payload(),
+        )
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"),
+            ("protein_type", protein_type),
+            ("protein_portion", "one_palm"),
+            ("protein_more", "add"),
+        ), start=1):
+            draft = _apply_answer(
+                conn, token, field, value, event_id=f"DUPLICATE-BASE-{index}"
+            )
+        version_before = draft["version"]
+
+        with pytest.raises(ValueError, match="已經選過"):
+            _apply_answer(
+                conn, token, "protein_extra_type", protein_type,
+                event_id=f"DUPLICATE-{protein_type}-EVENT",
+            )
+
+        unchanged = get_meal_photo_draft(conn, user_id="U1", token=token)
+        assert unchanged["version"] == version_before
+        assert unchanged["answers"]["protein_extra_type"] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM meal_photo_events WHERE event_id=?",
+            (f"DUPLICATE-{protein_type}-EVENT",),
+        ).fetchone()[0] == 0
+
+
+def test_formal_boundary_rejects_duplicate_unknown_protein_items(tmp_path):
+    duplicate_items = [
+        {
+            "type": "unknown", "portion": "one_palm",
+            "exchange": {"min": 2.0, "max": 3.0, "basis": "hand_portion_range_v1"},
+        },
+        {
+            "type": "unknown", "portion": "half_palm",
+            "exchange": {"min": 1.0, "max": 2.0, "basis": "hand_portion_range_v1"},
+        },
+    ]
+    exact = {
+        "milk_exchange": 0, "protein_low_exchange": 0,
+        "protein_medium_exchange": 4, "protein_high_exchange": 0,
+        "starch_exchange": 0, "vegetable_exchange": 3,
+        "fruit_exchange": 0, "fat_exchange": 0,
+    }
+    with sqlite3.connect(tmp_path / "formal-duplicate-unknown.db") as conn:
+        with pytest.raises(ValueError, match="複數蛋白質種類重複"):
+            insert_approved_meal_photo_log(
+                conn, token="abcdef123456", user_id="U1", reviewer="ADMIN",
+                consumed_at="2026-09-12T12:00:00+08:00", meal_slot="lunch",
+                source_image_ref="nutrition-image:test.jpg", observed_payload={},
+                answers={
+                    "protein_type": "unknown",
+                    "protein_portion": "one_palm",
+                    "protein_items": [
+                        {"type": item["type"], "portion": item["portion"]}
+                        for item in duplicate_items
+                    ],
+                },
+                exact_exchange=exact,
+                estimate={
+                    "protein_items": duplicate_items,
+                    "protein_total_exchange": {
+                        "min": 3.0, "max": 5.0,
+                        "basis": "summed_hand_portion_ranges_v2",
+                    },
+                    "rule_version": "hand-portion-range-v2",
+                },
+            )
+
+
+@pytest.mark.parametrize(
+    ("target", "bad_value"),
+    [
+        ("exact", "4.0"),
+        ("exact", True),
+        ("item_min", "2.0"),
+        ("item_min", True),
+        ("item_max", math.inf),
+        ("total_min", "3.0"),
+        ("total_min", True),
+        ("total_max", math.nan),
+    ],
+)
+def test_formal_boundary_rejects_noncanonical_v2_numbers_without_writes(
+    tmp_path, target, bad_value
+):
+    items = [
+        {
+            "type": "chicken", "portion": "one_palm",
+            "exchange": {"min": 2.0, "max": 3.0, "basis": "hand_portion_range_v1"},
+        },
+        {
+            "type": "fish", "portion": "half_palm",
+            "exchange": {"min": 1.0, "max": 2.0, "basis": "hand_portion_range_v1"},
+        },
+    ]
+    exact = {
+        "milk_exchange": 0, "protein_low_exchange": 0,
+        "protein_medium_exchange": 4, "protein_high_exchange": 0,
+        "starch_exchange": 0, "vegetable_exchange": 3,
+        "fruit_exchange": 0, "fat_exchange": 0,
+    }
+    total = {"min": 3.0, "max": 5.0, "basis": "summed_hand_portion_ranges_v2"}
+    if target == "exact":
+        exact["protein_medium_exchange"] = bad_value
+    elif target == "item_min":
+        items[0]["exchange"]["min"] = bad_value
+    elif target == "item_max":
+        items[0]["exchange"]["max"] = bad_value
+    elif target == "total_min":
+        total["min"] = bad_value
+    else:
+        total["max"] = bad_value
+
+    with sqlite3.connect(tmp_path / f"formal-number-{target}.db") as conn:
+        with pytest.raises(ValueError, match="JSON數字|有限數字"):
+            insert_approved_meal_photo_log(
+                conn, token="abcdef123456", user_id="U1", reviewer="ADMIN",
+                consumed_at="2026-09-12T12:00:00+08:00", meal_slot="lunch",
+                source_image_ref="nutrition-image:test.jpg", observed_payload={},
+                answers={
+                    "protein_type": "chicken", "protein_portion": "one_palm",
+                    "protein_items": [
+                        {"type": item["type"], "portion": item["portion"]}
+                        for item in items
+                    ],
+                },
+                exact_exchange=exact,
+                estimate={
+                    "protein_items": items,
+                    "protein_total_exchange": total,
+                    "rule_version": "hand-portion-range-v2",
+                },
+            )
+        assert not conn.in_transaction
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("protein_type", "protein_portion"),
+    [("none", None), ("chicken", "half_palm")],
+)
+def test_formal_boundary_rejects_v2_items_contradicting_top_level_answer(
+    tmp_path, protein_type, protein_portion
+):
+    items = [
+        {
+            "type": "chicken", "portion": "one_palm",
+            "exchange": {"min": 2.0, "max": 3.0, "basis": "hand_portion_range_v1"},
+        },
+        {
+            "type": "fish", "portion": "half_palm",
+            "exchange": {"min": 1.0, "max": 2.0, "basis": "hand_portion_range_v1"},
+        },
+    ]
+    with sqlite3.connect(tmp_path / f"formal-contradiction-{protein_type}.db") as conn:
+        with pytest.raises(ValueError, match="蛋白質明細與主要回答不符"):
+            insert_approved_meal_photo_log(
+                conn, token="abcdef123456", user_id="U1", reviewer="ADMIN",
+                consumed_at="2026-09-12T12:00:00+08:00", meal_slot="lunch",
+                source_image_ref="nutrition-image:test.jpg", observed_payload={},
+                answers={
+                    "protein_type": protein_type,
+                    "protein_portion": protein_portion,
+                    "protein_items": [
+                        {"type": item["type"], "portion": item["portion"]}
+                        for item in items
+                    ],
+                },
+                exact_exchange={
+                    "milk_exchange": 0, "protein_low_exchange": 0,
+                    "protein_medium_exchange": 4, "protein_high_exchange": 0,
+                    "starch_exchange": 0, "vegetable_exchange": 3,
+                    "fruit_exchange": 0, "fat_exchange": 0,
+                },
+                estimate={
+                    "protein_items": items,
+                    "protein_total_exchange": {
+                        "min": 3.0, "max": 5.0,
+                        "basis": "summed_hand_portion_ranges_v2",
+                    },
+                    "rule_version": "hand-portion-range-v2",
+                },
+            )
+
+
+def test_formal_boundary_rejects_single_item_contradicting_top_level_answer(tmp_path):
+    with sqlite3.connect(tmp_path / "formal-single-contradiction.db") as conn:
+        with pytest.raises(ValueError, match="蛋白質明細與主要回答不符"):
+            insert_approved_meal_photo_log(
+                conn, token="abcdef123456", user_id="U1", reviewer="ADMIN",
+                consumed_at="2026-09-12T12:00:00+08:00", meal_slot="lunch",
+                source_image_ref="nutrition-image:test.jpg", observed_payload={},
+                answers={
+                    "protein_type": "chicken", "protein_portion": "one_palm",
+                    "protein_items": [{"type": "fish", "portion": "half_palm"}],
+                },
+                exact_exchange={
+                    "milk_exchange": 0, "protein_low_exchange": 0,
+                    "protein_medium_exchange": 1.5, "protein_high_exchange": 0,
+                    "starch_exchange": 0, "vegetable_exchange": 3,
+                    "fruit_exchange": 0, "fat_exchange": 0,
+                },
+                estimate={
+                    "protein_total_exchange": {
+                        "min": 1.0, "max": 2.0, "basis": "hand_portion_range_v1",
+                    },
+                    "rule_version": "hand-portion-range-v1",
+                },
+            )
+
+
+def test_zero_first_protein_portion_skips_additional_protein_without_mutation(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo-zero-first-protein.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="ZERO-FIRST-PROTEIN",
+            payload=sample_payload(),
+        )
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"),
+            ("protein_type", "chicken"),
+            ("protein_portion", "none"),
+        ), start=1):
+            draft = _apply_answer(
+                conn, token, field, value, event_id=f"ZERO-FIRST-{index}"
+            )
+
+        assert next_meal_photo_step(draft) == "starch_portion"
+        version_before = draft["version"]
+        with pytest.raises(ValueError, match="餐點確認步驟不符"):
+            _apply_answer(
+                conn, token, "protein_more", "add", event_id="ZERO-FIRST-STALE-ADD"
+            )
+        unchanged = get_meal_photo_draft(conn, user_id="U1", token=token)
+        assert unchanged["version"] == version_before
+        assert unchanged["answers"]["protein_more"] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM meal_photo_events WHERE event_id='ZERO-FIRST-STALE-ADD'"
+        ).fetchone()[0] == 0
+
+
+def test_old_single_protein_estimate_without_v2_items_remains_approvable(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo-legacy-single.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="LEGACY-SINGLE-1",
+            payload=sample_payload(),
+        )
+        legacy_answers = {
+            "scope": "visible_only", "protein_type": "chicken",
+            "protein_portion": "one_palm", "starch_portion": "none",
+            "vegetable_portion": "two_bowl", "cooking_oil": "light",
+            "sauce_level": "half",
+        }
+        legacy_estimate = {
+            "calories_kcal": None, "protein_g": None, "fat_g": None,
+            "carbohydrate_g": None,
+            "protein_total_exchange": {
+                "min": 2.0, "max": 3.0, "basis": "hand_portion_range_v1",
+            },
+            "starch_exchange": {
+                "min": 0.0, "max": 0.0, "basis": "user_confirmed_none",
+            },
+            "vegetable_exchange": {
+                "min": 2.0, "max": 4.0, "basis": "hand_portion_range_v1",
+            },
+            "formal_status": "pending_review_not_counted",
+            "rule_version": "hand-portion-range-v1",
+        }
+        conn.execute(
+            """UPDATE pending_meal_photo_drafts
+               SET answers_json=?,estimate_json=?,status='estimated',version=8
+               WHERE token=?""",
+            (
+                json.dumps(legacy_answers, ensure_ascii=False, sort_keys=True),
+                json.dumps(legacy_estimate, ensure_ascii=False, sort_keys=True),
+                token,
+            ),
+        )
+        conn.commit()
+
+        review = apply_meal_photo_review_action(
+            conn, event_id="LEGACY-START", user_id="U1", admin_user_id="ADMIN",
+            required_admin_user_id="ADMIN", token=token,
+            expected_version=8, action="start",
+        )
+        values = {
+            "protein_class": "medium", "protein_exchange": "2.5",
+            "starch_exchange": "0", "vegetable_exchange": "3",
+            "milk_exchange": "0", "fruit_exchange": "0",
+        }
+        index = 0
+        while next_meal_photo_review_step(review["draft"]) != "complete":
+            index += 1
+            field = next_meal_photo_review_step(review["draft"])
+            review = apply_meal_photo_review_action(
+                conn, event_id=f"LEGACY-SET-{index}", user_id="U1",
+                admin_user_id="ADMIN", required_admin_user_id="ADMIN",
+                token=token, expected_version=review["draft"]["version"],
+                action="set", field=field, value=values[field],
+            )
+        approved = apply_meal_photo_review_action(
+            conn, event_id="LEGACY-APPROVE", user_id="U1", admin_user_id="ADMIN",
+            required_admin_user_id="ADMIN", token=token,
+            expected_version=review["draft"]["version"], action="approve",
+        )
+        canonical = json.loads(conn.execute(
+            "SELECT exchange_snapshot_json FROM food_logs WHERE log_id=?",
+            (approved["result"]["log_id"],),
+        ).fetchone()[0])
+        assert "protein_items" not in canonical
+        assert canonical["protein_medium_exchange"] == 2.5
+
+
+def test_v2_protein_total_without_items_is_rejected_without_formal_write(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo-missing-protein-items.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="MISSING-PROTEIN-ITEMS",
+            payload=sample_payload(),
+        )
+        estimated = _answer_all(conn, token)
+        malformed = dict(estimated["estimate"])
+        malformed.pop("protein_items", None)
+        malformed["protein_total_exchange"] = {
+            "min": 3.0, "max": 5.0,
+            "basis": "summed_hand_portion_ranges_v2",
+        }
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET estimate_json=? WHERE token=?",
+            (json.dumps(malformed, ensure_ascii=False, sort_keys=True), token),
+        )
+        conn.commit()
+
+        review = apply_meal_photo_review_action(
+            conn, event_id="MISSING-START", user_id="U1", admin_user_id="ADMIN",
+            required_admin_user_id="ADMIN", token=token,
+            expected_version=estimated["version"], action="start",
+        )
+        values = {
+            "protein_class": "medium", "protein_exchange": "4",
+            "starch_exchange": "0", "vegetable_exchange": "3",
+            "milk_exchange": "0", "fruit_exchange": "0",
+        }
+        while next_meal_photo_review_step(review["draft"]) != "complete":
+            field = next_meal_photo_review_step(review["draft"])
+            review = apply_meal_photo_review_action(
+                conn, event_id=f"MISSING-SET-{field}", user_id="U1",
+                admin_user_id="ADMIN", required_admin_user_id="ADMIN",
+                token=token, expected_version=review["draft"]["version"],
+                action="set", field=field, value=values[field],
+            )
+        before = conn.execute(
+            "SELECT status,version FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()
+        with pytest.raises(ValueError, match="複數蛋白質明細無效"):
+            apply_meal_photo_review_action(
+                conn, event_id="MISSING-APPROVE", user_id="U1",
+                admin_user_id="ADMIN", required_admin_user_id="ADMIN",
+                token=token, expected_version=review["draft"]["version"],
+                action="approve",
+            )
+        after = conn.execute(
+            "SELECT status,version FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()
+        assert after == before
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+
+
+def test_v2_answers_cannot_be_downgraded_to_legacy_estimate(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo-v2-downgrade.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="V2-DOWNGRADE",
+            payload=sample_payload(),
+        )
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        for index, (field, value) in enumerate((
+            ("scope", "visible_only"), ("protein_type", "chicken"),
+            ("protein_portion", "one_palm"), ("protein_more", "add"),
+            ("protein_extra_type", "fish"),
+            ("protein_extra_portion", "half_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"), ("vegetable_portion", "two_bowl"),
+            ("cooking_oil", "light"), ("sauce_level", "half"),
+        ), start=1):
+            draft = _apply_answer(
+                conn, token, field, value, event_id=f"DOWNGRADE-ANSWER-{index}"
+            )
+        assert len(draft["answers"]["protein_items"]) == 2
+        malformed = dict(draft["estimate"])
+        malformed.pop("protein_items")
+        malformed["rule_version"] = "hand-portion-range-v1"
+        malformed["protein_total_exchange"] = {
+            "min": 3.0, "max": 5.0, "basis": "hand_portion_range_v1",
+        }
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET estimate_json=? WHERE token=?",
+            (json.dumps(malformed, ensure_ascii=False, sort_keys=True), token),
+        )
+        conn.commit()
+
+        review = apply_meal_photo_review_action(
+            conn, event_id="DOWNGRADE-START", user_id="U1", admin_user_id="ADMIN",
+            required_admin_user_id="ADMIN", token=token,
+            expected_version=draft["version"], action="start",
+        )
+        values = {
+            "protein_class": "medium", "protein_exchange": "4",
+            "starch_exchange": "0", "vegetable_exchange": "3",
+            "milk_exchange": "0", "fruit_exchange": "0",
+        }
+        while next_meal_photo_review_step(review["draft"]) != "complete":
+            field = next_meal_photo_review_step(review["draft"])
+            review = apply_meal_photo_review_action(
+                conn, event_id=f"DOWNGRADE-SET-{field}", user_id="U1",
+                admin_user_id="ADMIN", required_admin_user_id="ADMIN",
+                token=token, expected_version=review["draft"]["version"],
+                action="set", field=field, value=values[field],
+            )
+        before = conn.execute(
+            "SELECT status,version FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone()
+        with pytest.raises(ValueError, match="複數蛋白質明細無效"):
+            apply_meal_photo_review_action(
+                conn, event_id="DOWNGRADE-APPROVE", user_id="U1",
+                admin_user_id="ADMIN", required_admin_user_id="ADMIN",
+                token=token, expected_version=review["draft"]["version"],
+                action="approve",
+            )
+        assert conn.execute(
+            "SELECT status,version FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone() == before
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+
+
 def test_button_state_machine_collects_every_required_confirmation(tmp_path):
     with sqlite3.connect(tmp_path / "meal-photo.db") as conn:
         ensure_meal_photo_schema(conn)
@@ -307,12 +1096,13 @@ def test_button_state_machine_collects_every_required_confirmation(tmp_path):
         )
         draft = get_meal_photo_draft(conn, user_id="U1", token=token)
         expected_steps = [
-            "scope", "protein_type", "protein_portion", "starch_portion",
+            "scope", "protein_type", "protein_portion", "protein_more", "starch_portion",
             "vegetable_portion", "cooking_oil", "sauce_level",
         ]
         choices = {
             "scope": "visible_only", "protein_type": "chicken",
-            "protein_portion": "one_palm", "starch_portion": "none",
+            "protein_portion": "one_palm", "protein_more": "done",
+            "starch_portion": "none",
             "vegetable_portion": "two_bowl", "cooking_oil": "light",
             "sauce_level": "half",
         }
@@ -497,7 +1287,8 @@ def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
         )
         values = (
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "one_half_bowl"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "one_half_bowl"),
             ("vegetable_portion", "none"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         )
@@ -507,22 +1298,22 @@ def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
                 expected_version=index, action="answer", field=field, value=value,
             )
         draft = get_meal_photo_draft(conn, user_id="U_ADMIN", token=token)
-        assert draft["version"] == 8 and draft["status"] == "estimated"
+        assert draft["version"] == 9 and draft["status"] == "estimated"
 
         with pytest.raises(PermissionError):
             apply_meal_photo_review_action(
                 conn, event_id="UNAUTHORIZED", user_id="U_ADMIN", admin_user_id="OTHER",
                 required_admin_user_id="U_ADMIN",
-                token=token, expected_version=8, action="start",
+                token=token, expected_version=9, action="start",
             )
-        assert get_meal_photo_draft(conn, user_id="U_ADMIN", token=token)["version"] == 8
+        assert get_meal_photo_draft(conn, user_id="U_ADMIN", token=token)["version"] == 9
 
         started = apply_meal_photo_review_action(
             conn, event_id="REVIEW-START", user_id="U_ADMIN", admin_user_id="U_ADMIN",
             required_admin_user_id="U_ADMIN",
-            token=token, expected_version=8, action="start",
+            token=token, expected_version=9, action="start",
         )
-        assert started["result"] == {"kind": "review_question", "step": "protein_class", "version": 9}
+        assert started["result"] == {"kind": "review_question", "step": "protein_class", "version": 10}
         assert next_meal_photo_review_step(started["draft"]) == "protein_class"
 
         sequence = (
@@ -533,7 +1324,7 @@ def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
             ("fruit_exchange", "0"),
         )
         current = started
-        for offset, (field, value) in enumerate(sequence, start=9):
+        for offset, (field, value) in enumerate(sequence, start=10):
             option_values = {item["value"] for item in meal_photo_review_options(current["draft"], field)}
             assert value in option_values
             current = apply_meal_photo_review_action(
@@ -547,7 +1338,7 @@ def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
         approved = apply_meal_photo_review_action(
             conn, event_id="REVIEW-APPROVE", user_id="U_ADMIN", admin_user_id="U_ADMIN",
             required_admin_user_id="U_ADMIN",
-            token=token, expected_version=14, action="approve",
+            token=token, expected_version=15, action="approve",
         )
         assert approved["result"]["kind"] == "approved"
         assert approved["result"]["estimated_nutrition"]["calories_kcal"] == 590.5
@@ -563,7 +1354,7 @@ def test_admin_review_selects_exact_values_and_applies_once(tmp_path):
         replay = apply_meal_photo_review_action(
             conn, event_id="REVIEW-APPROVE", user_id="U_ADMIN", admin_user_id="U_ADMIN",
             required_admin_user_id="U_ADMIN",
-            token=token, expected_version=14, action="approve",
+            token=token, expected_version=15, action="approve",
         )
         assert replay["replayed"] is True
         assert replay["result"]["estimated_nutrition"] == approved["result"]["estimated_nutrition"]

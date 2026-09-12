@@ -60,6 +60,8 @@ from nutrition_system import (
     ensure_nutrition_schema,
     estimate_nutrition_from_exchanges,
     exchange_approval_hash,
+    exchange_applied_payload_matches_approval_hash,
+    exchange_approval_payload_is_valid,
     get_nutrition_input_state,
     normalize_garmin_payload,
     normalize_label_payload,
@@ -424,7 +426,8 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
                   fl.meal_slot,fl.consumed_servings,fl.consumed_amount,fl.consumed_unit,
                   fl.nutrition_snapshot_json,fl.nutrient_sources_json,fl.version,
                   fl.approved_exchange_json,fc.fingerprint,a.food_fingerprint,
-                  a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id
+                  a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id,
+                  a.approved_exchange_json
            FROM food_logs fl
            JOIN food_catalog fc ON fc.food_id=fl.food_id
            LEFT JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
@@ -435,16 +438,44 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
     ).fetchall()
 
 
+def _safe_json_object(value):
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _ledger_item_from_row(row) -> dict:
-    nutrition = json.loads(row[9] or "{}")
-    # 已核准餐點照片以驗證過的交換份估算；未核准/無值維持 NA。
-    if not nutrition and row[12] and row[13] and row[14] == row[13]:
+    nutrition = _safe_json_object(row[9])
+    # 餐點照片必須先驗證核准快照；完整性失效時即使營養快照存在也維持 NA。
+    if row[3] == "user_meal_photo":
+        verified_approval = False
         try:
             approved = json.loads(row[12] or "{}")
-            expected = exchange_approval_hash(row[14], row[15], approved)
-            if secrets.compare_digest(str(row[16] or ""), expected):
+            approved_definition = json.loads(row[18] or "{}")
+            if (
+                isinstance(approved, dict)
+                and isinstance(approved_definition, dict)
+                and row[17]
+                and row[13]
+                and row[14] == row[13]
+                and exchange_approval_payload_is_valid(row[15], approved)
+                and exchange_approval_payload_is_valid(row[15], approved_definition)
+                and exchange_applied_payload_matches_approval_hash(
+                    row[14], row[15], approved, row[6], row[16]
+                )
+                and secrets.compare_digest(
+                    str(row[16] or ""),
+                    exchange_approval_hash(row[14], row[15], approved_definition),
+                )
+            ):
+                verified_approval = True
+            if verified_approval:
                 nutrition = estimate_nutrition_from_exchanges(approved)
         except (TypeError, ValueError, json.JSONDecodeError):
+            verified_approval = False
+        if not verified_approval:
             nutrition = {}
     return {
         "log_id": row[0], "food_id": row[1], "product_name": row[2],
@@ -547,7 +578,7 @@ def apply_daily_food_log_edit(
         row = conn.execute(
             """SELECT fl.version,fl.consumed_servings,fl.nutrition_snapshot_json,
                       fl.nutrient_sources_json,fl.consumed_at,fc.product_name,
-                      fl.food_id,fc.source_type
+                      fl.food_id,fc.source_type,fl.approved_exchange_json
                FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
                WHERE fl.log_id=? AND fl.user_id=? AND fl.confirmation_status='confirmed'
                  AND COALESCE(fl.deleted_at,'')=''""",
@@ -560,6 +591,9 @@ def apply_daily_food_log_edit(
             raise ValueError("這筆紀錄已更新，請重新開啟最新卡片")
         nutrition = json.loads(row[2] or "{}")
         sources = json.loads(row[3] or "{}")
+        approved_exchanges = json.loads(row[8] or "{}")
+        if not isinstance(nutrition, dict) or not isinstance(approved_exchanges, dict):
+            raise ValueError("飲食紀錄資料格式錯誤")
         new_servings = old_servings
         new_name = ""
         if action == "correct_nutrition":
@@ -581,9 +615,24 @@ def apply_daily_food_log_edit(
                 raise ValueError("份量需介於 0.1～100 份")
             ratio = new_servings / old_servings
             nutrition = {
-                key: (None if nutrient is None else round(float(nutrient) * ratio, 4))
+                key: (
+                    None if nutrient is None
+                    else round(float(nutrient) * ratio, 4)
+                ) if key in DAILY_FOOD_NUTRIENT_FIELDS else nutrient
                 for key, nutrient in nutrition.items()
             }
+            for key in (
+                "milk_exchange", "protein_low_exchange", "protein_medium_exchange",
+                "protein_high_exchange", "starch_exchange", "vegetable_exchange",
+                "fruit_exchange", "fat_exchange",
+            ):
+                if key in approved_exchanges:
+                    exchange_value = _ledger_number(
+                        approved_exchanges[key], allow_none=False
+                    )
+                    if exchange_value is None:
+                        raise ValueError("核准交換份資料格式錯誤")
+                    approved_exchanges[key] = round(exchange_value * ratio, 4)
         elif action == "set_meal_slot":
             if str(value) not in {"早餐", "午餐", "晚餐", "點心"}:
                 raise ValueError("餐別不支援")
@@ -657,12 +706,14 @@ def apply_daily_food_log_edit(
         else:
             conn.execute(
                 """UPDATE food_logs SET consumed_servings=?,consumed_amount=?,
-                   nutrition_snapshot_json=?,nutrient_sources_json=?,version=?,updated_at=?
+                   nutrition_snapshot_json=?,nutrient_sources_json=?,approved_exchange_json=?,
+                   version=?,updated_at=?
                    WHERE log_id=?""",
                 (
                     new_servings, new_servings,
                     json.dumps(nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False),
                     json.dumps(sources, ensure_ascii=False, sort_keys=True),
+                    json.dumps(approved_exchanges, ensure_ascii=False, sort_keys=True, allow_nan=False),
                     new_version, now, log_id,
                 ),
             )
@@ -5626,7 +5677,8 @@ def get_dashboard_data(user_id: str) -> dict:
                 c.execute(
                     """SELECT fc.product_name,fc.fingerprint,a.food_fingerprint,
                               a.suggestion_rule_version,a.approved_exchange_json,
-                              a.approved_exchange_hash
+                              a.approved_exchange_hash,fl.approved_exchange_json,
+                              fl.consumed_servings
                        FROM food_logs fl
                        JOIN food_catalog fc ON fc.food_id=fl.food_id
                        JOIN food_exchange_approvals a
@@ -5643,10 +5695,37 @@ def get_dashboard_data(user_id: str) -> dict:
                         if str(row[2] or "") != str(row[1] or ""):
                             continue
                         approved_exchange = json.loads(row[4] or "{}")
+                        applied_exchange = json.loads(row[6] or "{}")
                         expected_hash = exchange_approval_hash(row[2], row[3], approved_exchange)
-                        if not secrets.compare_digest(str(row[5] or ""), expected_hash):
+                        if (
+                            not exchange_approval_payload_is_valid(row[3], approved_exchange)
+                            or not exchange_approval_payload_is_valid(row[3], applied_exchange)
+                            or not secrets.compare_digest(str(row[5] or ""), expected_hash)
+                        ):
                             continue
-                        estimated = estimate_nutrition_from_exchanges(approved_exchange)
+                        if not exchange_applied_payload_matches_approval_hash(
+                            row[2], row[3], applied_exchange, row[7], row[5]
+                        ):
+                            continue
+                        expected_applied = {
+                            key: round(
+                                float(approved_exchange.get(key, 0) or 0)
+                                * float(row[7] or 0),
+                                4,
+                            )
+                            for key in (
+                                "milk_exchange", "protein_low_exchange",
+                                "protein_medium_exchange", "protein_high_exchange",
+                                "starch_exchange", "vegetable_exchange",
+                                "fruit_exchange", "fat_exchange",
+                            )
+                        }
+                        if not all(
+                            abs(float(applied_exchange.get(key, 0) or 0) - value) <= 0.0001
+                            for key, value in expected_applied.items()
+                        ):
+                            continue
+                        estimated = estimate_nutrition_from_exchanges(applied_exchange)
                     except (TypeError, ValueError, json.JSONDecodeError):
                         continue
                     product_name = str(row[0] or "").strip()
@@ -8766,13 +8845,28 @@ def _sync_food_outbox(entity_id):
         """, (entity_id,)).fetchone()
     if not food:
         raise RuntimeError("food outbox entity missing")
-    per = json.loads(food[10] or "{}")
-    exch = {}
-    if food[12] == "approved" and food[20] and food[20] == food[16]:
+    try:
+        per = json.loads(food[10] or "{}")
         candidate = json.loads(food[19] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        per, candidate = {}, {}
+    if not isinstance(per, dict):
+        per = {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+    exch = {}
+    approval_valid = False
+    if food[12] == "approved" and food[20] and food[20] == food[16]:
         expected_hash = exchange_approval_hash(food[20], food[21], candidate)
-        if secrets.compare_digest(str(food[22] or ""), expected_hash):
+        approval_valid = (
+            exchange_approval_payload_is_valid(food[21], candidate)
+            and secrets.compare_digest(str(food[22] or ""), expected_hash)
+        )
+        if approval_valid:
             exch = candidate
+    review_status = (
+        "pending_review" if food[12] == "approved" and not approval_valid else food[12]
+    )
     ws = _nutrition_ws("食品資料庫")
     row_values = [
         food[0], food[1], food[2], food[3], food[4], food[5], food[6],
@@ -8782,7 +8876,7 @@ def _sync_food_outbox(entity_id):
         exch.get("protein_low_exchange", 0), exch.get("protein_medium_exchange", 0),
         exch.get("protein_high_exchange", 0), exch.get("starch_exchange", 0),
         exch.get("vegetable_exchange", 0), exch.get("fruit_exchange", 0),
-        exch.get("fat_exchange", 0), food[12], food[13], food[14], food[15],
+        exch.get("fat_exchange", 0), review_status, food[13], food[14], food[15],
         food[16], food[17], food[18]
     ]
     _upsert_raw_sheet_row(ws, entity_id, row_values)
@@ -8796,20 +8890,29 @@ def _sync_food_log_outbox(entity_id):
                    l.nutrition_snapshot_json, l.approved_exchange_json, l.source_image_ref,
                    l.plan_id, l.confirmation_status, l.created_at, l.updated_at,
                    l.exchange_approval_id, a.food_fingerprint, a.suggestion_rule_version,
-                   a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint
+                   a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint,
+                   f.source_type
             FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
             LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
             WHERE l.log_id=?
         """, (entity_id,)).fetchone()
     if not log:
         raise RuntimeError("food log outbox entity missing")
-    nutrition = json.loads(log[9] or "{}")
-    exch = json.loads(log[10] or "{}")
-    approval_values = json.loads(log[19] or "{}")
+    nutrition = _safe_json_object(log[9])
+    exch = _safe_json_object(log[10])
+    approval_values = _safe_json_object(log[19])
     approval_valid = bool(log[16] and log[17] and log[17] == log[21])
     if approval_valid:
         expected_hash = exchange_approval_hash(log[17], log[18], approval_values)
-        approval_valid = secrets.compare_digest(str(log[20] or ""), expected_hash)
+        approval_valid = (
+            exchange_approval_payload_is_valid(log[18], approval_values)
+            and exchange_approval_payload_is_valid(log[18], exch)
+            and secrets.compare_digest(str(log[20] or ""), expected_hash)
+        )
+    if approval_valid:
+        approval_valid = exchange_applied_payload_matches_approval_hash(
+            log[17], log[18], exch, log[6], log[20]
+        )
     if approval_valid:
         expected_applied = {
             key: round(float(approval_values.get(key, 0) or 0) * float(log[6] or 0), 4)
@@ -8825,6 +8928,8 @@ def _sync_food_log_outbox(entity_id):
         )
     if not approval_valid:
         exch = {}
+    if log[22] == "user_meal_photo":
+        nutrition = estimate_nutrition_from_exchanges(exch) if approval_valid else {}
     ws = _nutrition_ws("飲食紀錄")
     row_values = [
         log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7], log[8],
@@ -10482,6 +10587,9 @@ MEAL_PHOTO_STEP_QUESTIONS = {
     "scope": "這餐是否還有照片外、未入鏡的食物或飲料？",
     "protein_type": "主要蛋白質食物是哪一類？若看不出來請選『不確定』。",
     "protein_portion": "蛋白質食物大約有幾個手掌大？",
+    "protein_more": "這餐還有其他蛋白質食物嗎？",
+    "protein_extra_type": "請選擇另一種蛋白質食物：",
+    "protein_extra_portion": "這一種蛋白質大約有幾個手掌大？",
     "starch_portion": "這餐主食大約多少？照片沒拍到但有吃，也請照實選擇。",
     "vegetable_portion": "蔬菜大約有幾碗？",
     "cooking_oil": "這餐的烹調用油大約如何？照片看不出來請選『不確定』。",

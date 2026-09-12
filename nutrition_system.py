@@ -92,6 +92,29 @@ def _number(
     return result
 
 
+def _strict_json_number(
+    value: Any, field: str, *, max_value: float | None = None
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} 必須是JSON數字")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field} 必須是有限數字")
+    if result < 0:
+        raise ValueError(f"{field} 不可為負數")
+    if max_value is not None and result > max_value:
+        raise ValueError(f"{field} 超過合理範圍")
+    return result
+
+
+def _json_object_or_none(raw: Any) -> dict[str, Any] | None:
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return dict(value) if isinstance(value, Mapping) else None
+
+
 MEAL_PHOTO_NUTRITION_RULE_VERSION = "tw-exchange-macros-v1"
 
 # 每一核准交換份的巨量營養素基準。奶類在現行審核流程沒有脂肪等級欄位，
@@ -427,15 +450,225 @@ def food_fingerprint(
 def exchange_approval_hash(
     food_fingerprint_value: str, rule_version: str, exchanges: Mapping[str, Any]
 ) -> str:
+    def canonical_number(value: Any) -> float | str:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "__invalid__"
+        number = float(value)
+        if not math.isfinite(number):
+            return "__invalid__"
+        return round(number, 4)
+
+    def canonical_string(container: Mapping[str, Any], key: str) -> Any:
+        if key not in container:
+            return {"_absent": True}
+        value = container[key]
+        return value if isinstance(value, str) else {"_invalid": True}
+
+    def canonical_legacy_number(value: Any) -> float | str:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str, type(None))):
+            return "__invalid__"
+        try:
+            number = float(value or 0)
+        except (TypeError, ValueError):
+            return "__invalid__"
+        if not math.isfinite(number):
+            return "__invalid__"
+        return round(number, 4)
+
+    rule_version = str(rule_version)
+    if not isinstance(exchanges, Mapping):
+        canonical = {
+            "food_fingerprint": str(food_fingerprint_value),
+            "rule_version": rule_version,
+            "exchanges": {"_invalid": True},
+        }
+        raw = json.dumps(
+            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if rule_version == "meal-photo-admin-v2":
+        canonical_exchanges = {
+            key: canonical_number(exchanges[key]) if key in exchanges else "__missing__"
+            for key in EXCHANGE_KEYS
+        }
+    else:
+        canonical_exchanges = {
+            key: canonical_legacy_number(exchanges.get(key, 0)) for key in EXCHANGE_KEYS
+        }
     canonical = {
         "food_fingerprint": str(food_fingerprint_value),
-        "rule_version": str(rule_version),
-        "exchanges": {
-            key: round(float(exchanges.get(key, 0) or 0), 4) for key in EXCHANGE_KEYS
-        },
+        "rule_version": rule_version,
+        "exchanges": canonical_exchanges,
     }
+    if rule_version == "meal-photo-admin-v2":
+        raw_items = exchanges.get("protein_items")
+        if "protein_items" not in exchanges:
+            canonical["protein_items"] = {"_absent": True}
+        elif raw_items is None:
+            canonical["protein_items"] = {"_invalid": True}
+        elif not isinstance(raw_items, list):
+            canonical["protein_items"] = {"_invalid": True}
+        else:
+            canonical_items = []
+            for raw_item in raw_items:
+                if not isinstance(raw_item, Mapping):
+                    canonical_items.append({"_invalid": True})
+                    continue
+                if "exchange" not in raw_item:
+                    canonical_exchange: Any = {"_absent": True}
+                else:
+                    raw_exchange = raw_item["exchange"]
+                    if not isinstance(raw_exchange, Mapping):
+                        canonical_exchange = {"_invalid": True}
+                    else:
+                        canonical_exchange = {
+                            "min": (
+                                canonical_number(raw_exchange["min"])
+                                if "min" in raw_exchange else {"_absent": True}
+                            ),
+                            "max": (
+                                canonical_number(raw_exchange["max"])
+                                if "max" in raw_exchange else {"_absent": True}
+                            ),
+                            "basis": canonical_string(raw_exchange, "basis"),
+                        }
+                canonical_items.append({
+                    "type": canonical_string(raw_item, "type"),
+                    "portion": canonical_string(raw_item, "portion"),
+                    "exchange": canonical_exchange,
+                })
+            canonical["protein_items"] = canonical_items
+        raw_total = exchanges.get("protein_total_exchange")
+        if "protein_total_exchange" not in exchanges:
+            canonical["protein_total_exchange"] = {"_absent": True}
+        elif raw_total is None:
+            canonical["protein_total_exchange"] = {"_invalid": True}
+        elif not isinstance(raw_total, Mapping):
+            canonical["protein_total_exchange"] = {"_invalid": True}
+        else:
+            canonical["protein_total_exchange"] = {
+                "min": (
+                    canonical_number(raw_total["min"])
+                    if "min" in raw_total else {"_absent": True}
+                ),
+                "max": (
+                    canonical_number(raw_total["max"])
+                    if "max" in raw_total else {"_absent": True}
+                ),
+                "basis": canonical_string(raw_total, "basis"),
+            }
     raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def exchange_approval_payload_is_valid(rule_version: str, exchanges: Any) -> bool:
+    if not isinstance(exchanges, Mapping):
+        return False
+    if str(rule_version) != "meal-photo-admin-v2":
+        try:
+            for key in EXCHANGE_KEYS:
+                value = exchanges.get(key, 0)
+                if isinstance(value, bool) or not isinstance(
+                    value, (int, float, str, type(None))
+                ):
+                    return False
+                number = float(value or 0)
+                if not math.isfinite(number) or number < 0 or number > 100:
+                    return False
+            return True
+        except (TypeError, ValueError):
+            return False
+    try:
+        for key in EXCHANGE_KEYS:
+            if key not in exchanges:
+                return False
+            _strict_json_number(exchanges[key], key, max_value=100)
+        has_items = "protein_items" in exchanges
+        has_total = "protein_total_exchange" in exchanges
+        if has_items != has_total:
+            return False
+        if not has_items:
+            return True
+        raw_items = exchanges["protein_items"]
+        raw_total = exchanges["protein_total_exchange"]
+        if (
+            not isinstance(raw_items, list)
+            or not 2 <= len(raw_items) <= 4
+            or not isinstance(raw_total, Mapping)
+        ):
+            return False
+        valid_types = {"chicken", "pork", "fish", "egg", "tofu", "other", "unknown"}
+        portion_ranges = {
+            "half_palm": (1.0, 2.0), "one_palm": (2.0, 3.0),
+            "one_half_palm": (3.0, 5.0), "two_palm": (4.0, 6.0),
+        }
+        seen_types: set[str] = set()
+        total_min = 0.0
+        total_max = 0.0
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                return False
+            protein_type = item.get("type")
+            portion = item.get("portion")
+            item_exchange = item.get("exchange")
+            if (
+                not isinstance(protein_type, str)
+                or protein_type not in valid_types
+                or protein_type in seen_types
+                or not isinstance(portion, str)
+                or portion not in portion_ranges
+                or not isinstance(item_exchange, Mapping)
+                or item_exchange.get("basis") != "hand_portion_range_v1"
+            ):
+                return False
+            item_min = _strict_json_number(
+                item_exchange.get("min"), "protein_item.min", max_value=100
+            )
+            item_max = _strict_json_number(
+                item_exchange.get("max"), "protein_item.max", max_value=100
+            )
+            if (item_min, item_max) != portion_ranges[portion]:
+                return False
+            seen_types.add(protein_type)
+            total_min += item_min
+            total_max += item_max
+        return (
+            raw_total.get("basis") == "summed_hand_portion_ranges_v2"
+            and _strict_json_number(
+                raw_total.get("min"), "protein_total.min", max_value=100
+            ) == total_min
+            and _strict_json_number(
+                raw_total.get("max"), "protein_total.max", max_value=100
+            ) == total_max
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def exchange_applied_payload_matches_approval_hash(
+    food_fingerprint_value: str,
+    rule_version: str,
+    applied: Any,
+    servings: Any,
+    approval_hash: Any,
+) -> bool:
+    if not exchange_approval_payload_is_valid(rule_version, applied):
+        return False
+    try:
+        if str(rule_version) != "meal-photo-admin-v2":
+            return True
+        serving_count = _strict_json_number(servings, "consumed_servings", max_value=100)
+        if serving_count <= 0:
+            return False
+        normalized = dict(applied)
+        for key in EXCHANGE_KEYS:
+            normalized[key] = round(float(normalized[key]) / serving_count, 4)
+        expected = exchange_approval_hash(
+            food_fingerprint_value, rule_version, normalized
+        )
+        return secrets.compare_digest(str(approval_hash or ""), expected)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False
 
 
 def remaining_targets(target: Mapping[str, Any], consumed: Mapping[str, Any]) -> dict[str, float]:
@@ -1625,33 +1858,51 @@ def _confirmed_result(conn: sqlite3.Connection, log_id: str, *, already_confirme
     ).fetchone()
     if not row:
         raise ValueError("已確認紀錄遺失，請聯繫客服")
-    suggested = json.loads(row[11] or "{}")
-    approved = json.loads(row[12] or "{}")
+    suggested = _json_object_or_none(row[11]) or {}
+    approved = _json_object_or_none(row[12]) or {}
     applied: dict[str, Any] = {}
     candidate_approval_id = row[13] or ""
     approval_id = ""
     if candidate_approval_id and approved and row[15] and row[15] == row[19]:
-        approved_definition = json.loads(row[17] or "{}")
-        expected_hash = exchange_approval_hash(row[15], row[16], approved_definition)
-        expected_applied = {
-            key: round(float(approved_definition.get(key, 0) or 0) * float(row[7] or 0), 4)
-            for key in EXCHANGE_KEYS
-        }
-        if secrets.compare_digest(str(row[18] or ""), expected_hash) and all(
-            abs(float(approved.get(key, 0) or 0) - value) <= 0.0001
-            for key, value in expected_applied.items()
-        ):
-            applied = approved
-            approval_id = candidate_approval_id
-        else:
-            approval_id = ""
+        approved_definition = _json_object_or_none(row[17])
+        if approved_definition is not None:
+            expected_hash = exchange_approval_hash(row[15], row[16], approved_definition)
+            definition_hash_valid = (
+                exchange_approval_payload_is_valid(row[16], approved_definition)
+                and secrets.compare_digest(str(row[18] or ""), expected_hash)
+            )
+            applied_detail_hash_valid = exchange_applied_payload_matches_approval_hash(
+                row[15], row[16], approved, row[7], row[18]
+            )
+            if definition_hash_valid and applied_detail_hash_valid:
+                try:
+                    expected_applied = {
+                        key: round(
+                            float(approved_definition.get(key, 0) or 0)
+                            * float(row[7] or 0),
+                            4,
+                        )
+                        for key in EXCHANGE_KEYS
+                    }
+                    applied_values_match = all(
+                        abs(float(approved.get(key, 0) or 0) - value) <= 0.0001
+                        for key, value in expected_applied.items()
+                    )
+                except (TypeError, ValueError):
+                    applied_values_match = False
+                if applied_values_match:
+                    applied = approved
+                    approval_id = candidate_approval_id
+    nutrition = _json_object_or_none(row[10]) or {}
+    if row[3] == "user_meal_photo":
+        nutrition = estimate_nutrition_from_exchanges(applied) if applied else {}
     return {
         "already_confirmed": already_confirmed,
         "food": {"food_id": row[0], "product_name": row[1], "brand": row[2], "source_type": row[3]},
         "log": {
             "log_id": row[4], "consumed_at": row[5], "meal_slot": row[6],
             "consumed_servings": float(row[7]), "consumed_amount": float(row[8]),
-            "consumed_unit": row[9], "nutrition": json.loads(row[10] or "{}"),
+            "consumed_unit": row[9], "nutrition": nutrition,
             "suggested_exchange": suggested,
             "approved_exchange": applied,
             "exchange": applied or suggested,
@@ -1744,9 +1995,15 @@ def confirm_pending_label(
         if existing:
             food_id = existing[0]
             if existing[2] == "approved" and existing[3] and existing[4] == fingerprint:
-                candidate = json.loads(existing[6] or "{}")
-                expected_hash = exchange_approval_hash(fingerprint, existing[5], candidate)
-                if secrets.compare_digest(str(existing[7] or ""), expected_hash):
+                candidate = _json_object_or_none(existing[6])
+                expected_hash = ""
+                if candidate is not None:
+                    expected_hash = exchange_approval_hash(fingerprint, existing[5], candidate)
+                if (
+                    candidate is not None
+                    and exchange_approval_payload_is_valid(existing[5], candidate)
+                    and secrets.compare_digest(str(existing[7] or ""), expected_hash)
+                ):
                     approved_food_payload = candidate
                     approval_id = existing[3]
                     approved_valid = True
@@ -1861,6 +2118,7 @@ def insert_approved_meal_photo_log(
     observed_payload: Mapping[str, Any],
     answers: Mapping[str, Any],
     exact_exchange: Mapping[str, Any],
+    estimate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """在呼叫端交易內建立照片餐點的正式核准、食品與飲食快照；不自行commit。"""
     token = str(token or "").strip()
@@ -1872,17 +2130,142 @@ def insert_approved_meal_photo_log(
         raise ValueError("餐點照片核准身分無效")
     approved_at = utcish_now()
     values = {
-        key: round(_number(exact_exchange.get(key), key, max_value=100), 4)
+        key: round(_strict_json_number(exact_exchange.get(key), key, max_value=100), 4)
         for key in EXCHANGE_KEYS
     }
     if values["fat_exchange"] != 0:
         raise ValueError("目前規則不計油脂交換份")
+    protein_items: list[dict[str, Any]] = []
+    protein_total_exchange: dict[str, Any] | None = None
+    raw_protein_items = (estimate or {}).get("protein_items")
+    raw_protein_total = (estimate or {}).get("protein_total_exchange")
+    raw_answer_items = (answers or {}).get("protein_items")
+    if raw_answer_items is None:
+        raw_answer_items = []
+    if not isinstance(raw_answer_items, list):
+        raise ValueError("複數蛋白質明細無效")
+    valid_types = {"chicken", "pork", "fish", "egg", "tofu", "other", "unknown"}
+    portion_ranges = {
+        "half_palm": (1.0, 2.0), "one_palm": (2.0, 3.0),
+        "one_half_palm": (3.0, 5.0), "two_palm": (4.0, 6.0),
+    }
+    top_protein_type = str((answers or {}).get("protein_type") or "")
+    top_protein_portion = str((answers or {}).get("protein_portion") or "")
+    has_top_protein_answer = bool(
+        "protein_type" in (answers or {}) or "protein_portion" in (answers or {})
+    )
+    if has_top_protein_answer or raw_answer_items:
+        if top_protein_type == "none":
+            if top_protein_portion or raw_answer_items:
+                raise ValueError("蛋白質明細與主要回答不符")
+        elif (
+            top_protein_type not in valid_types
+            or top_protein_portion not in {*portion_ranges, "none", "unknown"}
+        ):
+            raise ValueError("蛋白質主要回答無效")
+        elif raw_answer_items:
+            first_answer_item = raw_answer_items[0]
+            if not isinstance(first_answer_item, Mapping) or (
+                str(first_answer_item.get("type") or "") != top_protein_type
+                or str(first_answer_item.get("portion") or "") != top_protein_portion
+            ):
+                raise ValueError("蛋白質明細與主要回答不符")
+    estimate_rule_version = str((estimate or {}).get("rule_version") or "")
+    total_is_v2 = bool(
+        isinstance(raw_protein_total, Mapping)
+        and raw_protein_total.get("basis") == "summed_hand_portion_ranges_v2"
+    )
+    v2_declared = bool(
+        len(raw_answer_items) >= 2
+        or raw_protein_items is not None
+        or estimate_rule_version == "hand-portion-range-v2"
+        or total_is_v2
+    )
+    if v2_declared and not (
+        2 <= len(raw_answer_items) <= 4
+        and isinstance(raw_protein_items, list)
+        and 2 <= len(raw_protein_items) <= 4
+        and estimate_rule_version == "hand-portion-range-v2"
+        and total_is_v2
+    ):
+        raise ValueError("複數蛋白質明細無效")
+    if has_top_protein_answer and not v2_declared:
+        if top_protein_type == "none" or top_protein_portion == "none":
+            expected_total = (0.0, 0.0, "user_confirmed_none")
+        elif top_protein_portion == "unknown":
+            raise ValueError("蛋白質份量仍為NA")
+        else:
+            expected_range = portion_ranges[top_protein_portion]
+            expected_total = (*expected_range, "hand_portion_range_v1")
+        if not isinstance(raw_protein_total, Mapping):
+            raise ValueError("蛋白質合計無效")
+        actual_total = (
+            _strict_json_number(raw_protein_total.get("min"), "protein_total.min", max_value=100),
+            _strict_json_number(raw_protein_total.get("max"), "protein_total.max", max_value=100),
+            raw_protein_total.get("basis"),
+        )
+        if actual_total != expected_total:
+            raise ValueError("蛋白質合計與主要回答不符")
+    if raw_protein_items is not None:
+        if not isinstance(raw_protein_items, list) or not 2 <= len(raw_protein_items) <= 4:
+            raise ValueError("複數蛋白質明細無效")
+        seen_types: set[str] = set()
+        for raw_item in raw_protein_items:
+            if not isinstance(raw_item, Mapping):
+                raise ValueError("複數蛋白質明細無效")
+            protein_type = str(raw_item.get("type") or "")
+            portion = str(raw_item.get("portion") or "")
+            exchange = raw_item.get("exchange")
+            expected_range = portion_ranges.get(portion)
+            if protein_type not in valid_types or expected_range is None or not isinstance(exchange, Mapping):
+                raise ValueError("複數蛋白質明細無效")
+            if protein_type in seen_types:
+                raise ValueError("複數蛋白質種類重複")
+            seen_types.add(protein_type)
+            item_min = _strict_json_number(exchange.get("min"), "protein_item.min", max_value=100)
+            item_max = _strict_json_number(exchange.get("max"), "protein_item.max", max_value=100)
+            if (
+                (item_min, item_max) != expected_range
+                or exchange.get("basis") != "hand_portion_range_v1"
+            ):
+                raise ValueError("複數蛋白質明細與份量不符")
+            protein_items.append({
+                "type": protein_type, "portion": portion,
+                "exchange": {
+                    "min": item_min, "max": item_max,
+                    "basis": "hand_portion_range_v1",
+                },
+            })
+        answer_items = [
+            {"type": str(item.get("type") or ""), "portion": str(item.get("portion") or "")}
+            for item in raw_answer_items
+            if isinstance(item, Mapping)
+        ]
+        if answer_items != [
+            {"type": item["type"], "portion": item["portion"]} for item in protein_items
+        ]:
+            raise ValueError("複數蛋白質明細與確認答案不符")
+        raw_total = (estimate or {}).get("protein_total_exchange")
+        if not isinstance(raw_total, Mapping):
+            raise ValueError("複數蛋白質合計無效")
+        total_min = _strict_json_number(raw_total.get("min"), "protein_total.min", max_value=100)
+        total_max = _strict_json_number(raw_total.get("max"), "protein_total.max", max_value=100)
+        if (
+            raw_total.get("basis") != "summed_hand_portion_ranges_v2"
+            or total_min != sum(item["exchange"]["min"] for item in protein_items)
+            or total_max != sum(item["exchange"]["max"] for item in protein_items)
+        ):
+            raise ValueError("複數蛋白質合計與明細不符")
+        protein_total_exchange = {
+            "min": total_min, "max": total_max,
+            "basis": "summed_hand_portion_ranges_v2",
+        }
     estimated_nutrition = estimate_nutrition_from_exchanges(values)
     estimated_nutrition_json = json.dumps(
         estimated_nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False
     )
     categories = [key for key in EXCHANGE_KEYS if values[key] > 0]
-    rule_version = "meal-photo-admin-v1"
+    rule_version = "meal-photo-admin-v2"
     approved_payload: dict[str, Any] = {
         **values,
         "_review_status": "approved",
@@ -1893,6 +2276,9 @@ def insert_approved_meal_photo_log(
         "_approved_at": approved_at,
         "_source_type": "meal_photo",
     }
+    if protein_items:
+        approved_payload["protein_items"] = protein_items
+        approved_payload["protein_total_exchange"] = protein_total_exchange
     approved_json = json.dumps(
         approved_payload, ensure_ascii=False, sort_keys=True, allow_nan=False
     )
@@ -2253,9 +2639,16 @@ def approve_food_exchange_suggestion(
             ).fetchone()
             if not approval:
                 raise ValueError("核准紀錄遺失，已停止套用")
-            approved_payload = json.loads(approval[2] or "{}")
+            parsed_approved_payload = _json_object_or_none(approval[2])
+            if parsed_approved_payload is None:
+                raise ValueError("核准紀錄驗證失敗，已停止套用")
+            approved_payload = parsed_approved_payload
             expected_hash = exchange_approval_hash(approval[4], approval[1], approved_payload)
-            if approval[4] != fingerprint or not secrets.compare_digest(approval[3], expected_hash):
+            if (
+                approval[4] != fingerprint
+                or not exchange_approval_payload_is_valid(approval[1], approved_payload)
+                or not secrets.compare_digest(approval[3], expected_hash)
+            ):
                 raise ValueError("核准紀錄驗證失敗，已停止套用")
             conn.commit()
             return {
@@ -2393,18 +2786,31 @@ def daily_consumed_totals(
         params.append(meal_slot)
     rows = conn.execute(sql, params).fetchall()
     for nutrition_json, applied_json, approval_id, consumed_servings, approval_fingerprint, rule_version, approved_json, approval_hash, food_fp, source_type in rows:
-        nutrition_data = json.loads(nutrition_json or "{}")
         if source_type != "user_meal_photo":
+            nutrition_data = _json_object_or_none(nutrition_json) or {}
             for key, value in nutrition_data.items():
                 if key in totals:
                     totals[key] += float(value or 0)
         if not approval_id or not approval_fingerprint or approval_fingerprint != food_fp:
             continue
-        approved_data = json.loads(approved_json or "{}")
-        expected_hash = exchange_approval_hash(approval_fingerprint, rule_version, approved_data)
-        if not secrets.compare_digest(str(approval_hash or ""), expected_hash):
+        approved_data = _json_object_or_none(approved_json)
+        if approved_data is None:
             continue
-        applied_data = json.loads(applied_json or "{}")
+        expected_hash = exchange_approval_hash(approval_fingerprint, rule_version, approved_data)
+        if (
+            not exchange_approval_payload_is_valid(rule_version, approved_data)
+            or not secrets.compare_digest(str(approval_hash or ""), expected_hash)
+        ):
+            continue
+        applied_data = _json_object_or_none(applied_json)
+        if applied_data is None:
+            continue
+        if not exchange_approval_payload_is_valid(rule_version, applied_data):
+            continue
+        if not exchange_applied_payload_matches_approval_hash(
+            approval_fingerprint, rule_version, applied_data, consumed_servings, approval_hash
+        ):
+            continue
         expected_applied = {
             key: round(float(approved_data.get(key, 0) or 0) * float(consumed_servings or 0), 4)
             for key in EXCHANGE_KEYS
@@ -2417,7 +2823,8 @@ def daily_consumed_totals(
         for key, value in expected_applied.items():
             totals[key] += value
         if source_type == "user_meal_photo":
-            for key, value in nutrition_data.items():
+            estimated = estimate_nutrition_from_exchanges(applied_data)
+            for key, value in estimated.items():
                 if key in totals:
                     totals[key] += float(value or 0)
     return {key: round(value, 4) for key, value in totals.items()}
@@ -2432,7 +2839,7 @@ def daily_food_summary(
         SELECT l.consumed_at,f.product_name,l.nutrition_snapshot_json,
                l.exchange_approval_id,a.food_fingerprint,a.suggestion_rule_version,
                a.approved_exchange_json,a.approved_exchange_hash,f.fingerprint,
-               l.approved_exchange_json,l.consumed_servings
+               l.approved_exchange_json,l.consumed_servings,f.source_type
         FROM food_logs l
         JOIN food_catalog f ON f.food_id=l.food_id
         LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
@@ -2447,9 +2854,9 @@ def daily_food_summary(
     for (
         consumed_at, product_name, nutrition_json, approval_id, approval_fingerprint,
         rule_version, approved_json, approval_hash, food_fingerprint_value,
-        applied_json, consumed_servings,
+        applied_json, consumed_servings, source_type,
     ) in rows:
-        nutrition = json.loads(nutrition_json or "{}")
+        nutrition = _json_object_or_none(nutrition_json) or {}
         try:
             consumed_dt = datetime.fromisoformat(str(consumed_at))
             if consumed_dt.tzinfo is None:
@@ -2459,6 +2866,50 @@ def daily_food_summary(
             consumed_time = consumed_dt.strftime("%H:%M")
         except ValueError:
             consumed_time = str(consumed_at)[11:16] if len(str(consumed_at)) >= 16 else "--:--"
+        valid_approval = False
+        applied_data = None
+        if approval_id and approval_fingerprint and approval_fingerprint == food_fingerprint_value:
+            approved_data = _json_object_or_none(approved_json)
+            applied_data = _json_object_or_none(applied_json)
+            if approved_data is not None and applied_data is not None:
+                expected_hash = exchange_approval_hash(
+                    approval_fingerprint, rule_version, approved_data
+                )
+                if (
+                    exchange_approval_payload_is_valid(rule_version, approved_data)
+                    and exchange_approval_payload_is_valid(rule_version, applied_data)
+                    and secrets.compare_digest(str(approval_hash or ""), expected_hash)
+                ):
+                    try:
+                        expected_applied = {
+                            key: round(
+                                float(approved_data.get(key, 0) or 0)
+                                * float(consumed_servings or 0),
+                                4,
+                            )
+                            for key in EXCHANGE_KEYS
+                        }
+                        valid_approval = all(
+                            abs(float(applied_data.get(key, 0) or 0) - value) <= 0.0001
+                            for key, value in expected_applied.items()
+                        )
+                    except (TypeError, ValueError):
+                        valid_approval = False
+                if valid_approval:
+                    valid_approval = exchange_applied_payload_matches_approval_hash(
+                        approval_fingerprint,
+                        rule_version,
+                        applied_data,
+                        consumed_servings,
+                        approval_hash,
+                    )
+        if not valid_approval:
+            pending_reviews += 1
+        if source_type == "user_meal_photo":
+            nutrition = (
+                estimate_nutrition_from_exchanges(applied_data)
+                if valid_approval and applied_data is not None else {}
+            )
         foods.append(
             {
                 "time": consumed_time,
@@ -2468,27 +2919,6 @@ def daily_food_summary(
                 "protein_g": float(nutrition.get("protein_g", 0) or 0),
             }
         )
-        valid_approval = False
-        if approval_id and approval_fingerprint and approval_fingerprint == food_fingerprint_value:
-            approved_data = json.loads(approved_json or "{}")
-            expected_hash = exchange_approval_hash(
-                approval_fingerprint, rule_version, approved_data
-            )
-            expected_applied = {
-                key: round(
-                    float(approved_data.get(key, 0) or 0) * float(consumed_servings or 0), 4
-                )
-                for key in EXCHANGE_KEYS
-            }
-            applied_data = json.loads(applied_json or "{}")
-            valid_approval = secrets.compare_digest(
-                str(approval_hash or ""), expected_hash
-            ) and all(
-                abs(float(applied_data.get(key, 0) or 0) - value) <= 0.0001
-                for key, value in expected_applied.items()
-            )
-        if not valid_approval:
-            pending_reviews += 1
     return {
         "foods": foods,
         "totals": daily_consumed_totals(conn, user_id=user_id, date_iso=date_iso),

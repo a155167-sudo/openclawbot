@@ -4048,7 +4048,8 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
         ), start=1):
             apply_meal_photo_action(
@@ -4058,7 +4059,7 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     replies = []
     monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, message: replies.append(message))
     event = SimpleNamespace(
-        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        postback=SimpleNamespace(data=f"mp:v1:{token}:8:answer:sauce_level:half"),
         source=SimpleNamespace(user_id="U_MEAL"), reply_token="reply-final",
         webhook_event_id="WEBHOOK-FINAL", timestamp=1784740620000,
     )
@@ -4069,7 +4070,7 @@ def test_meal_photo_postback_finalizes_estimate(tmp_path, monkeypatch):
     estimate_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
     assert "照片估算" in estimate_text
     assert "審核並加入" in estimate_text
-    assert f"mpr:v1:{token}:8:start" in estimate_text
+    assert f"mpr:v1:{token}:9:start" in estimate_text
     with sqlite3.connect(db) as conn:
         draft = get_meal_photo_draft(conn, user_id="U_MEAL", token=token)
     assert draft["status"] == "estimated"
@@ -4090,7 +4091,8 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
         ), start=1):
             apply_meal_photo_action(
@@ -4115,7 +4117,7 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
         ),
     )
     event = SimpleNamespace(
-        postback=SimpleNamespace(data=f"mp:v1:{token}:7:answer:sauce_level:half"),
+        postback=SimpleNamespace(data=f"mp:v1:{token}:8:answer:sauce_level:half"),
         source=SimpleNamespace(user_id="U_CUSTOMER"), reply_token="reply-customer-final",
         webhook_event_id="WEBHOOK-CUSTOMER-FINAL", timestamp=1784740620000,
     )
@@ -4137,7 +4139,7 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
         [json.loads(str(message)) for message in admin_payload], ensure_ascii=False
     )
     assert "新的餐點審核需求" in admin_text
-    assert f"mpr:v1:{token}:8:start" in admin_text
+    assert f"mpr:v1:{token}:9:start" in admin_text
 
 
 def test_meal_photo_review_photo_failure_falls_back_to_text_and_card(monkeypatch):
@@ -4624,7 +4626,8 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         ), start=1):
@@ -4639,7 +4642,7 @@ def test_pending_meal_photo_admin_command_lists_cross_user_review_buttons(tmp_pa
     assert "待審餐點（1筆" in message.text
     assert "U_CUSTOMER"[-8:] in message.text
     actions = [item.action.data for item in message.quick_reply.items]
-    assert actions == [f"mpr:v1:{token}:8:start"]
+    assert actions == [f"mpr:v1:{token}:9:start"]
     with sqlite3.connect(db) as conn:
         conn.execute(
             """UPDATE pending_meal_photo_drafts
@@ -4665,7 +4668,8 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "one_half_bowl"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "one_half_bowl"),
             ("vegetable_portion", "none"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         ), start=1):
@@ -4690,22 +4694,22 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
         server.handle_meal_photo_postback(event)
         return replies[-1]
 
-    first = send(f"mpr:v1:{token}:8:start", "ADMIN-START")
+    first = send(f"mpr:v1:{token}:9:start", "ADMIN-START")
     assert "蛋白質分類" in first.text
-    assert any(":9:set:protein_class:medium" in item.action.data for item in first.quick_reply.items)
-    resumed_step = send(f"mpr:v1:{token}:9:resume", "ADMIN-RESUME")
+    assert any(":10:set:protein_class:medium" in item.action.data for item in first.quick_reply.items)
+    resumed_step = send(f"mpr:v1:{token}:10:resume", "ADMIN-RESUME")
     assert "蛋白質分類" in resumed_step.text
-    assert any(":9:set:protein_class:medium" in item.action.data for item in resumed_step.quick_reply.items)
-    send(f"mpr:v1:{token}:9:set:protein_class:medium", "ADMIN-CLASS")
-    send(f"mpr:v1:{token}:10:set:protein_exchange:2.5", "ADMIN-PROTEIN")
-    send(f"mpr:v1:{token}:11:set:starch_exchange:6", "ADMIN-STARCH")
-    send(f"mpr:v1:{token}:12:set:milk_exchange:0", "ADMIN-MILK")
-    ready = send(f"mpr:v1:{token}:13:set:fruit_exchange:0", "ADMIN-FRUIT")
+    assert any(":10:set:protein_class:medium" in item.action.data for item in resumed_step.quick_reply.items)
+    send(f"mpr:v1:{token}:10:set:protein_class:medium", "ADMIN-CLASS")
+    send(f"mpr:v1:{token}:11:set:protein_exchange:2.5", "ADMIN-PROTEIN")
+    send(f"mpr:v1:{token}:12:set:starch_exchange:6", "ADMIN-STARCH")
+    send(f"mpr:v1:{token}:13:set:milk_exchange:0", "ADMIN-MILK")
+    ready = send(f"mpr:v1:{token}:14:set:fruit_exchange:0", "ADMIN-FRUIT")
     ready_text = json.dumps(json.loads(str(ready.contents)), ensure_ascii=False)
     assert "最終核准份量" in ready_text
-    assert f"mpr:v1:{token}:14:approve" in ready_text
+    assert f"mpr:v1:{token}:15:approve" in ready_text
 
-    done = send(f"mpr:v1:{token}:14:approve", "ADMIN-APPROVE")
+    done = send(f"mpr:v1:{token}:15:approve", "ADMIN-APPROVE")
     done_text = json.dumps(json.loads(str(done.contents)), ensure_ascii=False)
     assert "已核准｜已計入正式份量" in done_text
     assert '"主食"' in done_text and '"6份"' in done_text
@@ -4719,7 +4723,7 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     assert pushes and pushes[-1][0] == "U_CUSTOMER"
     assert "已由營養師核准" in pushes[-1][1].text
     push_count = len(pushes)
-    replayed_done = send(f"mpr:v1:{token}:14:approve", "ADMIN-APPROVE")
+    replayed_done = send(f"mpr:v1:{token}:15:approve", "ADMIN-APPROVE")
     assert "已核准｜已計入正式份量" in json.dumps(
         json.loads(str(replayed_done.contents)), ensure_ascii=False
     )
@@ -4728,6 +4732,40 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
         assert daily_consumed_totals(
             conn, user_id="U_CUSTOMER", date_iso="2026-07-23"
         )["starch_exchange"] == 6.0
+        food_id, log_id, approval_id = conn.execute(
+            "SELECT food_id,log_id,exchange_approval_id FROM food_logs "
+            "WHERE user_id='U_CUSTOMER'"
+        ).fetchone()
+        conn.execute(
+            "UPDATE food_exchange_approvals SET approved_exchange_json='[]' WHERE approval_id=?",
+            (approval_id,),
+        )
+        conn.commit()
+
+    with sqlite3.connect(db) as conn:
+        server.ensure_daily_food_ledger_schema(conn)
+        ledger_item = server._ledger_item_from_row(
+            server._daily_food_rows(conn, "U_CUSTOMER", "2026-07-23")[0]
+        )
+    assert ledger_item["nutrition"] == {}
+
+    sheet_rows = {}
+
+    class IntegritySheet:
+        def __init__(self, title):
+            self.title = title
+
+        def find(self, *_args, **_kwargs):
+            return None
+
+        def append_row(self, values, **_kwargs):
+            sheet_rows[self.title] = values
+
+    monkeypatch.setattr(server, "_nutrition_ws", lambda title: IntegritySheet(title))
+    server._sync_food_outbox(food_id)
+    server._sync_food_log_outbox(log_id)
+    assert sheet_rows["食品資料庫"][25] == "pending_review"
+    assert sheet_rows["飲食紀錄"][16:24] == [0] * 8
 
 
 def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(tmp_path, monkeypatch):
@@ -4742,7 +4780,8 @@ def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(t
         )
         for index, (field, value) in enumerate((
             ("scope", "visible_only"), ("protein_type", "chicken"),
-            ("protein_portion", "one_palm"), ("starch_portion", "none"),
+            ("protein_portion", "one_palm"), ("protein_more", "done"),
+            ("starch_portion", "none"),
             ("vegetable_portion", "two_bowl"), ("cooking_oil", "light"),
             ("sauce_level", "half"),
         ), start=1):
@@ -4759,12 +4798,12 @@ def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(t
         ),
     )
     server.handle_meal_photo_postback(SimpleNamespace(
-        postback=SimpleNamespace(data=f"mpr:v1:{token}:8:start"),
+        postback=SimpleNamespace(data=f"mpr:v1:{token}:9:start"),
         source=SimpleNamespace(user_id="U_ADMIN"), reply_token="reject-start",
         webhook_event_id="REJECT-START", timestamp=1784740620000,
     ))
     server.handle_meal_photo_postback(SimpleNamespace(
-        postback=SimpleNamespace(data=f"mpr:v1:{token}:9:reject"),
+        postback=SimpleNamespace(data=f"mpr:v1:{token}:10:reject"),
         source=SimpleNamespace(user_id="U_ADMIN"), reply_token="reject-final",
         webhook_event_id="REJECT-FINAL", timestamp=1784740620001,
     ))
@@ -6108,6 +6147,131 @@ def test_dashboard_counts_approved_meal_photo_estimates_once_including_legacy_na
     replayed_dashboard = server.get_dashboard_data("U1")
     assert replayed_dashboard["extra_cal"] == 293.0
     assert replayed_dashboard["extra_pro"] == 24.0
+
+    with sqlite3.connect(db) as conn:
+        log_id, approval_id, food_fingerprint, approved_json = conn.execute(
+            """SELECT fl.log_id,a.approval_id,a.food_fingerprint,a.approved_exchange_json
+               FROM food_logs fl JOIN food_exchange_approvals a
+                 ON a.approval_id=fl.exchange_approval_id
+               WHERE fl.source_image_ref='photo.jpg'"""
+        ).fetchone()
+        v2_hash = server.exchange_approval_hash(
+            food_fingerprint, "meal-photo-admin-v2", json.loads(approved_json)
+        )
+        restored_nutrition = server.estimate_nutrition_from_exchanges(
+            json.loads(approved_json)
+        )
+        conn.execute(
+            """UPDATE food_exchange_approvals
+               SET suggestion_rule_version='meal-photo-admin-v2',approved_exchange_hash=?
+               WHERE approval_id=?""",
+            (v2_hash, approval_id),
+        )
+        conn.execute(
+            "UPDATE food_logs SET nutrition_snapshot_json=? WHERE log_id=?",
+            (json.dumps(restored_nutrition, ensure_ascii=False), log_id),
+        )
+        conn.commit()
+
+    serving_edit = server.apply_daily_food_log_edit(
+        user_id="U1", log_id=log_id, expected_version=1,
+        event_id="photo-serving-2", action="set_servings", value=2,
+    )
+    assert serving_edit["servings"] == 2
+    assert serving_edit["nutrition"]["_estimate_type"] == "approved_exchange_estimate"
+    assert serving_edit["nutrition"]["_rule_version"] == "tw-exchange-macros-v1"
+    with sqlite3.connect(db) as conn:
+        applied = json.loads(conn.execute(
+            "SELECT approved_exchange_json FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0])
+    assert applied["protein_medium_exchange"] == 4.0
+    assert applied["starch_exchange"] == 2.0
+    assert applied["vegetable_exchange"] == 2.0
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE food_logs SET nutrition_snapshot_json=? WHERE log_id=?""",
+            (json.dumps({"calories_kcal": 999999, "protein_g": 888888}), log_id),
+        )
+        conn.commit()
+        totals = daily_consumed_totals(
+            conn, user_id="U1", date_iso=server.tw_today().isoformat()
+        )
+        summary = server.daily_food_summary(
+            conn, user_id="U1", date_iso=server.tw_today().isoformat()
+        )
+    assert totals["calories_kcal"] == 531.0
+    assert totals["protein_g"] == 41.0
+    assert totals["protein_medium_exchange"] == 4.0
+    assert totals["starch_exchange"] == 2.0
+    assert totals["vegetable_exchange"] == 2.0
+    assert summary["pending_reviews"] == 0
+    summary_item = next(
+        item for item in summary["foods"] if item["name"] == "餐點照片：雞胸肉、青花菜"
+    )
+    assert summary_item["calories_kcal"] == 476.0
+    assert summary_item["protein_g"] == 34.0
+    ledger = server.get_daily_food_ledger("U1", server.tw_today().isoformat())
+    edited_item = next(item for item in ledger["items"] if item["log_id"] == log_id)
+    assert edited_item["servings"] == 2.0
+    assert edited_item["nutrition"]["calories_kcal"] == 476.0
+    assert edited_item["nutrition"]["protein_g"] == 34.0
+
+    class _Rows:
+        def __init__(self):
+            self.data = []
+
+        def find(self, _entity_id, in_column=None):
+            return None
+
+        def append_row(self, values, value_input_option=None):
+            self.data.append(values)
+
+    outbox_rows = _Rows()
+    monkeypatch.setattr(server, "_nutrition_ws", lambda _title: outbox_rows)
+    server._sync_food_log_outbox(log_id)
+    assert outbox_rows.data[0][9] == 476.0
+    assert outbox_rows.data[0][10] == 34.0
+    assert outbox_rows.data[0][18] == 4.0
+    assert outbox_rows.data[0][20] == 2.0
+    assert outbox_rows.data[0][21] == 2.0
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE food_logs SET nutrition_snapshot_json='{' WHERE log_id=?", (log_id,)
+        )
+        conn.commit()
+    malformed_ledger = server.get_daily_food_ledger(
+        "U1", server.tw_today().isoformat()
+    )
+    malformed_item = next(
+        item for item in malformed_ledger["items"] if item["log_id"] == log_id
+    )
+    assert malformed_item["nutrition"]["calories_kcal"] == 476.0
+    outbox_rows.data.clear()
+    server._sync_food_log_outbox(log_id)
+    assert outbox_rows.data[0][9] == 476.0
+    assert outbox_rows.data[0][10] == 34.0
+    assert outbox_rows.data[0][18] == 4.0
+
+    doubled_dashboard = server.get_dashboard_data("U1")
+    assert set(doubled_dashboard["food_list"]) == {
+        "餐點照片：雞胸肉、青花菜",
+        "餐點照片：UTC跨日雞胸",
+    }
+    assert doubled_dashboard["recorded_count"] == 2
+    assert doubled_dashboard["extra_cal"] == 531.0
+    assert doubled_dashboard["extra_pro"] == 41.0
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE food_logs SET approved_exchange_json='[]' WHERE source_image_ref='photo.jpg'"
+        )
+        conn.commit()
+    tampered_dashboard = server.get_dashboard_data("U1")
+    assert tampered_dashboard["food_list"] == ["餐點照片：UTC跨日雞胸"]
+    assert tampered_dashboard["recorded_count"] == 1
+    assert tampered_dashboard["extra_cal"] == 55.0
+    assert tampered_dashboard["extra_pro"] == 7.0
 
 
 def test_dashboard_without_profile_excludes_deleted_confirmed_photo(tmp_path, monkeypatch):

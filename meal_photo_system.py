@@ -12,7 +12,11 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
-from nutrition_system import ensure_nutrition_schema, insert_approved_meal_photo_log
+from nutrition_system import (
+    _confirmed_result,
+    ensure_nutrition_schema,
+    insert_approved_meal_photo_log,
+)
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
@@ -23,6 +27,9 @@ ANSWER_VALUES = {
     "scope": {"visible_only", "has_unseen", "unknown"},
     "protein_type": {"chicken", "pork", "fish", "egg", "tofu", "other", "none", "unknown"},
     "protein_portion": {"half_palm", "one_palm", "one_half_palm", "two_palm", "none", "unknown"},
+    "protein_more": {"done", "add"},
+    "protein_extra_type": {"chicken", "pork", "fish", "egg", "tofu", "other", "unknown"},
+    "protein_extra_portion": {"half_palm", "one_palm", "one_half_palm", "two_palm", "unknown"},
     "starch_portion": {"none", "half_bowl", "one_bowl", "one_half_bowl", "two_bowl", "unseen_unknown", "unknown"},
     "vegetable_portion": {"none", "half_bowl", "one_bowl", "one_half_bowl", "two_bowl", "three_bowl", "unknown"},
     "cooking_oil": {"none", "light", "normal", "heavy", "unknown"},
@@ -212,8 +219,10 @@ def ensure_meal_photo_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _blank_answers() -> dict[str, str | None]:
-    return {field: None for field in ANSWER_VALUES}
+def _blank_answers() -> dict[str, Any]:
+    answers: dict[str, Any] = {field: None for field in ANSWER_VALUES}
+    answers["protein_items"] = []
+    return answers
 
 
 def _expired(expires_at: str) -> bool:
@@ -569,12 +578,21 @@ def daily_pending_meal_photo_count(
 
 def next_meal_photo_step(draft: Mapping[str, Any]) -> str:
     answers = {**_blank_answers(), **dict(draft.get("answers") or {})}
-    for field in (
-        "scope", "protein_type", "protein_portion", "starch_portion",
-        "vegetable_portion", "cooking_oil", "sauce_level",
-    ):
-        if field == "protein_portion" and answers.get("protein_type") == "none":
-            continue
+    for field in ("scope", "protein_type"):
+        if answers.get(field) is None:
+            return field
+    if answers.get("protein_type") != "none":
+        if answers.get("protein_portion") is None:
+            return "protein_portion"
+        if answers.get("protein_portion") != "none":
+            if answers.get("protein_more") is None:
+                return "protein_more"
+            if answers.get("protein_more") == "add":
+                if answers.get("protein_extra_type") is None:
+                    return "protein_extra_type"
+                if answers.get("protein_extra_portion") is None:
+                    return "protein_extra_portion"
+    for field in ("starch_portion", "vegetable_portion", "cooking_oil", "sauce_level"):
         if answers.get(field) is None:
             return field
     return "complete"
@@ -591,6 +609,17 @@ STEP_OPTIONS = {
         ("半個手掌", "half_palm"), ("1個手掌", "one_palm"),
         ("1.5個手掌", "one_half_palm"), ("2個手掌", "two_palm"),
         ("沒有", "none"), ("不確定", "unknown"),
+    ],
+    "protein_more": [("就這一種", "done"), ("＋還有其他蛋白質", "add")],
+    "protein_extra_type": [
+        ("雞肉", "chicken"), ("豬肉", "pork"), ("魚類", "fish"),
+        ("蛋", "egg"), ("豆製品", "tofu"), ("其他", "other"),
+        ("不確定", "unknown"),
+    ],
+    "protein_extra_portion": [
+        ("半個手掌", "half_palm"), ("1個手掌", "one_palm"),
+        ("1.5個手掌", "one_half_palm"), ("2個手掌", "two_palm"),
+        ("不確定", "unknown"),
     ],
     "starch_portion": [
         ("沒有吃主食", "none"), ("半碗", "half_bowl"), ("1碗", "one_bowl"),
@@ -660,14 +689,37 @@ def _range_value(field: str, value: str | None, *, confirmed_none: bool = False)
 
 def _estimate_from_answers(answers: Mapping[str, Any]) -> dict[str, Any]:
     protein_none = answers.get("protein_type") == "none"
-    return {
+    protein_items = list(answers.get("protein_items") or [])
+    if not protein_none and not protein_items:
+        protein_items = [{
+            "type": answers.get("protein_type"),
+            "portion": answers.get("protein_portion"),
+        }]
+    estimated_items = []
+    for item in protein_items:
+        exchange = _range_value("protein_portion", item.get("portion"))
+        estimated_items.append({
+            "type": item.get("type"), "portion": item.get("portion"),
+            "exchange": exchange,
+        })
+    if protein_none:
+        protein_total = _range_value("protein_portion", None, confirmed_none=True)
+    elif any(item["exchange"] is None for item in estimated_items):
+        protein_total = None
+    elif len(estimated_items) == 1:
+        protein_total = estimated_items[0]["exchange"]
+    else:
+        protein_total = {
+            "min": round(sum(item["exchange"]["min"] for item in estimated_items), 4),
+            "max": round(sum(item["exchange"]["max"] for item in estimated_items), 4),
+            "basis": "summed_hand_portion_ranges_v2",
+        }
+    estimate = {
         "calories_kcal": None,
         "protein_g": None,
         "fat_g": None,
         "carbohydrate_g": None,
-        "protein_total_exchange": _range_value(
-            "protein_portion", answers.get("protein_portion"), confirmed_none=protein_none
-        ),
+        "protein_total_exchange": protein_total,
         "starch_exchange": _range_value("starch_portion", answers.get("starch_portion")),
         "vegetable_exchange": _range_value("vegetable_portion", answers.get("vegetable_portion")),
         "cooking_oil_confirmation": answers.get("cooking_oil"),
@@ -675,6 +727,10 @@ def _estimate_from_answers(answers: Mapping[str, Any]) -> dict[str, Any]:
         "formal_status": "pending_review_not_counted",
         "rule_version": "hand-portion-range-v1",
     }
+    if len(estimated_items) > 1:
+        estimate["protein_items"] = estimated_items
+        estimate["rule_version"] = "hand-portion-range-v2"
+    return estimate
 
 
 def apply_meal_photo_action(
@@ -855,6 +911,38 @@ def apply_meal_photo_action(
             if field != expected_step:
                 raise ValueError("餐點確認步驟不符，請使用最新按鈕")
             answers[field] = value
+            if field == "protein_more" and value == "done":
+                if not answers.get("protein_items"):
+                    answers["protein_items"] = [{
+                        "type": answers.get("protein_type"),
+                        "portion": answers.get("protein_portion"),
+                    }]
+            elif field == "protein_extra_type":
+                selected = {
+                    str(item.get("type"))
+                    for item in answers.get("protein_items") or []
+                    if isinstance(item, Mapping)
+                }
+                selected.add(str(answers.get("protein_type")))
+                if value in selected:
+                    raise ValueError("這種蛋白質已經選過")
+            elif field == "protein_extra_portion":
+                items = list(answers.get("protein_items") or [])
+                if not items:
+                    items.append({
+                        "type": answers.get("protein_type"),
+                        "portion": answers.get("protein_portion"),
+                    })
+                if len(items) >= 4:
+                    raise ValueError("一餐最多記錄4種蛋白質")
+                items.append({
+                    "type": answers.get("protein_extra_type"),
+                    "portion": value,
+                })
+                answers["protein_items"] = items
+                answers["protein_more"] = "done" if len(items) >= 4 else None
+                answers["protein_extra_type"] = None
+                answers["protein_extra_portion"] = None
             step = next_meal_photo_step({"answers": answers})
             if step == "complete":
                 estimate = _estimate_from_answers(answers)
@@ -1065,6 +1153,18 @@ def apply_meal_photo_review_action(
             ):
                 raise ValueError("餐點審核事件識別碼衝突")
             result = json.loads(existing[4])
+            if action == "approve":
+                if not isinstance(result, dict):
+                    raise ValueError("餐點核准重播紀錄驗證失敗")
+                confirmed = _confirmed_result(
+                    conn, str(result.get("log_id") or ""), already_confirmed=True
+                )
+                confirmed_log = confirmed.get("log") or {}
+                if (
+                    confirmed_log.get("exchange_review_status") != "approved"
+                    or confirmed_log.get("exchange_approval_id") != result.get("approval_id")
+                ):
+                    raise ValueError("餐點核准重播紀錄驗證失敗")
             conn.commit()
             return {
                 "replayed": True, "result": result,
@@ -1146,6 +1246,7 @@ def apply_meal_photo_review_action(
                 conn, token=token, user_id=user_id, reviewer=admin_user_id,
                 consumed_at=row[9], meal_slot=row[8], source_image_ref=row[7],
                 observed_payload=observed, answers=answers, exact_exchange=exact,
+                estimate=estimate,
             )
             status = "approved"
             result = {
@@ -1216,6 +1317,20 @@ def build_meal_photo_estimate_bubble(
         "none": "沒有", "little": "少量", "half": "約一半",
         "all": "全部", "unknown": "NA（不確定）",
     }.get(str(estimate.get("sauce_confirmation") or ""), "NA（待確認）")
+    protein_type_labels = {
+        "chicken": "雞肉", "pork": "豬肉", "fish": "魚類", "egg": "蛋",
+        "tofu": "豆製品", "other": "其他蛋白質", "unknown": "不確定蛋白質",
+    }
+    protein_items = estimate.get("protein_items")
+    protein_lines = []
+    protein_total_label = "蛋白質食物"
+    if isinstance(protein_items, list) and len(protein_items) > 1:
+        for item in protein_items:
+            if not isinstance(item, Mapping):
+                continue
+            label = protein_type_labels.get(str(item.get("type") or ""), "蛋白質")
+            protein_lines.append(line(_format_exchange_range(item.get("exchange"), label)))
+        protein_total_label = "蛋白質食物合計"
     bubble = {
         "type": "bubble",
         "header": {
@@ -1227,7 +1342,10 @@ def build_meal_photo_estimate_bubble(
             "contents": [
                 line("熱量：NA（沒有營養標示，無法精確判定）", "#B00020"),
                 line(_format_exchange_range(estimate.get("starch_exchange"), "主食")),
-                line(_format_exchange_range(estimate.get("protein_total_exchange"), "蛋白質食物")),
+                *protein_lines,
+                line(_format_exchange_range(
+                    estimate.get("protein_total_exchange"), protein_total_label
+                )),
                 line(_format_exchange_range(estimate.get("vegetable_exchange"), "蔬菜")),
                 line(f"烹調用油：{oil_text}（使用者確認）"),
                 line(f"湯汁／醬汁：{sauce_text}（使用者確認）"),
