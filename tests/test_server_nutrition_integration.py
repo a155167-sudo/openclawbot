@@ -17,6 +17,8 @@ os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy")
 
 import server
 from nutrition_system import (
+    _confirmed_result,
+    confirm_user_meal_photo_revision,
     confirm_pending_label,
     daily_consumed_totals,
     ensure_nutrition_schema,
@@ -27,13 +29,19 @@ from nutrition_system import (
     update_pending_consumption,
     utcish_now,
 )
-from daily_health_report import ensure_daily_health_schema, get_daily_health_checkin
+from daily_health_report import (
+    ensure_daily_health_schema,
+    format_daily_health_report,
+    get_daily_health_checkin,
+)
 from meal_photo_system import (
     apply_meal_photo_action,
+    create_meal_photo_revision_draft,
     ensure_meal_photo_schema,
     get_meal_photo_draft,
     save_meal_photo_draft,
 )
+from test_meal_photo_system import _answer_all, ai_estimated_payload, sample_payload
 
 
 class FakeWorksheet:
@@ -4860,6 +4868,33 @@ def test_food_log_sheet_exports_exchange_only_after_approval(tmp_path, monkeypat
     assert captured[-1][1][16:24] == [0] * 8
 
 
+def test_ordinary_approved_catalog_sheet_remains_valid_without_a_food_log(tmp_path, monkeypatch):
+    db = tmp_path / "catalog-without-log.db"
+    with sqlite3.connect(db) as conn:
+        ensure_nutrition_schema(conn)
+        token = save_pending_label(conn, user_id="U_CATALOG", payload=valid_label())
+        confirmed = confirm_pending_label(conn, token=token, user_id="U_CATALOG")
+        food_id = confirmed["food"]["food_id"]
+        server.approve_food_exchange_suggestion(conn, food_id=food_id, reviewer="ADMIN")
+        conn.execute("DELETE FROM food_logs WHERE food_id=?", (food_id,))
+        conn.commit()
+
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    captured = []
+    monkeypatch.setattr(server, "_nutrition_ws", lambda _: object())
+    monkeypatch.setattr(
+        server, "_upsert_raw_sheet_row",
+        lambda _ws, entity_id, values: captured.append((entity_id, values)),
+    )
+
+    server._sync_food_outbox(food_id)
+
+    assert captured[-1][0] == food_id
+    assert captured[-1][1][18] == 2.71
+    assert captured[-1][1][21] == 0.53
+    assert captured[-1][1][25] == "approved"
+
+
 def test_jason_health_checkin_is_admin_scoped_and_saved_for_taipei_date(tmp_path, monkeypatch):
     db = tmp_path / "health-checkin.db"
     with sqlite3.connect(db) as conn:
@@ -6741,8 +6776,9 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
     monkeypatch.setattr(server, "_nutrition_ws", lambda title: IntegritySheet(title))
     server._sync_food_outbox(food_id)
     server._sync_food_log_outbox(log_id)
-    assert sheet_rows["食品資料庫"][25] == "pending_review"
-    assert sheet_rows["飲食紀錄"][16:24] == [0] * 8
+    assert sheet_rows["食品資料庫"][10:25] == [""] * 15
+    assert sheet_rows["食品資料庫"][25] == "integrity_verification_failed"
+    assert sheet_rows["飲食紀錄"][9:24] == [""] * 15
 
 
 def test_admin_meal_photo_reject_returns_result_to_customer_without_formal_log(tmp_path, monkeypatch):
@@ -8033,6 +8069,633 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
         assert len(rows) == 3
         assert all(r[0] == "早餐" for r in rows)
     assert refresh_users == ["U1"]
+
+
+def _confirm_dashboard_ai_photo(
+    conn, *, user_id="U-AI-DASHBOARD", source_message_id="AI-DASHBOARD-1",
+    consumed_at, calories=680, protein=35,
+):
+    payload = ai_estimated_payload()
+    payload["ai_estimate"]["calories_kcal"] = {
+        "estimate": calories, "min": max(0, calories - 100), "max": calories + 120,
+    }
+    payload["ai_estimate"]["protein_g"] = {
+        "estimate": protein, "min": max(0, protein - 6), "max": protein + 8,
+    }
+    token = save_meal_photo_draft(
+        conn, user_id=user_id, source_message_id=source_message_id,
+        payload=payload, source_image_ref=f"nutrition-image:{source_message_id}.jpg",
+        meal_slot="午餐", consumed_at=consumed_at,
+        workflow_version="user_confirmed_ai_nutrition_v2",
+    )
+    draft = get_meal_photo_draft(conn, user_id=user_id, token=token)
+    confirmed = apply_meal_photo_action(
+        conn, event_id=f"CONFIRM-{source_message_id}", user_id=user_id, token=token,
+        expected_version=draft["version"], action="confirm_estimate",
+    )
+    return confirmed["result"]["log_id"]
+
+
+def _dashboard_revision_estimate(conn, log_id, *, calories, protein):
+    estimate = json.loads(conn.execute(
+        "SELECT exchange_snapshot_json FROM food_logs WHERE log_id=?", (log_id,)
+    ).fetchone()[0])
+    estimate["calories_kcal"] = calories
+    estimate["protein_g"] = protein
+    estimate["calories_kcal_range"] = {
+        "min": max(0, calories - 60), "max": calories + 70,
+        "basis": "ai_vision_estimate_range_v1",
+    }
+    estimate["protein_g_range"] = {
+        "min": max(0, protein - 4), "max": protein + 5,
+        "basis": "ai_vision_estimate_range_v1",
+    }
+    estimate["estimate_items"] = [{
+        "name": "儀表板修正版餐點", "portion": "測試修正",
+        "calories_kcal": calories, "protein_g": protein,
+    }]
+    return estimate
+
+
+def test_dashboard_counts_verified_ai_photo_and_labels_estimate_without_profile(tmp_path, monkeypatch):
+    db_dir = tmp_path / "confirmed-ai-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+    yesterday = (server.tw_today() - timedelta(days=1)).isoformat()
+
+    with sqlite3.connect(db) as conn:
+        # Preview is not a canonical meal and must not make a profile/dashboard appear.
+        save_meal_photo_draft(
+            conn, user_id="U-PREVIEW", source_message_id="AI-PREVIEW",
+            payload=ai_estimated_payload(), source_image_ref="nutrition-image:preview.jpg",
+            meal_slot="午餐", consumed_at=f"{today}T11:30:00+08:00",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        _confirm_dashboard_ai_photo(
+            conn, consumed_at=f"{today}T12:00:00+08:00",
+        )
+        _confirm_dashboard_ai_photo(
+            conn, user_id="U-AI-DASHBOARD", source_message_id="AI-DASHBOARD-OLD",
+            consumed_at=f"{yesterday}T12:00:00+08:00", calories=900, protein=60,
+        )
+        _confirm_dashboard_ai_photo(
+            conn, user_id="U-OTHER", source_message_id="AI-DASHBOARD-OTHER",
+            consumed_at=f"{today}T12:30:00+08:00", calories=800, protein=50,
+        )
+        assert conn.execute(
+            "SELECT 1 FROM health_profile WHERE user_id='U-AI-DASHBOARD'"
+        ).fetchone() is None
+
+    assert server.get_dashboard_data("U-PREVIEW") is None
+    dashboard = server.get_dashboard_data("U-AI-DASHBOARD")
+    replayed = server.get_dashboard_data("U-AI-DASHBOARD")
+
+    assert dashboard["extra_cal"] == 680
+    assert dashboard["extra_pro"] == 35
+    assert dashboard["food_list"] == ["餐點照片：雞腿便當、白飯"]
+    assert dashboard["recorded_count"] == 1
+    assert dashboard["ai_estimated_cal"] == 680
+    assert dashboard["ai_estimated_pro"] == 35
+    assert dashboard["ai_estimated_count"] == 1
+    assert replayed["extra_cal"] == 680
+    assert replayed["recorded_count"] == 1
+
+    rendered = json.dumps(
+        server.build_dashboard_flex("U-AI-DASHBOARD").as_json_dict(), ensure_ascii=False,
+    )
+    assert "今日已記錄（含 AI 照片估算）" in rendered
+    assert "AI 照片估算小計：680.0 kcal / 蛋白質 35.0 g" in rendered
+    assert "非營養師核准" in rendered
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM health_profile WHERE user_id='U-AI-DASHBOARD'"
+        ).fetchone() is None
+
+
+def test_dashboard_uses_latest_verified_ai_revision_then_removes_with_delete(tmp_path, monkeypatch):
+    db_dir = tmp_path / "revised-ai-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        log_id = _confirm_dashboard_ai_photo(
+            conn, consumed_at=f"{today}T12:00:00+08:00",
+        )
+        genesis = server.get_dashboard_data("U-AI-DASHBOARD")
+        assert genesis["extra_cal"] == 680
+        assert genesis["extra_pro"] == 35
+        assert genesis["recorded_count"] == 1
+        revision2 = create_meal_photo_revision_draft(
+            conn, user_id="U-AI-DASHBOARD", log_id=log_id, from_version=1,
+            request_text="白飯只吃一半",
+            estimate=_dashboard_revision_estimate(conn, log_id, calories=510, protein=31),
+        )
+        confirm_user_meal_photo_revision(
+            conn, event_id="Z-DASHBOARD-REVISION", user_id="U-AI-DASHBOARD",
+            log_id=log_id, from_version=1, draft_token=revision2["token"],
+        )
+        revision3 = create_meal_photo_revision_draft(
+            conn, user_id="U-AI-DASHBOARD", log_id=log_id, from_version=2,
+            request_text="再加一顆蛋",
+            estimate=_dashboard_revision_estimate(conn, log_id, calories=590, protein=38),
+        )
+        confirm_user_meal_photo_revision(
+            conn, event_id="A-DASHBOARD-REVISION", user_id="U-AI-DASHBOARD",
+            log_id=log_id, from_version=2, draft_token=revision3["token"],
+        )
+
+    revised = server.get_dashboard_data("U-AI-DASHBOARD")
+    assert revised["extra_cal"] == 590
+    assert revised["extra_pro"] == 38
+    assert revised["recorded_count"] == 1
+    assert revised["ai_estimated_cal"] == 590
+
+    server.apply_daily_food_log_edit(
+        user_id="U-AI-DASHBOARD", log_id=log_id, expected_version=3,
+        event_id="DELETE-AI-DASHBOARD", action="delete",
+    )
+    assert server.get_dashboard_data("U-AI-DASHBOARD") is None
+
+
+def test_dashboard_does_not_treat_verified_v1_unknown_nutrition_as_zero(tmp_path, monkeypatch):
+    db_dir = tmp_path / "v1-unknown-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U-V1-UNKNOWN", source_message_id="V1-UNKNOWN",
+            payload=sample_payload(), source_image_ref="nutrition-image:v1.jpg",
+            meal_slot="午餐", consumed_at=f"{today}T12:00:00+08:00",
+        )
+        estimated = _answer_all(conn, token, unknown=True, user_id="U-V1-UNKNOWN")
+        confirmed = apply_meal_photo_action(
+            conn, event_id="CONFIRM-V1-UNKNOWN", user_id="U-V1-UNKNOWN", token=token,
+            expected_version=estimated["version"], action="confirm_estimate",
+        )
+        log_id = confirmed["result"]["log_id"]
+        assert conn.execute(
+            "SELECT nutrition_snapshot_json FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0] == "{}"
+
+    assert server.get_dashboard_data("U-V1-UNKNOWN") is None
+
+
+def test_dashboard_mixes_ordinary_approved_and_ai_once_and_fails_closed_on_ai_tamper(
+    tmp_path, monkeypatch,
+):
+    db_dir = tmp_path / "mixed-authority-dashboard"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,today_extra_cal,today_extra_pro,today_food_items,today_date)
+               VALUES ('U-MIXED','混合來源',2000,100,9999,9999,'舊快取不得重加',?)""",
+            (today,),
+        )
+        server.create_daily_food_log(
+            conn, user_id="U-MIXED", product_name="正常餐", meal_slot="早餐",
+            consumed_at=f"{today}T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 100, "protein_g": 10},
+            source_type="official_menu",
+        )
+        insert_approved_meal_photo_log(
+            conn, token="abcdefabc123", user_id="U-MIXED", reviewer="U-MIXED",
+            consumed_at=f"{today}T10:00:00+08:00", meal_slot="午餐",
+            source_image_ref="mixed-approved.jpg",
+            observed_payload={
+                "visible_items": [{
+                    "name": "核准雞胸", "category": "protein", "confidence": 0.9,
+                }],
+            },
+            answers={},
+            exact_exchange={
+                "milk_exchange": 0, "protein_low_exchange": 1,
+                "protein_medium_exchange": 0, "protein_high_exchange": 0,
+                "starch_exchange": 0, "vegetable_exchange": 0,
+                "fruit_exchange": 0, "fat_exchange": 0,
+            },
+        )
+        ai_log_id = _confirm_dashboard_ai_photo(
+            conn, user_id="U-MIXED", source_message_id="AI-MIXED",
+            consumed_at=f"{today}T12:00:00+08:00",
+        )
+
+    dashboard = server.get_dashboard_data("U-MIXED")
+    assert dashboard["extra_cal"] == 835
+    assert dashboard["extra_pro"] == 52
+    assert dashboard["recorded_count"] == 3
+    assert dashboard["ai_estimated_count"] == 1
+    assert dashboard["ai_estimated_cal"] == 680
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE food_logs SET nutrition_snapshot_json=? WHERE log_id=?",
+            (json.dumps({"calories_kcal": 0, "protein_g": 0}), ai_log_id),
+        )
+        conn.commit()
+
+    failed_closed = server.get_dashboard_data("U-MIXED")
+    assert failed_closed["extra_cal"] == 155
+    assert failed_closed["extra_pro"] == 17
+    assert failed_closed["recorded_count"] == 2
+    assert failed_closed["ai_estimated_count"] == 0
+    assert "餐點照片：雞腿便當、白飯" not in failed_closed["food_list"]
+
+
+@pytest.mark.parametrize("tampered_source", ["official_menu", "user_private_food"])
+def test_photo_source_type_tamper_cannot_downgrade_failed_trust_into_ordinary_dashboard(
+    tmp_path, monkeypatch, tampered_source,
+):
+    db_dir = tmp_path / f"photo-source-tamper-{tampered_source}"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,today_extra_cal,today_extra_pro,today_food_items,today_date)
+               VALUES ('U-SOURCE-TAMPER','來源竄改',2000,100,680,35,'舊快取',?)""",
+            (today,),
+        )
+        log_id = _confirm_dashboard_ai_photo(
+            conn, user_id="U-SOURCE-TAMPER", source_message_id="SOURCE-TAMPER",
+            consumed_at=f"{today}T12:00:00+08:00",
+        )
+        food_id = conn.execute(
+            "SELECT food_id FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE food_catalog SET source_type=? WHERE food_id=?",
+            (tampered_source, food_id),
+        )
+        conn.commit()
+
+    ledger = server.get_daily_food_ledger("U-SOURCE-TAMPER", today)
+    item = next(item for item in ledger["items"] if item["log_id"] == log_id)
+    assert item["trust_integrity_status"] == "integrity_verification_failed"
+    assert item["trust_type"] == "untrusted_user_confirmed_ai_estimate"
+    assert item["nutrition_authority"] == ""
+    assert all(item["nutrition"].get(field) is None for field in server.DAILY_FOOD_NUTRIENT_FIELDS)
+
+    with sqlite3.connect(db) as conn:
+        server._sync_health_profile_from_ledger_conn(conn, "U-SOURCE-TAMPER", today)
+        conn.commit()
+        cached = conn.execute(
+            """SELECT today_extra_cal,today_extra_pro,today_food_items
+               FROM health_profile WHERE user_id='U-SOURCE-TAMPER'"""
+        ).fetchone()
+    assert cached == (0.0, 0.0, "")
+
+    dashboard = server.get_dashboard_data("U-SOURCE-TAMPER")
+    assert dashboard["extra_cal"] == 0
+    assert dashboard["extra_pro"] == 0
+    assert dashboard["food_list"] == []
+    assert dashboard["recorded_count"] == 0
+    assert dashboard["task_logged_once"] is False
+    assert dashboard["task_two_meals"] is False
+    assert dashboard["ai_estimated_count"] == 0
+
+
+@pytest.mark.parametrize("tamper_mode", ["latest_revision_source", "missing_revision_evidence"])
+def test_revised_photo_fails_closed_when_latest_chain_or_source_evidence_is_missing(
+    tmp_path, monkeypatch, tamper_mode,
+):
+    db_dir = tmp_path / f"revised-photo-{tamper_mode}"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        log_id = _confirm_dashboard_ai_photo(
+            conn, user_id="U-REVISED-TAMPER", source_message_id="REVISED-TAMPER",
+            consumed_at=f"{today}T12:00:00+08:00",
+        )
+        revision = create_meal_photo_revision_draft(
+            conn, user_id="U-REVISED-TAMPER", log_id=log_id, from_version=1,
+            request_text="飯量減半",
+            estimate=_dashboard_revision_estimate(conn, log_id, calories=510, protein=31),
+        )
+        confirm_user_meal_photo_revision(
+            conn, event_id="REVISED-TAMPER-CONFIRM", user_id="U-REVISED-TAMPER",
+            log_id=log_id, from_version=1, draft_token=revision["token"],
+        )
+        if tamper_mode == "latest_revision_source":
+            conn.execute(
+                """UPDATE food_catalog SET source_type='official_menu'
+                   WHERE food_id=(SELECT food_id FROM food_logs WHERE log_id=?)""",
+                (log_id,),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM pending_meal_photo_drafts WHERE token=?", (revision["token"],)
+            )
+        conn.commit()
+
+    ledger = server.get_daily_food_ledger("U-REVISED-TAMPER", today)
+    item = next(item for item in ledger["items"] if item["log_id"] == log_id)
+    assert item["version"] == 2
+    assert item["trust_integrity_status"] == "integrity_verification_failed"
+    assert item["is_meal_photo_origin"] is True
+    assert item["is_nutrition_countable"] is False
+    assert item["nutrition"] == {}
+    assert server.get_dashboard_data("U-REVISED-TAMPER") is None
+
+
+def test_approval_and_source_tamper_cannot_fall_back_to_raw_snapshot(tmp_path, monkeypatch):
+    db_dir = tmp_path / "approved-photo-source-tamper"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        approved = insert_approved_meal_photo_log(
+            conn, token="aabbccdd0011", user_id="U-APPROVAL-TAMPER",
+            reviewer="U-APPROVAL-TAMPER", consumed_at=f"{today}T12:00:00+08:00",
+            meal_slot="午餐", source_image_ref="approval-tamper.jpg",
+            observed_payload={
+                "visible_items": [{"name": "核准照片", "category": "protein", "confidence": 0.9}]
+            },
+            answers={},
+            exact_exchange={
+                "milk_exchange": 0, "protein_low_exchange": 1,
+                "protein_medium_exchange": 0, "protein_high_exchange": 0,
+                "starch_exchange": 0, "vegetable_exchange": 0,
+                "fruit_exchange": 0, "fat_exchange": 0,
+            },
+        )
+        conn.execute(
+            """UPDATE food_catalog SET source_type='official_menu'
+               WHERE food_id=(SELECT food_id FROM food_logs WHERE log_id=?)""",
+            (approved["log_id"],),
+        )
+        conn.execute(
+            """UPDATE food_exchange_approvals SET approved_exchange_hash='tampered'
+               WHERE approval_id=(SELECT exchange_approval_id FROM food_logs WHERE log_id=?)""",
+            (approved["log_id"],),
+        )
+        conn.commit()
+
+    ledger = server.get_daily_food_ledger("U-APPROVAL-TAMPER", today)
+    item = next(item for item in ledger["items"] if item["log_id"] == approved["log_id"])
+    assert item["is_meal_photo_origin"] is True
+    assert item["is_nutrition_countable"] is False
+    assert item["nutrition_authority"] == ""
+    assert item["nutrition"] == {}
+    assert server.get_dashboard_data("U-APPROVAL-TAMPER") is None
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    ["source-only", "source-and-hash", "missing-approval", "cross-food-id", "owner"],
+)
+def test_approved_photo_integrity_tamper_fails_closed_in_totals_and_sheet_outbox(
+    tmp_path, monkeypatch, tamper_mode,
+):
+    db = tmp_path / f"approved-photo-consumers-{tamper_mode}.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    server.init_db()
+    user_id = "U-APPROVED-PHOTO-CONSUMERS"
+    consumed_at = "2026-09-13T12:00:00+08:00"
+    exchange = {
+        "milk_exchange": 0, "protein_low_exchange": 1,
+        "protein_medium_exchange": 0, "protein_high_exchange": 0,
+        "starch_exchange": 0, "vegetable_exchange": 0,
+        "fruit_exchange": 0, "fat_exchange": 0,
+    }
+    with sqlite3.connect(db) as conn:
+        ordinary = server.create_daily_food_log(
+            conn, user_id=user_id, product_name="一般餐", meal_slot="早餐",
+            consumed_at="2026-09-13T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 100, "protein_g": 10},
+            source_type="official_menu",
+        )
+        valid_approved = insert_approved_meal_photo_log(
+            conn, token="feedface0001", user_id=user_id, reviewer="ADMIN",
+            consumed_at="2026-09-13T10:00:00+08:00", meal_slot="點心",
+            source_image_ref="valid-approved.jpg",
+            observed_payload={"visible_items": [{
+                "name": "合法核准照片", "category": "protein", "confidence": 0.9,
+            }]}, answers={}, exact_exchange=exchange,
+        )
+        tampered = insert_approved_meal_photo_log(
+            conn, token="feedface0002", user_id=user_id, reviewer="ADMIN",
+            consumed_at=consumed_at, meal_slot="午餐",
+            source_image_ref="tampered-approved.jpg",
+            observed_payload={"visible_items": [{
+                "name": "來源遭竄改照片", "category": "protein", "confidence": 0.9,
+            }]}, answers={}, exact_exchange=exchange,
+        )
+        if tamper_mode.startswith("source"):
+            conn.execute(
+                "UPDATE food_catalog SET source_type='official_menu' WHERE food_id=?",
+                (tampered["food_id"],),
+            )
+        if tamper_mode == "source-and-hash":
+            conn.execute(
+                "UPDATE food_exchange_approvals SET approved_exchange_hash='tampered' "
+                "WHERE approval_id=?",
+                (tampered["approval_id"],),
+            )
+        elif tamper_mode == "missing-approval":
+            conn.execute(
+                "DELETE FROM food_exchange_approvals WHERE approval_id=?",
+                (tampered["approval_id"],),
+            )
+        elif tamper_mode == "cross-food-id":
+            conn.execute(
+                "UPDATE food_exchange_approvals SET food_id=? WHERE approval_id=?",
+                (ordinary["food_id"], tampered["approval_id"]),
+            )
+        elif tamper_mode == "owner":
+            conn.execute(
+                "UPDATE food_catalog SET owner_user_id='U-OTHER' WHERE food_id=?",
+                (tampered["food_id"],),
+            )
+        ai_log_id = _confirm_dashboard_ai_photo(
+            conn, user_id=user_id, source_message_id=f"AI-CONTROL-{tamper_mode}",
+            consumed_at="2026-09-13T14:00:00+08:00",
+        )
+        unknown_token = save_meal_photo_draft(
+            conn, user_id=user_id, source_message_id=f"UNKNOWN-CONTROL-{tamper_mode}",
+            payload=sample_payload(), source_image_ref="nutrition-image:unknown-control.jpg",
+            meal_slot="晚餐", consumed_at="2026-09-13T18:00:00+08:00",
+        )
+        unknown_draft = _answer_all(conn, unknown_token, unknown=True, user_id=user_id)
+        unknown = apply_meal_photo_action(
+            conn, event_id=f"UNKNOWN-CONFIRM-{tamper_mode}", user_id=user_id,
+            token=unknown_token, expected_version=unknown_draft["version"],
+            action="confirm_estimate",
+        )
+        unknown_log_id = unknown["result"]["log_id"]
+        ai_food_id = conn.execute(
+            "SELECT food_id FROM food_logs WHERE log_id=?", (ai_log_id,)
+        ).fetchone()[0]
+        unknown_food_id = conn.execute(
+            "SELECT food_id FROM food_logs WHERE log_id=?", (unknown_log_id,)
+        ).fetchone()[0]
+        conn.commit()
+
+        totals = daily_consumed_totals(
+            conn, user_id=user_id, date_iso="2026-09-13",
+        )
+        summary = server.daily_food_summary(
+            conn, user_id=user_id, date_iso="2026-09-13",
+        )
+        replay_projection = _confirmed_result(
+            conn, tampered["log_id"], already_confirmed=True,
+        )
+
+    # Formal totals count the ordinary log and the intact approved photo only.
+    # AI nutrition remains in its separate estimated lane and unknown stays unknown.
+    assert totals["calories_kcal"] == 155.0
+    assert totals["protein_g"] == 17.0
+    assert totals["protein_low_exchange"] == 1.0
+    summary_by_name = {item["name"]: item for item in summary["foods"]}
+    corrupted = summary_by_name["餐點照片：來源遭竄改照片"]
+    assert corrupted["calories_kcal"] is None
+    assert corrupted["protein_g"] is None
+    assert corrupted["trust_integrity_status"] == "integrity_verification_failed"
+    # Only the unrelated ordinary row still awaits exchange review; corruption
+    # is reported as an integrity failure, not mislabeled as another review.
+    assert summary["pending_reviews"] == 1
+    assert summary["totals"]["calories_kcal"] == 155.0
+    assert summary["estimated_totals"] == {
+        "calories_kcal": 680.0, "protein_g": 35.0,
+    }
+    assert replay_projection["log"]["nutrition"] == {}
+    assert replay_projection["log"]["approved_exchange"] == {}
+    assert replay_projection["log"]["exchange_review_status"] == "integrity_verification_failed"
+
+    ledger = server.get_daily_food_ledger(user_id, "2026-09-13")
+    ledger_by_id = {item["log_id"]: item for item in ledger["items"]}
+    corrupted_ledger = ledger_by_id[tampered["log_id"]]
+    assert corrupted_ledger["nutrition"] == {}
+    assert corrupted_ledger["is_nutrition_countable"] is False
+    assert corrupted_ledger["trust_integrity_status"] == "integrity_verification_failed"
+    corrupted_bubble = json.dumps(
+        server._daily_food_item_bubble(corrupted_ledger), ensure_ascii=False,
+    )
+    assert "來源未驗證" in corrupted_bubble
+    assert "資料完整性驗證未通過，營養資料暫不可用" in corrupted_bubble
+    assert "🔥 NA" in corrupted_bubble and "🥩 NA" in corrupted_bubble
+    assert "來源：official_menu" not in corrupted_bubble
+    assert "核准" not in corrupted_bubble and "待審" not in corrupted_bubble
+    for invalid_edit_entry in ("調整份量", "修正營養", "更多操作", "修改品項", "修改這餐"):
+        assert invalid_edit_entry not in corrupted_bubble
+
+    valid_ordinary_bubble = json.dumps(
+        server._daily_food_item_bubble(ledger_by_id[ordinary["log_id"]]), ensure_ascii=False,
+    )
+    valid_approved_bubble = json.dumps(
+        server._daily_food_item_bubble(ledger_by_id[valid_approved["log_id"]]), ensure_ascii=False,
+    )
+    valid_ai_bubble = json.dumps(
+        server._daily_food_item_bubble(ledger_by_id[ai_log_id]), ensure_ascii=False,
+    )
+    assert "來源：official_menu" in valid_ordinary_bubble
+    assert "來源：餐點照片" in valid_approved_bubble
+    assert "來源：顧客確認・AI估算" in valid_ai_bubble
+    assert ledger_by_id[ordinary["log_id"]]["trust_integrity_status"] == ""
+    assert ledger_by_id[valid_approved["log_id"]]["trust_integrity_status"] == ""
+    assert ledger_by_id[ai_log_id]["trust_integrity_status"] == "verified"
+    assert ledger_by_id[unknown_log_id]["trust_integrity_status"] == "verified"
+    assert ledger_by_id[unknown_log_id]["nutrition"] == {}
+    assert ledger_by_id[valid_approved["log_id"]]["nutrition"]["calories_kcal"] == 55.0
+    assert ledger_by_id[ai_log_id]["nutrition"]["calories_kcal"] == 680.0
+
+    dashboard = server.get_dashboard_data(user_id)
+    assert dashboard["extra_cal"] == 835.0
+    assert dashboard["extra_pro"] == 52.0
+    assert dashboard["recorded_count"] == 3
+    assert "餐點照片：來源遭竄改照片" not in dashboard["food_list"]
+
+    report = format_daily_health_report(
+        report_date="2026-09-13", checkin=None, foods=summary["foods"],
+        totals=summary["totals"], estimated_totals=summary["estimated_totals"],
+        target=None, exercise=None, pending_reviews=summary["pending_reviews"],
+    )
+    corrupted_line = next(
+        line for line in report.splitlines() if "來源遭竄改照片" in line
+    )
+    assert "NA kcal｜蛋白質NAg" in corrupted_line
+    assert "55 kcal｜蛋白質7g" not in corrupted_line
+    assert "資料完整性驗證未通過，營養資料暫不可用" in report
+    assert "待營養師核准" not in report
+
+    sheet_rows = {}
+
+    class Sheet:
+        def __init__(self, title):
+            self.title = title
+
+        def find(self, *_args, **_kwargs):
+            return None
+
+        def append_row(self, values, **_kwargs):
+            sheet_rows[(self.title, values[0])] = values
+
+    monkeypatch.setattr(server, "_nutrition_ws", lambda title: Sheet(title))
+    for food_id in (
+        ordinary["food_id"], valid_approved["food_id"], tampered["food_id"],
+        ai_food_id, unknown_food_id,
+    ):
+        server._sync_food_outbox(food_id)
+    for log_id in (
+        ordinary["log_id"], valid_approved["log_id"], tampered["log_id"],
+        ai_log_id, unknown_log_id,
+    ):
+        server._sync_food_log_outbox(log_id)
+
+    food_sheet = "食品資料庫"
+    log_sheet = "飲食紀錄"
+    assert sheet_rows[(food_sheet, ordinary["food_id"])][10:12] == [100.0, 10.0]
+    assert sheet_rows[(food_sheet, valid_approved["food_id"])][10:12] == [55.0, 7.0]
+    assert sheet_rows[(food_sheet, valid_approved["food_id"])][18] == 1.0
+    assert sheet_rows[(food_sheet, tampered["food_id"])][10:25] == [""] * 15
+    assert sheet_rows[(food_sheet, tampered["food_id"])][25] == "integrity_verification_failed"
+    assert sheet_rows[(food_sheet, ai_food_id)][10:25] == [""] * 15
+    assert sheet_rows[(food_sheet, ai_food_id)][25] == "user_confirmed_ai_estimate"
+    assert sheet_rows[(food_sheet, unknown_food_id)][10:25] == [""] * 15
+    assert sheet_rows[(food_sheet, unknown_food_id)][25] == "user_confirmed_ai_estimate"
+
+    assert sheet_rows[(log_sheet, ordinary["log_id"])][9:11] == [100.0, 10.0]
+    assert sheet_rows[(log_sheet, valid_approved["log_id"])][9:11] == [55.0, 7.0]
+    assert sheet_rows[(log_sheet, valid_approved["log_id"])][17] == 1.0
+    # Upserts with blanks clear previously synced trusted values instead of
+    # silently leaving them behind while the local outbox is marked synced.
+    assert sheet_rows[(log_sheet, tampered["log_id"])][9:24] == [""] * 15
+    assert sheet_rows[(log_sheet, ai_log_id)][9:13] == [680.0, 35.0, "", ""]
+    assert sheet_rows[(log_sheet, ai_log_id)][16:24] == [""] * 8
+    assert sheet_rows[(log_sheet, unknown_log_id)][9:24] == [""] * 15
 
 
 def test_dashboard_uses_food_ledger_without_creating_placeholder_health_profile(tmp_path, monkeypatch):

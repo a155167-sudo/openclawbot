@@ -913,7 +913,7 @@ def test_optional_second_protein_is_explicitly_added_summed_and_persisted(tmp_pa
         )
         conn.commit()
         tampered_log = _confirmed_result(conn, log_id, already_confirmed=True)
-        assert tampered_log["log"]["exchange_review_status"] == "pending_review"
+        assert tampered_log["log"]["exchange_review_status"] == "integrity_verification_failed"
         assert tampered_log["log"]["exchange_approval_id"] == ""
         tampered_totals = daily_consumed_totals(
             conn, user_id="U1", date_iso=local_date
@@ -922,7 +922,7 @@ def test_optional_second_protein_is_explicitly_added_summed_and_persisted(tmp_pa
         tampered_summary = daily_food_summary(
             conn, user_id="U1", date_iso=local_date
         )
-        assert tampered_summary["pending_reviews"] == 1
+        assert tampered_summary["pending_reviews"] == 0
         conn.execute(
             "UPDATE food_logs SET approved_exchange_json=? WHERE log_id=?",
             (applied_json, log_id),
@@ -935,7 +935,7 @@ def test_optional_second_protein_is_explicitly_added_summed_and_persisted(tmp_pa
         )
         conn.commit()
         tampered_approval = _confirmed_result(conn, log_id, already_confirmed=True)
-        assert tampered_approval["log"]["exchange_review_status"] == "pending_review"
+        assert tampered_approval["log"]["exchange_review_status"] == "integrity_verification_failed"
         assert tampered_approval["log"]["exchange_approval_id"] == ""
 
         for table, column, original_json in (
@@ -958,13 +958,13 @@ def test_optional_second_protein_is_explicitly_added_summed_and_persisted(tmp_pa
                 )
                 conn.commit()
                 failed_closed = _confirmed_result(conn, log_id, already_confirmed=True)
-                assert failed_closed["log"]["exchange_review_status"] == "pending_review"
+                assert failed_closed["log"]["exchange_review_status"] == "integrity_verification_failed"
                 assert daily_consumed_totals(
                     conn, user_id="U1", date_iso=local_date
                 )["protein_medium_exchange"] == 0
                 assert daily_food_summary(
                     conn, user_id="U1", date_iso=local_date
-                )["pending_reviews"] == 1
+                )["pending_reviews"] == 0
             conn.execute(
                 f"UPDATE {table} SET approved_exchange_json=? WHERE {column}=?",
                 (original_json, approval_id if table == "food_exchange_approvals" else log_id),
@@ -993,13 +993,13 @@ def test_optional_second_protein_is_explicitly_added_summed_and_persisted(tmp_pa
         )
         conn.commit()
         recomputed = _confirmed_result(conn, log_id, already_confirmed=True)
-        assert recomputed["log"]["exchange_review_status"] == "pending_review"
+        assert recomputed["log"]["exchange_review_status"] == "integrity_verification_failed"
         assert daily_consumed_totals(
             conn, user_id="U1", date_iso=local_date
         )["protein_medium_exchange"] == 0.0
         assert daily_food_summary(
             conn, user_id="U1", date_iso=local_date
-        )["pending_reviews"] == 1
+        )["pending_reviews"] == 0
         with pytest.raises(ValueError, match="核准重播紀錄驗證失敗"):
             apply_meal_photo_review_action(
                 conn,

@@ -62,8 +62,8 @@ from nutrition_system import (
     ensure_nutrition_schema,
     estimate_nutrition_from_exchanges,
     exchange_approval_hash,
-    exchange_applied_payload_matches_approval_hash,
-    exchange_approval_payload_is_valid,
+    verified_catalog_exchange_approval_projection,
+    verified_exchange_approval_projection,
     get_nutrition_input_state,
     normalize_garmin_payload,
     normalize_label_payload,
@@ -560,7 +560,7 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
                   fl.approved_exchange_json,fc.fingerprint,a.food_fingerprint,
                   a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id,
                   a.approved_exchange_json,fl.trust_type,fl.exchange_snapshot_json,
-                  fl.trust_payload_json
+                  fl.trust_payload_json,fc.owner_user_id,a.food_id,fl.user_id
            FROM food_logs fl
            JOIN food_catalog fc ON fc.food_id=fl.food_id
            LEFT JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
@@ -582,35 +582,49 @@ def _safe_json_object(value):
 def _ledger_item_from_row(conn: sqlite3.Connection, row) -> dict:
     nutrition = _safe_json_object(row[9])
     trust = user_confirmed_meal_photo_trust_projection(conn, row[0], str(row[19] or ""))
+    approval = verified_exchange_approval_projection(
+        log_user_id=row[24],
+        log_food_id=row[1], catalog_source_type=row[3],
+        catalog_owner_user_id=row[22], catalog_fingerprint=row[13],
+        consumed_servings=row[6], applied_json=row[12], approval_id=row[17],
+        approval_food_id=row[23], approval_fingerprint=row[14],
+        rule_version=row[15], approved_json=row[18], approval_hash=row[16],
+    )
+    nutrition_authority = ""
+    # source_type is mutable and therefore cannot be the sole discriminator for
+    # a photo-origin record.  Trust projection status and an attached approval
+    # are durable corroborating evidence; integrity failure must stay in this
+    # lane instead of silently becoming an ordinary food log.
+    is_meal_photo_origin = bool(
+        row[3] == "user_meal_photo"
+        or trust.get("integrity_status") in {"verified", "integrity_verification_failed"}
+        or approval["is_meal_photo_origin"]
+    )
     # 餐點照片必須先驗證核准快照；完整性失效時即使營養快照存在也維持 NA。
-    if row[3] == "user_meal_photo":
-        verified_approval = False
-        try:
-            approved = json.loads(row[12] or "{}")
-            approved_definition = json.loads(row[18] or "{}")
+    if is_meal_photo_origin:
+        verified_approval = bool(approval["is_valid"])
+        if verified_approval:
+            nutrition = estimate_nutrition_from_exchanges(approval["applied"])
+            nutrition_authority = "approved_exchange"
+        if not verified_approval:
             if (
-                isinstance(approved, dict)
-                and isinstance(approved_definition, dict)
-                and row[17]
-                and row[13]
-                and row[14] == row[13]
-                and exchange_approval_payload_is_valid(row[15], approved)
-                and exchange_approval_payload_is_valid(row[15], approved_definition)
-                and exchange_applied_payload_matches_approval_hash(
-                    row[14], row[15], approved, row[6], row[16]
-                )
-                and secrets.compare_digest(
-                    str(row[16] or ""),
-                    exchange_approval_hash(row[14], row[15], approved_definition),
-                )
+                trust.get("integrity_status") == "verified"
+                and trust.get("schema_version") == "meal-photo-user-confirmation-v2"
+                and trust.get("workflow_version") == "user_confirmed_ai_nutrition_v2"
+                and isinstance(trust.get("nutrition"), dict)
             ):
-                verified_approval = True
-            if verified_approval:
-                nutrition = estimate_nutrition_from_exchanges(approved)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            verified_approval = False
-        if not verified_approval and trust["integrity_status"] != "verified":
-            nutrition = {}
+                # The trust projection validates genesis, every contiguous revision,
+                # and the current snapshots. Never fall back to the mutable raw row.
+                nutrition = trust["nutrition"]
+                nutrition_authority = "user_confirmed_ai_nutrition_v2"
+            else:
+                nutrition = {}
+    trust_integrity_status = trust["integrity_status"]
+    # An attached meal-photo approval is a higher-authority integrity contract.
+    # Its failure must be visible even when no AI trust projection exists. Do
+    # not flag approval-less ordinary/AI flows as invalid approval attempts.
+    if row[17] and approval["is_meal_photo_origin"] and not approval["is_valid"]:
+        trust_integrity_status = "integrity_verification_failed"
     return {
         "log_id": row[0], "food_id": row[1], "product_name": row[2],
         "source_type": row[3], "consumed_at": row[4], "meal_slot": row[5] or "",
@@ -619,7 +633,10 @@ def _ledger_item_from_row(conn: sqlite3.Connection, row) -> dict:
         "nutrient_sources": json.loads(row[10] or "{}"), "version": int(row[11] or 1),
         "trust_type": trust["trust_type"],
         "trust_schema_version": trust.get("schema_version") or "",
-        "trust_integrity_status": trust["integrity_status"],
+        "trust_integrity_status": trust_integrity_status,
+        "nutrition_authority": nutrition_authority,
+        "is_meal_photo_origin": is_meal_photo_origin,
+        "is_nutrition_countable": bool(not is_meal_photo_origin or nutrition_authority),
         "is_confirmed_ai_nutrition_v2": bool(
             _safe_json_object(row[20]).get("rule_version") == "ai-vision-nutrition-estimate-v1"
             or _safe_json_object(row[21]).get("schema_version") == "meal-photo-user-confirmation-v2"
@@ -682,6 +699,8 @@ def _sync_health_profile_from_ledger_conn(
     cal = pro = 0.0
     names = []
     for item in items:
+        if not item.get("is_nutrition_countable", True):
+            continue
         names.append(item["product_name"])
         nutrition = item["nutrition"]
         if nutrition.get("calories_kcal") is not None:
@@ -1085,7 +1104,7 @@ def _daily_food_item_bubble(item: dict) -> dict:
                 and item.get("trust_integrity_status") == "verified"
             ),
         )
-    elif item["source_type"] == "legacy_daily_carryover":
+    elif integrity_failed or item["source_type"] == "legacy_daily_carryover":
         footer_contents = [{
             "type": "button", "style": "secondary", "height": "sm",
             "action": {"type": "message", "label": "重新查看", "text": "飲食紀錄"},
@@ -1110,7 +1129,9 @@ def _daily_food_item_bubble(item: dict) -> dict:
         {"type": "text", "text": f"🔥 {val('calories_kcal', 'kcal')}", "size": "sm"},
         {"type": "text", "text": f"🥩 {val('protein_g', 'g')}", "size": "sm"},
         {"type": "text", "text": f"🍚 {val('carbohydrate_g', 'g')}｜🥑 {val('fat_g', 'g')}", "size": "xs", "wrap": True},
-        {"type": "text", "text": f"來源：{source_text}", "size": "xs", "color": "#777777", "wrap": True},
+        {"type": "text", "text": (
+            "來源未驗證" if integrity_failed else f"來源：{source_text}"
+        ), "size": "xs", "color": "#777777", "wrap": True},
     ]
     if integrity_failed:
         body_contents.append({
@@ -6428,9 +6449,9 @@ def get_dashboard_data(user_id: str) -> dict:
     checked_slots = set()
     workout_done = False
     frequent_foods = []
-    approved_photo_foods = []
-    approved_photo_cal = 0.0
-    approved_photo_pro = 0.0
+    ai_estimated_cal = 0.0
+    ai_estimated_pro = 0.0
+    ai_estimated_count = 0
     today_str = tw_today().isoformat()
 
     # 🌟 優化：將原本散落的 3 次資料庫連線，合併成 1 次安全連線！
@@ -6447,27 +6468,41 @@ def get_dashboard_data(user_id: str) -> dict:
         ledger_items = [
             _ledger_item_from_row(conn, row) for row in ledger_rows
         ]
-        ordinary_ledger_items = [
-            item for row, item in zip(ledger_rows, ledger_items)
-            if item.get("source_type") != "user_meal_photo"
-            and not str(row[17] or "").strip()
-        ]
-        ledger_names = [
-            item["product_name"] for item in ordinary_ledger_items
-        ]
-        ordinary_ledger_cal = ordinary_ledger_pro = 0.0
-        for item in ordinary_ledger_items:
+        # Project each canonical log exactly once. Photo logs enter only through
+        # _ledger_item_from_row's centralized trust/approval validation.
+        dashboard_items = []
+        for row, item in zip(ledger_rows, ledger_items):
+            if not item.get("is_nutrition_countable", True):
+                continue
+            if item.get("is_meal_photo_origin"):
+                if item.get("nutrition_authority") not in {
+                    "approved_exchange", "user_confirmed_ai_nutrition_v2",
+                }:
+                    continue
+            elif str(row[17] or "").strip():
+                # Preserve the historical exclusion for unrelated approved rows.
+                continue
+            dashboard_items.append(item)
+        ledger_names = [item["product_name"] for item in dashboard_items]
+        canonical_ledger_cal = canonical_ledger_pro = 0.0
+        for item in dashboard_items:
             nutrition = item.get("nutrition") or {}
             if nutrition.get("calories_kcal") is not None:
-                ordinary_ledger_cal += float(nutrition["calories_kcal"])
+                canonical_ledger_cal += float(nutrition["calories_kcal"])
             if nutrition.get("protein_g") is not None:
-                ordinary_ledger_pro += float(nutrition["protein_g"])
+                canonical_ledger_pro += float(nutrition["protein_g"])
+            if item.get("nutrition_authority") == "user_confirmed_ai_nutrition_v2":
+                ai_estimated_count += 1
+                if nutrition.get("calories_kcal") is not None:
+                    ai_estimated_cal += float(nutrition["calories_kcal"])
+                if nutrition.get("protein_g") is not None:
+                    ai_estimated_pro += float(nutrition["protein_g"])
 
         if not hp:
             # 新 VIP 可能先完成 LINE 飲食紀錄、稍後才填健康表單。
             # Dashboard 只讀 canonical food_logs 作 fallback；不要建立空的
             # health_profile，否則舊流程可能誤判為已完成 onboarding。
-            if ledger_items:
+            if dashboard_items:
                 hp = ("", 2000, 100, 0, 0, "", today_str, "")
         
         if hp:
@@ -6490,70 +6525,6 @@ def get_dashboard_data(user_id: str) -> dict:
             except Exception:
                 pass
 
-            # 4. 照片餐點只有在管理員完成精確份量核准後，才從正式 food_logs 顯示。
-            # 營養值只從通過 approval hash 的核准交換份重算，舊NA快照亦可安全納入。
-            try:
-                c.execute(
-                    """SELECT fc.product_name,fc.fingerprint,a.food_fingerprint,
-                              a.suggestion_rule_version,a.approved_exchange_json,
-                              a.approved_exchange_hash,fl.approved_exchange_json,
-                              fl.consumed_servings
-                       FROM food_logs fl
-                       JOIN food_catalog fc ON fc.food_id=fl.food_id
-                       JOIN food_exchange_approvals a
-                         ON a.approval_id=fl.exchange_approval_id AND a.food_id=fl.food_id
-                       WHERE fl.user_id=? AND date(fl.consumed_at, '+8 hours')=?
-                         AND fl.confirmation_status='confirmed'
-                         AND COALESCE(fl.deleted_at,'')=''
-                         AND fc.source_type='user_meal_photo'
-                       ORDER BY fl.consumed_at, fl.created_at""",
-                    (user_id, today_str),
-                )
-                for row in c.fetchall():
-                    try:
-                        if str(row[2] or "") != str(row[1] or ""):
-                            continue
-                        approved_exchange = json.loads(row[4] or "{}")
-                        applied_exchange = json.loads(row[6] or "{}")
-                        expected_hash = exchange_approval_hash(row[2], row[3], approved_exchange)
-                        if (
-                            not exchange_approval_payload_is_valid(row[3], approved_exchange)
-                            or not exchange_approval_payload_is_valid(row[3], applied_exchange)
-                            or not secrets.compare_digest(str(row[5] or ""), expected_hash)
-                        ):
-                            continue
-                        if not exchange_applied_payload_matches_approval_hash(
-                            row[2], row[3], applied_exchange, row[7], row[5]
-                        ):
-                            continue
-                        expected_applied = {
-                            key: round(
-                                float(approved_exchange.get(key, 0) or 0)
-                                * float(row[7] or 0),
-                                4,
-                            )
-                            for key in (
-                                "milk_exchange", "protein_low_exchange",
-                                "protein_medium_exchange", "protein_high_exchange",
-                                "starch_exchange", "vegetable_exchange",
-                                "fruit_exchange", "fat_exchange",
-                            )
-                        }
-                        if not all(
-                            abs(float(applied_exchange.get(key, 0) or 0) - value) <= 0.0001
-                            for key, value in expected_applied.items()
-                        ):
-                            continue
-                        estimated = estimate_nutrition_from_exchanges(applied_exchange)
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        continue
-                    product_name = str(row[0] or "").strip()
-                    if product_name:
-                        approved_photo_foods.append(product_name)
-                    approved_photo_cal += float(estimated["calories_kcal"])
-                    approved_photo_pro += float(estimated["protein_g"])
-            except Exception:
-                pass
 
     if not hp:
         return None
@@ -6562,10 +6533,10 @@ def get_dashboard_data(user_id: str) -> dict:
     tdee = tdee or 2000
     protein_goal = protein_goal or 100
 
-    # Dashboard 的今日飲食只信任 canonical food_logs。一般餐由逐筆快照加總，
-    # 照片餐則只加入上方通過 fingerprint／approval hash 驗證的數值。
-    extra_cal = round(ordinary_ledger_cal + approved_photo_cal, 4)
-    extra_pro = round(ordinary_ledger_pro + approved_photo_pro, 4)
+    # Dashboard only trusts the one canonical projection above; health_profile's
+    # cached daily totals are deliberately not added again.
+    extra_cal = round(canonical_ledger_cal, 4)
+    extra_pro = round(canonical_ledger_pro, 4)
 
     cal_remaining = max(0, tdee - extra_cal)
     pro_remaining = max(0, protein_goal - extra_pro)
@@ -6630,7 +6601,6 @@ def get_dashboard_data(user_id: str) -> dict:
     dinner_checked = "晚餐" in checked_slots
 
     food_list = list(ledger_names)
-    food_list.extend(approved_photo_foods)
     recorded_count = len(food_list)
     task_logged_once = (extra_cal > 0 or extra_pro > 0 or recorded_count >= 1)
     task_two_meals = recorded_count >= 2
@@ -6710,6 +6680,9 @@ def get_dashboard_data(user_id: str) -> dict:
         "dinner_checked": dinner_checked, "workout_done": workout_done, "task_logged_once": task_logged_once,
         "task_two_meals": task_two_meals, "task_protein_80": task_protein_80, "frequent_foods": frequent_foods,
         "future_days": future_days,
+        "ai_estimated_cal": round(ai_estimated_cal, 4),
+        "ai_estimated_pro": round(ai_estimated_pro, 4),
+        "ai_estimated_count": ai_estimated_count,
     }
     try:
         result.update(compute_achievement_snapshot(user_id, result))
@@ -6864,6 +6837,18 @@ def build_dashboard_flex(user_id: str):
     food_summary = "、".join(item[:32] for item in recorded_foods[:3]) or "尚無紀錄"
     if len(recorded_foods) > 3:
         food_summary += f"，另有 {len(recorded_foods) - 3} 筆"
+    recorded_label = "今日已記錄"
+    ai_estimate_notice = []
+    if d.get("ai_estimated_count", 0):
+        recorded_label += "（含 AI 照片估算）"
+        ai_estimate_notice = [{
+            "type": "text",
+            "text": (
+                f"AI 照片估算小計：{d['ai_estimated_cal']} kcal / "
+                f"蛋白質 {d['ai_estimated_pro']} g（非營養師核准）"
+            ),
+            "size": "xxs", "color": "#9A6700", "margin": "md", "wrap": True,
+        }]
 
     diet_bubble = {
         "type": "bubble", "size": "mega",
@@ -6879,13 +6864,14 @@ def build_dashboard_flex(user_id: str):
             "type": "box", "layout": "vertical", "paddingAll": "20px",
             "contents": [
                 {"type": "text", "text": "🔥 熱量進度", "size": "xs", "color": "#888888"},
-                {"type": "text", "text": f"今日已記錄：{d['extra_cal']} / {d['tdee']} kcal", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm"},
+                {"type": "text", "text": f"{recorded_label}：{d['extra_cal']} / {d['tdee']} kcal", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm"},
                 dual_progress_bar(d["cal_recorded_segment"], d["cal_planned_segment"], d["cal_remaining_segment"], "#06C755", "#B7E8C8"),
                 {"type": "separator", "margin": "md"},
                 
                 {"type": "text", "text": "🥩 蛋白進度", "size": "xs", "color": "#888888", "margin": "md"},
-                {"type": "text", "text": f"今日已記錄：{d['extra_pro']} / {d['protein_goal']} g", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm"},
+                {"type": "text", "text": f"{recorded_label}：{d['extra_pro']} / {d['protein_goal']} g", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm"},
                 dual_progress_bar(d["pro_recorded_segment"], d["pro_planned_segment"], d["pro_remaining_segment"], "#FF6B35", "#FFD2C2"),
+                *ai_estimate_notice,
                 {"type": "separator", "margin": "md"},
 
                 {"type": "text", "text": "🍽️ 今日飲食紀錄", "size": "xs", "color": "#888888", "margin": "md"},
@@ -9675,7 +9661,11 @@ def _sync_food_outbox(entity_id):
                    original_image_ref, recognition_confidence, verification_status,
                    fingerprint, created_at, updated_at,
                    a.approved_exchange_json, a.food_fingerprint,
-                   a.suggestion_rule_version, a.approved_exchange_hash
+                   a.suggestion_rule_version, a.approved_exchange_hash,
+                   a.approval_id, a.food_id,
+                   (SELECT l.user_id FROM food_logs l
+                    WHERE l.exchange_approval_id=a.approval_id AND l.food_id=f.food_id
+                    ORDER BY l.created_at, l.log_id LIMIT 1)
             FROM food_catalog f
             LEFT JOIN food_exchange_approvals a ON a.approval_id=(
                 SELECT approval_id FROM food_exchange_approvals
@@ -9688,30 +9678,35 @@ def _sync_food_outbox(entity_id):
         raise RuntimeError("food outbox entity missing")
     try:
         per = json.loads(food[10] or "{}")
-        candidate = json.loads(food[19] or "{}")
     except (TypeError, json.JSONDecodeError):
-        per, candidate = {}, {}
+        per = {}
     if not isinstance(per, dict):
         per = {}
-    if not isinstance(candidate, dict):
-        candidate = {}
-    exch = {}
-    approval_valid = False
-    if food[12] == "approved" and food[20] and food[20] == food[16]:
-        expected_hash = exchange_approval_hash(food[20], food[21], candidate)
-        approval_valid = (
-            exchange_approval_payload_is_valid(food[21], candidate)
-            and secrets.compare_digest(str(food[22] or ""), expected_hash)
-        )
-        if approval_valid:
-            exch = candidate
-    review_status = (
-        "pending_review" if food[12] == "approved" and not approval_valid else food[12]
+    approval = verified_catalog_exchange_approval_projection(
+        catalog_food_id=food[0], catalog_source_type=food[4],
+        catalog_owner_user_id=food[5], catalog_fingerprint=food[16],
+        approval_id=food[23], approval_food_id=food[24],
+        approval_fingerprint=food[20], rule_version=food[21],
+        approved_json=food[19], approval_hash=food[22],
+        canonical_log_user_id=food[25],
     )
+    approval_valid = bool(food[12] == "approved" and approval["is_valid"])
+    exch = approval["approved"] if approval_valid else {}
+    review_status = food[12]
+    if food[12] == "approved" and not approval_valid:
+        review_status = (
+            "integrity_verification_failed"
+            if approval["is_meal_photo_origin"] else "pending_review"
+        )
+        if approval["is_meal_photo_origin"]:
+            per = {}
     if food_trust["trust_type"]:
         per, exch = {}, {}
         review_status = food_trust["trust_type"]
-    unknown_value = "" if food_trust["trust_type"] else 0
+    unknown_value = "" if (
+        food_trust["trust_type"]
+        or (approval["is_meal_photo_origin"] and not approval_valid)
+    ) else 0
     ws = _nutrition_ws("食品資料庫")
     row_values = [
         food[0], food[1], food[2], food[3], food[4], food[5], food[6],
@@ -9736,7 +9731,8 @@ def _sync_food_log_outbox(entity_id):
                    l.plan_id, l.confirmation_status, l.created_at, l.updated_at,
                    l.exchange_approval_id, a.food_fingerprint, a.suggestion_rule_version,
                    a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint,
-                   f.source_type,l.trust_type,l.exchange_snapshot_json
+                   f.source_type,l.trust_type,l.exchange_snapshot_json,
+                   f.owner_user_id,a.food_id
             FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
             LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
             WHERE l.log_id=?
@@ -9745,46 +9741,32 @@ def _sync_food_log_outbox(entity_id):
         raise RuntimeError("food log outbox entity missing")
     nutrition = _safe_json_object(log[9])
     exch = _safe_json_object(log[10])
-    approval_values = _safe_json_object(log[19])
-    approval_valid = bool(log[16] and log[17] and log[17] == log[21])
-    if approval_valid:
-        expected_hash = exchange_approval_hash(log[17], log[18], approval_values)
-        approval_valid = (
-            exchange_approval_payload_is_valid(log[18], approval_values)
-            and exchange_approval_payload_is_valid(log[18], exch)
-            and secrets.compare_digest(str(log[20] or ""), expected_hash)
-        )
-    if approval_valid:
-        approval_valid = exchange_applied_payload_matches_approval_hash(
-            log[17], log[18], exch, log[6], log[20]
-        )
-    if approval_valid:
-        expected_applied = {
-            key: round(float(approval_values.get(key, 0) or 0) * float(log[6] or 0), 4)
-            for key in (
-                "milk_exchange", "protein_low_exchange", "protein_medium_exchange",
-                "protein_high_exchange", "starch_exchange", "vegetable_exchange",
-                "fruit_exchange", "fat_exchange",
-            )
-        }
-        approval_valid = all(
-            abs(float(exch.get(key, 0) or 0) - value) <= 0.0001
-            for key, value in expected_applied.items()
-        )
-    if not approval_valid:
-        exch = {}
+    approval = verified_exchange_approval_projection(
+        log_user_id=log[1], log_food_id=log[2], catalog_source_type=log[22],
+        catalog_owner_user_id=log[25], catalog_fingerprint=log[21],
+        consumed_servings=log[6], applied_json=log[10], approval_id=log[16],
+        approval_food_id=log[26], approval_fingerprint=log[17],
+        rule_version=log[18], approved_json=log[19], approval_hash=log[20],
+    )
+    approval_valid = bool(approval["is_valid"])
+    exch = approval["applied"] if approval_valid else {}
     with sqlite3.connect(DB_PATH) as trust_conn:
         trust = user_confirmed_meal_photo_trust_projection(
             trust_conn, str(log[0] or ""), str(log[23] or "")
         )
-    if log[22] == "user_meal_photo" or trust["trust_type"]:
+    is_meal_photo_origin = bool(
+        approval["is_meal_photo_origin"]
+        or trust.get("integrity_status") in {"verified", "integrity_verification_failed"}
+        or trust.get("trust_type")
+    )
+    if is_meal_photo_origin:
         if approval_valid:
             nutrition = estimate_nutrition_from_exchanges(exch)
         elif trust.get("integrity_status") == "verified":
             nutrition = dict(trust.get("nutrition") or {})
         else:
             nutrition = {}
-    unknown_value = "" if trust["trust_type"] else 0
+    unknown_value = "" if is_meal_photo_origin else 0
     ws = _nutrition_ws("飲食紀錄")
     row_values = [
         log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7], log[8],
