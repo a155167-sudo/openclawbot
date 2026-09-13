@@ -6731,6 +6731,27 @@ def build_dashboard_flex(user_id: str):
             ]
         }
 
+    def display_number(value):
+        """Keep dashboard numbers compact without losing meaningful decimals."""
+        from decimal import Decimal, InvalidOperation
+
+        try:
+            number = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return str(value)
+        if not number.is_finite():
+            return str(value)
+        return format(number.normalize(), "f")
+
+    def remaining_number(goal, consumed):
+        from decimal import Decimal, InvalidOperation
+
+        try:
+            remaining = max(Decimal("0"), Decimal(str(goal)) - Decimal(str(consumed)))
+        except (InvalidOperation, TypeError, ValueError):
+            return "0"
+        return display_number(remaining)
+
     # --- 2. 準備左卡資料 (飲食) ---
     hour = tw_now().hour
     greeting = "早安" if hour < 12 else ("午安" if hour < 17 else "晚安")
@@ -6837,16 +6858,11 @@ def build_dashboard_flex(user_id: str):
     food_summary = "、".join(item[:32] for item in recorded_foods[:3]) or "尚無紀錄"
     if len(recorded_foods) > 3:
         food_summary += f"，另有 {len(recorded_foods) - 3} 筆"
-    recorded_label = "今日已記錄"
     ai_estimate_notice = []
     if d.get("ai_estimated_count", 0):
-        recorded_label += "（含 AI 照片估算）"
         ai_estimate_notice = [{
             "type": "text",
-            "text": (
-                f"AI 照片估算小計：{d['ai_estimated_cal']} kcal / "
-                f"蛋白質 {d['ai_estimated_pro']} g（非營養師核准）"
-            ),
+            "text": "含 AI 估算，非營養師核准",
             "size": "xxs", "color": "#9A6700", "margin": "md", "wrap": True,
         }]
 
@@ -6864,12 +6880,14 @@ def build_dashboard_flex(user_id: str):
             "type": "box", "layout": "vertical", "paddingAll": "20px",
             "contents": [
                 {"type": "text", "text": "🔥 熱量進度", "size": "xs", "color": "#888888"},
-                {"type": "text", "text": f"{recorded_label}：{d['extra_cal']} / {d['tdee']} kcal", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm"},
+                {"type": "text", "text": f"已攝取 {display_number(d['extra_cal'])} kcal", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm", "wrap": True},
+                {"type": "text", "text": f"目標 {display_number(d['tdee'])} kcal・剩餘 {remaining_number(d['tdee'], d['extra_cal'])} kcal", "size": "xs", "color": "#666666", "margin": "xs", "wrap": True},
                 dual_progress_bar(d["cal_recorded_segment"], d["cal_planned_segment"], d["cal_remaining_segment"], "#06C755", "#B7E8C8"),
                 {"type": "separator", "margin": "md"},
                 
                 {"type": "text", "text": "🥩 蛋白進度", "size": "xs", "color": "#888888", "margin": "md"},
-                {"type": "text", "text": f"{recorded_label}：{d['extra_pro']} / {d['protein_goal']} g", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm"},
+                {"type": "text", "text": f"已攝取 {display_number(d['extra_pro'])} g", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm", "wrap": True},
+                {"type": "text", "text": f"目標 {display_number(d['protein_goal'])} g・剩餘 {remaining_number(d['protein_goal'], d['extra_pro'])} g", "size": "xs", "color": "#666666", "margin": "xs", "wrap": True},
                 dual_progress_bar(d["pro_recorded_segment"], d["pro_planned_segment"], d["pro_remaining_segment"], "#FF6B35", "#FFD2C2"),
                 *ai_estimate_notice,
                 {"type": "separator", "margin": "md"},

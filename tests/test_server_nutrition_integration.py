@@ -8117,6 +8117,25 @@ def _dashboard_revision_estimate(conn, log_id, *, calories, protein):
     return estimate
 
 
+def _dashboard_flex_text_nodes(message):
+    payload = message.as_json_dict()
+    assert payload["contents"]["type"] == "carousel"
+    nodes = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            if value.get("type") == "text":
+                nodes.append(value)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    return payload, nodes
+
+
 def test_dashboard_counts_verified_ai_photo_and_labels_estimate_without_profile(tmp_path, monkeypatch):
     db_dir = tmp_path / "confirmed-ai-dashboard"
     db = db_dir / "health.db"
@@ -8164,12 +8183,25 @@ def test_dashboard_counts_verified_ai_photo_and_labels_estimate_without_profile(
     assert replayed["extra_cal"] == 680
     assert replayed["recorded_count"] == 1
 
-    rendered = json.dumps(
-        server.build_dashboard_flex("U-AI-DASHBOARD").as_json_dict(), ensure_ascii=False,
+    payload, text_nodes = _dashboard_flex_text_nodes(
+        server.build_dashboard_flex("U-AI-DASHBOARD")
     )
-    assert "今日已記錄（含 AI 照片估算）" in rendered
-    assert "AI 照片估算小計：680.0 kcal / 蛋白質 35.0 g" in rendered
-    assert "非營養師核准" in rendered
+    texts = [node["text"] for node in text_nodes]
+    assert payload["contents"]["contents"]
+    assert "已攝取 680 kcal" in texts
+    assert "已攝取 35 g" in texts
+    assert "含 AI 估算，非營養師核准" in texts
+    assert texts.count("含 AI 估算，非營養師核准") == 1
+    assert all(
+        node.get("wrap") is True
+        for node in text_nodes
+        if node["text"] in {
+            "已攝取 680 kcal", "已攝取 35 g", "含 AI 估算，非營養師核准",
+        }
+    )
+    rendered = json.dumps(payload, ensure_ascii=False)
+    assert "今日已記錄（含 AI 照片估算）" not in rendered
+    assert "AI 照片估算小計" not in rendered
     with sqlite3.connect(db) as conn:
         assert conn.execute(
             "SELECT 1 FROM health_profile WHERE user_id='U-AI-DASHBOARD'"
@@ -8305,6 +8337,12 @@ def test_dashboard_mixes_ordinary_approved_and_ai_once_and_fails_closed_on_ai_ta
     assert dashboard["recorded_count"] == 3
     assert dashboard["ai_estimated_count"] == 1
     assert dashboard["ai_estimated_cal"] == 680
+
+    _, text_nodes = _dashboard_flex_text_nodes(server.build_dashboard_flex("U-MIXED"))
+    texts = [node["text"] for node in text_nodes]
+    assert "已攝取 835 kcal" in texts
+    assert "已攝取 52 g" in texts
+    assert texts.count("含 AI 估算，非營養師核准") == 1
 
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -8452,6 +8490,19 @@ def test_approval_and_source_tamper_cannot_fall_back_to_raw_snapshot(tmp_path, m
                 "fruit_exchange": 0, "fat_exchange": 0,
             },
         )
+        conn.commit()
+
+    approved_dashboard = server.get_dashboard_data("U-APPROVAL-TAMPER")
+    assert approved_dashboard["ai_estimated_count"] == 0
+    _, approved_text_nodes = _dashboard_flex_text_nodes(
+        server.build_dashboard_flex("U-APPROVAL-TAMPER")
+    )
+    approved_texts = [node["text"] for node in approved_text_nodes]
+    assert "已攝取 55 kcal" in approved_texts
+    assert "已攝取 7 g" in approved_texts
+    assert "含 AI 估算，非營養師核准" not in approved_texts
+
+    with sqlite3.connect(db) as conn:
         conn.execute(
             """UPDATE food_catalog SET source_type='official_menu'
                WHERE food_id=(SELECT food_id FROM food_logs WHERE log_id=?)""",
@@ -8787,13 +8838,59 @@ def test_dashboard_without_profile_keeps_delimiter_in_single_food_name(tmp_path,
     rendered = json.dumps(flex.as_json_dict(), ensure_ascii=False)
     assert '"text": "雞胸、青花菜"' in rendered
     assert "今日飲食紀錄" in rendered
-    assert "今日已記錄：200.0 / 2000 kcal" in rendered
-    assert "今日已記錄：20.0 / 100 g" in rendered
+    assert "已攝取 200 kcal" in rendered
+    assert "已攝取 20 g" in rendered
+    assert "目標 2000 kcal・剩餘 1800 kcal" in rendered
+    assert "目標 100 g・剩餘 80 g" in rendered
+    assert "含 AI 估算，非營養師核准" not in rendered
+    assert "今日已記錄" not in rendered
 
     with sqlite3.connect(db) as conn:
         assert conn.execute(
             "SELECT 1 FROM health_profile WHERE user_id='U-SINGLE-FOOD'"
         ).fetchone() is None
+
+
+def test_dashboard_large_nutrition_numbers_remain_complete_and_wrapped(tmp_path, monkeypatch):
+    db_dir = tmp_path / "large-dashboard-values"
+    db = db_dir / "health.db"
+    monkeypatch.setattr(server, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U-LARGE-DASHBOARD", product_name="大量測試餐", meal_slot="早餐",
+            consumed_at=f"{today}T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 200, "protein_g": 20},
+            source_type="official_menu",
+        )
+        conn.commit()
+
+    dashboard = server.get_dashboard_data("U-LARGE-DASHBOARD")
+    dashboard.update({
+        "extra_cal": 1234567.5,
+        "tdee": 2000000,
+        "extra_pro": 98765.25,
+        "protein_goal": 100000,
+    })
+    monkeypatch.setattr(server, "get_dashboard_data", lambda _user_id: dashboard)
+
+    _, text_nodes = _dashboard_flex_text_nodes(
+        server.build_dashboard_flex("U-LARGE-DASHBOARD")
+    )
+    expected = {
+        "已攝取 1234567.5 kcal",
+        "目標 2000000 kcal・剩餘 765432.5 kcal",
+        "已攝取 98765.25 g",
+        "目標 100000 g・剩餘 1234.75 g",
+    }
+    matching = [node for node in text_nodes if node["text"] in expected]
+    assert {node["text"] for node in matching} == expected
+    assert all(node.get("wrap") is True for node in matching)
+    assert all(node.get("size") in {"xs", "md"} for node in matching)
 
 
 def test_dashboard_with_profile_uses_canonical_log_names_without_delimiter_xp(tmp_path, monkeypatch):
