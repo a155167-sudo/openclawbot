@@ -12911,6 +12911,9 @@ def handle_meal_photo_postback(event):
     request_adjust = re.fullmatch(
         r"mp:v1:([0-9a-f]{12}):(\d+):request_adjust", data
     )
+    meal_slot_choice = re.fullmatch(
+        r"mp:v1:([0-9a-f]{12}):(\d+):meal:(早餐|午餐|晚餐|點心)", data
+    )
     answer = re.fullmatch(
         r"mp:v1:([0-9a-f]{12}):(\d+):answer:([a-z_]+):([a-z_]+)", data
     )
@@ -12934,11 +12937,11 @@ def handle_meal_photo_postback(event):
     review_cancel = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):cancel_review", data)
     review_reject = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):reject", data)
     review_approve = re.fullmatch(r"mpr:v1:([0-9a-f]{12}):(\d+):approve", data)
-    if not (start or cancel or confirm_estimate or request_adjust or answer or remove_item or request_add or cancel_add or add_category or review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
+    if not (start or cancel or confirm_estimate or request_adjust or meal_slot_choice or answer or remove_item or request_add or cancel_add or add_category or review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
         return
     uid = event.source.user_id
     if not (review_start or review_resume or review_set or review_cancel or review_reject or review_approve):
-        matched = start or cancel or confirm_estimate or request_adjust or answer or remove_item or request_add or cancel_add or add_category
+        matched = start or cancel or confirm_estimate or request_adjust or meal_slot_choice or answer or remove_item or request_add or cancel_add or add_category
         assert matched is not None
         token, version = matched.group(1), int(matched.group(2))
     event_id = str(getattr(event, "webhook_event_id", "") or "").strip()
@@ -13079,18 +13082,24 @@ def handle_meal_photo_postback(event):
                         _read_valid_nutrition_image(confirm_draft.get("source_image_ref"))
                     except (FileNotFoundError, OSError, ValueError) as exc:
                         raise ValueError("原圖尚未安全保存，不能確認記錄；請重送原照片以恢復") from exc
-                _prepare_health_check_refresh_connection(conn)
                 applied = apply_meal_photo_action(
                     conn, event_id=event_id, user_id=uid, token=token,
                     expected_version=version, action="confirm_estimate",
                 )
                 draft, result = applied["draft"], applied["result"]
-                _refresh_health_check_after_food_log(conn, user_id=uid)
             elif request_adjust:
                 applied = apply_meal_photo_action(
                     conn, event_id=event_id, user_id=uid,
                     token=request_adjust.group(1),
                     expected_version=int(request_adjust.group(2)), action="request_adjust",
+                )
+                draft, result = applied["draft"], applied["result"]
+            elif meal_slot_choice:
+                applied = apply_meal_photo_action(
+                    conn, event_id=event_id, user_id=uid,
+                    token=meal_slot_choice.group(1),
+                    expected_version=int(meal_slot_choice.group(2)),
+                    action="set_meal_slot", value=meal_slot_choice.group(3),
                 )
                 draft, result = applied["draft"], applied["result"]
             elif cancel:
@@ -13143,6 +13152,9 @@ def handle_meal_photo_postback(event):
                     field=answer.group(3), value=answer.group(4),
                 )
                 draft, result = applied["draft"], applied["result"]
+            if result["kind"] in {"recorded", "recorded_updated"}:
+                _prepare_health_check_refresh_connection(conn)
+                _refresh_health_check_after_food_log(conn, user_id=uid)
         kind = result["kind"]
         if kind == "question":
             reply = build_meal_photo_step_message(
@@ -13169,20 +13181,25 @@ def handle_meal_photo_postback(event):
                     draft, allow_admin_review=is_admin_owner
                 ),
             )
-        elif kind == "recorded":
-            from linebot.models import FlexSendMessage
+        elif kind in {"recorded", "recorded_updated"}:
             log_version = _daily_food_log_brief(uid, result["log_id"])["version"]
-            reply = FlexSendMessage(
-                alt_text="✅ 已記錄｜顧客確認・AI估算",
-                contents=build_meal_photo_recorded_bubble(
-                    draft,
-                    allow_confirmed_revision=(
-                        CONFIRMED_MEAL_PHOTO_REVISION_WRITER_ENABLED
-                        and draft.get("workflow_version") == "user_confirmed_ai_nutrition_v2"
+            if kind == "recorded_updated" or log_version > 1:
+                reply = TextSendMessage(
+                    text="✅ 紀錄已更新，請開啟飲食紀錄查看最新內容。"
+                )
+            else:
+                from linebot.models import FlexSendMessage
+                reply = FlexSendMessage(
+                    alt_text="✅ 已記錄｜顧客確認・AI估算",
+                    contents=build_meal_photo_recorded_bubble(
+                        draft,
+                        allow_confirmed_revision=(
+                            CONFIRMED_MEAL_PHOTO_REVISION_WRITER_ENABLED
+                            and draft.get("workflow_version") == "user_confirmed_ai_nutrition_v2"
+                        ),
+                        log_id=result["log_id"], log_version=log_version,
                     ),
-                    log_id=result["log_id"], log_version=log_version,
-                ),
-            )
+                )
         elif kind == "cancel":
             image_ref = str(result.get("source_image_ref") or "")
             if image_ref and _delete_nutrition_image(image_ref):
@@ -13191,6 +13208,12 @@ def handle_meal_photo_postback(event):
                         conn, user_id=uid, token=token, expected_ref=image_ref
                     )
             reply = TextSendMessage(text="✅ 已取消餐點照片紀錄，辨識內容已清除。")
+        elif kind == "terminal":
+            reply = TextSendMessage(text=(
+                "✅ 這筆餐點照片紀錄已取消，無法再操作。"
+                if result.get("status") == "cancelled"
+                else "⌛ 這筆餐點照片草稿已逾時，請重新上傳照片。"
+            ))
         elif kind == "ask_item_name":
             reply = TextSendMessage(
                 text=(

@@ -688,7 +688,8 @@ def cancel_meal_photo_revision_draft(
 
 
 def get_meal_photo_draft(
-    conn: sqlite3.Connection, *, user_id: str, token: str
+    conn: sqlite3.Connection, *, user_id: str, token: str,
+    allow_expired: bool = False,
 ) -> dict[str, Any]:
     ensure_meal_photo_schema(conn)
     row = conn.execute(
@@ -713,7 +714,9 @@ def get_meal_photo_draft(
             (retired, token, user_id),
         )
         conn.commit()
-        raise ValueError("這筆餐點照片草稿已逾時")
+        if not allow_expired:
+            raise ValueError("這筆餐點照片草稿已逾時")
+        return get_meal_photo_draft(conn, user_id=user_id, token=token)
     return {
         "token": token,
         "user_id": user_id,
@@ -1148,6 +1151,11 @@ def apply_meal_photo_action(
         value = str(value or "").strip()
         if value not in ANSWER_VALUES[field]:
             raise ValueError("餐點回答選項不支援")
+    elif action == "set_meal_slot":
+        field = ""
+        value = str(value or "").strip()
+        if value not in {"早餐", "午餐", "晚餐", "點心"}:
+            raise ValueError("餐別選項不支援")
     elif action in {"cancel", "confirm_estimate", "request_adjust"}:
         field = ""
         value = ""
@@ -1191,16 +1199,43 @@ def apply_meal_photo_action(
             ):
                 raise ValueError("餐點事件識別碼衝突")
             result = json.loads(existing[4])
-            if action == "confirm_estimate" and not user_confirmed_meal_photo_estimate_is_valid(
-                conn, str(result.get("log_id") or ""), expected_user_id=user_id,
-                expected_draft_token=token, expected_draft_version=expected_version + 1,
-            ):
-                raise ValueError("已記錄餐點完整性驗證失敗")
+            draft = get_meal_photo_draft(
+                conn, user_id=user_id, token=token, allow_expired=True,
+            )
+            status = str(draft.get("status") or "")
+            if status == "user_confirmed":
+                confirmed_log_id = str(draft.get("confirmed_log_id") or "")
+                if not user_confirmed_meal_photo_estimate_is_valid(
+                    conn, confirmed_log_id, expected_user_id=user_id,
+                    expected_draft_token=token,
+                    expected_draft_version=int(draft.get("version") or 0),
+                ):
+                    raise ValueError("已記錄餐點完整性驗證失敗")
+                log_version = 1
+                if draft.get("workflow_version") == "user_confirmed_ai_nutrition_v2":
+                    log_version_row = conn.execute(
+                        "SELECT version FROM food_logs WHERE log_id=? AND user_id=?",
+                        (confirmed_log_id, user_id),
+                    ).fetchone()
+                    log_version = int(log_version_row[0])
+                result = {
+                    "kind": "recorded_updated" if log_version > 1 else "recorded",
+                    "version": int(draft["version"]),
+                    "log_id": confirmed_log_id,
+                }
+            elif (
+                status == "cancelled" and result.get("kind") != "cancel"
+            ) or status == "expired" or _expired(str(draft.get("expires_at") or "")):
+                terminal_status = status if status in {"cancelled", "expired"} else "expired"
+                result = {
+                    "kind": "terminal", "status": terminal_status,
+                    "version": int(draft.get("version") or 0),
+                }
             conn.commit()
             return {
                 "replayed": True,
                 "result": result,
-                "draft": get_meal_photo_draft(conn, user_id=user_id, token=token),
+                "draft": draft,
             }
         row = conn.execute(
             """SELECT answers_json,status,expires_at,version,source_image_ref,
@@ -1224,7 +1259,18 @@ def apply_meal_photo_action(
             ):
                 raise ValueError("已記錄餐點完整性驗證失敗")
             now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
-            result = {"kind": "recorded", "version": current_version, "log_id": confirmed_log_id}
+            log_version = 1
+            if row[10] == "user_confirmed_ai_nutrition_v2":
+                log_version_row = conn.execute(
+                    "SELECT version FROM food_logs WHERE log_id=? AND user_id=?",
+                    (confirmed_log_id, user_id),
+                ).fetchone()
+                log_version = int(log_version_row[0])
+            result = {
+                "kind": "recorded_updated" if log_version > 1 else "recorded",
+                "version": current_version,
+                "log_id": confirmed_log_id,
+            }
             conn.execute(
                 """INSERT INTO meal_photo_events
                    (event_id,user_id,token,action,request_payload_hash,result_json,created_at)
@@ -1241,7 +1287,7 @@ def apply_meal_photo_action(
             {"awaiting_item_name"} if action in {"add_item", "cancel_add"}
             else {"estimated"} if action == "confirm_estimate"
             else {"awaiting_confirmation", "confirming", "estimated", "awaiting_adjustment", "adjusting"} if action == "cancel"
-            else {"estimated"} if action == "request_adjust"
+            else {"estimated"} if action in {"request_adjust", "set_meal_slot"}
             else {"awaiting_confirmation", "confirming"}
         )
         if status not in allowed_statuses:
@@ -1250,7 +1296,18 @@ def apply_meal_photo_action(
             raise ValueError("餐點確認畫面已更新，請使用最新按鈕")
         next_version = current_version + 1
         now = datetime.now(TAIPEI_TZ).isoformat(timespec="seconds")
-        if action == "request_adjust":
+        if action == "set_meal_slot":
+            if row[10] not in {"user_confirmed_ai_estimate_v1", "user_confirmed_ai_nutrition_v2"}:
+                raise ValueError("這筆餐點不能由顧客選擇餐別")
+            result = {"kind": "estimate", "version": next_version}
+            changed = conn.execute(
+                """UPDATE pending_meal_photo_drafts
+                   SET meal_slot=?,updated_at=?,version=?
+                   WHERE token=? AND user_id=? AND version=? AND status='estimated'
+                     AND workflow_version IN ('user_confirmed_ai_estimate_v1','user_confirmed_ai_nutrition_v2')""",
+                (value, now, next_version, token, user_id, current_version),
+            ).rowcount
+        elif action == "request_adjust":
             if row[10] != "user_confirmed_ai_nutrition_v2":
                 raise ValueError("只有AI先估餐點可使用文字調整")
             result = {"kind": "ask_adjustment", "version": next_version}
@@ -2048,9 +2105,24 @@ def build_meal_photo_estimate_bubble(
         bubble["body"]["contents"][-2]["text"] = (
             "確認後會記入飲食紀錄；AI照片估算，非營養師核准，不會冒充營養師核准值。"
         )
+        meal_slot = str(draft.get("meal_slot") or "").strip()
+        meal_slot_label = meal_slot if meal_slot in {"早餐", "午餐", "晚餐", "點心"} else "未指定"
+        bubble["body"]["contents"].insert(0, line(f"餐別：{meal_slot_label}（確認前可更改）", "#0F766E"))
         bubble["footer"] = {
             "type": "box", "layout": "vertical", "spacing": "sm",
             "contents": [
+                {
+                    "type": "box", "layout": "horizontal", "spacing": "xs",
+                    "contents": [{
+                        "type": "button", "style": "primary" if slot == meal_slot else "secondary",
+                        "height": "sm", "flex": 1,
+                        "action": {
+                            "type": "postback", "label": slot,
+                            "data": f"mp:v1:{token}:{version}:meal:{slot}",
+                            "displayText": f"這餐是{slot}",
+                        },
+                    } for slot in ("早餐", "午餐", "晚餐", "點心")],
+                },
                 {
                     "type": "button", "style": "primary", "color": "#0F766E",
                     "action": {
@@ -2120,6 +2192,9 @@ def build_meal_photo_recorded_bubble(
     source["status"] = "estimated"
     bubble = build_meal_photo_estimate_bubble(source)
     bubble["header"]["contents"][0]["text"] = "✅ 已記錄｜顧客確認・AI估算"
+    meal_slot = str(draft.get("meal_slot") or "").strip()
+    meal_slot_label = meal_slot if meal_slot in {"早餐", "午餐", "晚餐", "點心"} else "未指定"
+    bubble["body"]["contents"][0]["text"] = f"餐別：{meal_slot_label}"
     bubble["body"]["contents"][-2]["text"] = (
         "這餐已記入飲食紀錄；估算區間未當成營養師核准值。"
     )

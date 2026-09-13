@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import meal_photo_system
 from nutrition_system import (
     _confirmed_result,
     daily_consumed_totals,
@@ -442,6 +443,210 @@ def test_ai_first_photo_is_immediately_estimated_and_one_confirmation_persists_s
         assert summary["foods"][0]["calories_kcal"] == 680.0
         assert summary["foods"][0]["protein_g"] == 35.0
         assert summary["estimated_totals"] == {"calories_kcal": 680.0, "protein_g": 35.0}
+
+
+def test_ai_first_meal_slot_choice_is_visible_versioned_owned_and_replay_safe(tmp_path):
+    with sqlite3.connect(tmp_path / "ai-first-meal-slot.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="AI-PHOTO-SLOT",
+            payload=ai_estimated_payload(), meal_slot="早餐",
+            consumed_at="2026-09-13T08:00:00+08:00",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        card = build_meal_photo_estimate_bubble(draft)
+        text = "\n".join(flatten_text(card))
+        actions = json.dumps(card, ensure_ascii=False)
+        assert "餐別：早餐（確認前可更改）" in text
+        for slot in ("早餐", "午餐", "晚餐", "點心"):
+            assert f"mp:v1:{token}:1:meal:{slot}" in actions
+
+        selected = apply_meal_photo_action(
+            conn, event_id="SLOT-EVENT-1", user_id="U1", token=token,
+            expected_version=1, action="set_meal_slot", value="晚餐",
+        )
+        assert selected["result"] == {"kind": "estimate", "version": 2}
+        assert selected["draft"]["meal_slot"] == "晚餐"
+        assert selected["draft"]["consumed_at"] == "2026-09-13T08:00:00+08:00"
+        assert selected["draft"]["estimate"] == draft["estimate"]
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+
+        replay = apply_meal_photo_action(
+            conn, event_id="SLOT-EVENT-1", user_id="U1", token=token,
+            expected_version=1, action="set_meal_slot", value="晚餐",
+        )
+        assert replay["replayed"] is True
+        assert replay["draft"]["meal_slot"] == "晚餐"
+        with pytest.raises(ValueError, match="事件識別碼衝突"):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-EVENT-1", user_id="U1", token=token,
+                expected_version=1, action="set_meal_slot", value="午餐",
+            )
+        with pytest.raises(ValueError, match="找不到"):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-FOREIGN", user_id="U2", token=token,
+                expected_version=2, action="set_meal_slot", value="午餐",
+            )
+        with pytest.raises(ValueError, match="最新按鈕"):
+            apply_meal_photo_action(
+                conn, event_id="STALE-CONFIRM", user_id="U1", token=token,
+                expected_version=1, action="confirm_estimate",
+            )
+        with pytest.raises(ValueError, match="選項不支援"):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-INVALID", user_id="U1", token=token,
+                expected_version=2, action="set_meal_slot", value="宵夜",
+            )
+        cancelled = apply_meal_photo_action(
+            conn, event_id="SLOT-CANCEL", user_id="U1", token=token,
+            expected_version=2, action="cancel",
+        )
+        with pytest.raises(ValueError, match="不能再修改"):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-AFTER-CANCEL", user_id="U1", token=token,
+                expected_version=cancelled["draft"]["version"],
+                action="set_meal_slot", value="午餐",
+            )
+        with pytest.raises(ValueError, match="token無效"):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-BAD-TOKEN", user_id="U1", token="not-a-token",
+                expected_version=1, action="set_meal_slot", value="午餐",
+            )
+
+        expired_token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="AI-PHOTO-SLOT-EXPIRED",
+            payload=ai_estimated_payload(), meal_slot="早餐",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        conn.execute(
+            "UPDATE pending_meal_photo_drafts SET expires_at=? WHERE token=?",
+            ("2000-01-01T00:00:00+08:00", expired_token),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match="已逾時"):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-EXPIRED", user_id="U1", token=expired_token,
+                expected_version=1, action="set_meal_slot", value="午餐",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+
+
+def test_old_verified_event_replay_becomes_terminal_after_natural_expiry(
+    tmp_path, monkeypatch,
+):
+    class AdvancingDateTime(datetime):
+        current = datetime(2026, 9, 14, 8, 0, tzinfo=timezone(timedelta(hours=8)))
+
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr(meal_photo_system, "datetime", AdvancingDateTime)
+    with sqlite3.connect(tmp_path / "natural-expiry-replay.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="AI-PHOTO-NATURAL-EXPIRY",
+            payload=ai_estimated_payload(), meal_slot="早餐",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        selected = apply_meal_photo_action(
+            conn, event_id="SLOT-NATURAL-EXPIRY", user_id="U1", token=token,
+            expected_version=1, action="set_meal_slot", value="午餐",
+        )
+        assert selected["draft"]["status"] == "estimated"
+        assert selected["draft"]["meal_slot"] == "午餐"
+
+        original_event = conn.execute(
+            "SELECT request_payload_hash,result_json FROM meal_photo_events WHERE event_id=?",
+            ("SLOT-NATURAL-EXPIRY",),
+        ).fetchone()
+        original_event_count = conn.execute("SELECT COUNT(*) FROM meal_photo_events").fetchone()[0]
+        original_log_count = conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0]
+        original_outbox_count = conn.execute(
+            "SELECT COUNT(*) FROM nutrition_sheet_outbox"
+        ).fetchone()[0]
+
+        AdvancingDateTime.current += timedelta(hours=25)
+
+        # A new event is still rejected and rolled back; only a previously verified
+        # owner/request replay may turn natural expiry into a safe terminal response.
+        with pytest.raises(ValueError, match="已逾時"):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-AFTER-NATURAL-EXPIRY", user_id="U1", token=token,
+                expected_version=2, action="set_meal_slot", value="晚餐",
+            )
+        assert conn.execute(
+            "SELECT status FROM pending_meal_photo_drafts WHERE token=?", (token,)
+        ).fetchone()[0] == "estimated"
+        assert conn.execute("SELECT COUNT(*) FROM meal_photo_events").fetchone()[0] == original_event_count
+
+        with pytest.raises(ValueError, match="事件識別碼衝突"):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-NATURAL-EXPIRY", user_id="U2", token=token,
+                expected_version=1, action="set_meal_slot", value="午餐",
+            )
+        with pytest.raises(ValueError, match="事件識別碼衝突"):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-NATURAL-EXPIRY", user_id="U1", token=token,
+                expected_version=1, action="set_meal_slot", value="晚餐",
+            )
+        conn.execute(
+            "UPDATE meal_photo_events SET result_json='{' WHERE event_id=?",
+            ("SLOT-NATURAL-EXPIRY",),
+        )
+        conn.commit()
+        with pytest.raises(json.JSONDecodeError):
+            apply_meal_photo_action(
+                conn, event_id="SLOT-NATURAL-EXPIRY", user_id="U1", token=token,
+                expected_version=1, action="set_meal_slot", value="午餐",
+            )
+        conn.execute(
+            "UPDATE meal_photo_events SET result_json=? WHERE event_id=?",
+            (original_event[1], "SLOT-NATURAL-EXPIRY"),
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT status FROM pending_meal_photo_drafts WHERE token=?", (token,)
+        ).fetchone()[0] == "estimated"
+
+        replay = apply_meal_photo_action(
+            conn, event_id="SLOT-NATURAL-EXPIRY", user_id="U1", token=token,
+            expected_version=1, action="set_meal_slot", value="午餐",
+        )
+        assert replay["replayed"] is True
+        assert replay["result"] == {"kind": "terminal", "status": "expired", "version": 2}
+        assert replay["draft"]["status"] == "expired"
+        assert replay["draft"]["estimate"] == {}
+        assert conn.execute(
+            "SELECT status,estimate_json FROM pending_meal_photo_drafts WHERE token=?",
+            (token,),
+        ).fetchone() == ("expired", "{}")
+        assert conn.execute(
+            "SELECT request_payload_hash,result_json FROM meal_photo_events WHERE event_id=?",
+            ("SLOT-NATURAL-EXPIRY",),
+        ).fetchone() == original_event
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == original_log_count
+        assert conn.execute(
+            "SELECT COUNT(*) FROM nutrition_sheet_outbox"
+        ).fetchone()[0] == original_outbox_count
+
+        # Expiry was intentionally committed by the terminal replay, not left as
+        # caller transaction state that a later rollback could resurrect.
+        conn.rollback()
+        assert conn.execute(
+            "SELECT status FROM pending_meal_photo_drafts WHERE token=?", (token,)
+        ).fetchone()[0] == "expired"
+        second = apply_meal_photo_action(
+            conn, event_id="SLOT-NATURAL-EXPIRY", user_id="U1", token=token,
+            expected_version=1, action="set_meal_slot", value="午餐",
+        )
+        assert second["result"] == replay["result"]
+        assert second["draft"] == replay["draft"]
+        assert conn.execute(
+            "SELECT request_payload_hash,result_json FROM meal_photo_events WHERE event_id=?",
+            ("SLOT-NATURAL-EXPIRY",),
+        ).fetchone() == original_event
 
 
 def test_ai_first_estimate_cancel_is_effective_and_owner_version_safe(tmp_path):
@@ -1661,6 +1866,13 @@ def test_estimate_card_actions_match_workflow_and_viewer(
     actions = [
         item.get("action", {}).get("data")
         for item in card.get("footer", {}).get("contents", [])
+        if item.get("action", {}).get("data")
+    ]
+    meal_actions = [
+        item.get("action", {}).get("data")
+        for box in card.get("footer", {}).get("contents", [])
+        for item in box.get("contents", [])
+        if item.get("action", {}).get("data")
     ]
 
     assert expected_heading in text
@@ -1679,7 +1891,12 @@ def test_estimate_card_actions_match_workflow_and_viewer(
         ]
     else:
         assert actions == []
-    assert not any("confirm_estimate" in (action or "") for action in actions) or (
+    expected_meal_actions = (
+        [f"mp:v1:{token}:{draft['version']}:meal:{slot}" for slot in ("早餐", "午餐", "晚餐", "點心")]
+        if workflow_version == "user_confirmed_ai_estimate_v1" else []
+    )
+    assert meal_actions == expected_meal_actions
+    assert not any("confirm_estimate" in action for action in actions) or (
         workflow_version == "user_confirmed_ai_estimate_v1"
     )
 

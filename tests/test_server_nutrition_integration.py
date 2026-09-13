@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import os
 import json
 import sqlite3
@@ -27,6 +28,7 @@ from nutrition_system import (
     save_pending_label,
     set_nutrition_input_state,
     update_pending_consumption,
+    user_confirmed_meal_photo_trust_projection,
     utcish_now,
 )
 from daily_health_report import (
@@ -698,6 +700,367 @@ def test_daily_food_log_refreshes_open_health_check_case(tmp_path, monkeypatch):
             "SELECT COUNT(*) FROM vip_health_check_source_refs WHERE case_id=?",
             (case["case_id"],),
         ).fetchone()[0] == 1
+
+
+def test_meal_photo_postback_selects_slot_before_confirm_and_refreshes_health_check(
+    tmp_path, monkeypatch,
+):
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+    )
+
+    db = _daily_ledger_db(tmp_path, monkeypatch, "meal-photo-slot-health-check.db")
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    monkeypatch.setattr(server, "_read_valid_nutrition_image", lambda _ref: b"safe")
+    monkeypatch.setattr(
+        server.client.chat.completions, "create",
+        lambda **_kwargs: pytest.fail("meal-slot selection/confirmation must not rerun AI"),
+    )
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    now = server.tw_now()
+    with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        case = create_first_vip_health_check_case(
+            conn, user_id="U1", first_vip_activation_id="activation-photo-slot",
+            activation_event_key="event-photo-slot",
+            activated_at=now - server.timedelta(minutes=5),
+        )
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-SLOT-INTEGRATION",
+            payload=ai_estimated_payload(),
+            source_image_ref="nutrition-image:" + "f" * 32 + ".jpg",
+            meal_slot="早餐", consumed_at=now.isoformat(timespec="seconds"),
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+
+    def postback(data, event_id):
+        server.handle_meal_photo_postback(SimpleNamespace(
+            postback=SimpleNamespace(data=data), source=SimpleNamespace(user_id="U1"),
+            reply_token=f"reply-{event_id}", webhook_event_id=event_id,
+            timestamp=int(now.timestamp() * 1000),
+        ))
+
+    postback(f"mp:v1:{token}:1:meal:晚餐", "PHOTO-SLOT-SELECT")
+    selected_card = json.loads(replies[-1].contents.as_json_string())
+    assert "餐別：晚餐（確認前可更改）" in json.dumps(selected_card, ensure_ascii=False)
+    postback(f"mp:v1:{token}:2:confirm_estimate", "PHOTO-SLOT-CONFIRM")
+
+    with sqlite3.connect(db) as conn:
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        rows = conn.execute(
+            "SELECT log_id,meal_slot FROM food_logs WHERE user_id='U1'"
+        ).fetchall()
+        source_rows = conn.execute(
+            "SELECT food_log_id FROM vip_health_check_source_refs WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchall()
+    assert draft["status"] == "user_confirmed"
+    assert rows == [(draft["confirmed_log_id"], "晚餐")]
+    assert source_rows == [(draft["confirmed_log_id"],)]
+    assert replies[-1].alt_text == "✅ 已記錄｜顧客確認・AI估算"
+    recorded = json.dumps(json.loads(replies[-1].contents.as_json_string()), ensure_ascii=False)
+    assert "餐別：晚餐" in recorded
+    assert "確認前可更改" not in recorded
+
+
+def test_delayed_meal_slot_postback_after_adjust_and_confirm_replays_recorded_state(
+    tmp_path, monkeypatch,
+):
+    db = _daily_ledger_db(tmp_path, monkeypatch, "meal-photo-delayed-slot-confirmed.db")
+    image_ref = "nutrition-image:" + "d" * 32 + ".jpg"
+    monkeypatch.setattr(server, "_read_valid_nutrition_image", lambda _ref: b"safe")
+    monkeypatch.setattr(server, "CONFIRMED_MEAL_PHOTO_REVISION_WRITER_ENABLED", True)
+    provider_calls = []
+    revised = ai_estimated_payload()
+
+    def fake_provider(_image_ref, _original_payload, _correction):
+        provider_calls.append(True)
+        return revised
+
+    monkeypatch.setattr(server, "_estimate_adjusted_meal_photo", fake_provider)
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    consumed_at = "2026-09-13T18:20:00+08:00"
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-DELAYED-SLOT",
+            payload=ai_estimated_payload(), source_image_ref=image_ref,
+            meal_slot="早餐", consumed_at=consumed_at,
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+
+    def postback(data, event_id):
+        server.handle_meal_photo_postback(SimpleNamespace(
+            postback=SimpleNamespace(data=data), source=SimpleNamespace(user_id="U1"),
+            reply_token=f"reply-{event_id}", webhook_event_id=event_id,
+            timestamp=1789314000000,
+        ))
+
+    postback(f"mp:v1:{token}:1:meal:晚餐", "DELAYED-SLOT")
+    postback(f"mp:v1:{token}:2:request_adjust", "DELAYED-ADJUST-REQUEST")
+    server.processed_messages.clear()
+    server._handle_message_impl(_text_event(
+        "DELAYED-ADJUST-TEXT", "飯少一半", user_id="U1"
+    ))
+    assert len(provider_calls) == 1
+    postback(f"mp:v1:{token}:4:confirm_estimate", "DELAYED-CONFIRM")
+    postback(f"mp:v1:{token}:1:meal:晚餐", "DELAYED-SLOT")
+    postback(f"mp:v1:{token}:4:confirm_estimate", "DELAYED-CONFIRM")
+
+    assert len(provider_calls) == 1
+    assert all(
+        message.alt_text == "✅ 已記錄｜顧客確認・AI估算"
+        for message in replies[-3:]
+    )
+    rendered_cards = [message.as_json_dict() for message in replies[-3:]]
+    assert rendered_cards[0] == rendered_cards[1] == rendered_cards[2]
+    for card in rendered_cards:
+        rendered = json.dumps(card, ensure_ascii=False)
+        assert "餐別：晚餐" in rendered
+        assert "確認前可更改" not in rendered
+        assert "mealrev:v1:" in rendered
+    with sqlite3.connect(db) as conn:
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        logs = conn.execute(
+            "SELECT log_id,meal_slot,consumed_at FROM food_logs WHERE user_id='U1'"
+        ).fetchall()
+        saved_slot_result = json.loads(conn.execute(
+            "SELECT result_json FROM meal_photo_events WHERE event_id='DELAYED-SLOT'"
+        ).fetchone()[0])
+    assert logs == [(draft["confirmed_log_id"], "晚餐", consumed_at)]
+    assert draft["version"] == 5
+    assert saved_slot_result == {"kind": "estimate", "version": 2}
+
+
+@pytest.mark.parametrize("replay_action", ["slot", "adjust", "old_confirm", "new_confirm"])
+def test_recorded_updated_replay_repairs_failed_health_check_projection(
+    tmp_path, monkeypatch, replay_action,
+):
+    from vip_health_check import (
+        configure_vip_health_check_connection,
+        create_first_vip_health_check_case,
+        ensure_vip_health_check_schema,
+    )
+
+    db = _daily_ledger_db(tmp_path, monkeypatch, "meal-photo-revised-delayed-actions.db")
+    image_ref = "nutrition-image:" + "e" * 32 + ".jpg"
+    monkeypatch.setattr(server, "VIP_HEALTH_CHECK_ENABLED", True)
+    monkeypatch.setattr(server, "_read_valid_nutrition_image", lambda _ref: b"safe")
+    monkeypatch.setattr(server, "CONFIRMED_MEAL_PHOTO_REVISION_WRITER_ENABLED", True)
+    provider_calls = []
+
+    def fake_provider(_image_ref, _original_payload, _correction):
+        provider_calls.append(True)
+        return ai_estimated_payload()
+
+    monkeypatch.setattr(server, "_estimate_adjusted_meal_photo", fake_provider)
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    now = server.tw_now().replace(microsecond=0)
+    with sqlite3.connect(db) as conn:
+        configure_vip_health_check_connection(conn)
+        ensure_vip_health_check_schema(conn)
+        case = create_first_vip_health_check_case(
+            conn, user_id="U1", first_vip_activation_id=f"activation-{replay_action}",
+            activation_event_key=f"activation-event-{replay_action}",
+            activated_at=now - server.timedelta(minutes=5),
+        )
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-REVISED-DELAYED",
+            payload=ai_estimated_payload(), source_image_ref=image_ref,
+            meal_slot="早餐", consumed_at=now.isoformat(),
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+
+    def postback(data, event_id):
+        server.handle_meal_photo_postback(SimpleNamespace(
+            postback=SimpleNamespace(data=data), source=SimpleNamespace(user_id="U1"),
+            reply_token=f"reply-{event_id}", webhook_event_id=event_id,
+            timestamp=1789314000000,
+        ))
+
+    postback(f"mp:v1:{token}:1:meal:晚餐", "REVISED-DELAYED-SLOT")
+    postback(f"mp:v1:{token}:2:request_adjust", "REVISED-DELAYED-ADJUST")
+    server.processed_messages.clear()
+    server._handle_message_impl(_text_event(
+        "REVISED-DELAYED-ADJUST-TEXT", "飯少一半", user_id="U1"
+    ))
+    postback(f"mp:v1:{token}:4:confirm_estimate", "REVISED-DELAYED-CONFIRM")
+    assert len(provider_calls) == 1
+
+    with sqlite3.connect(db) as conn:
+        initial_ref = conn.execute(
+            "SELECT food_log_version,source_hash FROM vip_health_check_source_refs "
+            "WHERE case_id=?", (case["case_id"],),
+        ).fetchone()
+        assert initial_ref is not None and initial_ref[0] == 1
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        log_id = draft["confirmed_log_id"]
+        revision2 = create_meal_photo_revision_draft(
+            conn, user_id="U1", log_id=log_id, from_version=1,
+            request_text="白飯改半碗",
+            estimate=_dashboard_revision_estimate(conn, log_id, calories=510, protein=31),
+        )
+        confirm_user_meal_photo_revision(
+            conn, event_id="REVISED-DELAYED-REVISION-2", user_id="U1",
+            log_id=log_id, from_version=1, draft_token=revision2["token"],
+        )
+        revision3 = create_meal_photo_revision_draft(
+            conn, user_id="U1", log_id=log_id, from_version=2,
+            request_text="再加一顆蛋",
+            estimate=_dashboard_revision_estimate(conn, log_id, calories=590, protein=38),
+        )
+        confirm_user_meal_photo_revision(
+            conn, event_id="REVISED-DELAYED-REVISION-3", user_id="U1",
+            log_id=log_id, from_version=2, draft_token=revision3["token"],
+        )
+        assert conn.execute(
+            "SELECT version FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone() == (3,)
+        stale_manifest = conn.execute(
+            "SELECT source_manifest_hash FROM vip_health_check_cases WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()[0]
+        conn.execute("""CREATE TRIGGER reject_recorded_updated_refresh
+            BEFORE UPDATE ON vip_health_check_cases
+            BEGIN SELECT RAISE(ABORT, 'temporary recorded-updated refresh failure'); END""")
+        conn.commit()
+
+    replies.clear()
+    replay = {
+        "slot": (f"mp:v1:{token}:1:meal:晚餐", "REVISED-DELAYED-SLOT"),
+        "adjust": (f"mp:v1:{token}:2:request_adjust", "REVISED-DELAYED-ADJUST"),
+        "old_confirm": (f"mp:v1:{token}:4:confirm_estimate", "REVISED-DELAYED-CONFIRM"),
+        "new_confirm": (f"mp:v1:{token}:4:confirm_estimate", "REVISED-DELAYED-LATE-CONFIRM"),
+    }[replay_action]
+    postback(*replay)
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT food_log_version,source_hash FROM vip_health_check_source_refs "
+            "WHERE case_id=?", (case["case_id"],),
+        ).fetchone() == initial_ref
+        conn.execute("DROP TRIGGER reject_recorded_updated_refresh")
+        canonical_tables = (
+            "food_logs", "daily_food_log_events", "nutrition_sheet_outbox",
+            "pending_meal_photo_drafts", "meal_photo_events",
+        )
+        committed = {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            for table in canonical_tables
+        }
+        conn.commit()
+
+    postback(*replay)
+
+    assert len(provider_calls) == 1
+    assert [message.type for message in replies] == ["text", "text"]
+    assert {message.text for message in replies} == {
+        "✅ 紀錄已更新，請開啟飲食紀錄查看最新內容。"
+    }
+    rendered = json.dumps([message.as_json_dict() for message in replies], ensure_ascii=False)
+    for stale_value in ("680", "35", "510", "31"):
+        assert stale_value not in rendered
+    assert "mealrev:v1:" not in rendered
+    assert "foodlog:v1:" not in rendered
+    with sqlite3.connect(db) as conn:
+        assert {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            for table in canonical_tables
+        } == committed
+        current = user_confirmed_meal_photo_trust_projection(
+            conn, log_id, "user_confirmed_ai_estimate",
+        )
+        expected_source_hash = hashlib.sha256(
+            f"{log_id}:3:{json.dumps(current['nutrition'], ensure_ascii=False, sort_keys=True, separators=(',', ':'))}:user_confirmed_ai_estimate:{current['effective_revision_hash']}".encode()
+        ).hexdigest()
+        refreshed_ref = conn.execute(
+            "SELECT food_log_version,source_hash FROM vip_health_check_source_refs "
+            "WHERE case_id=? AND food_log_id=?", (case["case_id"], log_id),
+        ).fetchone()
+        refreshed_manifest = conn.execute(
+            "SELECT source_manifest_hash FROM vip_health_check_cases WHERE case_id=?",
+            (case["case_id"],),
+        ).fetchone()[0]
+        assert refreshed_ref == (3, expected_source_hash)
+        assert refreshed_manifest != stale_manifest
+        assert conn.execute(
+            "SELECT COUNT(*) FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM daily_food_log_events "
+            "WHERE log_id=? AND action='confirm_ai_revision'", (log_id,)
+        ).fetchone() == (2,)
+        assert conn.execute(
+            "SELECT version,nutrition_snapshot_json FROM food_logs WHERE log_id=?", (log_id,)
+        ).fetchone() == (3, json.dumps({"calories_kcal": 590.0, "protein_g": 38.0}, sort_keys=True))
+
+
+@pytest.mark.parametrize("terminal_status", ["cancelled", "expired"])
+def test_delayed_meal_slot_postback_renders_terminal_state_without_reviving_draft(
+    tmp_path, monkeypatch, terminal_status,
+):
+    db = _daily_ledger_db(tmp_path, monkeypatch, f"delayed-slot-{terminal_status}.db")
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    monkeypatch.setattr(
+        server.client.chat.completions, "create",
+        lambda **_kwargs: pytest.fail("terminal replay must not call AI"),
+    )
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id=f"SLOT-{terminal_status}",
+            payload=ai_estimated_payload(), meal_slot="早餐",
+            consumed_at="2026-09-13T08:00:00+08:00",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        apply_meal_photo_action(
+            conn, event_id=f"SLOT-EVENT-{terminal_status}", user_id="U1",
+            token=token, expected_version=1, action="set_meal_slot", value="午餐",
+        )
+        if terminal_status == "cancelled":
+            apply_meal_photo_action(
+                conn, event_id="CANCEL-AFTER-SLOT", user_id="U1", token=token,
+                expected_version=2, action="cancel",
+            )
+        else:
+            conn.execute(
+                """UPDATE pending_meal_photo_drafts
+                   SET status='expired',observed_payload_json='{}',answers_json='{}',
+                       estimate_json='{}',version=3 WHERE token=?""",
+                (token,),
+            )
+            conn.commit()
+
+    server.handle_meal_photo_postback(SimpleNamespace(
+        postback=SimpleNamespace(data=f"mp:v1:{token}:1:meal:午餐"),
+        source=SimpleNamespace(user_id="U1"), reply_token="terminal-replay",
+        webhook_event_id=f"SLOT-EVENT-{terminal_status}", timestamp=1789314000000,
+    ))
+
+    assert len(replies) == 1
+    assert replies[0].type == "text"
+    assert ("已取消" if terminal_status == "cancelled" else "已逾時") in replies[0].text
+    with sqlite3.connect(db) as conn:
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        assert draft["status"] == terminal_status
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone() == (0,)
+        assert json.loads(conn.execute(
+            "SELECT result_json FROM meal_photo_events WHERE event_id=?",
+            (f"SLOT-EVENT-{terminal_status}",),
+        ).fetchone()[0]) == {"kind": "estimate", "version": 2}
 
 
 def test_daily_food_log_survives_best_effort_health_check_refresh_failure(tmp_path, monkeypatch):
