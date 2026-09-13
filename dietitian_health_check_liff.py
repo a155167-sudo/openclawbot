@@ -41,6 +41,7 @@ def _html() -> str:
     .empty,.error{background:#fff7e8;border-radius:12px;padding:14px}.error{color:#8a2d22;background:#fff0ee}
     .photo-actions{margin-top:8px}.photo-actions button{margin-right:8px}.photo-preview{margin-top:8px}
     .photo-preview img{display:block;max-width:100%;height:auto;border-radius:10px}.photo-message{margin:8px 0;color:#6a3d27}
+    .meal-card{list-style:none;border:1px solid #dce8df;border-radius:12px;padding:12px;margin:10px 0}.nutrition{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 12px;margin-top:8px}
   </style>
   <script src="https://static.line-scdn.net/liff/edge/2/sdk.js" defer></script>
   <script src="/dietitian-health-check/app.js" defer></script>
@@ -69,6 +70,8 @@ const photoUrls=new Map();
 const photoPanels=new Set();
 const photoRequests=new Map();
 const statusLabels={{collecting:'收集中',ready_for_review:'可審核',needs_more_info:'需補資料',approved_pending_delivery:'已核准待發送',delivery_failed:'發送失敗',delivered:'已送達',expired:'已過期',cancelled:'已取消'}};
+const viewablePhotoStatuses=new Set(['ready_for_review','needs_more_info','approved_pending_delivery','delivery_failed']);
+const completenessLabels={{qualified:'符合',incomplete:'未符合'}};
 function node(tag,text,klass){{const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(klass)el.className=klass;return el;}}
 function clearPhoto(panel){{
   const request=photoRequests.get(panel);
@@ -98,6 +101,17 @@ function rangeText(value){{
 function nutritionEstimateText(point,range,unit){{
   if(!Number.isFinite(point)||!range||typeof range!=='object'||!Number.isFinite(range.min)||!Number.isFinite(range.max)||range.min>point||point>range.max)return 'NA';
   return `約${{point}}${{unit}}（${{range.min}}～${{range.max}}）`;
+}}
+function nutritionValue(snapshot,key,unit){{
+  const value=snapshot&&snapshot[key];
+  return Number.isFinite(value)?`${{value}} ${{unit}}`:'NA';
+}}
+function photoUnavailableText(status){{
+  if(status==='collecting')return '收集中，照片尚未開放';
+  if(status==='delivered')return '案件已送達，照片不再開放';
+  if(status==='expired')return '案件已過期，照片不再開放';
+  if(status==='cancelled')return '案件已取消，照片不再開放';
+  return '目前案件狀態不開放照片';
 }}
 function photoErrorMessage(status){{
   if(status===401)return 'LINE身分驗證失敗';
@@ -153,25 +167,39 @@ async function loadPhoto(caseId,logId,button,panel){{
     }}
   }}
 }}
-function renderSource(caseId,log){{
-  const item=node('li');
-  const label=log.trust_type==='user_confirmed_ai_estimate'?'顧客確認・AI估算':'已驗證營養快照';
-  item.append(node('strong',`${{label}}｜紀錄 ${{log.log_id}}`));
-  if(log.trust_type==='user_confirmed_ai_estimate'){{
+function renderSource(caseId,caseStatus,log){{
+  const item=node('li',undefined,'meal-card');
+  const isAi=log.trust_type==='user_confirmed_ai_estimate';
+  const isApproved=log.approval_status==='approved';
+  const label=isAi?'顧客確認・AI估算，非營養師核准':isApproved?'營養師核准':'可驗證營養快照（未標示營養師核准）';
+  item.append(node('strong','餐點紀錄'));
+  item.append(node('div','未提供驗證日期餐別','meta'));
+  item.append(node('div',label,'meta'));
+  if(isAi){{
     const estimate=log.estimate||{{}};
     if(log.estimate_schema_version==='meal-photo-user-confirmation-v2'){{
       item.append(node('div',`${{nutritionEstimateText(estimate.calories_kcal,estimate.calories_kcal_range,' kcal')}}｜蛋白質${{nutritionEstimateText(estimate.protein_g,estimate.protein_g_range,'g')}}`,'meta'));
-      item.append(node('div','脂肪 NA｜碳水 NA｜顧客確認・AI估算，非營養師核准','meta'));
-    }}else{{
-      item.append(node('div',`熱量：NA｜蛋白質：${{rangeText(estimate.protein_total_exchange)}}｜主食：${{rangeText(estimate.starch_exchange)}}｜蔬菜：${{rangeText(estimate.vegetable_exchange)}}`,'meta'));
-    }}
-  }}else item.append(node('pre',JSON.stringify(log.nutrition_snapshot||{{}},null,2)));
+      const nutrition=node('div',undefined,'nutrition');
+      nutrition.append(node('span',`脂肪：${{nutritionValue(log.nutrition_snapshot,'fat_g','g')}}`),node('span',`碳水化合物：${{nutritionValue(log.nutrition_snapshot,'carbohydrate_g','g')}}`),node('span',`膳食纖維：${{nutritionValue(log.nutrition_snapshot,'fiber_g','g')}}`),node('span',`鈉：${{nutritionValue(log.nutrition_snapshot,'sodium_mg','mg')}}`));
+      item.append(nutrition);
+    }}else item.append(node('div',`熱量：NA｜蛋白質：${{rangeText(estimate.protein_total_exchange)}}｜主食：${{rangeText(estimate.starch_exchange)}}｜蔬菜：${{rangeText(estimate.vegetable_exchange)}}`,'meta'));
+  }}else{{
+    const snapshot=log.nutrition_snapshot||{{}};
+    const nutrition=node('div',undefined,'nutrition');
+    for(const [title,key,unit] of [['熱量','calories_kcal','kcal'],['蛋白質','protein_g','g'],['脂肪','fat_g','g'],['碳水化合物','carbohydrate_g','g'],['膳食纖維','fiber_g','g'],['鈉','sodium_mg','mg']])nutrition.append(node('span',`${{title}}：${{nutritionValue(snapshot,key,unit)}}`));
+    item.append(nutrition);
+  }}
+  const technical=node('details');
+  technical.append(node('summary','技術資料'),node('pre',JSON.stringify({{log_id:log.log_id,food_log_version:log.food_log_version,nutrition_snapshot:log.nutrition_snapshot||{{}}}},null,2)));
+  item.append(technical);
   const actions=node('div',undefined,'photo-actions');
-  const view=node('button','查看照片');
-  view.setAttribute('type','button');
   const panel=node('div',undefined,'photo-preview');
-  view.addEventListener('click',()=>loadPhoto(caseId,log.log_id,view,panel));
-  actions.append(view);
+  if(viewablePhotoStatuses.has(caseStatus)){{
+    const view=node('button','查看照片');
+    view.setAttribute('type','button');
+    view.addEventListener('click',()=>loadPhoto(caseId,log.log_id,view,panel));
+    actions.append(view);
+  }}else actions.append(node('p',photoUnavailableText(caseStatus),'photo-message'));
   item.append(actions,panel);
   return item;
 }}
@@ -229,21 +257,23 @@ function renderCase(item,detail){{
   const days=node('ul',undefined,'days');
   if(validDays===null)days.append(node('li','有效日期：資料不可用'));
   else if(validDays.length===0)days.append(node('li','目前尚無可列入的日期'));
-  for(const day of validDays||[])days.append(node('li',`${{day.local_date}}｜${{day.qualifying_meal_count}} 餐｜${{day.completeness_status}}`));
+  for(const day of validDays||[])days.append(node('li',`${{day.local_date}}｜${{day.qualifying_meal_count}} 餐｜${{completenessLabels[day.completeness_status]||'資料不可用'}}`));
   card.append(days);
-  const disclosure=node('details');
-  disclosure.append(node('summary','查看來源參照與可驗證營養快照'));
-  const sources=node('ul',undefined,'days');
   const rawSourceLogs=detail&&detail.source_logs;
   const sourceLogs=Array.isArray(rawSourceLogs)?rawSourceLogs:[];
   const sourceCounts=validatedSourceCounts(detail,rawSourceLogs);
-  sources.append(node('li',sourceCounts===null?'保留來源參照：資料不可用':`保留來源參照：${{sourceCounts.referenced}} 筆`));
-  sources.append(node('li',sourceCounts===null?'目前可驗證快照：資料不可用':`目前可驗證快照：${{sourceCounts.available}} 筆`));
+  const disclosure=node('details');
+  disclosure.append(node('summary','來源完整性資料'));
+  const integrity=node('ul',undefined,'days');
+  integrity.append(node('li',sourceCounts===null?'保留來源參照：資料不可用':`保留來源參照：${{sourceCounts.referenced}} 筆`));
+  integrity.append(node('li',sourceCounts===null?'目前可驗證快照：資料不可用':`目前可驗證快照：${{sourceCounts.available}} 筆`));
+  disclosure.append(integrity);
+  card.append(disclosure);
+  const sources=node('ul',undefined,'days');
   if(sourceCounts===null&&sourceLogs.length===0)sources.append(node('li','來源快照清單資料不可用'));
   else if(sourceCounts&&sourceCounts.available===0)sources.append(node('li','目前無可顯示的來源快照；不代表沒有飲食紀錄'));
-  for(const log of sourceLogs)sources.append(renderSource(item.case_id,log));
-  disclosure.append(sources);
-  card.append(disclosure);
+  for(const log of sourceLogs)sources.append(renderSource(item.case_id,item.status,log));
+  card.append(sources);
   return card;
 }}
 async function loadCases(){{

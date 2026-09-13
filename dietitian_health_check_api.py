@@ -23,6 +23,7 @@ from nutrition_system import (
     meal_photo_estimate_snapshot_is_valid,
     user_confirmed_meal_photo_estimate_is_valid,
     user_confirmed_meal_photo_trust_projection,
+    verified_exchange_approval_projection,
 )
 from protected_health_check_image import ImagePreview, ImageUnavailable, read_bounded_preview
 
@@ -740,6 +741,53 @@ def load_health_check_list(
     return {"items": items, "total": count, "limit": limit, "offset": offset}
 
 
+def _verified_source_approval_status(
+    conn: sqlite3.Connection, *, log_id: str
+) -> str | None:
+    """Return approved only when the canonical approval relationship and hash validate."""
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    if "food_exchange_approvals" not in tables:
+        return None
+    log_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(food_logs)")}
+    catalog_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(food_catalog)")}
+    approval_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(food_exchange_approvals)")
+    }
+    required_log = {"exchange_approval_id", "food_id", "user_id", "consumed_servings", "approved_exchange_json"}
+    required_catalog = {"source_type", "owner_user_id", "fingerprint"}
+    required_approval = {
+        "approval_id", "food_id", "food_fingerprint", "suggestion_rule_version",
+        "approved_exchange_json", "approved_exchange_hash",
+    }
+    if (
+        not required_log.issubset(log_columns)
+        or not required_catalog.issubset(catalog_columns)
+        or not required_approval.issubset(approval_columns)
+    ):
+        return None
+    row = conn.execute(
+        """SELECT fl.user_id AS log_user_id,fl.food_id AS log_food_id,
+                  fc.source_type AS catalog_source_type,fc.owner_user_id AS catalog_owner_user_id,
+                  fc.fingerprint AS catalog_fingerprint,fl.consumed_servings,
+                  fl.approved_exchange_json AS applied_json,fl.exchange_approval_id AS approval_id,
+                  a.food_id AS approval_food_id,a.food_fingerprint AS approval_fingerprint,
+                  a.suggestion_rule_version AS rule_version,
+                  a.approved_exchange_json AS approved_json,
+                  a.approved_exchange_hash AS approval_hash
+           FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+           JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
+           WHERE fl.log_id=?""",
+        (log_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    projection = verified_exchange_approval_projection(**dict(row))
+    return "approved" if projection.get("is_valid") is True else None
+
+
 def load_health_check_detail(
     conn: sqlite3.Connection,
     *,
@@ -828,6 +876,12 @@ def load_health_check_detail(
                 "estimate_schema_version": trust["schema_version"],
                 "estimate": estimate,
             })
+        else:
+            approval_status = _verified_source_approval_status(
+                conn, log_id=str(log["log_id"])
+            )
+            if approval_status is not None:
+                source["approval_status"] = approval_status
         source_logs.append(source)
     result["source_logs"] = source_logs
     result["source_integrity"] = {

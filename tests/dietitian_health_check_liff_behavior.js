@@ -124,7 +124,12 @@ async function happyPath() {
   const text = renderedText(app.cases);
   assert.ok(text.includes('約680 kcal（580～800）'));
   assert.ok(text.includes('蛋白質約35g（29～43）'));
-  assert.ok(text.includes('脂肪 NA｜碳水 NA'));
+  assert.ok(text.includes('脂肪：NA'));
+  assert.ok(text.includes('碳水化合物：NA'));
+  assert.ok(text.includes('餐點紀錄'));
+  assert.ok(text.includes('未提供驗證日期餐別'));
+  assert.ok(text.includes('膳食纖維：NA'));
+  assert.ok(text.includes('鈉：NA'));
   assert.ok(text.includes('非營養師核准'));
   assert.ok(!text.includes('熱量：NA'));
   const view = find(app.cases, el => el.tagName === 'BUTTON' && el.textContent === '查看照片');
@@ -145,6 +150,50 @@ async function happyPath() {
   await close.dispatch('click');
   assert.deepEqual(app.revoked, ['blob:test-1']);
   assert.equal(find(app.cases, el => el.tagName === 'IMG'), undefined);
+}
+
+async function chineseCardsAndPhotoStatusCopy() {
+  for (const [status, message] of [
+    ['collecting', '收集中，照片尚未開放'],
+    ['delivered', '案件已送達，照片不再開放'],
+    ['expired', '案件已過期，照片不再開放'],
+    ['cancelled', '案件已取消，照片不再開放'],
+  ]) {
+    const calls = [];
+    const caseListing = {items: [{...listing.items[0], status}]};
+    const app = await createApp(async (path, options) => {
+      calls.push({path, options});
+      return path.includes('?') ? jsonResponse(caseListing) : jsonResponse(detail);
+    });
+    assert.ok(renderedText(app.cases).includes(message), status);
+    assert.equal(find(app.cases, el => el.tagName === 'BUTTON' && el.textContent === '查看照片'), undefined, status);
+    assert.equal(calls.filter(call => call.path.includes('/sources/')).length, 0, status);
+  }
+
+  const approvedDetail = {
+    ...detail,
+    source_logs: [{
+      log_id: '<img src=x onerror=alert(1)>', food_log_version: 9,
+      local_date: '2099-12-31', meal_slot: '晚餐', approval_status: 'approved',
+      nutrition_snapshot: {calories_kcal: 510, protein_g: 28, fat_g: 16, carbohydrate_g: 62, fiber_g: 7, sodium_mg: 820},
+    }],
+  };
+  const app = await createApp(async path => path.includes('?') ? jsonResponse(listing) : jsonResponse(approvedDetail));
+  const text = renderedText(app.cases);
+  assert.ok(text.includes('營養師核准'));
+  assert.ok(!text.includes('非營養師核准'));
+  const mealCard = find(app.cases, el => el.className === 'meal-card');
+  const mealText = renderedText(mealCard);
+  assert.ok(mealText.includes('餐點紀錄'));
+  assert.ok(mealText.includes('未提供驗證日期餐別'));
+  assert.ok(!mealText.includes('2099-12-31'));
+  assert.ok(!mealText.includes('晚餐'));
+  for (const expected of ['熱量：510 kcal', '蛋白質：28 g', '脂肪：16 g', '碳水化合物：62 g', '膳食纖維：7 g', '鈉：820 mg']) assert.ok(text.includes(expected), expected);
+  assert.equal(find(app.cases, el => el.tagName === 'IMG'), undefined, 'identifier text cannot create markup');
+  const technical = find(app.cases, el => el.tagName === 'DETAILS' && renderedText(el).includes('技術資料'));
+  assert.ok(technical, 'long identifiers and JSON are placed in technical details');
+  assert.equal(technical.attributes.open, undefined, 'technical details are collapsed by default');
+  assert.ok(renderedText(technical).includes('<img src=x onerror=alert(1)>'), 'escaped text remains inspectable');
 }
 
 async function staleRequestCannotAttach() {
@@ -449,9 +498,9 @@ async function invalidSourceCountsNeverFallBackToRenderedLogLength() {
 
 async function validDayCountRequiresConsistentDayRecords() {
   const validCases = [
-    ['three qualified days', 3, threeQualifiedDays, ['有效日：3 / 3', '2026-09-02｜2 餐｜qualified', '2026-09-04｜2 餐｜qualified']],
+    ['three qualified days', 3, threeQualifiedDays, ['有效日：3 / 3', '2026-09-02｜2 餐｜符合', '2026-09-04｜2 餐｜符合']],
     ['zero days', 0, [], ['有效日：0 / 3', '目前尚無可列入的日期']],
-    ['incomplete day does not count', 0, [validDay('2026-09-02', 'incomplete', 1)], ['有效日：0 / 3', '2026-09-02｜1 餐｜incomplete']],
+    ['incomplete day does not count', 0, [validDay('2026-09-02', 'incomplete', 1)], ['有效日：0 / 3', '2026-09-02｜1 餐｜未符合']],
   ];
   for (const [name, count, validDays, expectedTexts] of validCases) {
     const caseListing = {items: [{...listing.items[0], valid_day_count: count}]};
@@ -481,6 +530,7 @@ async function validDayCountRequiresConsistentDayRecords() {
 
 (async () => {
   await happyPath();
+  await chineseCardsAndPhotoStatusCopy();
   await staleRequestCannotAttach();
   await reloadRevokesLoadedPhoto();
   await switchingCasesRevokesPriorCasePhotos();

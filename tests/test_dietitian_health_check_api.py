@@ -654,6 +654,98 @@ def test_projection_never_labels_unhashed_mutable_fields_as_snapshot_evidence(tm
         assert forbidden not in serialized
 
 
+def test_delivered_projection_does_not_expose_unbound_source_ref_date(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+
+    path = _populated_db(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE vip_health_check_cases SET status='delivered'")
+        conn.execute(
+            "UPDATE vip_health_check_source_refs SET local_date='2026-09-03' "
+            "WHERE food_log_id='log-owned'"
+        )
+        detail = load_health_check_detail(conn, case_id="case-1")
+        source = next(item for item in detail["source_logs"] if item["log_id"] == "log-owned")
+    assert "local_date" not in source
+    assert "meal_slot" not in source
+
+
+def test_ready_projection_does_not_expose_hash_unbound_legal_meal_slot_swap(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+
+    path = _populated_db(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE food_logs SET meal_slot=CASE log_id "
+            "WHEN 'log-owned' THEN 'breakfast' WHEN 'log-02-breakfast' THEN 'lunch' "
+            "ELSE meal_slot END WHERE log_id IN ('log-owned','log-02-breakfast')"
+        )
+        detail = load_health_check_detail(conn, case_id="case-1")
+        source = next(item for item in detail["source_logs"] if item["log_id"] == "log-owned")
+    assert "local_date" not in source
+    assert "meal_slot" not in source
+
+
+def test_refreshable_projection_rejects_stale_source_date_or_version(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+
+    path = _populated_db(tmp_path)
+    for statement in (
+        "UPDATE vip_health_check_source_refs SET local_date='2026-09-03' WHERE food_log_id='log-owned'",
+        "UPDATE vip_health_check_source_refs SET food_log_version=2 WHERE food_log_id='log-owned'",
+    ):
+        with sqlite3.connect(path) as conn:
+            conn.execute(statement)
+            with pytest.raises(ValueError):
+                load_health_check_detail(conn, case_id="case-1")
+            conn.rollback()
+
+
+def test_source_approval_label_requires_complete_verified_approval_contract(monkeypatch):
+    import dietitian_health_check_api as api
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE food_logs (
+          log_id TEXT, user_id TEXT, food_id TEXT, consumed_servings REAL,
+          approved_exchange_json TEXT, exchange_approval_id TEXT
+        );
+        CREATE TABLE food_catalog (
+          food_id TEXT, source_type TEXT, owner_user_id TEXT, fingerprint TEXT
+        );
+        CREATE TABLE food_exchange_approvals (
+          approval_id TEXT, food_id TEXT, food_fingerprint TEXT,
+          suggestion_rule_version TEXT, approved_exchange_json TEXT,
+          approved_exchange_hash TEXT
+        );
+        INSERT INTO food_logs VALUES ('log-1','owner','food-1',1,'{}','approval-1');
+        INSERT INTO food_catalog VALUES ('food-1','user_meal_photo','owner','fingerprint');
+        INSERT INTO food_exchange_approvals VALUES
+          ('approval-1','food-1','fingerprint','meal-photo-admin-v2','{}','hash');
+        """
+    )
+    seen = []
+
+    def verify(**kwargs):
+        seen.append(kwargs)
+        return {"is_valid": True}
+
+    monkeypatch.setattr(api, "verified_exchange_approval_projection", verify)
+    assert api._verified_source_approval_status(conn, log_id="log-1") == "approved"
+    assert seen[0]["log_user_id"] == "owner"
+    assert seen[0]["catalog_owner_user_id"] == "owner"
+    assert seen[0]["approval_id"] == "approval-1"
+
+    monkeypatch.setattr(
+        api, "verified_exchange_approval_projection", lambda **_kwargs: {"is_valid": False}
+    )
+    assert api._verified_source_approval_status(conn, log_id="log-1") is None
+    conn.execute("DELETE FROM food_exchange_approvals")
+    assert api._verified_source_approval_status(conn, log_id="log-1") is None
+
+
 def test_projection_suppresses_review_from_stale_source_manifest(tmp_path):
     from dietitian_health_check_api import load_health_check_detail
 
