@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -252,7 +253,10 @@ def test_joint_log_and_draft_ref_replacement_cannot_load_foreign_catalog_photo(t
         ) is None
 
 
-def test_real_database_user_confirmed_source_loads_bounded_preview(tmp_path):
+@pytest.mark.parametrize("workflow", [
+    "user_confirmed_ai_estimate_v1", "user_confirmed_ai_nutrition_v2",
+])
+def test_real_database_user_confirmed_source_loads_bounded_preview(tmp_path, workflow):
     from dietitian_health_check_api import load_health_check_image
     from meal_photo_system import (
         apply_meal_photo_action,
@@ -267,25 +271,35 @@ def test_real_database_user_confirmed_source_loads_bounded_preview(tmp_path):
     (root / filename).write_bytes(_jpeg())
     db = tmp_path / "health.db"
     with sqlite3.connect(db) as conn:
+        payload = {
+            "status": "success",
+            "image_type": "food_photo",
+            "visible_items": [
+                {"name": "高麗菜", "category": "vegetable", "confidence": 0.98}
+            ],
+            "uncertain_items": [],
+            "starch_visibility": "not_visible",
+            "oil_sauce_status": "unknown",
+            "observed_at": "2026-09-12T12:00:00+08:00",
+            "observed_at_confidence": 0.99,
+        }
+        if workflow == "user_confirmed_ai_nutrition_v2":
+            payload["ai_estimate"] = {
+                "items": [{"name": "高麗菜", "portion": "約2碗", "calories_kcal": 120, "protein_g": 6}],
+                "calories_kcal": {"estimate": 120, "min": 80, "max": 180},
+                "protein_g": {"estimate": 6, "min": 4, "max": 9},
+                "confidence": 0.75,
+                "provenance": {"provider": "openai", "model": "gpt-4o", "method": "vision_model_estimate", "nutrition_basis": "unlabeled_meal_photo"},
+            }
         token = save_meal_photo_draft(
             conn,
             user_id=CUSTOMER_UID,
             source_message_id="PHOTO-CONFIRMED-1",
-            payload={
-                "status": "success",
-                "image_type": "food_photo",
-                "visible_items": [
-                    {"name": "高麗菜", "category": "vegetable", "confidence": 0.98}
-                ],
-                "uncertain_items": [],
-                "starch_visibility": "not_visible",
-                "oil_sauce_status": "unknown",
-                "observed_at": "2026-09-12T12:00:00+08:00",
-                "observed_at_confidence": 0.99,
-            },
+            payload=payload,
             source_image_ref=image_ref,
             meal_slot="午餐",
             consumed_at="2026-09-12T12:00:00+08:00",
+            workflow_version=workflow,
         )
         answers = {
             "scope": "visible_only",
@@ -297,18 +311,19 @@ def test_real_database_user_confirmed_source_loads_bounded_preview(tmp_path):
             "cooking_oil": "light",
             "sauce_level": "half",
         }
-        for index, (field, value) in enumerate(answers.items(), start=1):
-            draft = get_meal_photo_draft(conn, user_id=CUSTOMER_UID, token=token)
-            apply_meal_photo_action(
-                conn,
-                event_id=f"ANSWER-{index}",
-                user_id=CUSTOMER_UID,
-                token=token,
-                expected_version=draft["version"],
-                action="answer",
-                field=field,
-                value=value,
-            )
+        if workflow == "user_confirmed_ai_estimate_v1":
+            for index, (field, value) in enumerate(answers.items(), start=1):
+                draft = get_meal_photo_draft(conn, user_id=CUSTOMER_UID, token=token)
+                apply_meal_photo_action(
+                    conn,
+                    event_id=f"ANSWER-{index}",
+                    user_id=CUSTOMER_UID,
+                    token=token,
+                    expected_version=draft["version"],
+                    action="answer",
+                    field=field,
+                    value=value,
+                )
         draft = get_meal_photo_draft(conn, user_id=CUSTOMER_UID, token=token)
         confirmed = apply_meal_photo_action(
             conn,
@@ -327,8 +342,11 @@ def test_real_database_user_confirmed_source_loads_bounded_preview(tmp_path):
             "SELECT version,nutrition_snapshot_json,trust_hash FROM food_logs WHERE log_id=?",
             (log_id,),
         ).fetchone()
+        canonical_nutrition = json.dumps(
+            json.loads(nutrition), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         source_hash = hashlib.sha256(
-            f"{log_id}:{version}:{nutrition}:user_confirmed_ai_estimate:{trust_hash}".encode()
+            f"{log_id}:{version}:{canonical_nutrition}:user_confirmed_ai_estimate:{trust_hash}".encode()
         ).hexdigest()
         conn.executescript("""
             CREATE TABLE vip_health_check_cases(case_id TEXT, user_id TEXT, status TEXT);
@@ -343,6 +361,12 @@ def test_real_database_user_confirmed_source_loads_bounded_preview(tmp_path):
         conn.execute(
             "INSERT INTO vip_health_check_source_refs VALUES ('case-confirmed',?,?,?)",
             (log_id, version, source_hash),
+        )
+        conn.row_factory = sqlite3.Row
+        confirmed_draft = get_meal_photo_draft(conn, user_id=CUSTOMER_UID, token=token)
+        assert user_confirmed_meal_photo_estimate_is_valid(
+            conn, log_id, expected_user_id=CUSTOMER_UID,
+            expected_draft_token=token, expected_draft_version=confirmed_draft["version"],
         )
         preview = load_health_check_image(
             conn, case_id="case-confirmed", log_id=log_id, image_root=root

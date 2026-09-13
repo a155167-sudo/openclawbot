@@ -60,7 +60,18 @@ const threeQualifiedDays = [validDay('2026-09-02'), validDay('2026-09-03'), vali
 const detail = {
   valid_day_count: 3,
   valid_days: threeQualifiedDays,
-  source_logs: [{log_id: 'log B', trust_type: 'user_confirmed_ai_estimate', estimate: {}}],
+  source_logs: [{
+    log_id: 'log B', trust_type: 'user_confirmed_ai_estimate',
+    estimate_schema_version: 'meal-photo-user-confirmation-v2',
+    nutrition_snapshot: {calories_kcal: 680, protein_g: 35},
+    estimate: {
+      calories_kcal: 680, protein_g: 35,
+      calories_kcal_range: {min: 580, max: 800, basis: 'ai_vision_estimate_range_v1'},
+      protein_g_range: {min: 29, max: 43, basis: 'ai_vision_estimate_range_v1'},
+      fat_g: null, carbohydrate_g: null,
+    },
+  }],
+  source_integrity: {referenced_count: 1, available_snapshot_count: 1, all_snapshots_available: true},
 };
 
 async function createApp(fetchImpl) {
@@ -110,6 +121,12 @@ async function happyPath() {
     return jsonResponse(detail);
   });
   assert.equal(calls.filter(call => call.path.includes('/sources/')).length, 0, 'images must not eagerly load');
+  const text = renderedText(app.cases);
+  assert.ok(text.includes('約680 kcal（580～800）'));
+  assert.ok(text.includes('蛋白質約35g（29～43）'));
+  assert.ok(text.includes('脂肪 NA｜碳水 NA'));
+  assert.ok(text.includes('非營養師核准'));
+  assert.ok(!text.includes('熱量：NA'));
   const view = find(app.cases, el => el.tagName === 'BUTTON' && el.textContent === '查看照片');
   assert.ok(view, 'source has a view-photo button');
   await view.dispatch('click');

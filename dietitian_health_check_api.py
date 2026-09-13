@@ -425,7 +425,7 @@ def _source_hash_matches(conn: sqlite3.Connection, log: sqlite3.Row) -> bool:
         (
             f"{log_id}:{version}:{canonical}"
             + (
-                f":user_confirmed_ai_estimate:{log['trust_hash']}"
+                f":user_confirmed_ai_estimate:{trust['effective_revision_hash']}"
                 if trust["integrity_status"] == "verified"
                 else ""
             )
@@ -812,17 +812,20 @@ def load_health_check_detail(
         trust = user_confirmed_meal_photo_trust_projection(
             conn, log["log_id"], str(log["trust_type"] or "")
         )
+        if trust["trust_type"] and trust["integrity_status"] != "verified":
+            continue
         if trust["integrity_status"] == "verified":
-            try:
-                estimate = json.loads(log["exchange_snapshot_json"])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
+            estimate = trust.get("estimate")
             if not meal_photo_estimate_snapshot_is_valid(estimate):
                 continue
+            nutrition_snapshot = trust.get("nutrition")
+            if not isinstance(nutrition_snapshot, dict):
+                continue
             source.update({
+                "nutrition_snapshot": nutrition_snapshot,
                 "trust_type": "user_confirmed_ai_estimate",
                 "trust_label": "顧客確認・AI估算",
-                "estimate_schema_version": "meal-photo-user-confirmation-v1",
+                "estimate_schema_version": trust["schema_version"],
                 "estimate": estimate,
             })
         source_logs.append(source)
@@ -957,7 +960,9 @@ def load_health_check_image(
         ):
             return None
         workflow = row["workflow_version"]
-        if workflow == "user_confirmed_ai_estimate_v1":
+        if workflow in {
+            "user_confirmed_ai_estimate_v1", "user_confirmed_ai_nutrition_v2"
+        }:
             if (
                 row["draft_status"] != "user_confirmed"
                 or row["confirmed_log_id"] != log_id

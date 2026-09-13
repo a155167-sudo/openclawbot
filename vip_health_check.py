@@ -2296,7 +2296,10 @@ def refresh_case_source_manifest(
                 f"{_canonical_json_text(nutrition_snapshot_json)}"
             )
             if trust["integrity_status"] == "verified":
-                source_material += f":user_confirmed_ai_estimate:{trust_hash}"
+                source_material += (
+                    ":user_confirmed_ai_estimate:"
+                    f"{trust['effective_revision_hash']}"
+                )
             item = {
                 "food_log_id": log_id,
                 "version": version,

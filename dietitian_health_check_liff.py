@@ -95,6 +95,10 @@ function rangeText(value){{
   if(typeof value==='object'&&Number.isFinite(value.min)&&Number.isFinite(value.max))return `${{value.min}}～${{value.max}}份`;
   return 'NA';
 }}
+function nutritionEstimateText(point,range,unit){{
+  if(!Number.isFinite(point)||!range||typeof range!=='object'||!Number.isFinite(range.min)||!Number.isFinite(range.max)||range.min>point||point>range.max)return 'NA';
+  return `約${{point}}${{unit}}（${{range.min}}～${{range.max}}）`;
+}}
 function photoErrorMessage(status){{
   if(status===401)return 'LINE身分驗證失敗';
   if(status===403)return '此LINE帳號未獲營養師唯讀權限';
@@ -155,7 +159,12 @@ function renderSource(caseId,log){{
   item.append(node('strong',`${{label}}｜紀錄 ${{log.log_id}}`));
   if(log.trust_type==='user_confirmed_ai_estimate'){{
     const estimate=log.estimate||{{}};
-    item.append(node('div',`熱量：NA｜蛋白質：${{rangeText(estimate.protein_total_exchange)}}｜主食：${{rangeText(estimate.starch_exchange)}}｜蔬菜：${{rangeText(estimate.vegetable_exchange)}}`,'meta'));
+    if(log.estimate_schema_version==='meal-photo-user-confirmation-v2'){{
+      item.append(node('div',`${{nutritionEstimateText(estimate.calories_kcal,estimate.calories_kcal_range,' kcal')}}｜蛋白質${{nutritionEstimateText(estimate.protein_g,estimate.protein_g_range,'g')}}`,'meta'));
+      item.append(node('div','脂肪 NA｜碳水 NA｜顧客確認・AI估算，非營養師核准','meta'));
+    }}else{{
+      item.append(node('div',`熱量：NA｜蛋白質：${{rangeText(estimate.protein_total_exchange)}}｜主食：${{rangeText(estimate.starch_exchange)}}｜蔬菜：${{rangeText(estimate.vegetable_exchange)}}`,'meta'));
+    }}
   }}else item.append(node('pre',JSON.stringify(log.nutrition_snapshot||{{}},null,2)));
   const actions=node('div',undefined,'photo-actions');
   const view=node('button','查看照片');

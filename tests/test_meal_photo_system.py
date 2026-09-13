@@ -1,6 +1,7 @@
 import json
 import math
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -17,8 +18,11 @@ from nutrition_system import (
     user_confirmed_meal_photo_trust_projection,
 )
 from meal_photo_system import (
+    apply_meal_photo_ai_adjustment,
     build_meal_photo_confirmation_bubble,
+    claim_meal_photo_image_event,
     ensure_meal_photo_schema,
+    release_meal_photo_image_event,
     get_meal_photo_draft,
     get_meal_photo_draft_for_admin,
     list_pending_meal_photo_reviews,
@@ -49,6 +53,32 @@ def sample_payload(**overrides):
         "observed_at": "2026-07-22T22:37:00+08:00",
         "observed_at_confidence": 0.99,
     }
+    payload.update(overrides)
+    return payload
+
+
+def ai_estimated_payload(**overrides):
+    payload = sample_payload(
+        visible_items=[
+            {"name": "雞腿便當", "category": "protein", "confidence": 0.91},
+            {"name": "白飯", "category": "starch", "confidence": 0.96},
+        ],
+        starch_visibility="visible",
+        oil_sauce_status="visible",
+        ai_estimate={
+            "items": [
+                {"name": "雞腿", "portion": "約1支", "calories_kcal": 330, "protein_g": 27},
+                {"name": "白飯", "portion": "約1碗", "calories_kcal": 280, "protein_g": 5},
+            ],
+            "calories_kcal": {"estimate": 680, "min": 580, "max": 800},
+            "protein_g": {"estimate": 35, "min": 29, "max": 43},
+            "confidence": 0.78,
+            "provenance": {
+                "provider": "openai", "model": "gpt-4o",
+                "method": "vision_model_estimate", "nutrition_basis": "unlabeled_meal_photo",
+            },
+        },
+    )
     payload.update(overrides)
     return payload
 
@@ -359,6 +389,115 @@ def test_customer_final_confirmation_creates_one_canonical_unapproved_log(tmp_pa
         assert summary["foods"][0]["trust_type"] == "user_confirmed_ai_estimate"
         assert list_pending_meal_photo_reviews(conn) == []
         assert daily_pending_meal_photo_count(conn, user_id="U1", date_iso="2026-09-12") == 0
+
+
+def test_ai_first_photo_is_immediately_estimated_and_one_confirmation_persists_snapshot(tmp_path):
+    with sqlite3.connect(tmp_path / "ai-first-photo.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="AI-PHOTO-1",
+            payload=ai_estimated_payload(), source_image_ref="nutrition-image:kept.jpg",
+            meal_slot="午餐", consumed_at="2026-09-13T12:00:00+08:00",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        assert draft["status"] == "estimated"
+        assert draft["estimate"]["calories_kcal"] == 680
+        assert draft["estimate"]["protein_g_range"] == {
+            "min": 29.0, "max": 43.0, "basis": "ai_vision_estimate_range_v1"
+        }
+        text = "\n".join(flatten_text(build_meal_photo_estimate_bubble(draft)))
+        assert "雞腿：約1支" in text
+        assert "熱量：約680 kcal（580～800）" in text
+        assert "蛋白質：約35 g（29～43）" in text
+        assert "AI照片估算，非營養師核准" in text
+        assert any(
+            item.get("action", {}).get("data") == f"mp:v1:{token}:{draft['version']}:request_adjust"
+            for item in build_meal_photo_estimate_bubble(draft)["footer"]["contents"]
+        )
+        assert any(
+            item.get("action", {}).get("data") == f"mp:v1:{token}:{draft['version']}:cancel"
+            for item in build_meal_photo_estimate_bubble(draft)["footer"]["contents"]
+        )
+
+        confirmed = apply_meal_photo_action(
+            conn, event_id="AI-CONFIRM-1", user_id="U1", token=token,
+            expected_version=draft["version"], action="confirm_estimate",
+        )
+        log_id = confirmed["result"]["log_id"]
+        nutrition_json, approved_json = conn.execute(
+            "SELECT nutrition_snapshot_json,approved_exchange_json FROM food_logs WHERE log_id=?",
+            (log_id,),
+        ).fetchone()
+        assert json.loads(nutrition_json) == {"calories_kcal": 680.0, "protein_g": 35.0}
+        assert approved_json == "{}"
+        assert user_confirmed_meal_photo_estimate_is_valid(conn, log_id)
+        trust = user_confirmed_meal_photo_trust_projection(
+            conn, log_id, "user_confirmed_ai_estimate"
+        )
+        assert trust["schema_version"] == "meal-photo-user-confirmation-v2"
+        assert trust["workflow_version"] == "user_confirmed_ai_nutrition_v2"
+        assert trust["nutrition"] == {"calories_kcal": 680.0, "protein_g": 35.0}
+        assert trust["estimate"]["fat_g"] is None
+        summary = daily_food_summary(conn, user_id="U1", date_iso="2026-09-13")
+        assert summary["foods"][0]["calories_kcal"] == 680.0
+        assert summary["foods"][0]["protein_g"] == 35.0
+        assert summary["estimated_totals"] == {"calories_kcal": 680.0, "protein_g": 35.0}
+
+
+def test_ai_first_estimate_cancel_is_effective_and_owner_version_safe(tmp_path):
+    with sqlite3.connect(tmp_path / "ai-first-cancel.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="AI-PHOTO-CANCEL",
+            payload=ai_estimated_payload(), source_image_ref="nutrition-image:kept.jpg",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        with pytest.raises(ValueError, match="找不到"):
+            apply_meal_photo_action(
+                conn, event_id="AI-CANCEL-WRONG-OWNER", user_id="U2", token=token,
+                expected_version=draft["version"], action="cancel",
+            )
+        with pytest.raises(ValueError, match="已更新"):
+            apply_meal_photo_action(
+                conn, event_id="AI-CANCEL-STALE", user_id="U1", token=token,
+                expected_version=draft["version"] + 1, action="cancel",
+            )
+        cancelled = apply_meal_photo_action(
+            conn, event_id="AI-CANCEL", user_id="U1", token=token,
+            expected_version=draft["version"], action="cancel",
+        )
+        assert cancelled["result"]["kind"] == "cancel"
+        assert cancelled["draft"]["status"] == "cancelled"
+        assert cancelled["draft"]["estimate"] == {}
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+
+
+def test_ai_first_adjust_enters_owned_versioned_pending_state_without_writing_log(tmp_path):
+    with sqlite3.connect(tmp_path / "ai-first-adjust.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="AI-PHOTO-ADJUST",
+            payload=ai_estimated_payload(), source_image_ref="nutrition-image:kept.jpg",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        adjusted = apply_meal_photo_action(
+            conn, event_id="AI-ADJUST-1", user_id="U1", token=token,
+            expected_version=draft["version"], action="request_adjust",
+        )
+        assert adjusted["result"] == {"kind": "ask_adjustment", "version": 2}
+        assert adjusted["draft"]["status"] == "awaiting_adjustment"
+        assert adjusted["draft"]["estimate"] == draft["estimate"]
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+        replay = apply_meal_photo_action(
+            conn, event_id="AI-ADJUST-1", user_id="U1", token=token,
+            expected_version=draft["version"], action="request_adjust",
+        )
+        assert replay["replayed"] is True
+        with pytest.raises(ValueError, match="找不到"):
+            apply_meal_photo_action(
+                conn, event_id="AI-ADJUST-FOREIGN", user_id="U2", token=token,
+                expected_version=2, action="request_adjust",
+            )
 
 
 def test_customer_confirmation_replays_same_log_for_same_or_new_event(tmp_path):
@@ -1534,7 +1673,10 @@ def test_estimate_card_actions_match_workflow_and_viewer(
     if expected_action == "start":
         assert actions == [f"mpr:v1:{token}:{draft['version']}:start"]
     elif expected_action == "confirm_estimate":
-        assert actions == [f"mp:v1:{token}:{draft['version']}:confirm_estimate"]
+        assert actions == [
+            f"mp:v1:{token}:{draft['version']}:confirm_estimate",
+            f"mp:v1:{token}:{draft['version']}:cancel",
+        ]
     else:
         assert actions == []
     assert not any("confirm_estimate" in (action or "") for action in actions) or (
@@ -1877,11 +2019,131 @@ def test_schema_v1_migrates_to_versioned_events_without_dropping_drafts(tmp_path
         "original_confirmation_event_id",
     ):
         assert col in columns, f"migration should add {col}"
-    assert version == 7
+    assert version == 8
     assert draft == ("U1", "M1", 1)
     assert event_table == ("meal_photo_events",)
     assert notification_table == ("meal_photo_notification_events",)
     assert claim_table == ("meal_photo_notification_claims",)
+
+
+def test_schema_v7_adds_only_durable_image_claim_table_and_is_idempotent(tmp_path):
+    db = tmp_path / "meal-photo-v7.db"
+    with sqlite3.connect(db) as conn:
+        # Build the shipped v7 objects and rows, then remove the sole v8 addition.
+        ensure_meal_photo_schema(conn)
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="V7-PHOTO",
+            payload=sample_payload(), source_image_ref="nutrition-image:v7.jpg",
+        )
+        conn.execute(
+            """INSERT INTO meal_photo_notification_claims
+               (token,notification_kind,status,claim_token,lease_until,delivered_at,
+                attempts,last_error,updated_at)
+               VALUES (?,'estimate_ready','pending','','','',1,'old error','v7')""",
+            (token,),
+        )
+        conn.execute("DROP TABLE meal_photo_image_events")
+        conn.execute(
+            "UPDATE meal_photo_schema_versions SET version=7,updated_at='v7' "
+            "WHERE component='meal_photo_system'"
+        )
+        conn.commit()
+        before_rows = {
+            "draft": conn.execute(
+                "SELECT token,user_id,source_message_id,source_image_ref,status,version "
+                "FROM pending_meal_photo_drafts"
+            ).fetchall(),
+            "notification_claim": conn.execute(
+                "SELECT * FROM meal_photo_notification_claims"
+            ).fetchall(),
+        }
+
+        ensure_meal_photo_schema(conn)
+        first_contract = conn.execute("PRAGMA table_info(meal_photo_image_events)").fetchall()
+        first_rows = dict(before_rows)
+        first_rows["draft"] = conn.execute(
+            "SELECT token,user_id,source_message_id,source_image_ref,status,version "
+            "FROM pending_meal_photo_drafts"
+        ).fetchall()
+        first_rows["notification_claim"] = conn.execute(
+            "SELECT * FROM meal_photo_notification_claims"
+        ).fetchall()
+        ensure_meal_photo_schema(conn)
+
+        assert conn.execute(
+            "SELECT version FROM meal_photo_schema_versions WHERE component='meal_photo_system'"
+        ).fetchone() == (8,)
+        assert first_contract == [
+            (0, "user_id", "TEXT", 1, None, 1),
+            (1, "source_message_id", "TEXT", 1, None, 2),
+            (2, "status", "TEXT", 1, None, 0),
+            (3, "claim_token", "TEXT", 1, "''", 0),
+            (4, "lease_until", "TEXT", 1, "''", 0),
+            (5, "attempts", "INTEGER", 1, "0", 0),
+            (6, "result_json", "TEXT", 1, "'{}'", 0),
+            (7, "updated_at", "TEXT", 1, None, 0),
+        ]
+        assert first_rows == before_rows
+        assert conn.execute("SELECT COUNT(*) FROM meal_photo_image_events").fetchone() == (0,)
+        assert conn.execute("PRAGMA table_info(meal_photo_image_events)").fetchall() == first_contract
+        assert conn.execute(
+            "SELECT token,user_id,source_message_id,source_image_ref,status,version "
+            "FROM pending_meal_photo_drafts"
+        ).fetchall() == before_rows["draft"]
+        assert conn.execute("SELECT * FROM meal_photo_notification_claims").fetchall() == before_rows["notification_claim"]
+
+
+def test_original_photo_model_failure_releases_claim_for_retry(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo-model-failure.db") as conn:
+        first = claim_meal_photo_image_event(
+            conn, user_id="U1", source_message_id="PHOTO-MODEL-FAIL",
+        )
+        assert first["state"] == "claimed"
+        release_meal_photo_image_event(
+            conn, user_id="U1", source_message_id="PHOTO-MODEL-FAIL",
+            claim_token=first["claim_token"],
+        )
+        failed = conn.execute(
+            """SELECT status,claim_token,lease_until,attempts
+               FROM meal_photo_image_events WHERE user_id='U1' AND source_message_id='PHOTO-MODEL-FAIL'"""
+        ).fetchone()
+        assert failed == ("failed", "", "", 1)
+
+        retry = claim_meal_photo_image_event(
+            conn, user_id="U1", source_message_id="PHOTO-MODEL-FAIL",
+        )
+        assert retry["state"] == "claimed"
+        assert retry["claim_token"] != first["claim_token"]
+        assert conn.execute(
+            """SELECT status,attempts FROM meal_photo_image_events
+               WHERE user_id='U1' AND source_message_id='PHOTO-MODEL-FAIL'"""
+        ).fetchone() == ("processing", 2)
+
+
+def test_image_event_recovery_never_uses_another_owners_same_source_draft(tmp_path):
+    with sqlite3.connect(tmp_path / "meal-photo-recovery-owner.db") as conn:
+        first = claim_meal_photo_image_event(
+            conn, user_id="U1", source_message_id="SHARED-SOURCE",
+        )
+        save_meal_photo_draft(
+            conn, user_id="U2", source_message_id="SHARED-SOURCE", payload=sample_payload(),
+        )
+        conn.execute(
+            """UPDATE meal_photo_image_events SET lease_until='2000-01-01T00:00:00+08:00'
+               WHERE user_id='U1' AND source_message_id='SHARED-SOURCE'"""
+        )
+        conn.commit()
+
+        retry = claim_meal_photo_image_event(
+            conn, user_id="U1", source_message_id="SHARED-SOURCE",
+        )
+
+        assert retry["state"] == "claimed"
+        assert retry["claim_token"] != first["claim_token"]
+        assert conn.execute(
+            """SELECT status,attempts,result_json FROM meal_photo_image_events
+               WHERE user_id='U1' AND source_message_id='SHARED-SOURCE'"""
+        ).fetchone() == ("processing", 2, "{}")
 
 
 def test_durable_cancel_scrubs_content_but_retains_image_reference_for_delete(tmp_path):
@@ -1983,3 +2245,206 @@ def test_pending_review_list_includes_estimated_and_in_progress_drafts(tmp_path)
         resumed = list_pending_meal_photo_reviews(conn, limit=10)
         assert [item["token"] for item in resumed] == [first]
         assert resumed[0]["status"] == started["draft"]["status"]
+
+
+def test_adjustment_expired_processing_lease_is_recovered_with_fenced_retry(tmp_path):
+    db = tmp_path / "adjust-lease.db"
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-LEASE",
+            payload=ai_estimated_payload(), source_image_ref="nutrition-image:kept.jpg",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        apply_meal_photo_action(conn, event_id="REQUEST-ADJUST", user_id="U1", token=token,
+                                expected_version=1, action="request_adjust")
+        with pytest.raises(SystemExit):
+            apply_meal_photo_ai_adjustment(
+                conn, event_id="ADJUST-TEXT", user_id="U1", token=token,
+                expected_version=2, correction="飯吃一半",
+                estimate_provider=lambda *_: (_ for _ in ()).throw(SystemExit()), lease_seconds=30,
+            )
+        processing = json.loads(conn.execute(
+            "SELECT result_json FROM meal_photo_events WHERE event_id='ADJUST-TEXT'"
+        ).fetchone()[0])
+        assert processing["state"] == "processing"
+        conn.execute("UPDATE meal_photo_events SET result_json=? WHERE event_id='ADJUST-TEXT'",
+                     (json.dumps({**processing, "lease_until": "2000-01-01T00:00:00+08:00"}),))
+        conn.commit()
+        revised = ai_estimated_payload()
+        revised["ai_estimate"]["calories_kcal"] = {"estimate": 500, "min": 420, "max": 620}
+        result = apply_meal_photo_ai_adjustment(
+            conn, event_id="ADJUST-TEXT", user_id="U1", token=token,
+            expected_version=2, correction="飯吃一半",
+            estimate_provider=lambda *_: revised, lease_seconds=30,
+        )
+        assert result["draft"]["status"] == "estimated"
+        assert result["draft"]["estimate"]["calories_kcal"] == 500
+
+
+def test_adjustment_provider_timeout_preserves_estimate_and_allows_same_event_retry(tmp_path):
+    with sqlite3.connect(tmp_path / "adjust-timeout.db") as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-ADJUST-TIMEOUT",
+            payload=ai_estimated_payload(), source_image_ref="nutrition-image:kept.jpg",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        before = get_meal_photo_draft(conn, user_id="U1", token=token)["estimate"]
+        apply_meal_photo_action(
+            conn, event_id="REQUEST-ADJUST-TIMEOUT", user_id="U1", token=token,
+            expected_version=1, action="request_adjust",
+        )
+        with pytest.raises(TimeoutError, match="model timeout"):
+            apply_meal_photo_ai_adjustment(
+                conn, event_id="ADJUST-TIMEOUT", user_id="U1", token=token,
+                expected_version=2, correction="飯吃一半",
+                estimate_provider=lambda *_: (_ for _ in ()).throw(TimeoutError("model timeout")),
+            )
+        waiting = get_meal_photo_draft(conn, user_id="U1", token=token)
+        assert waiting["status"] == "awaiting_adjustment"
+        assert waiting["version"] == 2
+        assert waiting["estimate"] == before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM meal_photo_events WHERE event_id='ADJUST-TIMEOUT'"
+        ).fetchone() == (0,)
+
+        revised = ai_estimated_payload()
+        revised["ai_estimate"]["protein_g"] = {"estimate": 30, "min": 24, "max": 38}
+        retry = apply_meal_photo_ai_adjustment(
+            conn, event_id="ADJUST-TIMEOUT", user_id="U1", token=token,
+            expected_version=2, correction="飯吃一半", estimate_provider=lambda *_: revised,
+        )
+        assert retry["draft"]["status"] == "estimated"
+        assert retry["draft"]["version"] == 3
+        assert retry["draft"]["estimate"]["protein_g"] == 30
+
+
+def test_stale_adjustment_failure_cannot_clear_takeover_claim_or_regress_draft(tmp_path):
+    db = tmp_path / "adjust-stale-failure.db"
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-STALE-FAILURE",
+            payload=ai_estimated_payload(), source_image_ref="nutrition-image:kept.jpg",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        apply_meal_photo_action(
+            conn, event_id="REQUEST-ADJUST-STALE", user_id="U1", token=token,
+            expected_version=1, action="request_adjust",
+        )
+
+    a_claimed = threading.Event()
+    fail_a = threading.Event()
+    b_claimed = threading.Event()
+    finish_b = threading.Event()
+    outcomes = {}
+
+    def worker_a():
+        try:
+            with sqlite3.connect(db, timeout=2) as conn:
+                def provider(*_args):
+                    a_claimed.set()
+                    assert fail_a.wait(2)
+                    raise TimeoutError("stale worker timeout")
+
+                apply_meal_photo_ai_adjustment(
+                    conn, event_id="ADJUST-STALE", user_id="U1", token=token,
+                    expected_version=2, correction="飯吃一半", estimate_provider=provider,
+                )
+        except Exception as exc:
+            outcomes["a"] = exc
+
+    def worker_b():
+        try:
+            with sqlite3.connect(db, timeout=2) as conn:
+                def provider(*_args):
+                    b_claimed.set()
+                    assert finish_b.wait(2)
+                    revised = ai_estimated_payload()
+                    revised["ai_estimate"]["protein_g"] = {
+                        "estimate": 30, "min": 24, "max": 38,
+                    }
+                    return revised
+
+                outcomes["b"] = apply_meal_photo_ai_adjustment(
+                    conn, event_id="ADJUST-STALE", user_id="U1", token=token,
+                    expected_version=2, correction="飯吃一半", estimate_provider=provider,
+                )
+        except Exception as exc:
+            outcomes["b"] = exc
+
+    a = threading.Thread(target=worker_a)
+    a.start()
+    assert a_claimed.wait(2)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE meal_photo_events
+               SET result_json=json_set(result_json, '$.lease_until', '2000-01-01T00:00:00+08:00')
+               WHERE event_id='ADJUST-STALE'"""
+        )
+        conn.commit()
+
+    b = threading.Thread(target=worker_b)
+    b.start()
+    assert b_claimed.wait(2)
+    with sqlite3.connect(db) as conn:
+        takeover_json = conn.execute(
+            "SELECT result_json FROM meal_photo_events WHERE event_id='ADJUST-STALE'"
+        ).fetchone()[0]
+        assert json.loads(takeover_json)["attempt"] == 2
+
+    fail_a.set()
+    a.join(2)
+    assert not a.is_alive()
+    assert isinstance(outcomes.get("a"), TimeoutError)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT status,version FROM pending_meal_photo_drafts WHERE token=?", (token,)
+        ).fetchone() == ("adjusting", 2)
+        assert conn.execute(
+            "SELECT result_json FROM meal_photo_events WHERE event_id='ADJUST-STALE'"
+        ).fetchone()[0] == takeover_json
+
+    finish_b.set()
+    b.join(2)
+    assert not b.is_alive()
+    assert not isinstance(outcomes.get("b"), Exception)
+    assert outcomes["b"]["draft"]["status"] == "estimated"
+    assert outcomes["b"]["draft"]["version"] == 3
+    assert outcomes["b"]["draft"]["estimate"]["protein_g"] == 30
+    with sqlite3.connect(db) as conn:
+        event_result = json.loads(conn.execute(
+            "SELECT result_json FROM meal_photo_events WHERE event_id='ADJUST-STALE'"
+        ).fetchone()[0])
+        assert event_result == {"kind": "estimate", "version": 3}
+
+
+def test_cancel_during_adjustment_fences_late_model_result_and_preserves_cancel(tmp_path):
+    db = tmp_path / "adjust-cancel.db"
+    with sqlite3.connect(db) as conn:
+        token = save_meal_photo_draft(
+            conn, user_id="U1", source_message_id="PHOTO-CANCEL-LATE",
+            payload=ai_estimated_payload(), source_image_ref="nutrition-image:kept.jpg",
+            workflow_version="user_confirmed_ai_nutrition_v2",
+        )
+        apply_meal_photo_action(conn, event_id="REQUEST-ADJUST-CANCEL", user_id="U1", token=token,
+                                expected_version=1, action="request_adjust")
+        def cancel_then_return(*_args):
+            with sqlite3.connect(db) as other:
+                cancelled = apply_meal_photo_action(
+                    other, event_id="CANCEL-WHILE-MODEL", user_id="U1", token=token,
+                    expected_version=2, action="cancel",
+                )
+                assert cancelled["draft"]["status"] == "cancelled"
+            return ai_estimated_payload()
+        with pytest.raises(ValueError, match="取消|更新"):
+            apply_meal_photo_ai_adjustment(
+                conn, event_id="ADJUST-LATE", user_id="U1", token=token,
+                expected_version=2, correction="飯吃一半", estimate_provider=cancel_then_return,
+            )
+        draft = get_meal_photo_draft(conn, user_id="U1", token=token)
+        assert draft["status"] == "cancelled"
+        assert draft["estimate"] == {}
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+        result = json.loads(conn.execute(
+            "SELECT result_json FROM meal_photo_events WHERE event_id='ADJUST-LATE'"
+        ).fetchone()[0])
+        assert result["state"] == "cancelled"

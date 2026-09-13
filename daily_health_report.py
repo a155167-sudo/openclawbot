@@ -324,6 +324,7 @@ def format_daily_health_report(
     target: Mapping[str, Any] | None,
     exercise: Mapping[str, Any] | None,
     pending_reviews: int,
+    estimated_totals: Mapping[str, Any] | None = None,
 ) -> str:
     """Render a deterministic LINE-safe daily summary (no inferred facts)."""
     date_display = report_date.replace("-", "/")
@@ -377,14 +378,46 @@ def format_daily_health_report(
     else:
         lines.append("今日無已確認飲食紀錄")
 
-    lines.extend(
-        [
-            "",
-            "📊 今日攝取總計",
+    ai_records = [
+        item for item in foods
+        if item.get("trust_type") == "user_confirmed_ai_estimate"
+        and item.get("trust_integrity_status") == "verified"
+    ]
+    if ai_records:
+        estimated = estimated_totals or {}
+        ai_calories = estimated.get("calories_kcal")
+        ai_protein = estimated.get("protein_g")
+        lines.extend(["", "📊 已知／正式可計算小計"])
+        if len(ai_records) == len(foods):
+            lines.append("無可計算正式營養紀錄")
+        else:
+            lines.extend([
+                f"熱量{_fmt_number(totals.get('calories_kcal'))} kcal｜蛋白質{_fmt_number(totals.get('protein_g'))}g",
+                f"脂肪{_fmt_number(totals.get('fat_g'))}g｜碳水{_fmt_number(totals.get('carbohydrate_g'))}g",
+                f"纖維{_fmt_number(totals.get('fiber_g'))}g｜鈉{_fmt_number(totals.get('sodium_mg'))}mg",
+            ])
+        lines.extend([
+            "", "🤖 顧客確認・AI估算加計（非營養師核准）",
+            f"熱量約{_fmt_number(ai_calories)} kcal｜蛋白質約{_fmt_number(ai_protein)}g",
+            "脂肪NA｜碳水NA",
+        ])
+        if len(ai_records) < len(foods):
+            try:
+                combined_calories = float(totals.get("calories_kcal")) + float(ai_calories)
+                combined_protein = float(totals.get("protein_g")) + float(ai_protein)
+            except (TypeError, ValueError):
+                combined_calories = combined_protein = None
+            lines.extend([
+                "", "📎 今日估算合計（僅熱量／蛋白質）",
+                f"熱量約{_fmt_number(combined_calories)} kcal｜蛋白質約{_fmt_number(combined_protein)}g",
+                "脂肪／碳水仍為部分未知，不是完整今日總計",
+            ])
+    else:
+        lines.extend([
+            "", "📊 今日攝取總計",
             f"熱量{_fmt_number(totals.get('calories_kcal'))} kcal｜蛋白質{_fmt_number(totals.get('protein_g'))}g",
             f"脂肪{_fmt_number(totals.get('fat_g'))}g｜碳水{_fmt_number(totals.get('carbohydrate_g'))}g",
             f"纖維{_fmt_number(totals.get('fiber_g'))}g｜鈉{_fmt_number(totals.get('sodium_mg'))}mg",
-        ]
-    )
+        ])
     lines.extend(["", "資料截止：23:30；晚於此時間補記可輸入「今日健康日報」重新整理。"])
     return "\n".join(lines)[:5000]
