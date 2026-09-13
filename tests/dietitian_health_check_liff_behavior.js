@@ -30,6 +30,12 @@ function walk(root) {
 }
 function find(root, predicate) { return walk(root).find(predicate); }
 function renderedText(root) { return walk(root).map(element => element.textContent).join('\n'); }
+function renderedTextOutsideDetails(root) {
+  return [root, ...root.children.flatMap(child => {
+    if (!(child instanceof Element) || child.tagName === 'DETAILS') return [];
+    return walk(child);
+  })].map(element => element.textContent).join('\n');
+}
 function deferred() {
   let resolve;
   const promise = new Promise(r => { resolve = r; });
@@ -109,7 +115,7 @@ async function createApp(fetchImpl) {
   };
   vm.runInNewContext(script, context, {filename: 'app.js'});
   await settle();
-  return {status, cases, refresh, objectUrls, revoked, windowListeners};
+  return {status, cases, refresh, objectUrls, revoked, windowListeners, taipeiTimestamp: context.taipeiTimestamp};
 }
 
 async function happyPath() {
@@ -127,7 +133,7 @@ async function happyPath() {
   assert.ok(text.includes('脂肪：NA'));
   assert.ok(text.includes('碳水化合物：NA'));
   assert.ok(text.includes('餐點紀錄'));
-  assert.ok(text.includes('未提供驗證日期餐別'));
+  assert.ok(text.includes('日期與餐別尚無可驗證資料'));
   assert.ok(text.includes('膳食纖維：NA'));
   assert.ok(text.includes('鈉：NA'));
   assert.ok(text.includes('非營養師核准'));
@@ -185,7 +191,7 @@ async function chineseCardsAndPhotoStatusCopy() {
   const mealCard = find(app.cases, el => el.className === 'meal-card');
   const mealText = renderedText(mealCard);
   assert.ok(mealText.includes('餐點紀錄'));
-  assert.ok(mealText.includes('未提供驗證日期餐別'));
+  assert.ok(mealText.includes('日期與餐別尚無可驗證資料'));
   assert.ok(!mealText.includes('2099-12-31'));
   assert.ok(!mealText.includes('晚餐'));
   for (const expected of ['熱量：510 kcal', '蛋白質：28 g', '脂肪：16 g', '碳水化合物：62 g', '膳食纖維：7 g', '鈉：820 mg']) assert.ok(text.includes(expected), expected);
@@ -194,6 +200,85 @@ async function chineseCardsAndPhotoStatusCopy() {
   assert.ok(technical, 'long identifiers and JSON are placed in technical details');
   assert.equal(technical.attributes.open, undefined, 'technical details are collapsed by default');
   assert.ok(renderedText(technical).includes('<img src=x onerror=alert(1)>'), 'escaped text remains inspectable');
+}
+
+async function compactPeriodAndMealCardPresentation() {
+  const datedListing = {items: [{
+    ...listing.items[0],
+    window_started_at: '2026-09-02T01:05:00Z',
+    window_ends_at: '2026-09-04T16:30:00+08:00',
+  }]};
+  const twoSourceDetail = {
+    ...detail,
+    source_logs: [
+      detail.source_logs[0],
+      {log_id: 'second', trust_type: 'verified_snapshot', nutrition_snapshot: {calories_kcal: 420}},
+    ],
+    source_integrity: {referenced_count: 2, available_snapshot_count: 2, all_snapshots_available: true},
+  };
+  const app = await createApp(async path => path.includes('?') ? jsonResponse(datedListing) : jsonResponse(twoSourceDetail));
+  const text = renderedText(app.cases);
+  assert.ok(text.includes('開始：2026/09/02 09:05'), 'UTC start is shown in Asia/Taipei');
+  assert.ok(text.includes('截止：2026/09/04 16:30'), 'offset end preserves the Asia/Taipei instant');
+  assert.ok(!text.includes('2026-09-02T01:05:00Z'), 'raw ISO start is not shown');
+  assert.ok(!text.includes('2026-09-04T16:30:00+08:00'), 'raw ISO end is not shown');
+
+  const mealCards = walk(app.cases).filter(el => el.className === 'meal-card');
+  assert.equal(mealCards.length, 2);
+  assert.ok(renderedText(mealCards[0]).includes('餐點紀錄 1'));
+  assert.ok(renderedText(mealCards[1]).includes('餐點紀錄 2'));
+  for (const card of mealCards) {
+    assert.ok(!renderedTextOutsideDetails(card).includes('日期與餐別尚無可驗證資料'), 'technical hint stays out of the primary card');
+    const technical = find(card, el => el.tagName === 'DETAILS' && renderedText(el).includes('技術資料'));
+    assert.ok(technical);
+    assert.equal(technical.attributes.open, undefined, 'technical details are collapsed by default');
+    const summary = find(technical, el => el.tagName === 'SUMMARY' && el.textContent === '技術資料');
+    assert.ok(summary, 'native summary remains available to toggle the details');
+    assert.equal(summary.listeners.click, undefined, 'no handler overrides or force-closes the native details state');
+    assert.ok(renderedText(technical).includes('日期與餐別尚無可驗證資料'));
+  }
+
+  const invalidListing = {items: [{
+    ...listing.items[0],
+    window_started_at: 'not-a-timestamp',
+    window_ends_at: null,
+  }]};
+  const invalidApp = await createApp(async path => path.includes('?') ? jsonResponse(invalidListing) : jsonResponse(detail));
+  const invalidText = renderedText(invalidApp.cases);
+  assert.ok(invalidText.includes('開始：未提供'));
+  assert.ok(invalidText.includes('截止：未提供'));
+  assert.ok(!invalidText.includes('Invalid Date'));
+  assert.ok(!invalidText.includes('not-a-timestamp'));
+}
+
+async function taipeiTimestampRejectsNormalizedDateTimeFields() {
+  const app = await createApp(async path => path.includes('?') ? jsonResponse({items: []}) : jsonResponse(detail));
+  const invalidCases = [
+    ['24 hour at midnight', '2026-09-02T24:00:00+08:00'],
+    ['24 hour with minutes', '2026-09-02T24:01:00+08:00'],
+    ['minute 60', '2026-09-02T23:60:00+08:00'],
+    ['second 60', '2026-09-02T23:59:60+08:00'],
+    ['month 13', '2026-13-02T00:00:00+08:00'],
+    ['invalid month day', '2026-04-31T00:00:00+08:00'],
+    ['non-leap-year February 29', '2026-02-29T00:00:00+08:00'],
+    ['offset hour 24', '2026-09-02T00:00:00+24:00'],
+    ['offset minute 60', '2026-09-02T00:00:00-08:60'],
+  ];
+  for (const [name, value] of invalidCases) {
+    assert.equal(app.taipeiTimestamp(value), '未提供', name);
+  }
+
+  const validCases = [
+    ['UTC crosses into next Taipei day', '2026-09-02T16:00:00Z', '2026/09/03 00:00'],
+    ['positive offset crosses into prior Taipei day', '2026-09-03T00:30:00+09:00', '2026/09/02 23:30'],
+    ['negative offset crosses into next Taipei day', '2026-09-02T23:30:00-02:00', '2026/09/03 09:30'],
+    ['maximum positive offset is accepted', '2026-09-02T00:00:00+23:59', '2026/09/01 08:01'],
+    ['maximum negative offset is accepted', '2026-09-02T00:00:00-23:59', '2026/09/03 07:59'],
+    ['fractional seconds on leap day', '2024-02-29T00:00:00.123+08:00', '2024/02/29 00:00'],
+  ];
+  for (const [name, value, expected] of validCases) {
+    assert.equal(app.taipeiTimestamp(value), expected, name);
+  }
 }
 
 async function staleRequestCannotAttach() {
@@ -531,6 +616,8 @@ async function validDayCountRequiresConsistentDayRecords() {
 (async () => {
   await happyPath();
   await chineseCardsAndPhotoStatusCopy();
+  await compactPeriodAndMealCardPresentation();
+  await taipeiTimestampRejectsNormalizedDateTimeFields();
   await staleRequestCannotAttach();
   await reloadRevokesLoadedPhoto();
   await switchingCasesRevokesPriorCasePhotos();

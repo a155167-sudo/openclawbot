@@ -8536,6 +8536,8 @@ def test_approved_photo_integrity_tamper_fails_closed_in_totals_and_sheet_outbox
     server.init_db()
     user_id = "U-APPROVED-PHOTO-CONSUMERS"
     consumed_at = "2026-09-13T12:00:00+08:00"
+    fixture_date = datetime.fromisoformat(consumed_at).date()
+    monkeypatch.setattr(server, "tw_today", lambda: fixture_date)
     exchange = {
         "milk_exchange": 0, "protein_low_exchange": 1,
         "protein_medium_exchange": 0, "protein_high_exchange": 0,

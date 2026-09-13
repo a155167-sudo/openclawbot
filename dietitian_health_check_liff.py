@@ -37,7 +37,7 @@ def _html() -> str:
     button{border:0;border-radius:10px;background:#27734b;color:#fff;padding:11px 16px;font-weight:700}
     #status{margin:14px 0;color:#526159}.case{background:#fff;border-radius:14px;padding:16px;margin:12px 0;box-shadow:0 2px 12px #153b2420}
     .case h2{font-size:18px;margin:0 0 8px}.meta{line-height:1.65;font-size:14px}.days{margin:10px 0;padding-left:20px}
-    details{margin-top:10px}pre{white-space:pre-wrap;word-break:break-word;background:#f6f8f6;padding:10px;border-radius:8px;font-size:12px}
+    details{margin-top:10px}summary{cursor:pointer}.period{line-height:1.6;font-size:14px;overflow-wrap:anywhere}pre{white-space:pre-wrap;word-break:break-word;background:#f6f8f6;padding:10px;border-radius:8px;font-size:12px}
     .empty,.error{background:#fff7e8;border-radius:12px;padding:14px}.error{color:#8a2d22;background:#fff0ee}
     .photo-actions{margin-top:8px}.photo-actions button{margin-right:8px}.photo-preview{margin-top:8px}
     .photo-preview img{display:block;max-width:100%;height:auto;border-radius:10px}.photo-message{margin:8px 0;color:#6a3d27}
@@ -106,6 +106,24 @@ function nutritionValue(snapshot,key,unit){{
   const value=snapshot&&snapshot[key];
   return Number.isFinite(value)?`${{value}} ${{unit}}`:'NA';
 }}
+function taipeiTimestamp(value){{
+  if(typeof value!=='string')return '未提供';
+  const match=value.match(/^([0-9]{{4}})-([0-9]{{2}})-([0-9]{{2}})T([0-9]{{2}}):([0-9]{{2}}):([0-9]{{2}})(?:\\.[0-9]+)?(?:(Z)|([+-])([0-9]{{2}}):([0-9]{{2}}))$/);
+  if(!match)return '未提供';
+  const hour=Number(match[4]);
+  const minute=Number(match[5]);
+  const second=Number(match[6]);
+  const offsetHour=match[7]?0:Number(match[9]);
+  const offsetMinute=match[7]?0:Number(match[10]);
+  if(hour>23||minute>59||second>59||offsetHour>23||offsetMinute>59)return '未提供';
+  const calendarDate=new Date(`${{match[1]}}-${{match[2]}}-${{match[3]}}T00:00:00Z`);
+  if(!Number.isFinite(calendarDate.getTime())||calendarDate.toISOString().slice(0,10)!==`${{match[1]}}-${{match[2]}}-${{match[3]}}`)return '未提供';
+  const instant=new Date(value);
+  if(!Number.isFinite(instant.getTime()))return '未提供';
+  const parts={{}};
+  for(const part of new Intl.DateTimeFormat('en-CA',{{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}}).formatToParts(instant))parts[part.type]=part.value;
+  return `${{parts.year}}/${{parts.month}}/${{parts.day}} ${{parts.hour}}:${{parts.minute}}`;
+}}
 function photoUnavailableText(status){{
   if(status==='collecting')return '收集中，照片尚未開放';
   if(status==='delivered')return '案件已送達，照片不再開放';
@@ -167,13 +185,12 @@ async function loadPhoto(caseId,logId,button,panel){{
     }}
   }}
 }}
-function renderSource(caseId,caseStatus,log){{
+function renderSource(caseId,caseStatus,log,index){{
   const item=node('li',undefined,'meal-card');
   const isAi=log.trust_type==='user_confirmed_ai_estimate';
   const isApproved=log.approval_status==='approved';
   const label=isAi?'顧客確認・AI估算，非營養師核准':isApproved?'營養師核准':'可驗證營養快照（未標示營養師核准）';
-  item.append(node('strong','餐點紀錄'));
-  item.append(node('div','未提供驗證日期餐別','meta'));
+  item.append(node('strong',`餐點紀錄 ${{index+1}}`));
   item.append(node('div',label,'meta'));
   if(isAi){{
     const estimate=log.estimate||{{}};
@@ -190,7 +207,7 @@ function renderSource(caseId,caseStatus,log){{
     item.append(nutrition);
   }}
   const technical=node('details');
-  technical.append(node('summary','技術資料'),node('pre',JSON.stringify({{log_id:log.log_id,food_log_version:log.food_log_version,nutrition_snapshot:log.nutrition_snapshot||{{}}}},null,2)));
+  technical.append(node('summary','技術資料'),node('div','日期與餐別尚無可驗證資料','meta'),node('pre',JSON.stringify({{log_id:log.log_id,food_log_version:log.food_log_version,nutrition_snapshot:log.nutrition_snapshot||{{}}}},null,2)));
   item.append(technical);
   const actions=node('div',undefined,'photo-actions');
   const panel=node('div',undefined,'photo-preview');
@@ -253,7 +270,9 @@ function renderCase(item,detail){{
   const validDays=validatedValidDays(detail);
   const validDayCount=validatedValidDayCount(item,detail,validDays);
   card.append(node('div',validDayCount===null?'有效日：資料不可用':`有效日：${{validDayCount}} / 3`,'meta'));
-  card.append(node('div',`收集期間：${{item.window_started_at}} ～ ${{item.window_ends_at}}`,'meta'));
+  const period=node('div',undefined,'period');
+  period.append(node('div',`開始：${{taipeiTimestamp(item.window_started_at)}}`),node('div',`截止：${{taipeiTimestamp(item.window_ends_at)}}`));
+  card.append(period);
   const days=node('ul',undefined,'days');
   if(validDays===null)days.append(node('li','有效日期：資料不可用'));
   else if(validDays.length===0)days.append(node('li','目前尚無可列入的日期'));
@@ -272,7 +291,7 @@ function renderCase(item,detail){{
   const sources=node('ul',undefined,'days');
   if(sourceCounts===null&&sourceLogs.length===0)sources.append(node('li','來源快照清單資料不可用'));
   else if(sourceCounts&&sourceCounts.available===0)sources.append(node('li','目前無可顯示的來源快照；不代表沒有飲食紀錄'));
-  for(const log of sourceLogs)sources.append(renderSource(item.case_id,item.status,log));
+  sourceLogs.forEach((log,index)=>sources.append(renderSource(item.case_id,item.status,log,index)));
   card.append(sources);
   return card;
 }}
