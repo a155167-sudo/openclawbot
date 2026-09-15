@@ -41,8 +41,13 @@ When `APP_ENV` is `staging` or `production`, startup fails unless these environm
 If any Railway deployment metadata is present while `APP_ENV` is missing, startup
 fails closed instead of falling back to legacy resources or enabling the scheduler.
 `VIP_HEALTH_CHECK_ENABLED` is separately fail-closed: an unset or unrecognised value
-keeps the feature disabled. Both checked-in Railway templates pin it to `false`; change
-it only during a reviewed rollout.
+keeps the feature disabled. `DIETITIAN_HEALTH_CHECK_DELIVERY_RECOVERY_ENABLED` is a
+strict, independent `true|false` control and defaults to `false`; it may run the three
+bounded health-check delivery/recovery jobs while `ENABLE_SCHEDULER=false`, without
+enabling reminders, weekly reports, nutrition outboxes, or broad image cleanup. It
+becomes effective only when the validated dietitian read configuration and existing
+VIP benefit are both enabled. Both checked-in Railway templates pin both health-check
+flags to `false`; change them only during a reviewed rollout.
 `LIFF_ID` must match LINE's numeric-prefix format (for example,
 `2000000000-AbCdEfGh`). `GOOGLE_CREDENTIALS` must be valid service-account JSON,
 and a named environment stops at startup if its configured Sheet cannot initialize.
@@ -58,6 +63,8 @@ Named staging and production environments must explicitly set `SURVEY_REWARD_LIN
 | LINE webhook | `https://<staging-domain>/callback` | `https://<production-domain>/callback` |
 | Subscription Google Form Apps Script | POST to staging `/form-data` | POST to production `/form-data` |
 | LIFF endpoint | staging `/coach-dashboard` | production `/coach-dashboard` |
+| VIP customer health check LIFF | staging `/vip-health-check` | production `/vip-health-check` |
+| Dietitian read-only health check LIFF | staging `/dietitian-health-check` | production `/dietitian-health-check` |
 | Health check | staging `/health` | production `/health` |
 
 A Google Form link update alone is insufficient: each Form requires its own Apps Script `onFormSubmit` trigger and destination.
@@ -79,6 +86,58 @@ UrlFetchApp.fetch(destinationUrl, {
 
 Store `WEBHOOK_SECRET` in Apps Script **Script Properties**. Use separate values
 for subscription/survey and for staging/production.
+
+## Health-check deployment boundary
+
+This change reuses the resources already assigned to each environment. A deployment
+must not create or replace a LINE Provider, Messaging API Channel, LINE Login
+Channel, LIFF app, Railway service, domain, volume, or Google Sheet; it must not
+attach a staging resource to production (or the reverse). The endpoint rows above
+are route mappings only and are not instructions to provision new resources.
+
+Before any staging or production rollout, the release owner must record and compare
+the intended environment's exact:
+
+- Git branch and candidate commit;
+- Railway project, environment, and service IDs;
+- public domain and attached volume ID/mount;
+- Messaging API Channel and LINE Login Channel IDs, their Provider ownership, and
+  the target LIFF IDs/endpoints;
+- Google Sheet ID and the matching Apps Script destination.
+
+The relevant Messaging API and LINE Login Channels must be verified under the
+intended same Provider where Provider-scoped identity is required. Names alone are
+not evidence of ownership or isolation. This document and local tests do **not**
+claim that Railway, LINE Developers, volumes, domains, Channels, LIFF apps, or
+Sheets have been inspected or proven isolated remotely.
+
+A local PASS does not mean the commit has been deployed or that either public LIFF
+endpoint is online. Keep `VIP_HEALTH_CHECK_ENABLED=false`,
+`DIETITIAN_HEALTH_CHECK_DELIVERY_RECOVERY_ENABLED=false`, and
+`ENABLE_SCHEDULER=false` through the dark deployment and identity/resource checks;
+enabling any of them requires the reviewed rollout procedure and explicit release-owner
+approval.
+
+Before enabling the dedicated delivery/recovery trigger, read back and record that the
+deployment has exactly **one replica on one host**, and that its delivery lock directory
+and SQLite database reside on the same mounted filesystem. The current `flock` contract
+is host-local; more than one replica or a non-shared lock filesystem blocks enablement
+and requires a separately reviewed distributed/single-consumer design. The three
+10-minute interval jobs are:
+
+1. report delivery: selects at most one `pending`/`failed` persisted delivery and may
+   push its immutable approved report to LINE;
+2. delivered-image cleanup recovery: selects at most one coherently `delivered` case
+   that still retains an authoritative source-image reference and may delete only via
+   the reviewed protected cleanup path;
+3. supplement notification: selects at most one current `pending_customer` request
+   whose notification is `not_sent` and may push its persisted request to LINE.
+
+Startup immediately primes only report delivery and delivered-image cleanup recovery,
+once each; supplement notification begins on its interval. Every selector uses a finite
+cohort and each invocation processes at most one candidate. The report and supplement
+provider calls retain host-local per-operation `flock`; this is not a cross-replica
+exactly-once guarantee.
 
 ## Release workflow
 

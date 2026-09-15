@@ -241,6 +241,47 @@ def test_format_report_uses_na_without_guessing_missing_health_or_plan():
     assert "今日運動：NA" in report
 
 
+def test_ai_only_report_separates_estimate_and_preserves_unknown_macros():
+    report = format_daily_health_report(
+        report_date="2026-09-13", checkin=None,
+        foods=[{
+            "time": "12:00", "name": "餐點照片", "calories_kcal": 680,
+            "protein_g": 35, "trust_type": "user_confirmed_ai_estimate",
+            "trust_integrity_status": "verified",
+        }],
+        totals={"calories_kcal": 0, "protein_g": 0, "fat_g": 0, "carbohydrate_g": 0},
+        estimated_totals={"calories_kcal": 680, "protein_g": 35},
+        target=None, exercise=None, pending_reviews=0,
+    )
+
+    assert "已知／正式可計算小計" in report
+    assert "顧客確認・AI估算加計（非營養師核准）" in report
+    assert "熱量約680 kcal｜蛋白質約35g" in report
+    assert "脂肪NA｜碳水NA" in report
+    assert "無可計算正式營養紀錄" in report
+    assert "熱量0 kcal" not in report
+    assert "今日攝取總計" not in report
+
+
+def test_mixed_report_labels_estimated_combined_kcal_and_protein_as_incomplete():
+    report = format_daily_health_report(
+        report_date="2026-09-13", checkin=None,
+        foods=[
+            {"time": "08:00", "name": "豆漿", "calories_kcal": 200, "protein_g": 20},
+            {"time": "12:00", "name": "餐點照片", "calories_kcal": 680, "protein_g": 35,
+             "trust_type": "user_confirmed_ai_estimate", "trust_integrity_status": "verified"},
+        ],
+        totals={"calories_kcal": 200, "protein_g": 20, "fat_g": 8, "carbohydrate_g": 12,
+                "fiber_g": 2, "sodium_mg": 100},
+        estimated_totals={"calories_kcal": 680, "protein_g": 35},
+        target=None, exercise=None, pending_reviews=0,
+    )
+
+    assert "今日估算合計（僅熱量／蛋白質）" in report
+    assert "熱量約880 kcal｜蛋白質約55g" in report
+    assert "脂肪／碳水仍為部分未知，不是完整今日總計" in report
+
+
 def test_summarize_intervals_activities_uses_observed_activity_fields():
     summary = summarize_intervals_activities(
         [

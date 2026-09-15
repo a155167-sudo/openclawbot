@@ -2,6 +2,7 @@
 APP_ENV=staging
 ENABLE_SCHEDULER=false
 VIP_HEALTH_CHECK_ENABLED=false
+DIETITIAN_HEALTH_CHECK_DELIVERY_RECOVERY_ENABLED=false
 # Required only when VIP_HEALTH_CHECK_ENABLED=true; must belong to the same LINE Login Channel.
 VIP_HEALTH_CHECK_LIFF_ID=<dedicated staging customer health-check LIFF ID>
 VIP_HEALTH_CHECK_LINE_LOGIN_CHANNEL_ID=<owning staging LINE Login Channel ID>

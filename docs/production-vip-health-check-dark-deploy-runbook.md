@@ -5,6 +5,7 @@ This runbook applies only to a dark deployment with both controls pinned off:
 ```text
 ENABLE_SCHEDULER=false
 VIP_HEALTH_CHECK_ENABLED=false
+DIETITIAN_HEALTH_CHECK_DELIVERY_RECOVERY_ENABLED=false
 ```
 
 It does **not** authorize creating or advertising the production customer LIFF, enabling customer routes, or granting a historical-user backfill.
@@ -39,6 +40,7 @@ Read the production Railway variables without printing secret values. Confirm:
 APP_ENV=production
 ENABLE_SCHEDULER=false
 VIP_HEALTH_CHECK_ENABLED=false
+DIETITIAN_HEALTH_CHECK_DELIVERY_RECOVERY_ENABLED=false
 SURVEY_REWARD_LINK_COUNT=1
 SURVEY_REWARD_POINTS_PER_LINK=2
 ```

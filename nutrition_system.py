@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import secrets
 import sqlite3
 import uuid
@@ -90,6 +91,29 @@ def _number(
     if max_value is not None and result > max_value:
         raise ValueError(f"{field} 超過合理範圍")
     return result
+
+
+def _strict_json_number(
+    value: Any, field: str, *, max_value: float | None = None
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} 必須是JSON數字")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field} 必須是有限數字")
+    if result < 0:
+        raise ValueError(f"{field} 不可為負數")
+    if max_value is not None and result > max_value:
+        raise ValueError(f"{field} 超過合理範圍")
+    return result
+
+
+def _json_object_or_none(raw: Any) -> dict[str, Any] | None:
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return dict(value) if isinstance(value, Mapping) else None
 
 
 MEAL_PHOTO_NUTRITION_RULE_VERSION = "tw-exchange-macros-v1"
@@ -427,15 +451,353 @@ def food_fingerprint(
 def exchange_approval_hash(
     food_fingerprint_value: str, rule_version: str, exchanges: Mapping[str, Any]
 ) -> str:
+    def canonical_number(value: Any) -> float | str:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "__invalid__"
+        number = float(value)
+        if not math.isfinite(number):
+            return "__invalid__"
+        return round(number, 4)
+
+    def canonical_string(container: Mapping[str, Any], key: str) -> Any:
+        if key not in container:
+            return {"_absent": True}
+        value = container[key]
+        return value if isinstance(value, str) else {"_invalid": True}
+
+    def canonical_legacy_number(value: Any) -> float | str:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str, type(None))):
+            return "__invalid__"
+        try:
+            number = float(value or 0)
+        except (TypeError, ValueError):
+            return "__invalid__"
+        if not math.isfinite(number):
+            return "__invalid__"
+        return round(number, 4)
+
+    rule_version = str(rule_version)
+    if not isinstance(exchanges, Mapping):
+        canonical = {
+            "food_fingerprint": str(food_fingerprint_value),
+            "rule_version": rule_version,
+            "exchanges": {"_invalid": True},
+        }
+        raw = json.dumps(
+            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if rule_version == "meal-photo-admin-v2":
+        canonical_exchanges = {
+            key: canonical_number(exchanges[key]) if key in exchanges else "__missing__"
+            for key in EXCHANGE_KEYS
+        }
+    else:
+        canonical_exchanges = {
+            key: canonical_legacy_number(exchanges.get(key, 0)) for key in EXCHANGE_KEYS
+        }
     canonical = {
         "food_fingerprint": str(food_fingerprint_value),
-        "rule_version": str(rule_version),
-        "exchanges": {
-            key: round(float(exchanges.get(key, 0) or 0), 4) for key in EXCHANGE_KEYS
-        },
+        "rule_version": rule_version,
+        "exchanges": canonical_exchanges,
     }
+    if rule_version == "meal-photo-admin-v2":
+        raw_items = exchanges.get("protein_items")
+        if "protein_items" not in exchanges:
+            canonical["protein_items"] = {"_absent": True}
+        elif raw_items is None:
+            canonical["protein_items"] = {"_invalid": True}
+        elif not isinstance(raw_items, list):
+            canonical["protein_items"] = {"_invalid": True}
+        else:
+            canonical_items = []
+            for raw_item in raw_items:
+                if not isinstance(raw_item, Mapping):
+                    canonical_items.append({"_invalid": True})
+                    continue
+                if "exchange" not in raw_item:
+                    canonical_exchange: Any = {"_absent": True}
+                else:
+                    raw_exchange = raw_item["exchange"]
+                    if not isinstance(raw_exchange, Mapping):
+                        canonical_exchange = {"_invalid": True}
+                    else:
+                        canonical_exchange = {
+                            "min": (
+                                canonical_number(raw_exchange["min"])
+                                if "min" in raw_exchange else {"_absent": True}
+                            ),
+                            "max": (
+                                canonical_number(raw_exchange["max"])
+                                if "max" in raw_exchange else {"_absent": True}
+                            ),
+                            "basis": canonical_string(raw_exchange, "basis"),
+                        }
+                canonical_items.append({
+                    "type": canonical_string(raw_item, "type"),
+                    "portion": canonical_string(raw_item, "portion"),
+                    "exchange": canonical_exchange,
+                })
+            canonical["protein_items"] = canonical_items
+        raw_total = exchanges.get("protein_total_exchange")
+        if "protein_total_exchange" not in exchanges:
+            canonical["protein_total_exchange"] = {"_absent": True}
+        elif raw_total is None:
+            canonical["protein_total_exchange"] = {"_invalid": True}
+        elif not isinstance(raw_total, Mapping):
+            canonical["protein_total_exchange"] = {"_invalid": True}
+        else:
+            canonical["protein_total_exchange"] = {
+                "min": (
+                    canonical_number(raw_total["min"])
+                    if "min" in raw_total else {"_absent": True}
+                ),
+                "max": (
+                    canonical_number(raw_total["max"])
+                    if "max" in raw_total else {"_absent": True}
+                ),
+                "basis": canonical_string(raw_total, "basis"),
+            }
     raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def exchange_approval_payload_is_valid(rule_version: str, exchanges: Any) -> bool:
+    if not isinstance(exchanges, Mapping):
+        return False
+    if str(rule_version) != "meal-photo-admin-v2":
+        try:
+            for key in EXCHANGE_KEYS:
+                value = exchanges.get(key, 0)
+                if isinstance(value, bool) or not isinstance(
+                    value, (int, float, str, type(None))
+                ):
+                    return False
+                number = float(value or 0)
+                if not math.isfinite(number) or number < 0 or number > 100:
+                    return False
+            return True
+        except (TypeError, ValueError):
+            return False
+    try:
+        for key in EXCHANGE_KEYS:
+            if key not in exchanges:
+                return False
+            _strict_json_number(exchanges[key], key, max_value=100)
+        has_items = "protein_items" in exchanges
+        has_total = "protein_total_exchange" in exchanges
+        if has_items != has_total:
+            return False
+        if not has_items:
+            return True
+        raw_items = exchanges["protein_items"]
+        raw_total = exchanges["protein_total_exchange"]
+        if (
+            not isinstance(raw_items, list)
+            or not 2 <= len(raw_items) <= 4
+            or not isinstance(raw_total, Mapping)
+        ):
+            return False
+        valid_types = {"chicken", "pork", "fish", "egg", "tofu", "other", "unknown"}
+        portion_ranges = {
+            "half_palm": (1.0, 2.0), "one_palm": (2.0, 3.0),
+            "one_half_palm": (3.0, 5.0), "two_palm": (4.0, 6.0),
+        }
+        seen_types: set[str] = set()
+        total_min = 0.0
+        total_max = 0.0
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                return False
+            protein_type = item.get("type")
+            portion = item.get("portion")
+            item_exchange = item.get("exchange")
+            if (
+                not isinstance(protein_type, str)
+                or protein_type not in valid_types
+                or protein_type in seen_types
+                or not isinstance(portion, str)
+                or portion not in portion_ranges
+                or not isinstance(item_exchange, Mapping)
+                or item_exchange.get("basis") != "hand_portion_range_v1"
+            ):
+                return False
+            item_min = _strict_json_number(
+                item_exchange.get("min"), "protein_item.min", max_value=100
+            )
+            item_max = _strict_json_number(
+                item_exchange.get("max"), "protein_item.max", max_value=100
+            )
+            if (item_min, item_max) != portion_ranges[portion]:
+                return False
+            seen_types.add(protein_type)
+            total_min += item_min
+            total_max += item_max
+        return (
+            raw_total.get("basis") == "summed_hand_portion_ranges_v2"
+            and _strict_json_number(
+                raw_total.get("min"), "protein_total.min", max_value=100
+            ) == total_min
+            and _strict_json_number(
+                raw_total.get("max"), "protein_total.max", max_value=100
+            ) == total_max
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def exchange_applied_payload_matches_approval_hash(
+    food_fingerprint_value: str,
+    rule_version: str,
+    applied: Any,
+    servings: Any,
+    approval_hash: Any,
+) -> bool:
+    if not exchange_approval_payload_is_valid(rule_version, applied):
+        return False
+    try:
+        if str(rule_version) != "meal-photo-admin-v2":
+            return True
+        serving_count = _strict_json_number(servings, "consumed_servings", max_value=100)
+        if serving_count <= 0:
+            return False
+        normalized = dict(applied)
+        for key in EXCHANGE_KEYS:
+            normalized[key] = round(float(normalized[key]) / serving_count, 4)
+        expected = exchange_approval_hash(
+            food_fingerprint_value, rule_version, normalized
+        )
+        return secrets.compare_digest(str(approval_hash or ""), expected)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
+def verified_exchange_approval_projection(
+    *,
+    log_user_id: Any,
+    log_food_id: Any,
+    catalog_source_type: Any,
+    catalog_owner_user_id: Any,
+    catalog_fingerprint: Any,
+    consumed_servings: Any,
+    applied_json: Any,
+    approval_id: Any,
+    approval_food_id: Any,
+    approval_fingerprint: Any,
+    rule_version: Any,
+    approved_json: Any,
+    approval_hash: Any,
+) -> dict[str, Any]:
+    """Project one approval through its complete source and hash contract.
+
+    The approval/hash helpers remain the canonical payload validators.  This
+    wrapper adds the relational and source checks consumers previously applied
+    inconsistently, and preserves enough origin evidence to prevent a mutable
+    ``source_type`` from downgrading an approved photo into an ordinary log.
+    """
+    approved = _json_object_or_none(approved_json)
+    applied = _json_object_or_none(applied_json)
+    rule_version_text = str(rule_version or "")
+    is_meal_photo_origin = bool(
+        str(catalog_source_type or "") == "user_meal_photo"
+        or rule_version_text == "meal-photo-admin-v2"
+        or (isinstance(approved, Mapping) and approved.get("_source_type") == "meal_photo")
+        or (isinstance(applied, Mapping) and applied.get("_source_type") == "meal_photo")
+    )
+    result = {
+        "is_valid": False,
+        "is_meal_photo_origin": is_meal_photo_origin,
+        "approved": approved or {},
+        "applied": applied or {},
+    }
+    if (
+        not approval_id
+        or not approval_food_id
+        or str(approval_food_id) != str(log_food_id or "")
+        or not approval_fingerprint
+        or str(approval_fingerprint) != str(catalog_fingerprint or "")
+        or approved is None
+        or applied is None
+        or not exchange_approval_payload_is_valid(rule_version_text, approved)
+        or not exchange_approval_payload_is_valid(rule_version_text, applied)
+    ):
+        return result
+    if is_meal_photo_origin and (
+        str(catalog_source_type or "") != "user_meal_photo"
+        or not log_user_id
+        or str(catalog_owner_user_id or "") != str(log_user_id)
+    ):
+        return result
+    if rule_version_text == "meal-photo-admin-v2" and (
+        approved.get("_source_type") != "meal_photo"
+        or applied.get("_source_type") != "meal_photo"
+    ):
+        return result
+    expected_hash = exchange_approval_hash(
+        str(approval_fingerprint), rule_version_text, approved
+    )
+    if (
+        not secrets.compare_digest(str(approval_hash or ""), expected_hash)
+        or not exchange_applied_payload_matches_approval_hash(
+            str(approval_fingerprint), rule_version_text, applied,
+            consumed_servings, approval_hash,
+        )
+    ):
+        return result
+    try:
+        expected_applied = {
+            key: round(
+                float(approved.get(key, 0) or 0) * float(consumed_servings or 0), 4
+            )
+            for key in EXCHANGE_KEYS
+        }
+        if any(
+            abs(float(applied.get(key, 0) or 0) - expected_applied[key]) > 0.0001
+            for key in EXCHANGE_KEYS
+        ):
+            return result
+    except (TypeError, ValueError):
+        return result
+    result["is_valid"] = True
+    return result
+
+
+def verified_catalog_exchange_approval_projection(
+    *,
+    catalog_food_id: Any,
+    catalog_source_type: Any,
+    catalog_owner_user_id: Any,
+    catalog_fingerprint: Any,
+    approval_id: Any,
+    approval_food_id: Any,
+    approval_fingerprint: Any,
+    rule_version: Any,
+    approved_json: Any,
+    approval_hash: Any,
+    canonical_log_user_id: Any,
+) -> dict[str, Any]:
+    """Validate a catalog approval without requiring logs for ordinary foods.
+
+    Meal-photo approvals are created with a canonical food log, whose immutable
+    user binding supplies the ownership evidence that the catalog row itself
+    cannot provide after mutation.  Ordinary catalog approvals retain their
+    valid no-log lifecycle.
+    """
+    return verified_exchange_approval_projection(
+        log_user_id=canonical_log_user_id,
+        log_food_id=catalog_food_id,
+        catalog_source_type=catalog_source_type,
+        catalog_owner_user_id=catalog_owner_user_id,
+        catalog_fingerprint=catalog_fingerprint,
+        consumed_servings=1,
+        applied_json=approved_json,
+        approval_id=approval_id,
+        approval_food_id=approval_food_id,
+        approval_fingerprint=approval_fingerprint,
+        rule_version=rule_version,
+        approved_json=approved_json,
+        approval_hash=approval_hash,
+    )
 
 
 def remaining_targets(target: Mapping[str, Any], consumed: Mapping[str, Any]) -> dict[str, float]:
@@ -615,6 +977,7 @@ def nutrition_sheet_specs() -> dict[str, dict[str, list[list[Any]] | list[str]]]
                 "熱量kcal", "蛋白質g", "脂肪g", "碳水g", "糖g", "膳食纖維g", "鈉mg", "奶份",
                 "低脂蛋白份", "中脂蛋白份", "高脂蛋白份", "主食份", "蔬菜份", "水果份", "油脂份",
                 "來源圖片Ref", "plan_id", "確認狀態", "建立時間", "更新時間",
+                "信任類型", "估算Schema版本",
             ],
             "seed_rows": [],
         },
@@ -704,6 +1067,9 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             legacy_applied_at TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            trust_type TEXT NOT NULL DEFAULT '',
+            trust_payload_json TEXT NOT NULL DEFAULT '{}',
+            trust_hash TEXT NOT NULL DEFAULT '',
             FOREIGN KEY(food_id) REFERENCES food_catalog(food_id)
         );
 
@@ -794,7 +1160,7 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
         """
     )
     schema_component = "nutrition_system"
-    schema_version = 5
+    schema_version = 6
     version_row = conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component=?",
         (schema_component,),
@@ -822,6 +1188,9 @@ def ensure_nutrition_schema(conn: sqlite3.Connection) -> None:
             "plan_link_status": "TEXT NOT NULL DEFAULT 'pending'",
             "approved_exchange_json": "TEXT NOT NULL DEFAULT '{}'",
             "exchange_approval_id": "TEXT DEFAULT ''",
+            "trust_type": "TEXT NOT NULL DEFAULT ''",
+            "trust_payload_json": "TEXT NOT NULL DEFAULT '{}'",
+            "trust_hash": "TEXT NOT NULL DEFAULT ''",
         },
         "food_catalog": {
             "menu_category": "TEXT NOT NULL DEFAULT ''",
@@ -1607,6 +1976,904 @@ def update_pending_label_nutrient(
         raise
 
 
+def _canonical_json_hash(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _valid_estimate_range(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict) or set(value) != {"min", "max", "basis"}:
+        return False
+    minimum, maximum, basis = value["min"], value["max"], value["basis"]
+    if (
+        isinstance(minimum, bool) or isinstance(maximum, bool)
+        or not isinstance(minimum, (int, float)) or not isinstance(maximum, (int, float))
+        or not math.isfinite(minimum) or not math.isfinite(maximum)
+        or minimum < 0 or maximum < minimum or maximum > 100
+    ):
+        return False
+    return basis in {
+        "user_confirmed_none", "hand_portion_range_v1", "bowl_range_v1",
+        "summed_hand_portion_ranges_v2",
+    }
+
+
+def meal_photo_estimate_snapshot_is_valid(value: Any) -> bool:
+    """Strictly validate the canonical, non-approved range snapshot."""
+    if not isinstance(value, dict):
+        return False
+    if value.get("rule_version") == "ai-vision-nutrition-estimate-v1":
+        required = {
+            "calories_kcal", "protein_g", "fat_g", "carbohydrate_g",
+            "calories_kcal_range", "protein_g_range", "estimate_items",
+            "estimate_confidence", "provenance", "protein_total_exchange",
+            "starch_exchange", "vegetable_exchange", "cooking_oil_confirmation",
+            "sauce_confirmation", "formal_status", "rule_version",
+        }
+        if set(value) != required:
+            return False
+        def valid_number(raw: Any, maximum: float) -> bool:
+            return (
+                not isinstance(raw, bool) and isinstance(raw, (int, float))
+                and math.isfinite(raw) and 0 <= raw <= maximum
+            )
+        if not valid_number(value["calories_kcal"], 5000) or not valid_number(value["protein_g"], 500):
+            return False
+        for key, maximum in (("calories_kcal_range", 5000), ("protein_g_range", 500)):
+            raw = value[key]
+            point = value["calories_kcal" if key.startswith("calories") else "protein_g"]
+            if (
+                not isinstance(raw, dict) or set(raw) != {"min", "max", "basis"}
+                or raw.get("basis") != "ai_vision_estimate_range_v1"
+                or not valid_number(raw.get("min"), maximum)
+                or not valid_number(raw.get("max"), maximum)
+                or not raw["min"] <= point <= raw["max"] or raw["min"] == raw["max"]
+            ):
+                return False
+        items = value["estimate_items"]
+        if not isinstance(items, list) or not 1 <= len(items) <= 12:
+            return False
+        for item in items:
+            if (
+                not isinstance(item, dict) or set(item) != {"name", "portion", "calories_kcal", "protein_g"}
+                or not isinstance(item["name"], str) or not item["name"] or len(item["name"]) > 60
+                or not isinstance(item["portion"], str) or not item["portion"] or len(item["portion"]) > 40
+                or not valid_number(item["calories_kcal"], 3000)
+                or not valid_number(item["protein_g"], 300)
+            ):
+                return False
+        provenance = value["provenance"]
+        return (
+            valid_number(value["estimate_confidence"], 1)
+            and isinstance(provenance, dict)
+            and set(provenance) == {"provider", "model", "method", "nutrition_basis"}
+            and all(isinstance(provenance[key], str) and provenance[key] for key in provenance)
+            and provenance["method"] == "vision_model_estimate"
+            and provenance["nutrition_basis"] == "unlabeled_meal_photo"
+            and value["fat_g"] is None and value["carbohydrate_g"] is None
+            and value["protein_total_exchange"] is None and value["starch_exchange"] is None
+            and value["vegetable_exchange"] is None
+            and value["cooking_oil_confirmation"] == "unknown"
+            and value["sauce_confirmation"] == "unknown"
+            and value["formal_status"] == "user_confirmed_ai_estimate_not_approved"
+        )
+    required = {
+        "calories_kcal", "protein_g", "fat_g", "carbohydrate_g",
+        "protein_total_exchange", "starch_exchange", "vegetable_exchange",
+        "cooking_oil_confirmation", "sauce_confirmation", "formal_status", "rule_version",
+    }
+    if not required.issubset(value) or set(value) - (required | {"protein_items"}):
+        return False
+    if any(value[key] is not None for key in (
+        "calories_kcal", "protein_g", "fat_g", "carbohydrate_g",
+    )):
+        return False
+    if not all(_valid_estimate_range(value[key]) for key in (
+        "protein_total_exchange", "starch_exchange", "vegetable_exchange",
+    )):
+        return False
+    if value["cooking_oil_confirmation"] not in {"none", "light", "normal", "heavy", "unknown"}:
+        return False
+    if value["sauce_confirmation"] not in {"none", "little", "half", "all", "unknown"}:
+        return False
+    if value["formal_status"] != "pending_review_not_counted":
+        return False
+    if value["rule_version"] not in {"hand-portion-range-v1", "hand-portion-range-v2"}:
+        return False
+    items = value.get("protein_items")
+    if items is None:
+        return value["rule_version"] == "hand-portion-range-v1"
+    if value["rule_version"] != "hand-portion-range-v2" or not isinstance(items, list) or not 2 <= len(items) <= 4:
+        return False
+    seen = set()
+    total = value["protein_total_exchange"]
+    if not isinstance(total, dict) or total.get("basis") != "summed_hand_portion_ranges_v2":
+        return False
+    sum_min = sum_max = 0.0
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"type", "portion", "exchange"}:
+            return False
+        if item["type"] not in {"chicken", "pork", "fish", "egg", "tofu", "other", "unknown"} or item["type"] in seen:
+            return False
+        seen.add(item["type"])
+        if item["portion"] not in {"half_palm", "one_palm", "one_half_palm", "two_palm"}:
+            return False
+        if not _valid_estimate_range(item["exchange"]):
+            return False
+        sum_min += item["exchange"]["min"]
+        sum_max += item["exchange"]["max"]
+    return abs(sum_min - total["min"]) <= 0.0001 and abs(sum_max - total["max"]) <= 0.0001
+
+
+def _legacy_user_confirmed_meal_photo_estimate_is_valid(
+    conn: sqlite3.Connection, log_id: str, *, expected_user_id: str = "",
+    expected_draft_token: str = "", expected_draft_version: int | None = None,
+) -> bool:
+    """Validate owner/version/event-bound user confirmation without treating it as approval."""
+    try:
+        log_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_logs)")}
+        version_sql = "l.version" if "version" in log_columns else "1"
+        row = conn.execute(
+            f"""SELECT l.log_id,l.user_id,l.food_id,l.consumed_at,l.meal_slot,l.consumed_servings,
+                      l.exchange_snapshot_json,l.approved_exchange_json,l.exchange_approval_id,
+                      l.nutrition_snapshot_json,l.confirmation_status,l.trust_type,
+                      l.trust_payload_json,l.trust_hash,f.fingerprint,f.source_type,
+                      f.owner_user_id,f.exchange_review_status,f.verification_status,{version_sql}
+               FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id WHERE l.log_id=?""",
+            (str(log_id or ""),),
+        ).fetchone()
+        if not row or row[10] != "confirmed" or row[11] != "user_confirmed_ai_estimate":
+            return False
+        snapshot = json.loads(row[6])
+        nutrition_snapshot = json.loads(row[9])
+        is_ai_nutrition = snapshot.get("rule_version") == "ai-vision-nutrition-estimate-v1"
+        expected_nutrition = (
+            {"calories_kcal": float(snapshot["calories_kcal"]), "protein_g": float(snapshot["protein_g"])}
+            if is_ai_nutrition else {}
+        )
+        if row[7] != "{}" or str(row[8] or "") or nutrition_snapshot != expected_nutrition:
+            return False
+        if row[15:19] != ("user_meal_photo", row[1], "user_confirmed_ai_estimate", "user_confirmed_ai_estimate"):
+            return False
+        payload = json.loads(row[12])
+        required = {
+            "schema_version", "log_id", "food_id", "user_id", "draft_token",
+            "source_message_id", "confirmation_event_id", "consumed_at", "meal_slot",
+            "consumed_servings", "food_fingerprint", "exchange_snapshot",
+            "estimate_rule_version", "confirmed_at",
+        }
+        if is_ai_nutrition:
+            required.add("nutrition_snapshot")
+        if not isinstance(payload, dict) or set(payload) != required:
+            return False
+        if expected_user_id and payload["user_id"] != expected_user_id:
+            return False
+        if expected_draft_token and payload["draft_token"] != expected_draft_token:
+            return False
+        expected_schema = "meal-photo-user-confirmation-v2" if is_ai_nutrition else "meal-photo-user-confirmation-v1"
+        if payload["schema_version"] != expected_schema:
+            return False
+        if is_ai_nutrition and payload["nutrition_snapshot"] != nutrition_snapshot:
+            return False
+        if not all(isinstance(payload[key], str) and payload[key] for key in (
+            "draft_token", "source_message_id", "confirmation_event_id", "confirmed_at",
+        )):
+            return False
+        if isinstance(payload["consumed_servings"], bool) or payload["consumed_servings"] != 1:
+            return False
+        expected = (row[0], row[2], row[1], row[3], row[4], row[14])
+        actual = tuple(payload[key] for key in (
+            "log_id", "food_id", "user_id", "consumed_at", "meal_slot", "food_fingerprint",
+        ))
+        draft_columns = {
+            str(item[1]) for item in conn.execute("PRAGMA table_info(pending_meal_photo_drafts)")
+        }
+        if "original_confirmation_event_id" not in draft_columns:
+            return False
+        draft = conn.execute(
+            f"""SELECT user_id,source_message_id,status,version,workflow_version,
+                       confirmed_log_id,confirmed_by,original_confirmation_event_id
+                FROM pending_meal_photo_drafts WHERE token=?""",
+            (payload["draft_token"],),
+        ).fetchone()
+        expected_workflow = "user_confirmed_ai_nutrition_v2" if is_ai_nutrition else "user_confirmed_ai_estimate_v1"
+        if not draft or tuple(draft[:7]) != (
+            row[1], payload["source_message_id"], "user_confirmed",
+            int(draft[3]), expected_workflow, row[0], row[1],
+        ):
+            return False
+        if not draft[7] or draft[7] != payload["confirmation_event_id"]:
+            return False
+        if int(draft[3]) < 2 or int(row[19]) != 1:
+            return False
+        if expected_draft_version is not None and int(draft[3]) != int(expected_draft_version):
+            return False
+        event = conn.execute(
+            """SELECT user_id,token,action,request_payload_hash,result_json
+               FROM meal_photo_events WHERE event_id=?""",
+            (payload["confirmation_event_id"],),
+        ).fetchone()
+        if not event or event[:3] != (row[1], payload["draft_token"], "confirm_estimate"):
+            return False
+        original_request = {
+            "user_id": row[1], "token": payload["draft_token"],
+            "expected_version": int(draft[3]) - 1, "action": "confirm_estimate",
+            "field": "", "value": "",
+        }
+        request_hash = hashlib.sha256(json.dumps(
+            original_request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        event_result = json.loads(event[4])
+        if (
+            event[3] != request_hash or not isinstance(event_result, dict)
+            or event_result.get("kind") != "recorded"
+            or event_result.get("log_id") != row[0]
+            or event_result.get("version") != int(draft[3])
+        ):
+            return False
+        return (
+            actual == expected and payload["exchange_snapshot"] == snapshot
+            and meal_photo_estimate_snapshot_is_valid(snapshot)
+            and payload["estimate_rule_version"] == snapshot["rule_version"]
+            and secrets.compare_digest(str(row[13] or ""), _canonical_json_hash(payload))
+        )
+    except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error):
+        return False
+
+
+def _meal_photo_state(
+    *, food_id: str, consumed_at: str, meal_slot: str, consumed_servings: Any,
+    estimate: Mapping[str, Any], nutrition: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "food_id": str(food_id),
+        "consumed_at": str(consumed_at),
+        "meal_slot": str(meal_slot or ""),
+        "consumed_servings": float(consumed_servings),
+        "exchange_snapshot": dict(estimate),
+        "nutrition_snapshot": dict(nutrition),
+    }
+
+
+def _validated_current_meal_photo_state(
+    conn: sqlite3.Connection, log_id: str, *, expected_user_id: str = "",
+    expected_draft_token: str = "", expected_draft_version: int | None = None,
+) -> dict[str, Any] | None:
+    """Validate immutable confirmation genesis and every append-only current revision."""
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(food_logs)")}
+        version_sql = "l.version" if "version" in columns else "1"
+        deleted_sql = "COALESCE(l.deleted_at,'')" if "deleted_at" in columns else "''"
+        row = conn.execute(
+            f"""SELECT l.log_id,l.user_id,l.food_id,l.consumed_at,l.meal_slot,
+                       l.consumed_servings,l.exchange_snapshot_json,l.nutrition_snapshot_json,
+                       l.approved_exchange_json,l.exchange_approval_id,l.confirmation_status,
+                       l.trust_type,l.trust_payload_json,l.trust_hash,f.fingerprint,
+                       f.source_type,f.owner_user_id,f.exchange_review_status,
+                       f.verification_status,{version_sql},{deleted_sql}
+                FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
+                WHERE l.log_id=?""",
+            (str(log_id or ""),),
+        ).fetchone()
+        if (
+            not row or row[10] != "confirmed" or row[20] or row[11] != "user_confirmed_ai_estimate"
+            or row[15:19] != ("user_meal_photo", row[1], "user_confirmed_ai_estimate", "user_confirmed_ai_estimate")
+            or row[8] != "{}" or str(row[9] or "")
+            or (expected_user_id and row[1] != expected_user_id)
+        ):
+            return None
+        payload = json.loads(row[12])
+        base_required = {
+            "schema_version", "log_id", "food_id", "user_id", "draft_token",
+            "source_message_id", "confirmation_event_id", "consumed_at", "meal_slot",
+            "consumed_servings", "food_fingerprint", "exchange_snapshot",
+            "estimate_rule_version", "confirmed_at",
+        }
+        if not isinstance(payload, dict) or payload.get("schema_version") not in {
+            "meal-photo-user-confirmation-v1", "meal-photo-user-confirmation-v2"
+        }:
+            return None
+        is_v2 = payload["schema_version"] == "meal-photo-user-confirmation-v2"
+        if set(payload) != base_required | ({"nutrition_snapshot"} if is_v2 else set()):
+            return None
+        if expected_draft_token and payload["draft_token"] != expected_draft_token:
+            return None
+        if not all(isinstance(payload.get(key), str) and payload[key] for key in (
+            "draft_token", "source_message_id", "confirmation_event_id", "confirmed_at",
+        )):
+            return None
+        if payload["consumed_servings"] != 1 or isinstance(payload["consumed_servings"], bool):
+            return None
+        if tuple(payload[key] for key in (
+            "log_id", "food_id", "user_id", "consumed_at", "meal_slot", "food_fingerprint",
+        )) != (row[0], row[2], row[1], row[3], row[4], row[14]):
+            return None
+        original_estimate = payload["exchange_snapshot"]
+        if (
+            not meal_photo_estimate_snapshot_is_valid(original_estimate)
+            or payload["estimate_rule_version"] != original_estimate["rule_version"]
+        ):
+            return None
+        original_nutrition = payload.get("nutrition_snapshot", {})
+        if is_v2:
+            if original_nutrition != {
+                "calories_kcal": float(original_estimate["calories_kcal"]),
+                "protein_g": float(original_estimate["protein_g"]),
+            }:
+                return None
+            expected_workflow = "user_confirmed_ai_nutrition_v2"
+        else:
+            if original_nutrition:
+                return None
+            expected_workflow = "user_confirmed_ai_estimate_v1"
+        if not secrets.compare_digest(str(row[13] or ""), _canonical_json_hash(payload)):
+            return None
+        draft = conn.execute(
+            """SELECT user_id,source_message_id,status,version,workflow_version,
+                      confirmed_log_id,confirmed_by,original_confirmation_event_id
+               FROM pending_meal_photo_drafts WHERE token=?""",
+            (payload["draft_token"],),
+        ).fetchone()
+        if not draft or tuple(draft[:7]) != (
+            row[1], payload["source_message_id"], "user_confirmed", int(draft[3]),
+            expected_workflow, row[0], row[1],
+        ) or draft[7] != payload["confirmation_event_id"] or int(draft[3]) < 2:
+            return None
+        if expected_draft_version is not None and int(draft[3]) != int(expected_draft_version):
+            return None
+        event = conn.execute(
+            """SELECT user_id,token,action,request_payload_hash,result_json
+               FROM meal_photo_events WHERE event_id=?""",
+            (payload["confirmation_event_id"],),
+        ).fetchone()
+        original_request = {
+            "user_id": row[1], "token": payload["draft_token"],
+            "expected_version": int(draft[3]) - 1, "action": "confirm_estimate",
+            "field": "", "value": "",
+        }
+        request_hash = _canonical_json_hash(original_request)
+        event_result = json.loads(event[4]) if event else None
+        if (
+            not event or event[:3] != (row[1], payload["draft_token"], "confirm_estimate")
+            or event[3] != request_hash or not isinstance(event_result, dict)
+            or event_result.get("kind") != "recorded" or event_result.get("log_id") != row[0]
+            or event_result.get("version") != int(draft[3])
+        ):
+            return None
+        state = _meal_photo_state(
+            food_id=row[2], consumed_at=row[3], meal_slot=row[4], consumed_servings=1,
+            estimate=original_estimate, nutrition=original_nutrition,
+        )
+        previous_hash = str(row[13])
+        current_version = 1
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_food_log_events'"
+        ).fetchone()
+        revision_rows = conn.execute(
+            """SELECT event_id,user_id,log_id,result_json FROM daily_food_log_events
+               WHERE log_id=? AND action='confirm_ai_revision'""",
+            (row[0],),
+        ).fetchall() if table_exists else []
+        required = {
+            "schema_version", "event_id", "user_id", "log_id", "from_version",
+            "to_version", "draft_token", "original_confirmation_hash",
+            "previous_revision_hash", "request_text_hash", "before_state_hash",
+            "after_state", "estimate_provenance", "created_at", "revision_hash",
+        }
+        revisions = []
+        seen_from_versions = set()
+        for revision_row in revision_rows:
+            envelope = json.loads(revision_row[3])
+            if not isinstance(envelope, dict) or set(envelope) != required:
+                return None
+            from_version = envelope["from_version"]
+            to_version = envelope["to_version"]
+            if (
+                isinstance(from_version, bool) or not isinstance(from_version, int)
+                or isinstance(to_version, bool) or not isinstance(to_version, int)
+                or from_version < 1 or to_version != from_version + 1
+                or from_version in seen_from_versions
+            ):
+                return None
+            seen_from_versions.add(from_version)
+            revisions.append((from_version, revision_row, envelope))
+        revisions.sort(key=lambda item: item[0])
+        for _, revision_row, envelope in revisions:
+            if (
+                envelope["schema_version"] != "confirmed-food-log-revision-v1"
+                or (revision_row[0], revision_row[1], revision_row[2]) !=
+                   (envelope["event_id"], envelope["user_id"], envelope["log_id"])
+                or envelope["user_id"] != row[1] or envelope["log_id"] != row[0]
+                or envelope["from_version"] != current_version
+                or envelope["to_version"] != current_version + 1
+                or envelope["original_confirmation_hash"] != row[13]
+                or envelope["previous_revision_hash"] != previous_hash
+                or envelope["before_state_hash"] != _canonical_json_hash(state)
+                or not re.fullmatch(r"[0-9a-f]{64}", str(envelope["request_text_hash"] or ""))
+                or envelope["revision_hash"] != _canonical_json_hash({
+                    key: value for key, value in envelope.items() if key != "revision_hash"
+                })
+            ):
+                return None
+            after = envelope["after_state"]
+            if not isinstance(after, dict) or set(after) != {
+                "food_id", "consumed_at", "meal_slot", "consumed_servings",
+                "exchange_snapshot", "nutrition_snapshot",
+            }:
+                return None
+            estimate = after["exchange_snapshot"]
+            nutrition = after["nutrition_snapshot"]
+            provenance = envelope["estimate_provenance"]
+            if (
+                after["food_id"] != row[2] or after["consumed_at"] != row[3]
+                or after["meal_slot"] != row[4] or after["consumed_servings"] != 1.0
+                or not meal_photo_estimate_snapshot_is_valid(estimate)
+                or estimate.get("rule_version") != "ai-vision-nutrition-estimate-v1"
+                or nutrition != {"calories_kcal": float(estimate["calories_kcal"]),
+                                 "protein_g": float(estimate["protein_g"])}
+                or not isinstance(provenance, dict) or set(provenance) != {
+                    "rule_version", "provider", "model", "source"
+                }
+                or provenance != {
+                    "rule_version": "ai-vision-nutrition-estimate-v1",
+                    "provider": estimate["provenance"]["provider"],
+                    "model": estimate["provenance"]["model"],
+                    "source": "original_meal_photo_plus_user_revision",
+                }
+            ):
+                return None
+            revision_draft = conn.execute(
+                """SELECT user_id,status,workflow_version,review_json,estimate_json,
+                          confirmed_log_id,version
+                   FROM pending_meal_photo_drafts WHERE token=?""",
+                (envelope["draft_token"],),
+            ).fetchone()
+            if not revision_draft or revision_draft[:3] != (
+                row[1], "revision_confirmed", "confirmed_food_log_revision_v1"
+            ) or revision_draft[5] or json.loads(revision_draft[4]) != estimate:
+                return None
+            review = json.loads(revision_draft[3])
+            if (
+                not isinstance(review, dict)
+                or review.get("schema_version") != "confirmed-food-log-revision-preview-v1"
+                or review.get("parent") != {
+                    "user_id": row[1], "log_id": row[0],
+                    "from_version": current_version,
+                    "original_confirmation_hash": row[13],
+                    "previous_revision_hash": previous_hash,
+                }
+                or review.get("request_text_hash") != envelope["request_text_hash"]
+                or review.get("estimate_provenance") != provenance
+            ):
+                return None
+            state = after
+            previous_hash = envelope["revision_hash"]
+            current_version += 1
+        current_estimate = json.loads(row[6])
+        current_nutrition = json.loads(row[7])
+        if (
+            int(row[19]) != current_version
+            or current_estimate != state["exchange_snapshot"]
+            or current_nutrition != state["nutrition_snapshot"]
+            or float(row[5]) != state["consumed_servings"]
+        ):
+            return None
+        return {
+            "state": state, "log_version": current_version,
+            "effective_revision_hash": previous_hash,
+            "original_confirmation_hash": str(row[13]),
+            "workflow_version": expected_workflow,
+            "schema_version": payload["schema_version"],
+        }
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError, sqlite3.Error):
+        return None
+
+
+def user_confirmed_meal_photo_estimate_is_valid(
+    conn: sqlite3.Connection, log_id: str, *, expected_user_id: str = "",
+    expected_draft_token: str = "", expected_draft_version: int | None = None,
+) -> bool:
+    return _validated_current_meal_photo_state(
+        conn, log_id, expected_user_id=expected_user_id,
+        expected_draft_token=expected_draft_token,
+        expected_draft_version=expected_draft_version,
+    ) is not None
+
+
+def user_confirmed_meal_photo_trust_projection(
+    conn: sqlite3.Connection, log_id: str, trust_type: str,
+) -> dict[str, Any]:
+    """Project one explicit trust state without relabeling integrity failure as review."""
+    marker = "user_confirmed_ai_estimate"
+    try:
+        evidence = conn.execute(
+            """SELECT l.trust_type,l.trust_payload_json,l.trust_hash,
+                      f.source_type,f.exchange_review_status,f.verification_status,
+                      EXISTS(SELECT 1 FROM pending_meal_photo_drafts d
+                             WHERE d.confirmed_log_id=l.log_id
+                               AND d.workflow_version='user_confirmed_ai_estimate_v1')
+               FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
+               WHERE l.log_id=?""",
+            (str(log_id or ""),),
+        ).fetchone()
+    except sqlite3.Error:
+        evidence = None
+    is_new_lane = trust_type == marker
+    if evidence:
+        is_new_lane = is_new_lane or bool(
+            evidence[0] == marker
+            or str(evidence[1] or "") not in {"", "{}"}
+            or str(evidence[2] or "")
+            or evidence[4] == marker
+            or evidence[5] == marker
+            or evidence[6]
+        )
+    if not is_new_lane:
+        return {"trust_type": "", "schema_version": "", "integrity_status": ""}
+    validated = _validated_current_meal_photo_state(conn, log_id)
+    if validated is not None:
+        state = validated["state"]
+        return {
+            "trust_type": "user_confirmed_ai_estimate",
+            "schema_version": validated["schema_version"],
+            "workflow_version": validated["workflow_version"],
+            "integrity_status": "verified",
+            "estimate": state["exchange_snapshot"],
+            "nutrition": state["nutrition_snapshot"],
+            "effective_revision_hash": validated["effective_revision_hash"],
+            "original_confirmation_hash": validated["original_confirmation_hash"],
+            "log_version": validated["log_version"],
+        }
+    return {
+        "trust_type": "untrusted_user_confirmed_ai_estimate",
+        "schema_version": "",
+        "integrity_status": "integrity_verification_failed",
+    }
+
+
+def _ensure_food_log_revision_contract(conn: sqlite3.Connection) -> None:
+    required_tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('daily_food_log_events','pending_meal_photo_drafts','nutrition_sheet_outbox')"
+        )
+    }
+    if required_tables != {
+        "daily_food_log_events", "pending_meal_photo_drafts", "nutrition_sheet_outbox"
+    }:
+        raise RuntimeError("revision資料層尚未完成初始化")
+    log_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_logs)")}
+    if not {"version", "deleted_at"} <= log_columns:
+        raise RuntimeError("food log revision欄位尚未完成初始化")
+    conn.executescript("""
+        CREATE TRIGGER IF NOT EXISTS daily_food_revision_events_no_update
+        BEFORE UPDATE ON daily_food_log_events
+        WHEN OLD.action='confirm_ai_revision'
+        BEGIN SELECT RAISE(ABORT, 'confirm_ai_revision events are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS daily_food_revision_events_no_delete
+        BEFORE DELETE ON daily_food_log_events
+        WHEN OLD.action='confirm_ai_revision'
+        BEGIN SELECT RAISE(ABORT, 'confirm_ai_revision events are append-only'); END;
+    """)
+
+
+def confirm_user_meal_photo_revision(
+    conn: sqlite3.Connection, *, event_id: str, user_id: str, log_id: str,
+    from_version: int, draft_token: str,
+) -> dict[str, Any]:
+    """Atomically append a trusted revision and CAS-update the same meal occurrence."""
+    if conn.in_transaction:
+        raise RuntimeError("revision確認需要由domain API持有top-level transaction")
+    _ensure_food_log_revision_contract(conn)
+    event_id = str(event_id or "").strip()
+    user_id = str(user_id or "").strip()
+    log_id = str(log_id or "").strip()
+    draft_token = str(draft_token or "").strip()
+    if not all((event_id, user_id, log_id, draft_token)):
+        raise ValueError("revision確認來源不完整")
+    if isinstance(from_version, bool) or not isinstance(from_version, int) or from_version < 1:
+        raise ValueError("revision來源版本無效")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        previous = conn.execute(
+            """SELECT user_id,log_id,action,result_json FROM daily_food_log_events
+               WHERE event_id=?""", (event_id,),
+        ).fetchone()
+        if previous:
+            if previous[:3] != (user_id, log_id, "confirm_ai_revision"):
+                raise ValueError("revision事件識別碼衝突")
+            result = json.loads(previous[3])
+            if (
+                not isinstance(result, dict) or result.get("event_id") != event_id
+                or result.get("draft_token") != draft_token
+                or result.get("from_version") != from_version
+                or _validated_current_meal_photo_state(
+                    conn, log_id, expected_user_id=user_id
+                ) is None
+            ):
+                raise ValueError("revision重播資料驗證失敗")
+            now = utcish_now()
+            conn.execute(
+                """INSERT INTO nutrition_sheet_outbox
+                   (outbox_id,entity_type,entity_id,status,attempts,last_error,
+                    claimed_at,lease_owner,resync_required,created_at,synced_at)
+                   VALUES (?,'food_log',?,'pending',0,'','','',0,?,'')
+                   ON CONFLICT(entity_type,entity_id) DO UPDATE SET
+                     status=CASE WHEN status='processing' THEN status ELSE 'pending' END,
+                     last_error=CASE WHEN status='processing' THEN last_error ELSE '' END,
+                     claimed_at=CASE WHEN status='processing' THEN claimed_at ELSE '' END,
+                     lease_owner=CASE WHEN status='processing' THEN lease_owner ELSE '' END,
+                     synced_at=CASE WHEN status='processing' THEN synced_at ELSE '' END,
+                     resync_required=CASE WHEN status='processing' THEN 1 ELSE 0 END""",
+                (new_id("outbox"), log_id, now),
+            )
+            conn.commit()
+            return {**result, "replayed": True}
+        row = conn.execute(
+            """SELECT l.food_id,l.consumed_at,l.meal_slot,l.consumed_servings,
+                      l.version,l.trust_hash,l.confirmation_status,COALESCE(l.deleted_at,''),
+                      f.source_type,f.owner_user_id
+               FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
+               WHERE l.log_id=? AND l.user_id=?""",
+            (log_id, user_id),
+        ).fetchone()
+        if (
+            not row or row[6] != "confirmed" or row[7] or row[8] != "user_meal_photo"
+            or row[9] != user_id
+        ):
+            raise ValueError("找不到可修改的餐點紀錄")
+        if int(row[4]) != from_version:
+            raise ValueError("這筆紀錄已更新，請重新開啟最新卡片")
+        validated = _validated_current_meal_photo_state(
+            conn, log_id, expected_user_id=user_id
+        )
+        if validated is None or validated["log_version"] != from_version:
+            raise ValueError("原餐點可信鏈驗證失敗")
+        draft = conn.execute(
+            """SELECT user_id,status,workflow_version,version,expires_at,review_json,
+                      estimate_json,confirmed_log_id
+               FROM pending_meal_photo_drafts WHERE token=?""",
+            (draft_token,),
+        ).fetchone()
+        now = utcish_now()
+        if (
+            not draft or draft[0] != user_id or draft[1] != "estimated"
+            or draft[2] != "confirmed_food_log_revision_v1" or draft[7]
+        ):
+            raise ValueError("找不到可確認的revision草稿")
+        if str(draft[4] or "") <= now:
+            raise ValueError("revision草稿已逾時")
+        review = json.loads(draft[5])
+        estimate = json.loads(draft[6])
+        provenance = estimate.get("provenance") if isinstance(estimate, dict) else None
+        expected_provenance = {
+            "rule_version": "ai-vision-nutrition-estimate-v1",
+            "provider": provenance.get("provider") if isinstance(provenance, dict) else None,
+            "model": provenance.get("model") if isinstance(provenance, dict) else None,
+            "source": "original_meal_photo_plus_user_revision",
+        }
+        expected_parent = {
+            "user_id": user_id, "log_id": log_id, "from_version": from_version,
+            "original_confirmation_hash": validated["original_confirmation_hash"],
+            "previous_revision_hash": validated["effective_revision_hash"],
+        }
+        if (
+            not isinstance(review, dict) or set(review) != {
+                "schema_version", "parent", "request_text_hash", "estimate_provenance"
+            }
+            or review["schema_version"] != "confirmed-food-log-revision-preview-v1"
+            or review["parent"] != expected_parent
+            or review["estimate_provenance"] != expected_provenance
+            or not re.fullmatch(r"[0-9a-f]{64}", str(review["request_text_hash"] or ""))
+            or not meal_photo_estimate_snapshot_is_valid(estimate)
+            or estimate.get("rule_version") != "ai-vision-nutrition-estimate-v1"
+        ):
+            raise ValueError("revision草稿可信來源驗證失敗")
+        nutrition = {
+            "calories_kcal": float(estimate["calories_kcal"]),
+            "protein_g": float(estimate["protein_g"]),
+        }
+        before_state = validated["state"]
+        after_state = _meal_photo_state(
+            food_id=row[0], consumed_at=row[1], meal_slot=row[2],
+            consumed_servings=row[3], estimate=estimate, nutrition=nutrition,
+        )
+        envelope = {
+            "schema_version": "confirmed-food-log-revision-v1",
+            "event_id": event_id, "user_id": user_id, "log_id": log_id,
+            "from_version": from_version, "to_version": from_version + 1,
+            "draft_token": draft_token,
+            "original_confirmation_hash": validated["original_confirmation_hash"],
+            "previous_revision_hash": validated["effective_revision_hash"],
+            "request_text_hash": review["request_text_hash"],
+            "before_state_hash": _canonical_json_hash(before_state),
+            "after_state": after_state,
+            "estimate_provenance": expected_provenance,
+            "created_at": now,
+        }
+        envelope["revision_hash"] = _canonical_json_hash(envelope)
+        envelope_json = json.dumps(
+            envelope, ensure_ascii=False, sort_keys=True, allow_nan=False
+        )
+        conn.execute(
+            """INSERT INTO daily_food_log_events
+               (event_id,user_id,log_id,action,result_json,created_at)
+               VALUES (?,?,?,'confirm_ai_revision',?,?)""",
+            (event_id, user_id, log_id, envelope_json, now),
+        )
+        changed = conn.execute(
+            """UPDATE food_logs SET exchange_snapshot_json=?,nutrition_snapshot_json=?,
+                      consumed_servings=?,version=?,updated_at=?
+               WHERE log_id=? AND user_id=? AND version=?
+                 AND confirmation_status='confirmed' AND COALESCE(deleted_at,'')=''""",
+            (
+                json.dumps(estimate, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                json.dumps(nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                after_state["consumed_servings"], from_version + 1, now,
+                log_id, user_id, from_version,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise ValueError("這筆紀錄已更新，請重新開啟最新卡片")
+        changed = conn.execute(
+            """UPDATE pending_meal_photo_drafts
+               SET status='revision_confirmed',version=version+1,updated_at=?,
+                   confirmed_at=?,confirmed_by=?
+               WHERE token=? AND user_id=? AND version=? AND status='estimated'
+                 AND workflow_version='confirmed_food_log_revision_v1'""",
+            (now, now, user_id, draft_token, user_id, int(draft[3])),
+        ).rowcount
+        if changed != 1:
+            raise ValueError("revision草稿已更新")
+        conn.execute(
+            """INSERT INTO nutrition_sheet_outbox
+               (outbox_id,entity_type,entity_id,status,attempts,last_error,
+                claimed_at,lease_owner,resync_required,created_at,synced_at)
+               VALUES (?,'food_log',?,'pending',0,'','','',0,?,'')
+               ON CONFLICT(entity_type,entity_id) DO UPDATE SET
+                 status=CASE WHEN status='processing' THEN status ELSE 'pending' END,
+                 last_error=CASE WHEN status='processing' THEN last_error ELSE '' END,
+                 claimed_at=CASE WHEN status='processing' THEN claimed_at ELSE '' END,
+                 lease_owner=CASE WHEN status='processing' THEN lease_owner ELSE '' END,
+                 synced_at=CASE WHEN status='processing' THEN synced_at ELSE '' END,
+                 resync_required=CASE WHEN status='processing' THEN 1 ELSE 0 END""",
+            (new_id("outbox"), log_id, now),
+        )
+        if _validated_current_meal_photo_state(
+            conn, log_id, expected_user_id=user_id
+        ) is None:
+            raise ValueError("revision寫入後可信鏈驗證失敗")
+        conn.commit()
+        return {**envelope, "replayed": False}
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def user_confirmed_meal_photo_food_trust_projection(
+    conn: sqlite3.Connection, food_id: str,
+) -> dict[str, str]:
+    """Project catalog trust from catalog plus same-owner canonical-log evidence."""
+    marker = "user_confirmed_ai_estimate"
+    empty = {"trust_type": "", "schema_version": "", "integrity_status": ""}
+    try:
+        food = conn.execute(
+            """SELECT owner_user_id,exchange_review_status,verification_status
+               FROM food_catalog WHERE food_id=?""",
+            (str(food_id or ""),),
+        ).fetchone()
+        if not food:
+            return empty
+        logs = conn.execute(
+            """SELECT l.log_id,l.trust_type,l.trust_payload_json,l.trust_hash
+               FROM food_logs l WHERE l.food_id=? AND l.user_id=?""",
+            (str(food_id or ""), str(food[0] or "")),
+        ).fetchall()
+    except sqlite3.Error:
+        return empty
+    is_new_lane = food[1] == marker or food[2] == marker or any(
+        log[1] == marker
+        or str(log[2] or "") not in {"", "{}"}
+        or bool(str(log[3] or ""))
+        for log in logs
+    )
+    if not is_new_lane:
+        return empty
+    for log in logs:
+        projected = user_confirmed_meal_photo_trust_projection(conn, log[0], log[1])
+        if projected["integrity_status"] == "verified":
+            return projected
+    return {
+        "trust_type": "untrusted_user_confirmed_ai_estimate",
+        "schema_version": "",
+        "integrity_status": "integrity_verification_failed",
+    }
+
+
+def insert_user_confirmed_meal_photo_log(
+    conn: sqlite3.Connection, *, token: str, user_id: str, source_message_id: str,
+    confirmation_event_id: str, consumed_at: str, meal_slot: str, source_image_ref: str,
+    observed_payload: Mapping[str, Any], answers: Mapping[str, Any], estimate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create one canonical meal occurrence in the caller-owned confirmation transaction."""
+    if not meal_photo_estimate_snapshot_is_valid(dict(estimate or {})):
+        raise ValueError("餐點照片估算完整性驗證失敗")
+    if not token or not user_id or not source_message_id or not confirmation_event_id:
+        raise ValueError("餐點照片確認來源不完整")
+    now = utcish_now()
+    identity = json.dumps({
+        "source_type": "meal_photo", "token": token, "user_id": user_id,
+        "observed_payload": dict(observed_payload or {}), "answers": dict(answers or {}),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    fingerprint = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    names = [str(item.get("name") or "").strip() for item in
+             list((observed_payload or {}).get("visible_items") or [])[:4]
+             if isinstance(item, Mapping) and str(item.get("name") or "").strip()]
+    product_name = ("餐點照片" + ("：" + "、".join(names) if names else ""))[:160]
+    food_id, log_id = new_id("food"), new_id("log")
+    snapshot = dict(estimate)
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    is_ai_nutrition = snapshot.get("rule_version") == "ai-vision-nutrition-estimate-v1"
+    nutrition_snapshot = (
+        {"calories_kcal": float(snapshot["calories_kcal"]), "protein_g": float(snapshot["protein_g"])}
+        if is_ai_nutrition else {}
+    )
+    nutrition_snapshot_json = json.dumps(
+        nutrition_snapshot, ensure_ascii=False, sort_keys=True, allow_nan=False
+    )
+    conn.execute(
+        """INSERT INTO food_catalog
+           (food_id,product_name,brand,barcode,source_type,owner_user_id,visibility,
+            package_amount,package_unit,servings_per_package,per_serving_json,per_100_json,
+            exchange_json,exchange_review_status,fingerprint,original_image_ref,
+            recognition_confidence,verification_status,created_at,updated_at)
+           VALUES (?,?, '', '', 'user_meal_photo',?,'private',1,'meal',1,'{}','{}',
+                   ?,'user_confirmed_ai_estimate',?,?,0,'user_confirmed_ai_estimate',?,?)""",
+        (food_id, product_name, user_id, snapshot_json, fingerprint,
+         str(source_image_ref or "")[:240], now, now),
+    )
+    trust_payload = {
+        "schema_version": (
+            "meal-photo-user-confirmation-v2" if is_ai_nutrition
+            else "meal-photo-user-confirmation-v1"
+        ), "log_id": log_id,
+        "food_id": food_id, "user_id": user_id, "draft_token": token,
+        "source_message_id": source_message_id, "confirmation_event_id": confirmation_event_id,
+        "consumed_at": str(consumed_at or now)[:50], "meal_slot": str(meal_slot or "")[:30],
+        "consumed_servings": 1, "food_fingerprint": fingerprint,
+        "exchange_snapshot": snapshot, "estimate_rule_version": snapshot["rule_version"],
+        "confirmed_at": now,
+    }
+    if is_ai_nutrition:
+        trust_payload["nutrition_snapshot"] = nutrition_snapshot
+    conn.execute(
+        """INSERT INTO food_logs
+           (log_id,user_id,food_id,consumed_at,meal_slot,consumed_servings,consumed_amount,
+            consumed_unit,nutrition_snapshot_json,exchange_snapshot_json,approved_exchange_json,
+            exchange_approval_id,source_image_ref,plan_id,plan_link_status,confirmation_status,
+            legacy_applied_at,created_at,updated_at,trust_type,trust_payload_json,trust_hash)
+           VALUES (?,?,?,?,?,1,1,'meal',?,?,'{}','',?,'','pending','confirmed',
+                   'not_applicable',?,?,'user_confirmed_ai_estimate',?,?)""",
+        (log_id, user_id, food_id, trust_payload["consumed_at"], trust_payload["meal_slot"],
+         nutrition_snapshot_json, snapshot_json, str(source_image_ref or "")[:240], now, now,
+         json.dumps(trust_payload, ensure_ascii=False, sort_keys=True, allow_nan=False),
+         _canonical_json_hash(trust_payload)),
+    )
+    for entity_type, entity_id in (("food", food_id), ("food_log", log_id)):
+        conn.execute(
+            """INSERT OR IGNORE INTO nutrition_sheet_outbox
+               (outbox_id,entity_type,entity_id,status,attempts,last_error,created_at,synced_at)
+               VALUES (?,?,?,'pending',0,'',?,'')""",
+            (new_id("outbox"), entity_type, entity_id, now),
+        )
+    return {"food_id": food_id, "log_id": log_id, "product_name": product_name,
+            "estimate": snapshot, "trust_type": "user_confirmed_ai_estimate"}
+
+
 def _confirmed_result(conn: sqlite3.Connection, log_id: str, *, already_confirmed: bool) -> dict[str, Any]:
     row = conn.execute(
         """
@@ -1616,7 +2883,8 @@ def _confirmed_result(conn: sqlite3.Connection, log_id: str, *, already_confirme
                l.exchange_snapshot_json, l.approved_exchange_json,
                l.exchange_approval_id, l.plan_id,
                a.food_fingerprint, a.suggestion_rule_version,
-               a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint
+               a.approved_exchange_json, a.approved_exchange_hash, f.fingerprint,
+               l.trust_type,l.trust_hash,f.owner_user_id,a.food_id,l.user_id,l.food_id
         FROM food_logs l JOIN food_catalog f ON f.food_id=l.food_id
         LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
         WHERE l.log_id=?
@@ -1625,39 +2893,63 @@ def _confirmed_result(conn: sqlite3.Connection, log_id: str, *, already_confirme
     ).fetchone()
     if not row:
         raise ValueError("已確認紀錄遺失，請聯繫客服")
-    suggested = json.loads(row[11] or "{}")
-    approved = json.loads(row[12] or "{}")
-    applied: dict[str, Any] = {}
+    suggested = _json_object_or_none(row[11]) or {}
     candidate_approval_id = row[13] or ""
-    approval_id = ""
-    if candidate_approval_id and approved and row[15] and row[15] == row[19]:
-        approved_definition = json.loads(row[17] or "{}")
-        expected_hash = exchange_approval_hash(row[15], row[16], approved_definition)
-        expected_applied = {
-            key: round(float(approved_definition.get(key, 0) or 0) * float(row[7] or 0), 4)
-            for key in EXCHANGE_KEYS
-        }
-        if secrets.compare_digest(str(row[18] or ""), expected_hash) and all(
-            abs(float(approved.get(key, 0) or 0) - value) <= 0.0001
-            for key, value in expected_applied.items()
-        ):
-            applied = approved
-            approval_id = candidate_approval_id
-        else:
-            approval_id = ""
+    approval = verified_exchange_approval_projection(
+        log_user_id=row[24], log_food_id=row[25],
+        catalog_source_type=row[3], catalog_owner_user_id=row[22],
+        catalog_fingerprint=row[19], consumed_servings=row[7],
+        applied_json=row[12], approval_id=candidate_approval_id,
+        approval_food_id=row[23], approval_fingerprint=row[15],
+        rule_version=row[16], approved_json=row[17], approval_hash=row[18],
+    )
+    applied = approval["applied"] if approval["is_valid"] else {}
+    approval_id = candidate_approval_id if approval["is_valid"] else ""
+    nutrition = _json_object_or_none(row[10]) or {}
+    is_meal_photo_origin = bool(
+        row[3] == "user_meal_photo" or approval["is_meal_photo_origin"]
+    )
+    if is_meal_photo_origin:
+        nutrition = estimate_nutrition_from_exchanges(applied) if applied else {}
+    trust = user_confirmed_meal_photo_trust_projection(
+        conn, str(row[4] or ""), str(row[20] or "")
+    )
+    if (
+        trust["integrity_status"] == "verified"
+        and suggested.get("rule_version") == "ai-vision-nutrition-estimate-v1"
+    ):
+        nutrition = _json_object_or_none(row[10]) or {}
+    if trust["integrity_status"] == "integrity_verification_failed":
+        suggested = {}
+    approval_integrity_failed = bool(
+        is_meal_photo_origin and candidate_approval_id and not approval["is_valid"]
+    )
+    if approval_integrity_failed:
+        suggested = {}
+    integrity_status = (
+        "integrity_verification_failed"
+        if approval_integrity_failed else trust["integrity_status"]
+    )
     return {
         "already_confirmed": already_confirmed,
         "food": {"food_id": row[0], "product_name": row[1], "brand": row[2], "source_type": row[3]},
         "log": {
             "log_id": row[4], "consumed_at": row[5], "meal_slot": row[6],
             "consumed_servings": float(row[7]), "consumed_amount": float(row[8]),
-            "consumed_unit": row[9], "nutrition": json.loads(row[10] or "{}"),
+            "consumed_unit": row[9], "nutrition": nutrition,
             "suggested_exchange": suggested,
             "approved_exchange": applied,
             "exchange": applied or suggested,
-            "exchange_review_status": "approved" if applied else "pending_review",
+            "exchange_review_status": (
+                "approved" if applied else
+                "integrity_verification_failed" if approval_integrity_failed else
+                trust["trust_type"] if trust["trust_type"] else "pending_review"
+            ),
             "exchange_approval_id": approval_id,
             "plan_id": row[14] or "",
+            "trust_type": trust["trust_type"],
+            "trust_schema_version": trust["schema_version"],
+            "trust_integrity_status": integrity_status,
         },
     }
 
@@ -1744,9 +3036,15 @@ def confirm_pending_label(
         if existing:
             food_id = existing[0]
             if existing[2] == "approved" and existing[3] and existing[4] == fingerprint:
-                candidate = json.loads(existing[6] or "{}")
-                expected_hash = exchange_approval_hash(fingerprint, existing[5], candidate)
-                if secrets.compare_digest(str(existing[7] or ""), expected_hash):
+                candidate = _json_object_or_none(existing[6])
+                expected_hash = ""
+                if candidate is not None:
+                    expected_hash = exchange_approval_hash(fingerprint, existing[5], candidate)
+                if (
+                    candidate is not None
+                    and exchange_approval_payload_is_valid(existing[5], candidate)
+                    and secrets.compare_digest(str(existing[7] or ""), expected_hash)
+                ):
                     approved_food_payload = candidate
                     approval_id = existing[3]
                     approved_valid = True
@@ -1861,6 +3159,7 @@ def insert_approved_meal_photo_log(
     observed_payload: Mapping[str, Any],
     answers: Mapping[str, Any],
     exact_exchange: Mapping[str, Any],
+    estimate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """在呼叫端交易內建立照片餐點的正式核准、食品與飲食快照；不自行commit。"""
     token = str(token or "").strip()
@@ -1872,17 +3171,142 @@ def insert_approved_meal_photo_log(
         raise ValueError("餐點照片核准身分無效")
     approved_at = utcish_now()
     values = {
-        key: round(_number(exact_exchange.get(key), key, max_value=100), 4)
+        key: round(_strict_json_number(exact_exchange.get(key), key, max_value=100), 4)
         for key in EXCHANGE_KEYS
     }
     if values["fat_exchange"] != 0:
         raise ValueError("目前規則不計油脂交換份")
+    protein_items: list[dict[str, Any]] = []
+    protein_total_exchange: dict[str, Any] | None = None
+    raw_protein_items = (estimate or {}).get("protein_items")
+    raw_protein_total = (estimate or {}).get("protein_total_exchange")
+    raw_answer_items = (answers or {}).get("protein_items")
+    if raw_answer_items is None:
+        raw_answer_items = []
+    if not isinstance(raw_answer_items, list):
+        raise ValueError("複數蛋白質明細無效")
+    valid_types = {"chicken", "pork", "fish", "egg", "tofu", "other", "unknown"}
+    portion_ranges = {
+        "half_palm": (1.0, 2.0), "one_palm": (2.0, 3.0),
+        "one_half_palm": (3.0, 5.0), "two_palm": (4.0, 6.0),
+    }
+    top_protein_type = str((answers or {}).get("protein_type") or "")
+    top_protein_portion = str((answers or {}).get("protein_portion") or "")
+    has_top_protein_answer = bool(
+        "protein_type" in (answers or {}) or "protein_portion" in (answers or {})
+    )
+    if has_top_protein_answer or raw_answer_items:
+        if top_protein_type == "none":
+            if top_protein_portion or raw_answer_items:
+                raise ValueError("蛋白質明細與主要回答不符")
+        elif (
+            top_protein_type not in valid_types
+            or top_protein_portion not in {*portion_ranges, "none", "unknown"}
+        ):
+            raise ValueError("蛋白質主要回答無效")
+        elif raw_answer_items:
+            first_answer_item = raw_answer_items[0]
+            if not isinstance(first_answer_item, Mapping) or (
+                str(first_answer_item.get("type") or "") != top_protein_type
+                or str(first_answer_item.get("portion") or "") != top_protein_portion
+            ):
+                raise ValueError("蛋白質明細與主要回答不符")
+    estimate_rule_version = str((estimate or {}).get("rule_version") or "")
+    total_is_v2 = bool(
+        isinstance(raw_protein_total, Mapping)
+        and raw_protein_total.get("basis") == "summed_hand_portion_ranges_v2"
+    )
+    v2_declared = bool(
+        len(raw_answer_items) >= 2
+        or raw_protein_items is not None
+        or estimate_rule_version == "hand-portion-range-v2"
+        or total_is_v2
+    )
+    if v2_declared and not (
+        2 <= len(raw_answer_items) <= 4
+        and isinstance(raw_protein_items, list)
+        and 2 <= len(raw_protein_items) <= 4
+        and estimate_rule_version == "hand-portion-range-v2"
+        and total_is_v2
+    ):
+        raise ValueError("複數蛋白質明細無效")
+    if has_top_protein_answer and not v2_declared:
+        if top_protein_type == "none" or top_protein_portion == "none":
+            expected_total = (0.0, 0.0, "user_confirmed_none")
+        elif top_protein_portion == "unknown":
+            raise ValueError("蛋白質份量仍為NA")
+        else:
+            expected_range = portion_ranges[top_protein_portion]
+            expected_total = (*expected_range, "hand_portion_range_v1")
+        if not isinstance(raw_protein_total, Mapping):
+            raise ValueError("蛋白質合計無效")
+        actual_total = (
+            _strict_json_number(raw_protein_total.get("min"), "protein_total.min", max_value=100),
+            _strict_json_number(raw_protein_total.get("max"), "protein_total.max", max_value=100),
+            raw_protein_total.get("basis"),
+        )
+        if actual_total != expected_total:
+            raise ValueError("蛋白質合計與主要回答不符")
+    if raw_protein_items is not None:
+        if not isinstance(raw_protein_items, list) or not 2 <= len(raw_protein_items) <= 4:
+            raise ValueError("複數蛋白質明細無效")
+        seen_types: set[str] = set()
+        for raw_item in raw_protein_items:
+            if not isinstance(raw_item, Mapping):
+                raise ValueError("複數蛋白質明細無效")
+            protein_type = str(raw_item.get("type") or "")
+            portion = str(raw_item.get("portion") or "")
+            exchange = raw_item.get("exchange")
+            expected_range = portion_ranges.get(portion)
+            if protein_type not in valid_types or expected_range is None or not isinstance(exchange, Mapping):
+                raise ValueError("複數蛋白質明細無效")
+            if protein_type in seen_types:
+                raise ValueError("複數蛋白質種類重複")
+            seen_types.add(protein_type)
+            item_min = _strict_json_number(exchange.get("min"), "protein_item.min", max_value=100)
+            item_max = _strict_json_number(exchange.get("max"), "protein_item.max", max_value=100)
+            if (
+                (item_min, item_max) != expected_range
+                or exchange.get("basis") != "hand_portion_range_v1"
+            ):
+                raise ValueError("複數蛋白質明細與份量不符")
+            protein_items.append({
+                "type": protein_type, "portion": portion,
+                "exchange": {
+                    "min": item_min, "max": item_max,
+                    "basis": "hand_portion_range_v1",
+                },
+            })
+        answer_items = [
+            {"type": str(item.get("type") or ""), "portion": str(item.get("portion") or "")}
+            for item in raw_answer_items
+            if isinstance(item, Mapping)
+        ]
+        if answer_items != [
+            {"type": item["type"], "portion": item["portion"]} for item in protein_items
+        ]:
+            raise ValueError("複數蛋白質明細與確認答案不符")
+        raw_total = (estimate or {}).get("protein_total_exchange")
+        if not isinstance(raw_total, Mapping):
+            raise ValueError("複數蛋白質合計無效")
+        total_min = _strict_json_number(raw_total.get("min"), "protein_total.min", max_value=100)
+        total_max = _strict_json_number(raw_total.get("max"), "protein_total.max", max_value=100)
+        if (
+            raw_total.get("basis") != "summed_hand_portion_ranges_v2"
+            or total_min != sum(item["exchange"]["min"] for item in protein_items)
+            or total_max != sum(item["exchange"]["max"] for item in protein_items)
+        ):
+            raise ValueError("複數蛋白質合計與明細不符")
+        protein_total_exchange = {
+            "min": total_min, "max": total_max,
+            "basis": "summed_hand_portion_ranges_v2",
+        }
     estimated_nutrition = estimate_nutrition_from_exchanges(values)
     estimated_nutrition_json = json.dumps(
         estimated_nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False
     )
     categories = [key for key in EXCHANGE_KEYS if values[key] > 0]
-    rule_version = "meal-photo-admin-v1"
+    rule_version = "meal-photo-admin-v2"
     approved_payload: dict[str, Any] = {
         **values,
         "_review_status": "approved",
@@ -1893,6 +3317,9 @@ def insert_approved_meal_photo_log(
         "_approved_at": approved_at,
         "_source_type": "meal_photo",
     }
+    if protein_items:
+        approved_payload["protein_items"] = protein_items
+        approved_payload["protein_total_exchange"] = protein_total_exchange
     approved_json = json.dumps(
         approved_payload, ensure_ascii=False, sort_keys=True, allow_nan=False
     )
@@ -2253,9 +3680,16 @@ def approve_food_exchange_suggestion(
             ).fetchone()
             if not approval:
                 raise ValueError("核准紀錄遺失，已停止套用")
-            approved_payload = json.loads(approval[2] or "{}")
+            parsed_approved_payload = _json_object_or_none(approval[2])
+            if parsed_approved_payload is None:
+                raise ValueError("核准紀錄驗證失敗，已停止套用")
+            approved_payload = parsed_approved_payload
             expected_hash = exchange_approval_hash(approval[4], approval[1], approved_payload)
-            if approval[4] != fingerprint or not secrets.compare_digest(approval[3], expected_hash):
+            if (
+                approval[4] != fingerprint
+                or not exchange_approval_payload_is_valid(approval[1], approved_payload)
+                or not secrets.compare_digest(approval[3], expected_hash)
+            ):
                 raise ValueError("核准紀錄驗證失敗，已停止套用")
             conn.commit()
             return {
@@ -2380,7 +3814,8 @@ def daily_consumed_totals(
         SELECT l.nutrition_snapshot_json,l.approved_exchange_json,l.exchange_approval_id,
                l.consumed_servings,
                a.food_fingerprint,a.suggestion_rule_version,a.approved_exchange_json,
-               a.approved_exchange_hash,f.fingerprint,f.source_type
+               a.approved_exchange_hash,f.fingerprint,f.source_type,l.log_id,l.trust_type,
+               l.user_id,l.food_id,f.owner_user_id,a.food_id
         FROM food_logs l
         JOIN food_catalog f ON f.food_id=l.food_id
         LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
@@ -2392,32 +3827,45 @@ def daily_consumed_totals(
         sql += " AND l.meal_slot=?"
         params.append(meal_slot)
     rows = conn.execute(sql, params).fetchall()
-    for nutrition_json, applied_json, approval_id, consumed_servings, approval_fingerprint, rule_version, approved_json, approval_hash, food_fp, source_type in rows:
-        nutrition_data = json.loads(nutrition_json or "{}")
-        if source_type != "user_meal_photo":
+    for (
+        nutrition_json, applied_json, approval_id, consumed_servings,
+        approval_fingerprint, rule_version, approved_json, approval_hash,
+        food_fp, source_type, log_id, trust_type, log_user_id, log_food_id,
+        catalog_owner_user_id, approval_food_id,
+    ) in rows:
+        trust = user_confirmed_meal_photo_trust_projection(conn, log_id, trust_type)
+        approval = verified_exchange_approval_projection(
+            log_user_id=log_user_id,
+            log_food_id=log_food_id,
+            catalog_source_type=source_type,
+            catalog_owner_user_id=catalog_owner_user_id,
+            catalog_fingerprint=food_fp,
+            consumed_servings=consumed_servings,
+            applied_json=applied_json,
+            approval_id=approval_id,
+            approval_food_id=approval_food_id,
+            approval_fingerprint=approval_fingerprint,
+            rule_version=rule_version,
+            approved_json=approved_json,
+            approval_hash=approval_hash,
+        )
+        is_meal_photo_origin = bool(
+            approval["is_meal_photo_origin"]
+            or trust.get("integrity_status") in {"verified", "integrity_verification_failed"}
+            or trust.get("trust_type")
+        )
+        if not is_meal_photo_origin:
+            nutrition_data = _json_object_or_none(nutrition_json) or {}
             for key, value in nutrition_data.items():
                 if key in totals:
                     totals[key] += float(value or 0)
-        if not approval_id or not approval_fingerprint or approval_fingerprint != food_fp:
+        if not approval["is_valid"]:
             continue
-        approved_data = json.loads(approved_json or "{}")
-        expected_hash = exchange_approval_hash(approval_fingerprint, rule_version, approved_data)
-        if not secrets.compare_digest(str(approval_hash or ""), expected_hash):
-            continue
-        applied_data = json.loads(applied_json or "{}")
-        expected_applied = {
-            key: round(float(approved_data.get(key, 0) or 0) * float(consumed_servings or 0), 4)
-            for key in EXCHANGE_KEYS
-        }
-        if any(
-            abs(float(applied_data.get(key, 0) or 0) - expected_applied[key]) > 0.0001
-            for key in EXCHANGE_KEYS
-        ):
-            continue
-        for key, value in expected_applied.items():
-            totals[key] += value
-        if source_type == "user_meal_photo":
-            for key, value in nutrition_data.items():
+        for key in EXCHANGE_KEYS:
+            totals[key] += float(approval["applied"].get(key, 0) or 0)
+        if is_meal_photo_origin:
+            estimated = estimate_nutrition_from_exchanges(approval["applied"])
+            for key, value in estimated.items():
                 if key in totals:
                     totals[key] += float(value or 0)
     return {key: round(value, 4) for key, value in totals.items()}
@@ -2432,7 +3880,9 @@ def daily_food_summary(
         SELECT l.consumed_at,f.product_name,l.nutrition_snapshot_json,
                l.exchange_approval_id,a.food_fingerprint,a.suggestion_rule_version,
                a.approved_exchange_json,a.approved_exchange_hash,f.fingerprint,
-               l.approved_exchange_json,l.consumed_servings
+               l.approved_exchange_json,l.consumed_servings,f.source_type,
+               l.log_id,l.trust_type,l.exchange_snapshot_json,
+               l.user_id,l.food_id,f.owner_user_id,a.food_id
         FROM food_logs l
         JOIN food_catalog f ON f.food_id=l.food_id
         LEFT JOIN food_exchange_approvals a ON a.approval_id=l.exchange_approval_id
@@ -2444,12 +3894,14 @@ def daily_food_summary(
     ).fetchall()
     foods: list[dict[str, Any]] = []
     pending_reviews = 0
+    estimated_totals = {"calories_kcal": 0.0, "protein_g": 0.0}
     for (
         consumed_at, product_name, nutrition_json, approval_id, approval_fingerprint,
         rule_version, approved_json, approval_hash, food_fingerprint_value,
-        applied_json, consumed_servings,
+        applied_json, consumed_servings, source_type, log_id, trust_type, estimate_json,
+        log_user_id, log_food_id, catalog_owner_user_id, approval_food_id,
     ) in rows:
-        nutrition = json.loads(nutrition_json or "{}")
+        nutrition = _json_object_or_none(nutrition_json) or {}
         try:
             consumed_dt = datetime.fromisoformat(str(consumed_at))
             if consumed_dt.tzinfo is None:
@@ -2459,39 +3911,86 @@ def daily_food_summary(
             consumed_time = consumed_dt.strftime("%H:%M")
         except ValueError:
             consumed_time = str(consumed_at)[11:16] if len(str(consumed_at)) >= 16 else "--:--"
+        approval = verified_exchange_approval_projection(
+            log_user_id=log_user_id,
+            log_food_id=log_food_id,
+            catalog_source_type=source_type,
+            catalog_owner_user_id=catalog_owner_user_id,
+            catalog_fingerprint=food_fingerprint_value,
+            consumed_servings=consumed_servings,
+            applied_json=applied_json,
+            approval_id=approval_id,
+            approval_food_id=approval_food_id,
+            approval_fingerprint=approval_fingerprint,
+            rule_version=rule_version,
+            approved_json=approved_json,
+            approval_hash=approval_hash,
+        )
+        valid_approval = bool(approval["is_valid"])
+        trust = user_confirmed_meal_photo_trust_projection(conn, log_id, trust_type)
+        valid_user_estimate = trust["integrity_status"] == "verified"
+        is_meal_photo_origin = bool(
+            approval["is_meal_photo_origin"]
+            or source_type == "user_meal_photo"
+            or trust.get("integrity_status") in {"verified", "integrity_verification_failed"}
+            or trust.get("trust_type")
+        )
+        approval_integrity_failed = bool(
+            is_meal_photo_origin and approval_id and not valid_approval
+        )
+        if (
+            not valid_approval and not valid_user_estimate and not trust["trust_type"]
+            and not approval_integrity_failed
+        ):
+            pending_reviews += 1
+        if is_meal_photo_origin:
+            if valid_approval:
+                nutrition = estimate_nutrition_from_exchanges(approval["applied"])
+            elif valid_user_estimate:
+                nutrition = dict(trust.get("nutrition") or {})
+            else:
+                nutrition = {}
+        valid_ai_nutrition = (
+            valid_user_estimate
+            and is_meal_photo_origin
+            and nutrition.get("calories_kcal") is not None
+            and nutrition.get("protein_g") is not None
+        )
+        integrity_status = (
+            "integrity_verification_failed"
+            if approval_integrity_failed else trust["integrity_status"]
+        )
+        if valid_ai_nutrition:
+            estimated_totals["calories_kcal"] += float(nutrition["calories_kcal"])
+            estimated_totals["protein_g"] += float(nutrition["protein_g"])
         foods.append(
             {
                 "time": consumed_time,
                 "consumed_at": consumed_at,
                 "name": product_name,
-                "calories_kcal": float(nutrition.get("calories_kcal", 0) or 0),
-                "protein_g": float(nutrition.get("protein_g", 0) or 0),
+                "calories_kcal": (
+                    float(nutrition["calories_kcal"])
+                    if (valid_ai_nutrition or valid_approval)
+                    and nutrition.get("calories_kcal") is not None else
+                    (None if is_meal_photo_origin else float(nutrition.get("calories_kcal", 0) or 0))
+                ),
+                "protein_g": (
+                    float(nutrition["protein_g"])
+                    if (valid_ai_nutrition or valid_approval)
+                    and nutrition.get("protein_g") is not None else
+                    (None if is_meal_photo_origin else float(nutrition.get("protein_g", 0) or 0))
+                ),
+                "trust_type": trust["trust_type"],
+                "trust_integrity_status": integrity_status,
+                "estimate": (
+                    _json_object_or_none(estimate_json) if valid_user_estimate else None
+                ),
             }
         )
-        valid_approval = False
-        if approval_id and approval_fingerprint and approval_fingerprint == food_fingerprint_value:
-            approved_data = json.loads(approved_json or "{}")
-            expected_hash = exchange_approval_hash(
-                approval_fingerprint, rule_version, approved_data
-            )
-            expected_applied = {
-                key: round(
-                    float(approved_data.get(key, 0) or 0) * float(consumed_servings or 0), 4
-                )
-                for key in EXCHANGE_KEYS
-            }
-            applied_data = json.loads(applied_json or "{}")
-            valid_approval = secrets.compare_digest(
-                str(approval_hash or ""), expected_hash
-            ) and all(
-                abs(float(applied_data.get(key, 0) or 0) - value) <= 0.0001
-                for key, value in expected_applied.items()
-            )
-        if not valid_approval:
-            pending_reviews += 1
     return {
         "foods": foods,
         "totals": daily_consumed_totals(conn, user_id=user_id, date_iso=date_iso),
+        "estimated_totals": {key: round(value, 4) for key, value in estimated_totals.items()},
         "pending_reviews": pending_reviews,
     }
 

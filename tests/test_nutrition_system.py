@@ -204,7 +204,7 @@ def test_ensure_nutrition_schema_creates_required_tables():
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
-    ).fetchone()[0] == 5
+    ).fetchone()[0] == 6
     food_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_catalog)")}
     assert "menu_category" in food_columns
 
@@ -273,7 +273,7 @@ def test_existing_v1_marker_runs_latest_additive_migration():
     assert "consumed_time_source" in pending_columns
     assert conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
-    ).fetchone()[0] == 5
+    ).fetchone()[0] == 6
     food_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_catalog)")}
     assert "menu_category" in food_columns
 
@@ -293,7 +293,7 @@ def test_existing_v2_marker_runs_v3_time_source_migration():
     assert "consumed_time_source" in columns
     assert conn.execute(
         "SELECT version FROM nutrition_schema_versions WHERE component='nutrition_system'"
-    ).fetchone()[0] == 5
+    ).fetchone()[0] == 6
     food_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_catalog)")}
     assert "menu_category" in food_columns
 
