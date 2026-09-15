@@ -2,6 +2,7 @@ import subscription_meal_plan as meal_plan
 import pytest
 from subscription_meal_plan import (
     ensure_light_bento_coverage,
+    get_subscription_form_uid,
     get_subscription_form_value,
 )
 
@@ -16,6 +17,50 @@ def _dish(name, *, price=180):
         "category": "main",
         "carb_type": "高碳",
     }
+
+
+def test_subscription_uid_accepts_only_registered_exact_labels():
+    uid = "U" + "a" * 32
+
+    assert get_subscription_form_uid(
+        {"1. LINE UID (系統綁定用，請勿修改)": uid}
+    ) == uid
+    assert get_subscription_form_uid({"LINE UID": uid}) == uid
+    assert get_subscription_form_uid({"UID": uid}) == uid
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"1. LINE UID (系統綁定用，請勿修改)": ""},
+        {"1. LINE UID (系統綁定用，請勿修改)": "not-a-line-uid"},
+        {"LINE UID 額外說明": "U" + "a" * 32},
+        {"好友UID備註": "U" + "a" * 32},
+    ],
+)
+def test_subscription_uid_missing_invalid_or_unknown_fails_closed(payload):
+    assert get_subscription_form_uid(payload) == ""
+
+
+def test_subscription_uid_rejects_multiple_registered_aliases_instead_of_first_pick():
+    uid = "U" + "a" * 32
+
+    with pytest.raises(ValueError, match="multiple UID fields"):
+        get_subscription_form_uid(
+            {
+                "1. LINE UID (系統綁定用，請勿修改)": uid,
+                "UID": uid,
+            }
+        )
+
+    with pytest.raises(ValueError, match="multiple UID fields"):
+        get_subscription_form_uid(
+            {
+                "LINE UID": uid,
+                "UID": "U" + "b" * 32,
+            }
+        )
 
 
 def test_form_value_prefers_positive_new_column_over_disliked_column():

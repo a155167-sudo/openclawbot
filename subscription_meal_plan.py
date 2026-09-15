@@ -16,6 +16,32 @@ def _normalized_label(value: object) -> str:
     )
 
 
+_SUBSCRIPTION_UID_LABELS = frozenset(
+    _normalized_label(label)
+    for label in (
+        "1. LINE UID (系統綁定用，請勿修改)",
+        "LINE UID",
+        "UID",
+    )
+)
+_LINE_UID_RE = re.compile(r"U[0-9a-fA-F]{32}")
+
+
+def get_subscription_form_uid(data: Mapping[str, Any]) -> str:
+    """Return a valid UID from one explicitly registered form label only."""
+    matches = [
+        value
+        for key, value in data.items()
+        if _normalized_label(key) in _SUBSCRIPTION_UID_LABELS
+    ]
+    if len(matches) > 1:
+        raise ValueError("multiple UID fields")
+    if not matches:
+        return ""
+    uid = str(matches[0] or "").strip()
+    return uid if _LINE_UID_RE.fullmatch(uid) else ""
+
+
 def get_subscription_form_value(
     data: Mapping[str, Any],
     *aliases: str,

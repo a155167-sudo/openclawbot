@@ -109,6 +109,7 @@ from meal_photo_system import (
 from subscription_meal_plan import (
     dish_matches_restrictions,
     ensure_light_bento_coverage,
+    get_subscription_form_uid,
     get_subscription_form_value,
 )
 from customer_health_check_liff import attach_customer_health_check_routes
@@ -3297,9 +3298,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             )
         
         try:
-            user_id = get_val(
-                "LINE UID", "UID", allow_fuzzy=False, reject_ambiguous=True
-            )
+            user_id = get_subscription_form_uid(data)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="UID 欄位不明確") from exc
         print(f"🔍 [表單測試] 抓到的 UID 是：'{user_id}'")

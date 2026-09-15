@@ -1977,7 +1977,7 @@ def test_form_data_routes_delivery_quote_failure_to_manual_review(monkeypatch):
 
     async def request_json():
         return {
-            "UID": "U_FORM_MAPS_FAILURE",
+            "UID": "U11111111111111111111111111111111",
             "稱呼": "測試客戶",
             "本期取餐方式": "外送",
             "本期外送地址": "台北市測試路1號",
@@ -2023,7 +2023,7 @@ def test_form_data_routes_delivery_quote_failure_to_manual_review(monkeypatch):
     }
     assert created == []
     assert len(pushed) == 1
-    assert pushed[0][0] == "U_FORM_MAPS_FAILURE"
+    assert pushed[0][0] == "U11111111111111111111111111111111"
     assert "運費待客服確認" in pushed[0][1]
     assert "不需要重新填寫表單" in pushed[0][1]
     assert "$0" not in pushed[0][1]
@@ -2036,7 +2036,7 @@ def test_form_data_rejects_missing_dates_before_delivery_side_effects(monkeypatc
 
     async def request_json():
         return {
-            "UID": "U_NO_SCHEDULE",
+            "UID": "U22222222222222222222222222222222",
             "稱呼": "無日期",
             "本期取餐方式": "外送",
             "本期外送地址": "台北市測試路1號",
@@ -2065,7 +2065,7 @@ def test_form_data_rejects_missing_dates_before_delivery_side_effects(monkeypatc
 
     async def invalid_number_json():
         return {
-            "UID": "U_BAD_FORM_NUMBER",
+            "UID": "U33333333333333333333333333333333",
             "稱呼": "非法數值",
             "本期取餐方式": "外送",
             "本期外送地址": "台北市測試路1號",
@@ -2073,7 +2073,7 @@ def test_form_data_rejects_missing_dates_before_delivery_side_effects(monkeypatc
             "體重": "not-a-number",
         }
 
-    server.user_memory["U_BAD_FORM_NUMBER"] = [{"role": "user", "content": "keep"}]
+    server.user_memory["U33333333333333333333333333333333"] = [{"role": "user", "content": "keep"}]
     with pytest.raises(server.HTTPException) as number_exc:
         asyncio.run(server.receive_form_data(
             cast(Any, SimpleNamespace(json=invalid_number_json)),
@@ -2083,7 +2083,7 @@ def test_form_data_rejects_missing_dates_before_delivery_side_effects(monkeypatc
     assert quote_calls == []
     assert delivery_block_calls == []
     assert pushed == []
-    assert "U_BAD_FORM_NUMBER" in server.user_memory
+    assert "U33333333333333333333333333333333" in server.user_memory
 
     for index, (label, value) in enumerate(
         (
@@ -2092,7 +2092,7 @@ def test_form_data_rejects_missing_dates_before_delivery_side_effects(monkeypatc
             ("年齡", -1), ("年齡", 9999),
         )
     ):
-        uid = f"U_BAD_RANGE_{index}"
+        uid = f"U{index + 10:032x}"
 
         async def invalid_range_json(label=label, value=value, uid=uid):
             return {
@@ -2129,7 +2129,7 @@ def test_form_data_accepts_new_preference_columns_and_covers_light_bentos(monkey
 
     async def request_json():
         return {
-            "UID": "U_NEW_FORM_COLUMNS",
+            "UID": "U44444444444444444444444444444444",
             "稱呼": "新版表單客戶",
             "本期取餐方式": "自取",
             "禁忌": "豆腐,羊肉,起司",
@@ -2189,11 +2189,11 @@ def test_form_data_accepts_new_preference_columns_and_covers_light_bentos(monkey
             for meal in (row[2], row[5])
             for forbidden in ("豆腐", "雞肉香料食蔬", "香料便當", "雞肉起司食蔬")
         )
-    assert pushed and pushed[0][0] == "U_NEW_FORM_COLUMNS"
+    assert pushed and pushed[0][0] == "U44444444444444444444444444444444"
 
     async def legacy_request_json():
         return {
-            "UID": "U_LEGACY_FORM_COLUMNS",
+            "UID": "U55555555555555555555555555555555",
             "稱呼": "舊版表單客戶",
             "本期取餐方式": "自取",
             "取餐": ["週一", "週一", "週二", "週二"],
@@ -2212,7 +2212,7 @@ def test_form_data_accepts_new_preference_columns_and_covers_light_bentos(monkey
 
     async def fully_restricted_request_json():
         return {
-            "UID": "U_FULLY_RESTRICTED",
+            "UID": "U66666666666666666666666666666666",
             "稱呼": "無安全餐客戶",
             "本期取餐方式": "自取",
             "禁忌": "豆腐和羊肉",
@@ -2238,7 +2238,7 @@ def test_form_data_accepts_new_preference_columns_and_covers_light_bentos(monkey
 
     async def no_preferred_light_json():
         return {
-            "UID": "U_NO_PREFERRED_LIGHT",
+            "UID": "U77777777777777777777777777777777",
             "稱呼": "無偏好輕便當",
             "本期取餐方式": "自取",
             "您的主食選擇（可複選）": ["都不挑食"],
@@ -2260,7 +2260,7 @@ def test_form_data_accepts_new_preference_columns_and_covers_light_bentos(monkey
 
     async def ambiguous_restrictions_json():
         return {
-            "UID": "U_AMBIGUOUS_RESTRICTIONS",
+            "UID": "U99999999999999999999999999999999",
             "本期取餐方式": "自取",
             "取餐": ["週一"],
             "飲食禁忌補充": "牛肉",
@@ -2292,7 +2292,7 @@ def test_form_data_accepts_new_preference_columns_and_covers_light_bentos(monkey
 
     async def one_dish_json():
         return {
-            "UID": "U_ONE_SAFE_DISH",
+            "UID": "Uaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "本期取餐方式": "自取",
             "您的主食選擇（可複選）": ["飯食派"],
             "取餐": ["週一"],
@@ -2315,7 +2315,7 @@ def test_form_data_rejects_over_three_kilometer_delivery_before_pending_order(mo
 
     async def request_json():
         return {
-            "UID": "U_FORM_BLOCK",
+            "UID": "U88888888888888888888888888888888",
             "稱呼": "測試客戶",
             "本期取餐方式": "外送",
             "本期外送地址": "台北市測試路1號",
@@ -2363,7 +2363,7 @@ def test_form_data_rejects_over_three_kilometer_delivery_before_pending_order(mo
     assert created == []
     assert pushed == [
         (
-            "U_FORM_BLOCK",
+            "U88888888888888888888888888888888",
             "🚫 此地址暫不提供外送\n\n"
             "📍 台北市測試路1號\n"
             "📏 距本店距離：3.1 公里\n\n"
