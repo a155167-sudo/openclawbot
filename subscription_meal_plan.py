@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
+from datetime import timedelta
 from typing import Any
 
 
@@ -238,3 +239,84 @@ def ensure_light_bento_coverage(
             result[row_index] = tuple(row)
             replacement_number += 1
     return result
+
+
+_MENU_DATE_LINE_RE = re.compile(r"^20\d{2}/\d{2}/\d{2}")
+
+
+def build_plain_subscription_menu_summary(plan_requests: Sequence[tuple], start_date) -> str:
+    """Render selected subscription dates with meal names only."""
+    blocks = []
+    for week_number, day_number, _week_label, day_name, lunch, dinner in plan_requests:
+        target_date = start_date + timedelta(
+            days=(int(week_number) - 1) * 7 + (int(day_number) - 1)
+        )
+        blocks.append(
+            f"{target_date:%Y/%m/%d}（{day_name}）\n"
+            f"午：{lunch['name']}\n"
+            f"晚：{dinner['name']}"
+        )
+    return "\n\n".join(blocks)
+
+
+def sanitize_legacy_subscription_menu(summary_text: object) -> str:
+    """Hide legacy generated training/carb-cycle decoration without changing meals."""
+    kept = []
+    for raw_line in str(summary_text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        if stripped.startswith("課："):
+            continue
+        if "4 週訓練課表已生成" in stripped:
+            continue
+        if "高強度日" in stripped and "低強度" in stripped:
+            continue
+        if "已依現有課表強度重新套用碳循環" in stripped:
+            continue
+        if _MENU_DATE_LINE_RE.match(stripped):
+            line = re.sub(r"\s*[🔥🥗]\s*(?:高碳|低碳)\s*$", "", line)
+        kept.append(line)
+    return "\n".join(kept).strip("\n")
+
+
+def chunk_subscription_menu_text(
+    menu_text: object,
+    *,
+    heading: str,
+    footer: str,
+    max_chars: int = 5000,
+    max_messages: int = 5,
+) -> list[str]:
+    """Pack complete menu paragraphs into LINE-safe UTF-16-sized messages."""
+    def line_units(text: str) -> int:
+        # LINE's text limit is enforced on Java/JSON string units.  Counting
+        # UTF-16 prevents astral emoji from being under-counted by Python len().
+        return len(text.encode("utf-16-le")) // 2
+
+    sanitized = sanitize_legacy_subscription_menu(menu_text)
+    atoms = []
+    if heading.strip():
+        atoms.append(heading.strip())
+    atoms.extend(part.strip() for part in re.split(r"\n{2,}", sanitized) if part.strip())
+    if footer.strip():
+        atoms.append(footer.strip())
+    chunks: list[str] = []
+    current = ""
+    for atom in atoms:
+        if line_units(atom) > max_chars:
+            raise ValueError("a subscription menu block exceeds the LINE text limit")
+        candidate = atom if not current else f"{current}\n\n{atom}"
+        if line_units(candidate) <= max_chars:
+            current = candidate
+            continue
+        chunks.append(current)
+        current = atom
+    if current:
+        chunks.append(current)
+    if len(chunks) > max_messages:
+        raise ValueError("subscription menu exceeds one LINE reply")
+    return chunks

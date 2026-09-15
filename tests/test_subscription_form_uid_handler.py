@@ -66,9 +66,32 @@ def _install_isolated_form_dependencies(tmp_path, monkeypatch):
                 formalized_at TEXT DEFAULT ''
             )"""
         )
+        conn.execute(
+            """CREATE TABLE health_profile (
+                user_id TEXT PRIMARY KEY, name TEXT, tdee INTEGER, protein REAL,
+                goal TEXT, restrictions TEXT, summary_text TEXT, active_days TEXT,
+                today_extra_cal INTEGER, today_date TEXT, sheet_name TEXT,
+                is_coaching_enabled INTEGER, is_carb_cycling_enabled INTEGER,
+                ai_silenced_until TEXT, user_level INTEGER, race_date TEXT,
+                address TEXT, distance_text TEXT, distance_meters INTEGER,
+                delivery_fee INTEGER, delivery_zone TEXT, route_group TEXT,
+                delivery_note TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE usage (
+                user_id TEXT PRIMARY KEY, remaining_chat_quota INTEGER,
+                remaining_meals INTEGER, last_date TEXT, status TEXT,
+                expiry_date TEXT, daily_chat_limit INTEGER
+            )"""
+        )
     pushes = []
     monkeypatch.setattr(server, "DB_PATH", str(db_path))
-    monkeypatch.setattr(server, "MAIN_DISHES", [_dish("雞肉便當", 180), _dish("豬肉低碳", 190)])
+    monkeypatch.setattr(
+        server,
+        "MAIN_DISHES",
+        [_dish("雞肉便當", 180), _dish("豬肉低碳", 190), _dish("雞肉食蔬", 200)],
+    )
     monkeypatch.setattr(server.random, "sample", lambda population, count: population[:count])
     monkeypatch.setattr(server, "get_line_display_name_safe", lambda _uid: "測試名稱")
     monkeypatch.setattr(server, "update_subscription_delivery_block", lambda *_args: None)
@@ -151,3 +174,61 @@ def test_registered_form_handler_rejects_multiple_exact_uid_aliases(tmp_path, mo
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM subscription_orders").fetchone()[0] == 0
     assert pushes == []
+
+
+def test_monthly_form_snapshot_is_plain_meal_plan_and_formalize_starts_no_training_thread(
+    tmp_path, monkeypatch
+):
+    db_path, _pushes = _install_isolated_form_dependencies(tmp_path, monkeypatch)
+    payload = {
+        ACTUAL_UID_TITLE: VALID_UID,
+        "您的稱呼 (姓名或暱稱)": "普通配餐客戶",
+        "本期取餐方式": "自取",
+        "第一週想取餐的日期": ["週一"],
+        "第二週想取餐的日期": ["週二"],
+        "第三週想取餐的日期": ["週三"],
+        "第四週想取餐的日期": ["週四"],
+        "規律運動": "有，請安排課表",
+        "啟用碳循環": "是",
+        "您的主食選擇（可複選）": ["都不挑食"],
+        "您最喜歡的蛋白質是？（可複選）": ["雞肉", "豬肉"],
+    }
+
+    result = asyncio.run(
+        server.receive_form_data(_request(payload), cast(Any, SimpleNamespace()))
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        raw = conn.execute(
+            "SELECT form_payload_json FROM subscription_orders WHERE id=?",
+            (result["order_id"],),
+        ).fetchone()[0]
+    snapshot = json.loads(raw)
+    assert snapshot["is_coaching_enabled"] == 0
+    assert snapshot["is_carb_cycling_enabled"] == 0
+    assert len(snapshot["master_api_rows"]) == 4
+    assert all(row[6] == 0 and row[9] == "" and row[20] == 0 for row in snapshot["master_api_rows"])
+    assert "2026/" in snapshot["schedule_text"]
+    assert "午：" in snapshot["schedule_text"] and "晚：" in snapshot["schedule_text"]
+    assert "課：" not in snapshot["schedule_text"]
+    assert "高碳補糖" not in snapshot["schedule_text"]
+    prices = {"雞肉便當": 180, "豬肉低碳": 190, "雞肉食蔬": 200}
+    assert snapshot["total_price"] == sum(
+        prices[meal]
+        for row in snapshot["master_api_rows"]
+        for meal in (row[3], row[4])
+    )
+
+    class ForbiddenThread:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("monthly formalization started an automatic training thread")
+
+    monkeypatch.setattr(server.threading, "Thread", ForbiddenThread)
+    ok, _message = server.formalize_subscription_snapshot(result["order_id"], snapshot)
+    assert ok is True
+    with sqlite3.connect(db_path) as conn:
+        flags = conn.execute(
+            "SELECT is_coaching_enabled, is_carb_cycling_enabled FROM health_profile WHERE user_id=?",
+            (VALID_UID,),
+        ).fetchone()
+    assert flags == (0, 0)

@@ -107,10 +107,13 @@ from meal_photo_system import (
     save_meal_photo_draft,
 )
 from subscription_meal_plan import (
+    build_plain_subscription_menu_summary,
+    chunk_subscription_menu_text,
     dish_matches_restrictions,
     ensure_light_bento_coverage,
     get_subscription_form_uid,
     get_subscription_form_value,
+    sanitize_legacy_subscription_menu,
 )
 from customer_health_check_liff import attach_customer_health_check_routes
 from vip_health_check import (
@@ -3382,23 +3385,11 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             height *= 100
         if not 80 <= height <= 250:
             raise HTTPException(status_code=422, detail="身高必須介於 80 與 250 公分之間")
-        activity = get_val("活動量")  
-        # 雙開關骨架：安排課表 / 啟用碳循環
-        coaching_raw = get_val("規律運動") or get_val("安排課表") or ""
+        activity = get_val("活動量")
+        # 此版包月只做普通配餐；運動資料仍保留供非包月功能使用。
         sport_type = get_val("運動訓練菜單") or "未設定"
-        is_coaching_enabled = 1
-        if coaching_raw:
-            if "沒有" in coaching_raw or "飲食控制" in coaching_raw or "不需要" in coaching_raw:
-                is_coaching_enabled = 0
-            elif "安排課表" in coaching_raw or "有" in coaching_raw:
-                is_coaching_enabled = 1
-
-        carb_switch_raw = get_val("啟用碳循環") or ""
-        if carb_switch_raw:
-            is_carb_cycling_enabled = 1 if ("是" in carb_switch_raw or "啟用" in carb_switch_raw) else 0
-        else:
-            # 舊表單尚未放開關時，先沿用舊行為：有教練流程預設開啟，否則關閉
-            is_carb_cycling_enabled = 1 if is_coaching_enabled else 0
+        is_coaching_enabled = 0
+        is_carb_cycling_enabled = 0
 
         # 🔥 碳循環：等級與賽事日期
         _level_raw = get_val("Level") or get_val("等級") or ""
@@ -3611,37 +3602,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                         if "麵" not in pref_staple: unliked_staples.extend(["麵", "義大利麵", "烏龍", "筆管"])
                         if "飯" not in pref_staple: unliked_staples.extend(["飯", "燉飯", "紫米", "糙米"])
                     
-                    # 🔥 Phase 3: 依 4 週課表強度決定碳水 pool（含 fallback）
-                    target_date_check = start_date + timedelta(days=(w_num-1)*7 + (d_num-1))
-                    actual_date_check = target_date_check.strftime("%Y/%m/%d")
-
-                    if four_week_plan and actual_date_check in four_week_plan:
-                        # 優先用 AI 生成的 4 週課表強度
-                        day_intensity = four_week_plan[actual_date_check].get("intensity", "LOW")
-                        is_high_carb = day_intensity in ("HIGH", "MED")
-                    else:
-                        # Fallback: 根據 training_freq 與賽事倒數判斷
-                        _train_days = [t.strip() for t in training_freq.split(',') if t.strip()]
-                        _long_days  = [t.strip() for t in long_train_day.split(',') if t.strip()]
-                        _race_override = False
-                        if race_date:
-                            try:
-                                _race_dt = datetime.strptime(race_date, "%Y/%m/%d").replace(tzinfo=TW_TZ)
-                                _t_aware = datetime(target_date_check.year, target_date_check.month, target_date_check.day, tzinfo=TW_TZ)
-                                if 0 <= (_race_dt - _t_aware).days <= 7:
-                                    _race_override = True
-                            except Exception:
-                                pass
-                        is_high_carb = _race_override or any(lt in d for lt in _long_days) or any(td in d for td in _train_days)
-
-                    if is_high_carb:
-                        carb_pool = [dish for dish in safe_menu if dish.get('carb_type') == '高碳']
-                        if not carb_pool:
-                            carb_pool = safe_menu
-                    else:
-                        carb_pool = [dish for dish in safe_menu if dish.get('carb_type') == '低碳']
-                        if not carb_pool:
-                            carb_pool = safe_menu
+                    # 此版包月為普通配餐：不依訓練強度切換高／低碳池。
+                    carb_pool = safe_menu
 
                     matches = []
                     staple_only_matches = []
@@ -3771,7 +3733,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         # ==========================================
         # 5. 生成預覽文字與試算表資料 (🔥 升級版：自動推算日期與雙重表單)
         # ==========================================
-        schedule_text = ""
+        schedule_text = build_plain_subscription_menu_summary(plan_requests, start_date)
         schedule_sheet_rows = [["實際日期", "週期與星期", "午餐安排", "午餐熱量", "午餐蛋白", "晚餐安排", "晚餐熱量", "晚餐蛋白", "今日排餐總熱量", "今日排餐總蛋白", "熱量剩餘 / 蛋白質需補", "單日金額", "明日預定課表", "列印狀態"]]
         master_api_rows = []
         
@@ -3786,8 +3748,6 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             target_date = start_date + timedelta(days=(w_num-1)*7 + (d_num-1))
             actual_date_str = target_date.strftime("%Y/%m/%d")
 
-            schedule_text += f"\n【{w_label}-{day_name}】\n☀️午：{lunch['name']} ({lunch['cal']}kcal / ${lunch['price']})\n🌙晚：{dinner['name']} ({dinner['cal']}kcal / ${dinner['price']})\n👉 當日熱量剩餘: {day_tdee_left}kcal\n👉 蛋白質需補: {day_p_need}g\n"
-            
             lunch_str = f"{lunch['name']} (${lunch['price']})"
             dinner_str = f"{dinner['name']} (${dinner['price']})"
             planned_cal_total = lunch['cal'] + dinner['cal']
@@ -8059,14 +8019,15 @@ def formalize_subscription_snapshot(order_id: int, snapshot: dict):
     name = snapshot.get("name") or ""
     goal = snapshot.get("goal") or ""
     restrictions = snapshot.get("restrictions") or ""
-    schedule_text = snapshot.get("schedule_text") or ""
+    schedule_text = sanitize_legacy_subscription_menu(snapshot.get("schedule_text") or "")
     active_days_list = snapshot.get("active_days_list") or []
     safe_name = snapshot.get("safe_name") or f"{name}_{user_id[-4:]}_{tw_now().strftime('%Y%m%d')}"
     delivery_info = snapshot.get("delivery_info") or {}
     tdee = int(snapshot.get("tdee") or 0)
     protein = float(snapshot.get("protein") or 0)
-    is_coaching_enabled = int(snapshot.get("is_coaching_enabled") or 0)
-    is_carb_cycling_enabled = int(snapshot.get("is_carb_cycling_enabled") or 0)
+    # 包月正式化一律普通配餐；也涵蓋部署前已建立但尚未正式化的 pending snapshot。
+    is_coaching_enabled = 0
+    is_carb_cycling_enabled = 0
     user_level = int(snapshot.get("user_level") or 2)
     race_date = snapshot.get("race_date") or ""
     address = snapshot.get("address") or ""
@@ -14080,11 +14041,23 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                 "請輸入「找客服」，我們會協助確認。"
             )
         else:
-            reply_text = (
-                f"🍽️ 這是為你量身打造的本期專屬菜單（還剩 {remaining_meals} 餐，到期日 {expiry_date}）：\n\n"
-                f"{menu_text}\n\n"
-                "(若想更換菜色或加購單品，可以直接打字告訴我喔！)"
-            )
+            try:
+                menu_chunks = chunk_subscription_menu_text(
+                    menu_text,
+                    heading=f"🍽️ 這是為你量身打造的本期專屬菜單（還剩 {remaining_meals} 餐，到期日 {expiry_date}）：",
+                    footer="(若想更換菜色或加購單品，可以直接打字告訴我喔！)",
+                )
+            except ValueError:
+                menu_chunks = [
+                    "⚠️ 本期菜單內容超過 LINE 單次可完整顯示的容量，因此這次沒有截斷顯示。\n\n"
+                    "請輸入「找客服」，我們會提供完整菜單並協助調整。"
+                ]
+            menu_messages = [TextSendMessage(text=text) for text in menu_chunks]
+            # Preserve the SDK's long-standing single-message shape while
+            # using a list only when the complete menu actually needs pages.
+            reply_payload = menu_messages[0] if len(menu_messages) == 1 else menu_messages
+            line_bot_api.reply_message(event.reply_token, reply_payload)
+            return
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
     elif msg == "我要紀錄飲食":
@@ -14967,10 +14940,21 @@ async def get_lobster_targets(admin_secret: str, mode: str = "daily"):
     tomorrow_str = (tw_today() + timedelta(days=1)).strftime("%Y/%m/%d")
     targets = []
 
-    # 1. 取得資料庫中的使用者紀錄
+    # 已付款開通的包月訂單是可靠的產品來源；pending/approved 不代表已付款，不能排除原有教練。
+    # 只在自動 target 外層依精確 UID 排除，保留非包月 Garmin／手動 weekly 流程。
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     try:
-        c.execute("SELECT user_id, name, today_extra_cal, today_food_items, tdee FROM health_profile WHERE is_coaching_enabled = 1")
+        c.execute("""
+            SELECT h.user_id, h.name, h.today_extra_cal, h.today_food_items, h.tdee
+            FROM health_profile h
+            WHERE h.is_coaching_enabled = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM subscription_orders o
+                  WHERE o.user_id = h.user_id
+                    AND o.status = 'activated'
+              )
+        """)
         users = c.fetchall()
     except sqlite3.OperationalError:
         return {"status": "success", "targets": []}
