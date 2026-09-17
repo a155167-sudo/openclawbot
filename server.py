@@ -376,6 +376,7 @@ def create_daily_food_log(
     conn: sqlite3.Connection, *, user_id: str, product_name: str,
     meal_slot: str, consumed_at: str, servings: float,
     nutrition: dict, source_type: str, operation_key: str = "",
+    publish_catalog: bool = True,
 ) -> dict:
     """建立可編輯逐筆飲食紀錄；營養快照保留未知 None。"""
     _prepare_health_check_refresh_connection(conn)
@@ -414,8 +415,9 @@ def create_daily_food_log(
     if not normalized or all(value is None for value in normalized.values()):
         raise ValueError("至少需要一項可記錄的營養資料")
 
+    catalog_scope = product_name if publish_catalog else (operation_key or uuid.uuid4().hex)
     fingerprint = hashlib.sha256(
-        f"ledger|{user_id}|{source_type}|{product_name}".encode("utf-8")
+        f"ledger|{user_id}|{source_type}|{catalog_scope}".encode("utf-8")
     ).hexdigest()
     food_id = "ledger_" + fingerprint[:24]
     now = tw_now().isoformat(timespec="seconds")
@@ -431,13 +433,19 @@ def create_daily_food_log(
             recognition_confidence,verification_status,created_at,updated_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(food_id) DO UPDATE SET
-             product_name=excluded.product_name,per_serving_json=excluded.per_serving_json,
-             updated_at=excluded.updated_at""",
+             product_name=CASE WHEN food_catalog.visibility='ledger_internal'
+                               THEN food_catalog.product_name ELSE excluded.product_name END,
+             per_serving_json=CASE WHEN food_catalog.visibility='ledger_internal'
+                                   THEN food_catalog.per_serving_json ELSE excluded.per_serving_json END,
+             updated_at=CASE WHEN food_catalog.visibility='ledger_internal'
+                             THEN food_catalog.updated_at ELSE excluded.updated_at END""",
         (
-            food_id, product_name, "", "", source_type, user_id, "private",
+            food_id, product_name, "", "", source_type, user_id,
+            "private" if publish_catalog else "ledger_internal",
             1, "份", 1, json.dumps(per_serving, ensure_ascii=False, allow_nan=False),
             "{}", "{}", "pending_review", fingerprint, "", 0,
-            "user_confirmed" if source_type != "ai_text_estimate" else "ai_estimated",
+            ("user_confirmed" if source_type != "ai_text_estimate" else "ai_estimated")
+            if publish_catalog else "consumption_snapshot",
             now, now,
         ),
     )
@@ -6538,8 +6546,8 @@ def get_dashboard_data(user_id: str) -> dict:
     # cached daily totals are deliberately not added again.
     # The dashboard is a human-readable projection; keep canonical ledger and
     # health-profile values exact, but present daily totals to one decimal.
-    extra_cal = round(canonical_ledger_cal, 1)
-    extra_pro = round(canonical_ledger_pro, 1)
+    extra_cal = canonical_ledger_cal
+    extra_pro = canonical_ledger_pro
 
     cal_remaining = max(0, tdee - extra_cal)
     pro_remaining = max(0, protein_goal - extra_pro)
@@ -6735,7 +6743,7 @@ def build_dashboard_flex(user_id: str):
         }
 
     def display_number(value):
-        """Keep dashboard numbers compact without losing meaningful decimals."""
+        """Format dashboard presentation to one decimal; rules retain exact values."""
         from decimal import Decimal, InvalidOperation
 
         try:
@@ -6744,6 +6752,7 @@ def build_dashboard_flex(user_id: str):
             return str(value)
         if not number.is_finite():
             return str(value)
+        number = number.quantize(Decimal("0.1"))
         return format(number.normalize(), "f")
 
     def remaining_number(goal, consumed):
@@ -10011,11 +10020,12 @@ def parse_explicit_text_nutrition_log(text):
         return None
     # Deliberately not a general natural-language parser. Ambiguous text remains
     # on the existing intent/AI paths instead of creating a new ledger row.
+    semantic_probe = re.sub(r"\s+", "", message)
     if re.search(
         r"修改|修正|改成|取消|刪除|如果|假設|大概|約|可能|應該|"
-        r"不要|沒有|沒吃|未吃|不是|請問|問題|嗎(?:[。.!！]?$)|"
-        r"每\s*(?:100|份|包|克|g|毫升|ml)",
-        message, re.IGNORECASE,
+        r"不要|沒有|沒吃|未吃|不是|請問|問題|想知道|多少|"
+        r"嗎(?:[。.!！]?$)|每(?:100|一百|百)(?:公克|克|g)",
+        semantic_probe, re.IGNORECASE,
     ):
         return None
     slot = ""
@@ -10035,7 +10045,8 @@ def parse_explicit_text_nutrition_log(text):
     food_name = match.group("name").strip(" ：:。.!！-")
     if (
         not food_name or len(food_name) > 80
-        or re.search(r"(?:、|，|,|/|＋|\+|和|與|及)", food_name)
+        or re.search(r"\s|(?:、|，|,|/|＋|\+|和|與|及)", food_name)
+        or re.search(r"熱量|蛋白(?:質)?|脂肪|碳水|糖|鈉", food_name)
     ):
         return None
     calories_value = _ledger_number(match.group("cal"), allow_none=False)
@@ -10053,10 +10064,46 @@ def parse_explicit_text_nutrition_log(text):
     }
 
 
-def build_post_commit_food_dashboard(user_id):
-    """Render canonical post-commit UI without implying a committed log failed."""
+def build_post_commit_food_dashboard(user_id, committed_log_id=None):
+    """Render canonical UI and, for backdating, acknowledge the trusted committed row."""
     try:
         dashboard = build_dashboard_flex(user_id)
+        if dashboard is not None and committed_log_id:
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute(
+                    """SELECT fc.product_name,fl.consumed_at,fl.nutrition_snapshot_json
+                       FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+                       WHERE fl.log_id=? AND fl.user_id=?
+                         AND fl.confirmation_status='confirmed'
+                         AND COALESCE(fl.deleted_at,'')=''""",
+                    (str(committed_log_id), str(user_id)),
+                ).fetchone()
+            if row and str(row[1])[:10] != tw_today().isoformat():
+                nutrition = json.loads(row[2] or "{}")
+                cal = nutrition.get("calories_kcal")
+                pro = nutrition.get("protein_g")
+                cal_text = f"{float(cal):g}" if cal is not None else "未知"
+                pro_text = f"{float(pro):g}" if pro is not None else "未知"
+                ack = {
+                    "type": "box", "layout": "vertical", "margin": "md",
+                    "backgroundColor": "#FFF7ED", "paddingAll": "10px",
+                    "cornerRadius": "8px", "contents": [
+                        {"type": "text", "text": f"✅ 已補登 {str(row[1])[:10]}",
+                         "size": "sm", "weight": "bold", "color": "#C2410C"},
+                        {"type": "text", "text": str(row[0]), "size": "sm",
+                         "wrap": True, "margin": "xs"},
+                        {"type": "text",
+                         "text": f"{cal_text} kcal・{pro_text} g",
+                         "size": "xs", "color": "#666666", "margin": "xs"},
+                    ],
+                }
+                payload = dashboard.as_json_dict()
+                payload["contents"]["contents"][0]["body"]["contents"].insert(1, ack)
+                from linebot.models import FlexSendMessage
+                dashboard = FlexSendMessage(
+                    alt_text=payload.get("altText", "今日儀表板"),
+                    contents=payload["contents"],
+                )
         if dashboard is not None:
             return dashboard
     except Exception as exc:
@@ -10091,12 +10138,15 @@ def log_explicit_text_nutrition_once(*, user_id, message_id, request):
             },
             source_type="user_provided_nutrition",
             operation_key=operation_key,
+            publish_catalog=False,
         )
         _sync_health_profile_from_ledger_conn(
             conn, user_id, str(result["consumed_at"])[:10]
         )
         conn.commit()
-    return build_post_commit_food_dashboard(user_id)
+    return build_post_commit_food_dashboard(
+        user_id, committed_log_id=result["log_id"]
+    )
 
 
 def parse_natural_food_log_intent(text):
@@ -13245,13 +13295,9 @@ def handle_meal_photo_postback(event):
                 ),
             )
         elif kind in {"recorded", "recorded_updated"}:
-            log_version = _daily_food_log_brief(uid, result["log_id"])["version"]
-            if kind == "recorded_updated" or log_version > 1:
-                reply = TextSendMessage(
-                    text="✅ 紀錄已更新，請開啟飲食紀錄查看最新內容。"
-                )
-            else:
-                reply = build_post_commit_food_dashboard(uid)
+            reply = build_post_commit_food_dashboard(
+                uid, committed_log_id=result["log_id"]
+            )
         elif kind == "cancel":
             image_ref = str(result.get("source_image_ref") or "")
             if image_ref and _delete_nutrition_image(image_ref):
@@ -13927,14 +13973,14 @@ def _handle_message_impl(event):
                 # "我的食物"：只搜用戶自己的卡片
                 if query == "_my":
                     total = conn.execute(
-                        "SELECT COUNT(*) FROM food_catalog WHERE owner_user_id=?", (uid,)
+                        "SELECT COUNT(*) FROM food_catalog WHERE owner_user_id=? AND visibility<>'ledger_internal'", (uid,)
                     ).fetchone()[0]
                     catalog = conn.execute(
                         """SELECT food_id,product_name,brand,barcode,source_type,owner_user_id,
                                   package_amount,package_unit,servings_per_package,
                                   per_serving_json,exchange_json,exchange_review_status,
                                   created_at,updated_at
-                           FROM food_catalog WHERE owner_user_id=?
+                           FROM food_catalog WHERE owner_user_id=? AND visibility<>'ledger_internal'
                            ORDER BY updated_at DESC LIMIT ? OFFSET ?""",
                         (uid, page_limit, offset),
                     ).fetchall()
@@ -14154,7 +14200,9 @@ def _handle_message_impl(event):
             # canonical current-day dashboard (including backdated confirmations).
             apply_confirmed_nutrition_to_legacy_dashboard(uid, result)
             line_bot_api.reply_message(
-                event.reply_token, build_post_commit_food_dashboard(uid)
+                event.reply_token, build_post_commit_food_dashboard(
+                    uid, committed_log_id=result.get("log_id")
+                )
             )
         except ValueError as exc:
             if confirmation_committed:

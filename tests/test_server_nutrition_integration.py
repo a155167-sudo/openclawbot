@@ -407,9 +407,9 @@ def test_explicit_text_nutrition_parser_fails_closed_for_ambiguous_or_unsafe_tex
 
 def test_explicit_text_nutrition_parser_accepts_zero_protein_and_full_single_meal_only():
     assert server.parse_explicit_text_nutrition_log(
-        "點心：無糖茶 熱量 5 kcal 蛋白質 0 g"
+        "點心：紅茶 熱量 5 kcal 蛋白質 0 g"
     ) == {
-        "food_name": "無糖茶", "meal_slot": "點心",
+        "food_name": "紅茶", "meal_slot": "點心",
         "calories_kcal": 5.0, "protein_g": 0.0,
     }
     assert server.parse_explicit_text_nutrition_log(
@@ -418,6 +418,148 @@ def test_explicit_text_nutrition_parser_accepts_zero_protein_and_full_single_mea
         "food_name": "雞胸便當", "meal_slot": "午餐",
         "calories_kcal": 520.0, "protein_g": 38.0,
     }
+
+
+@pytest.mark.parametrize("text", [
+    "想知道鮪魚蛋吐司 熱量350 蛋白質17",
+    "鮪魚蛋吐司 每一百公克 熱量350 蛋白質17",
+    "我不 要記錄鮪魚蛋吐司 熱量350 蛋白質17",
+    "鮪魚蛋吐司 蛋白質17 熱量350 蛋白質17",
+    "鮪魚蛋吐司 豆漿 熱量350 蛋白質17",
+    "鮪魚蛋吐司 熱量是多少 熱量350 蛋白質17",
+])
+def test_explicit_text_review_counterexamples_do_not_write_via_real_handler(
+    tmp_path, monkeypatch, text,
+):
+    db = tmp_path / "explicit-text-review-counterexamples.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    monkeypatch.setattr(
+        server, "get_ai_response_with_memory",
+        lambda *_args, **_kwargs: ("這段文字不夠明確，請確認後再記錄。", None),
+    )
+
+    event = _text_event("REVIEW-NOWRITE", text, user_id="U-REVIEW-NOWRITE")
+    server.processed_messages.discard(event.message.id)
+    server._handle_message_impl(event)
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM food_logs WHERE user_id='U-REVIEW-NOWRITE'"
+        ).fetchone()[0] == 0
+    assert all("已入帳" not in getattr(reply, "text", "") for reply in replies)
+
+
+def test_explicit_text_consumption_does_not_publish_or_overwrite_private_food_card(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "explicit-text-no-auto-card.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U-NO-CARD", product_name="鮪魚蛋吐司", meal_slot="早餐",
+            consumed_at="2026-09-17T07:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 300, "protein_g": 15},
+            source_type="user_private_food", operation_key="saved-private-card",
+        )
+        conn.commit()
+
+    for message_id, calories in (("TEXT-350", 350), ("TEXT-400", 400)):
+        server.log_explicit_text_nutrition_once(
+            user_id="U-NO-CARD", message_id=message_id,
+            request={"food_name": "鮪魚蛋吐司", "meal_slot": "早餐",
+                     "calories_kcal": calories, "protein_g": 17},
+        )
+
+    with sqlite3.connect(db) as conn:
+        private_cards = conn.execute(
+            """SELECT per_serving_json FROM food_catalog
+               WHERE owner_user_id='U-NO-CARD' AND visibility='private'
+                 AND product_name='鮪魚蛋吐司'"""
+        ).fetchall()
+        snapshots = [json.loads(row[0]) for row in conn.execute(
+            """SELECT nutrition_snapshot_json FROM food_logs
+               WHERE user_id='U-NO-CARD' AND operation_key LIKE 'line-text-nutrition:%'
+               ORDER BY operation_key"""
+        )]
+    assert len(private_cards) == 1
+    assert json.loads(private_cards[0][0])["calories_kcal"] == 300
+    assert [item["calories_kcal"] for item in snapshots] == [350, 400]
+
+
+def test_backdated_post_commit_dashboard_acknowledges_trusted_log_without_changing_today_total(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "backdated-post-commit.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "gc", None)
+    fixed_now = server.datetime(2026, 9, 17, 8, 0, tzinfo=server.TW_TZ)
+    monkeypatch.setattr(server, "tw_now", lambda: fixed_now)
+    server.init_db()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,today_extra_cal,today_extra_pro,
+                today_food_items,today_date)
+               VALUES ('U-BACKDATED','測試',2000,100,0,0,'','2026-09-17')"""
+        )
+        result = server.create_daily_food_log(
+            conn, user_id="U-BACKDATED", product_name="補登鮪魚蛋吐司", meal_slot="早餐",
+            consumed_at="2026-09-16T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 350, "protein_g": 17},
+            source_type="user_provided_nutrition", operation_key="backdated-ack",
+            publish_catalog=False,
+        )
+        conn.commit()
+
+    reply = server.build_post_commit_food_dashboard(
+        "U-BACKDATED", committed_log_id=result["log_id"]
+    )
+    rendered = json.dumps(reply.as_json_dict(), ensure_ascii=False)
+    assert "已補登 2026-09-16" in rendered
+    assert "補登鮪魚蛋吐司" in rendered
+    assert "350 kcal" in rendered
+    assert "17 g" in rendered
+    assert "已攝取 0 kcal" in rendered
+
+
+@pytest.mark.parametrize(
+    ("protein", "display", "threshold"),
+    [(79.94, "79.9", False), (79.95, "80", False),
+     (79.96, "80", False), (80.0, "80", True)],
+)
+def test_dashboard_display_rounding_does_not_change_protein_threshold(
+    tmp_path, monkeypatch, protein, display, threshold,
+):
+    db = tmp_path / f"protein-boundary-{protein}.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U-BOUNDARY", product_name="邊界餐", meal_slot="早餐",
+            consumed_at=f"{today}T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 350, "protein_g": protein},
+            source_type="official_menu",
+        )
+        conn.commit()
+    dashboard = server.get_dashboard_data("U-BOUNDARY")
+    assert dashboard["extra_pro"] == pytest.approx(protein)
+    assert dashboard["task_protein_80"] is threshold
+    rendered = json.dumps(server.build_dashboard_flex("U-BOUNDARY").as_json_dict(), ensure_ascii=False)
+    assert f"已攝取 {display} g" in rendered
 
 
 def test_explicit_text_dashboard_render_failure_reports_committed_without_retry_prompt(
@@ -1096,13 +1238,27 @@ def test_recorded_updated_replay_repairs_failed_health_check_projection(
     postback(*replay)
 
     assert len(provider_calls) == 1
-    assert [message.type for message in replies] == ["text", "text"]
-    assert {message.text for message in replies} == {
-        "✅ 紀錄已更新，請開啟飲食紀錄查看最新內容。"
-    }
-    rendered = json.dumps([message.as_json_dict() for message in replies], ensure_ascii=False)
-    for stale_value in ("680", "35", "510", "31"):
-        assert stale_value not in rendered
+    assert [message.type for message in replies] == ["flex", "flex"]
+    assert all(message.alt_text == "今日儀表板" for message in replies)
+    payloads = [message.as_json_dict() for message in replies]
+    rendered = json.dumps(payloads, ensure_ascii=False)
+
+    def visible_texts(node):
+        if isinstance(node, dict):
+            if node.get("type") == "text" and isinstance(node.get("text"), str):
+                yield node["text"]
+            for value in node.values():
+                yield from visible_texts(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from visible_texts(value)
+
+    # Inspect displayed numbers, not CSS colours (e.g. #FF6B35) or IDs.
+    import re as regex
+    for payload in payloads:
+        numeric_tokens = set(regex.findall(r"(?<![\d.])\d+(?:\.\d+)?(?![\d.])", "\n".join(visible_texts(payload))))
+        assert {"590", "38"}.issubset(numeric_tokens)
+        assert not {"680", "35", "510", "31"}.intersection(numeric_tokens)
     assert "mealrev:v1:" not in rendered
     assert "foodlog:v1:" not in rendered
     with sqlite3.connect(db) as conn:
@@ -9409,8 +9565,8 @@ def test_dashboard_large_nutrition_numbers_remain_complete_and_wrapped(tmp_path,
     expected = {
         "已攝取 1234567.5 kcal",
         "目標 2000000 kcal・剩餘 765432.5 kcal",
-        "已攝取 98765.25 g",
-        "目標 100000 g・剩餘 1234.75 g",
+        "已攝取 98765.2 g",
+        "目標 100000 g・剩餘 1234.8 g",
     }
     matching = [node for node in text_nodes if node["text"] in expected]
     assert {node["text"] for node in matching} == expected

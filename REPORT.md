@@ -59,3 +59,10 @@
 
 - 測試全數通過；僅保留既有 LINE SDK deprecated warnings，未在本次窄幅修復中擴大處理。
 - 未部署。
+
+## 獨立審查修復 checkpoint（2026-09-17）
+
+- 起點固定 SHA：`11313f90e95dc7fb9f768fb836fd486c6b1f6534`；worktree 起始乾淨。
+- 已讀獨立審查 `/home/win-xi/text-meal-dashboard-review/REVIEW.md`，本輪只處理 H1–H4 與成功後回儀表板契約，不部署、不碰 runtime DB／Google／LINE。
+- RED 目標：H1 79.94/79.95/79.96/80 精度邊界；H2 六組真 handler 零 ledger write；H3 補登 trusted log acknowledgement；H4 explicit consumption 不發布／覆寫私人 catalog；照片 revision 成功回 dashboard。
+- 狀態：反例測試落檔中，尚未宣告 PASS。

@@ -3624,6 +3624,7 @@ def search_food_page(
              ON l.food_id=f.food_id AND l.user_id=?
             AND l.confirmation_status='confirmed'
            WHERE (f.owner_user_id=? OR f.visibility='public')
+             AND f.visibility<>'ledger_internal'
              AND {category_clause}
            GROUP BY f.food_id
            ORDER BY CASE WHEN COUNT(l.log_id)>0 THEN 0 ELSE 1 END,
