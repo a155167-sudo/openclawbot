@@ -221,7 +221,8 @@ def require_named_environment_resource(resource_name: str, resource) -> None:
 TW_TZ = ZoneInfo("Asia/Taipei")
 
 def tw_today():
-    return datetime.now(TW_TZ).date()
+    # Keep date boundaries on the same injectable Taipei clock as all meal writes.
+    return tw_now().date()
 
 def tw_now():
     return datetime.now(TW_TZ)
@@ -5904,7 +5905,7 @@ def add_frequent_food_to_today(user_id: str, meal_name: str):
 
     # 💡 離開 with 區塊後再呼叫其他函數，避免資料庫鎖定
     upsert_frequent_food(user_id, meal_name, cal, pro)
-    flex = build_meal_log_flex(meal_name, cal, pro, new_extra_cal, tdee or 2000, new_extra_pro, protein_goal or 100)
+    flex = build_post_commit_food_dashboard(user_id)
     return flex, f"已加入常吃：{meal_name}"
 
 
@@ -6070,7 +6071,7 @@ def mark_planned_meal_as_eaten(user_id: str, meal_slot: str):
     except Exception as e:
         return None, f"發生錯誤：{str(e)}"
 
-    flex = build_meal_log_flex(meal_name, cal, pro, new_extra_cal, tdee or 2000, new_extra_pro, protein_goal or 100)
+    flex = build_post_commit_food_dashboard(user_id)
     return flex, f"已幫你確認{meal_slot}：{meal_name}。"
 
 
@@ -6535,8 +6536,10 @@ def get_dashboard_data(user_id: str) -> dict:
 
     # Dashboard only trusts the one canonical projection above; health_profile's
     # cached daily totals are deliberately not added again.
-    extra_cal = round(canonical_ledger_cal, 4)
-    extra_pro = round(canonical_ledger_pro, 4)
+    # The dashboard is a human-readable projection; keep canonical ledger and
+    # health-profile values exact, but present daily totals to one decimal.
+    extra_cal = round(canonical_ledger_cal, 1)
+    extra_pro = round(canonical_ledger_pro, 1)
 
     cal_remaining = max(0, tdee - extra_cal)
     pro_remaining = max(0, protein_goal - extra_pro)
@@ -7342,13 +7345,17 @@ def load_ai_estimate_replay(user_id, operation_key):
     user_id = str(user_id or "").strip()
     if not operation_key or not user_id:
         return None
-    def _flex_from_payload(payload):
-        if not isinstance(payload, dict) or payload.get("type") != "flex":
-            raise ValueError("invalid replay flex")
-        from linebot.models import FlexSendMessage
-        return FlexSendMessage(
-            alt_text=payload["altText"], contents=payload["contents"]
-        )
+    def _message_from_payload(payload):
+        if not isinstance(payload, dict):
+            raise ValueError("invalid replay message")
+        if payload.get("type") == "flex":
+            from linebot.models import FlexSendMessage
+            return FlexSendMessage(
+                alt_text=payload["altText"], contents=payload["contents"]
+            )
+        if payload.get("type") == "text" and isinstance(payload.get("text"), str):
+            return TextSendMessage(text=payload["text"])
+        raise ValueError("invalid replay message")
     with sqlite3.connect(DB_PATH) as conn:
         ensure_daily_food_ledger_schema(conn)
         row = conn.execute(
@@ -7360,7 +7367,7 @@ def load_ai_estimate_replay(user_id, operation_key):
             try:
                 state = json.loads(row[0] or "{}")
                 payload = state["flex"]
-                return _flex_from_payload(payload)
+                return _message_from_payload(payload)
             except (KeyError, TypeError, ValueError, AttributeError, json.JSONDecodeError):
                 pass
         snapshot = conn.execute(
@@ -7371,7 +7378,7 @@ def load_ai_estimate_replay(user_id, operation_key):
         if snapshot:
             try:
                 payload = json.loads(snapshot[1] or "{}")
-                replay = _flex_from_payload(payload)
+                replay = _message_from_payload(payload)
                 state_json = json.dumps(
                     {"kind": "ai_estimate_log", "flex": payload},
                     ensure_ascii=False, separators=(",", ":"),
@@ -7400,16 +7407,7 @@ def load_ai_estimate_replay(user_id, operation_key):
         ).fetchone()
         if not log_row:
             return None
-        nutrition = json.loads(log_row[2] or "{}")
-        hp = conn.execute(
-            """SELECT today_extra_cal,tdee,today_extra_pro,protein
-               FROM health_profile WHERE user_id=?""", (user_id,)
-        ).fetchone() or (0, 2000, 0, 100)
-        replay = build_meal_log_flex(
-            log_row[3], nutrition.get("calories_kcal"), nutrition.get("protein_g"),
-            hp[0] or 0, hp[1] or 2000, hp[2] or 0, hp[3] or 100,
-            log_id=log_row[0], version=int(log_row[1] or 1),
-        )
+        replay = build_post_commit_food_dashboard(user_id)
         replay_state = json.dumps(
             {"kind": "ai_estimate_log", "flex": json.loads(replay.as_json_string())},
             ensure_ascii=False, separators=(",", ":"),
@@ -7719,39 +7717,10 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
                     print(f'⚠️ 最近一筆記錄保存失敗: {_se}')
                     raise
 
-                # Task 2: 組記錄成功回饋卡
-                try:
-                    version_row = c.execute(
-                        "SELECT version FROM food_logs WHERE log_id=? AND user_id=?",
-                        (daily_log["log_id"], user_id),
-                    ).fetchone()
-                    log_version = int(version_row[0] or 1) if version_row else 1
-                    meal_log_flex = build_meal_log_flex(
-                        logged_name, logged_cal, logged_pro,
-                        new_extra_cal, tdee_val, new_extra_pro, protein_val,
-                        log_id=daily_log["log_id"], version=log_version,
-                    )
-                except Exception as _fe:
-                    print(f'⚠️ 回饋卡組建失敗: {_fe}')
-                    from linebot.models import FlexSendMessage
-                    meal_log_flex = FlexSendMessage(
-                        alt_text=f"✅ 已記錄：{logged_name}",
-                        contents={
-                            "type": "bubble", "size": "kilo",
-                            "body": {"type": "box", "layout": "vertical", "contents": [
-                                {"type": "text", "text": "✅ 記錄成功", "weight": "bold", "size": "xl"},
-                                {"type": "text", "text": logged_name, "wrap": True, "margin": "md"},
-                                {"type": "text", "text": f"熱量 {logged_cal if logged_cal is not None else '未知'} kcal／蛋白質 {logged_pro if logged_pro is not None else '未知'} g", "wrap": True, "size": "sm", "margin": "sm"},
-                            ]},
-                            "footer": {"type": "box", "layout": "vertical", "contents": [
-                                {"type": "button", "style": "primary", "action": {
-                                    "type": "postback", "label": "修正內容",
-                                    "data": f"foodlog:v1:{daily_log['log_id']}:{int(daily_log.get('version') or 1)}:more",
-                                    "displayText": "修正這筆飲食紀錄",
-                                }}
-                            ]},
-                        },
-                    )
+                # Commit the canonical log and its legacy edit pointer before rendering.
+                # Dashboard rendering is post-commit and cannot roll back or misreport the meal.
+                conn.commit()
+                meal_log_flex = build_post_commit_food_dashboard(user_id)
 
                 if meal_log_flex is not None and operation_key:
                     flex_payload = json.loads(meal_log_flex.as_json_string())
@@ -10030,6 +9999,106 @@ def current_meal_slot(now=None):
     return "點心"
 
 
+def parse_explicit_text_nutrition_log(text):
+    """Fail closed unless text is one unambiguous, user-supplied meal total."""
+    import unicodedata
+
+    raw = str(text or "")
+    if any(unicodedata.category(char).startswith("C") for char in raw):
+        return None
+    message = " ".join(raw.strip().split())
+    if not message or re.search(r"[?？]", message):
+        return None
+    # Deliberately not a general natural-language parser. Ambiguous text remains
+    # on the existing intent/AI paths instead of creating a new ledger row.
+    if re.search(
+        r"修改|修正|改成|取消|刪除|如果|假設|大概|約|可能|應該|"
+        r"不要|沒有|沒吃|未吃|不是|請問|問題|嗎(?:[。.!！]?$)|"
+        r"每\s*(?:100|份|包|克|g|毫升|ml)",
+        message, re.IGNORECASE,
+    ):
+        return None
+    slot = ""
+    slot_match = re.match(r"^(早餐|午餐|晚餐|點心)[：:\s]+(.+)$", message)
+    if slot_match:
+        slot, message = slot_match.groups()
+    match = re.fullmatch(
+        r"(?P<name>.+?)\s+"
+        r"熱量\s*(?:為|是|[：:])?\s*(?P<cal>\d{1,7}(?:\.\d{1,3})?)"
+        r"\s*(?:kcal|大卡|卡)?(?:\s*[,，、/|｜]\s*|\s+)"
+        r"(?:蛋白質?|蛋白)\s*(?:為|是|[：:])?\s*"
+        r"(?P<pro>\d{1,7}(?:\.\d{1,3})?)\s*(?:g|克|公克)?\s*[。.!！]?",
+        message, re.IGNORECASE,
+    )
+    if not match:
+        return None
+    food_name = match.group("name").strip(" ：:。.!！-")
+    if (
+        not food_name or len(food_name) > 80
+        or re.search(r"(?:、|，|,|/|＋|\+|和|與|及)", food_name)
+    ):
+        return None
+    calories_value = _ledger_number(match.group("cal"), allow_none=False)
+    protein_value = _ledger_number(match.group("pro"), allow_none=False)
+    assert calories_value is not None and protein_value is not None
+    calories = float(calories_value)
+    protein_g = float(protein_value)
+    if not (0 < calories <= 10000) or not (0 <= protein_g <= 1000):
+        return None
+    return {
+        "food_name": food_name,
+        "meal_slot": slot,
+        "calories_kcal": calories,
+        "protein_g": protein_g,
+    }
+
+
+def build_post_commit_food_dashboard(user_id):
+    """Render canonical post-commit UI without implying a committed log failed."""
+    try:
+        dashboard = build_dashboard_flex(user_id)
+        if dashboard is not None:
+            return dashboard
+    except Exception as exc:
+        print(
+            "⚠️ 飲食已入帳，但儀表板建立失敗："
+            f"{type(exc).__name__}: {exc}"
+        )
+    return TextSendMessage(
+        text=(
+            "✅ 飲食已入帳，但儀表板暫時無法顯示。"
+            "請勿重複記錄；可稍後輸入「飲食儀表板」查看。"
+        )
+    )
+
+
+def log_explicit_text_nutrition_once(*, user_id, message_id, request):
+    """Commit one user-supplied meal idempotently, then render canonical dashboard."""
+    operation_key = f"line-text-nutrition:{user_id}:{message_id}"[:180]
+    with sqlite3.connect(DB_PATH) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        result = create_daily_food_log(
+            conn,
+            user_id=user_id,
+            product_name=request["food_name"],
+            meal_slot=request["meal_slot"] or current_meal_slot(),
+            consumed_at=tw_now().isoformat(timespec="seconds"),
+            servings=1,
+            nutrition={
+                "calories_kcal": request["calories_kcal"],
+                "protein_g": request["protein_g"],
+            },
+            source_type="user_provided_nutrition",
+            operation_key=operation_key,
+        )
+        _sync_health_profile_from_ledger_conn(
+            conn, user_id, str(result["consumed_at"])[:10]
+        )
+        conn.commit()
+    return build_post_commit_food_dashboard(user_id)
+
+
 def parse_natural_food_log_intent(text):
     """Parse an explicit single-food logging request without asking an LLM."""
     message = " ".join(str(text or "").strip().split())
@@ -12016,13 +12085,7 @@ def _quick_log_catalog_card_once(
             )
         _refresh_health_check_after_food_log(conn, user_id=user_id)
         conn.commit()
-    return build_meal_log_flex(
-        card_state["logged_name"], card_state.get("logged_cal"),
-        card_state.get("logged_pro"), card_state["daily_cal"],
-        card_state["tdee"], card_state["daily_pro"],
-        card_state["protein_goal"], log_id=card_state["log_id"],
-        version=card_state["version"],
-    )
+    return build_post_commit_food_dashboard(user_id)
 
 
 def _natural_unit_label(unit):
@@ -13188,18 +13251,7 @@ def handle_meal_photo_postback(event):
                     text="✅ 紀錄已更新，請開啟飲食紀錄查看最新內容。"
                 )
             else:
-                from linebot.models import FlexSendMessage
-                reply = FlexSendMessage(
-                    alt_text="✅ 已記錄｜顧客確認・AI估算",
-                    contents=build_meal_photo_recorded_bubble(
-                        draft,
-                        allow_confirmed_revision=(
-                            CONFIRMED_MEAL_PHOTO_REVISION_WRITER_ENABLED
-                            and draft.get("workflow_version") == "user_confirmed_ai_nutrition_v2"
-                        ),
-                        log_id=result["log_id"], log_version=log_version,
-                    ),
-                )
+                reply = build_post_commit_food_dashboard(uid)
         elif kind == "cancel":
             image_ref = str(result.get("source_image_ref") or "")
             if image_ref and _delete_nutrition_image(image_ref):
@@ -13443,9 +13495,7 @@ def _build_breakfast_combo_reply_once(
             ],
         },
     }
-    return FlexSendMessage(
-        alt_text=f"已記錄 {combo_name} {cal_text}kcal", contents=bubble
-    )
+    return build_post_commit_food_dashboard(user_id)
 
 
 def _handle_message_impl(event):
@@ -13821,6 +13871,18 @@ def _handle_message_impl(event):
             raise
         return
 
+    explicit_nutrition = parse_explicit_text_nutrition_log(msg)
+    if explicit_nutrition:
+        try:
+            reply = log_explicit_text_nutrition_once(
+                user_id=uid, message_id=msg_id, request=explicit_nutrition
+            )
+            line_bot_api.reply_message(event.reply_token, reply)
+        except Exception:
+            processed_messages.discard(msg_id)
+            raise
+        return
+
     natural_log = parse_natural_food_log_intent(msg)
     if natural_log:
         try:
@@ -14088,23 +14150,12 @@ def _handle_message_impl(event):
                 clear_nutrition_input_state(conn, user_id=uid)
                 _refresh_health_check_after_food_log(conn, user_id=uid)
             sync_confirmed_nutrition_to_sheet(result)
-            dashboard_flex = apply_confirmed_nutrition_to_legacy_dashboard(uid, result)
-            if dashboard_flex:
-                line_bot_api.reply_message(event.reply_token, dashboard_flex)
-            else:
-                n = result["log"]["nutrition"]
-                exchange_text = format_exchange_summary(result["log"].get("exchange") or {})
-                exchange_status = result["log"].get("exchange_review_status", "pending_review")
-                exchange_note = (
-                    f"正式營養份數：{exchange_text}\n油脂份不計；已納入個人計畫。"
-                    if exchange_status == "approved"
-                    else f"推算營養份數：{exchange_text}\n油脂份不計；建議值待營養師審核，尚未扣入個人計畫。"
-                )
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                    text=(f"✅ 已記錄並加入你的私人食品庫：{result['food']['product_name']}\n"
-                          f"熱量 {n.get('calories_kcal', 0):g} kcal｜蛋白質 {n.get('protein_g', 0):g}g\n"
-                          f"{exchange_note}")
-                ))
+            # Keep private-food/catalog synchronization, then always render the
+            # canonical current-day dashboard (including backdated confirmations).
+            apply_confirmed_nutrition_to_legacy_dashboard(uid, result)
+            line_bot_api.reply_message(
+                event.reply_token, build_post_commit_food_dashboard(uid)
+            )
         except ValueError as exc:
             if confirmation_committed:
                 processed_messages.discard(str(msg_id))

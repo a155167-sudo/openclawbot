@@ -233,7 +233,7 @@ def test_natural_food_log_transient_failure_releases_in_process_dedupe(monkeypat
     assert event.message.id not in server.processed_messages
 
 
-def test_ai_estimate_log_preserves_meal_and_builds_versioned_edit_card(
+def test_ai_estimate_log_preserves_meal_and_returns_replayable_dashboard(
     tmp_path, monkeypatch,
 ):
     db = tmp_path / "ai-estimate-log.db"
@@ -279,8 +279,10 @@ def test_ai_estimate_log_preserves_meal_and_builds_versioned_edit_card(
     assert food_log_count == 1
     assert frequent_count == 1
     assert replay_card.as_json_string() == card.as_json_string()
-    rendered = card.as_json_string()
-    assert f"foodlog:v1:{row[0]}:{row[1]}:more" in rendered
+    rendered = json.dumps(json.loads(card.as_json_string()), ensure_ascii=False)
+    assert "今日飲食儀表板" in rendered
+    assert "火星果汁 300ml" in rendered
+    assert "我要修改飲食紀錄" in rendered
     with sqlite3.connect(db) as conn:
         conn.execute(
             "UPDATE health_profile SET today_extra_cal=999 WHERE user_id='U-AI-ESTIMATE'"
@@ -299,7 +301,7 @@ def test_ai_estimate_log_preserves_meal_and_builds_versioned_edit_card(
     assert repaired_state["flex"]["type"] == "flex"
 
     monkeypatch.setattr(
-        server, "build_meal_log_flex",
+        server, "build_dashboard_flex",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("builder failed")),
     )
     _, fallback_card = server.get_ai_response_with_memory(
@@ -340,6 +342,135 @@ def test_ai_estimate_log_preserves_meal_and_builds_versioned_edit_card(
     assert rolled_back == (0, 0, 0)
 
 
+def test_explicit_text_nutrition_logs_once_and_returns_canonical_dashboard(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "explicit-text-dashboard.db"
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    fixed_now = server.datetime(2026, 9, 17, 8, 15, tzinfo=server.TW_TZ)
+    monkeypatch.setattr(server, "tw_now", lambda: fixed_now)
+    server.init_db()
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    event = _text_event(
+        "TEXT-350-17", "鮪魚蛋吐司 熱量350 蛋白質17", user_id="U-TEXT"
+    )
+
+    server._handle_message_impl(event)
+    server.processed_messages.discard(event.message.id)
+    server._handle_message_impl(event)
+
+    assert len(replies) == 2
+    first = json.loads(replies[0].as_json_string())
+    second = json.loads(replies[1].as_json_string())
+    assert first == second
+    rendered = json.dumps(first, ensure_ascii=False)
+    assert "今日飲食儀表板" in rendered
+    assert "鮪魚蛋吐司" in rendered
+    assert "已攝取 350 kcal" in rendered
+    assert "已攝取 17 g" in rendered
+    assert "記錄成功" not in rendered
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            """SELECT fc.product_name,fl.meal_slot,fl.nutrition_snapshot_json,
+                      fl.operation_key,fc.source_type
+               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
+               WHERE fl.user_id='U-TEXT'"""
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0:2] == ("鮪魚蛋吐司", "早餐")
+    assert json.loads(rows[0][2]) == {"calories_kcal": 350.0, "protein_g": 17.0}
+    assert rows[0][3] == "line-text-nutrition:U-TEXT:TEXT-350-17"
+    assert rows[0][4] == "user_provided_nutrition"
+
+
+@pytest.mark.parametrize("text", [
+    "幫我修改鮪魚蛋吐司 熱量350 蛋白質17",
+    "如果鮪魚蛋吐司 熱量350 蛋白質17",
+    "鮪魚蛋吐司大概 熱量350 蛋白質17",
+    "鮪魚蛋吐司 每100g熱量350 蛋白質17",
+    "鮪魚蛋吐司和豆漿 熱量350 蛋白質17",
+    "鮪魚蛋吐司、豆漿 熱量350 蛋白質17",
+    "我沒吃鮪魚蛋吐司 熱量350 蛋白質17",
+    "鮪魚蛋吐司 熱量350 蛋白質17 嗎",
+    "鮪魚蛋吐司 熱量350 蛋白質17\u0000",
+    "鮪魚蛋吐司 熱量999999999999 蛋白質17",
+    "鮪魚蛋吐司 熱量350 蛋白質999999999999",
+])
+def test_explicit_text_nutrition_parser_fails_closed_for_ambiguous_or_unsafe_text(text):
+    assert server.parse_explicit_text_nutrition_log(text) is None
+
+
+def test_explicit_text_nutrition_parser_accepts_zero_protein_and_full_single_meal_only():
+    assert server.parse_explicit_text_nutrition_log(
+        "點心：無糖茶 熱量 5 kcal 蛋白質 0 g"
+    ) == {
+        "food_name": "無糖茶", "meal_slot": "點心",
+        "calories_kcal": 5.0, "protein_g": 0.0,
+    }
+    assert server.parse_explicit_text_nutrition_log(
+        "午餐：雞胸便當 熱量 520 大卡，蛋白質 38 克"
+    ) == {
+        "food_name": "雞胸便當", "meal_slot": "午餐",
+        "calories_kcal": 520.0, "protein_g": 38.0,
+    }
+
+
+def test_explicit_text_dashboard_render_failure_reports_committed_without_retry_prompt(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "explicit-text-render-failure.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    monkeypatch.setattr(
+        server, "build_dashboard_flex",
+        lambda _uid: (_ for _ in ()).throw(RuntimeError("render failed")),
+    )
+
+    reply = server.log_explicit_text_nutrition_once(
+        user_id="U-TEXT", message_id="TEXT-RENDER-FAIL",
+        request={
+            "food_name": "無糖茶", "meal_slot": "點心",
+            "calories_kcal": 5.0, "protein_g": 0.0,
+        },
+    )
+
+    assert "已入帳" in reply.text
+    assert "儀表板暫時無法顯示" in reply.text
+    assert "重新記錄" not in reply.text
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
+
+
+def test_explicit_text_nutrition_failure_never_returns_dashboard(tmp_path, monkeypatch):
+    db = tmp_path / "explicit-text-failure.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    replies = []
+    monkeypatch.setattr(
+        server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
+    )
+    monkeypatch.setattr(
+        server, "create_daily_food_log",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("forced")),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="forced"):
+        server._handle_message_impl(
+            _text_event("TEXT-FAIL", "鮪魚蛋吐司 熱量350 蛋白質17", user_id="U-TEXT")
+        )
+
+    assert replies == []
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+
+
 def test_ai_estimate_button_records_midpoint_when_model_returns_only_ranges(
     tmp_path, monkeypatch,
 ):
@@ -371,7 +502,10 @@ def test_ai_estimate_button_records_midpoint_when_model_returns_only_ranges(
     )
 
     assert card is not None
-    assert "✅ 已記錄" in card.alt_text
+    assert card.alt_text == "今日儀表板"
+    assert "今日飲食儀表板" in json.dumps(
+        json.loads(card.as_json_string()), ensure_ascii=False
+    )
     with sqlite3.connect(db) as conn:
         row = conn.execute(
             """SELECT fc.product_name,fl.meal_slot,fl.nutrition_snapshot_json
@@ -650,18 +784,20 @@ def test_natural_food_unit_mismatch_offers_executable_ai_estimate(tmp_path, monk
 
 def _daily_ledger_db(tmp_path, monkeypatch, name="daily-ledger.db"):
     db = tmp_path / name
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
         server.ensure_daily_food_ledger_schema(conn)
-        conn.execute("""CREATE TABLE health_profile (
-            user_id TEXT PRIMARY KEY, today_extra_cal REAL, today_extra_pro REAL,
-            today_food_items TEXT, today_date TEXT, tdee REAL, protein REAL)""")
         conn.execute(
-            "INSERT INTO health_profile VALUES ('U1',0,0,'',?,2000,100)",
+            """INSERT OR REPLACE INTO health_profile
+               (user_id,name,today_extra_cal,today_extra_pro,today_food_items,
+                today_date,tdee,protein,sheet_name)
+               VALUES ('U1','',0,0,'',?,2000,100,'')""",
             (server.tw_today().isoformat(),),
         )
         conn.commit()
-    monkeypatch.setattr(server, "DB_PATH", str(db))
     return db
 
 
@@ -763,10 +899,10 @@ def test_meal_photo_postback_selects_slot_before_confirm_and_refreshes_health_ch
     assert draft["status"] == "user_confirmed"
     assert rows == [(draft["confirmed_log_id"], "晚餐")]
     assert source_rows == [(draft["confirmed_log_id"],)]
-    assert replies[-1].alt_text == "✅ 已記錄｜顧客確認・AI估算"
-    recorded = json.dumps(json.loads(replies[-1].contents.as_json_string()), ensure_ascii=False)
-    assert "餐別：晚餐" in recorded
-    assert "確認前可更改" not in recorded
+    assert replies[-1].alt_text == "今日儀表板"
+    assert "今日飲食儀表板" in json.dumps(
+        json.loads(replies[-1].as_json_string()), ensure_ascii=False
+    )
 
 
 def test_delayed_meal_slot_postback_after_adjust_and_confirm_replays_recorded_state(
@@ -816,17 +952,13 @@ def test_delayed_meal_slot_postback_after_adjust_and_confirm_replays_recorded_st
     postback(f"mp:v1:{token}:4:confirm_estimate", "DELAYED-CONFIRM")
 
     assert len(provider_calls) == 1
-    assert all(
-        message.alt_text == "✅ 已記錄｜顧客確認・AI估算"
-        for message in replies[-3:]
-    )
+    assert all(message.alt_text == "今日儀表板" for message in replies[-3:])
     rendered_cards = [message.as_json_dict() for message in replies[-3:]]
     assert rendered_cards[0] == rendered_cards[1] == rendered_cards[2]
     for card in rendered_cards:
         rendered = json.dumps(card, ensure_ascii=False)
-        assert "餐別：晚餐" in rendered
-        assert "確認前可更改" not in rendered
-        assert "mealrev:v1:" in rendered
+        assert "今日飲食儀表板" in rendered
+        assert "我要修改飲食紀錄" in rendered
     with sqlite3.connect(db) as conn:
         draft = get_meal_photo_draft(conn, user_id="U1", token=token)
         logs = conn.execute(
@@ -1777,11 +1909,11 @@ def test_legacy_recent_adjustments_update_the_linked_ledger_log(tmp_path, monkey
     db = _daily_ledger_db(tmp_path, monkeypatch, "daily-legacy-edit.db")
     today = server.tw_today().isoformat()
     with sqlite3.connect(db) as conn:
-        conn.execute("""CREATE TABLE recent_meal_logs (
+        conn.execute("""CREATE TABLE IF NOT EXISTS recent_meal_logs (
             user_id TEXT PRIMARY KEY,meal_name TEXT,base_cal REAL,base_pro REAL,
             current_cal REAL,current_pro REAL,meal_date TEXT,source_text TEXT,
             updated_at TEXT,food_log_id TEXT DEFAULT '')""")
-        conn.execute("""CREATE TABLE frequent_foods (
+        conn.execute("""CREATE TABLE IF NOT EXISTS frequent_foods (
             user_id TEXT,meal_name TEXT,last_cal REAL,last_pro REAL,use_count INTEGER DEFAULT 1,
             last_used TEXT,PRIMARY KEY(user_id,meal_name))""")
         log = server.create_daily_food_log(
@@ -4988,15 +5120,22 @@ def test_committed_text_edit_reply_failure_is_retriable(tmp_path, monkeypatch):
 
 def test_committed_confirmation_reply_failure_is_retriable(tmp_path, monkeypatch):
     db = tmp_path / "confirm-reply-failure.db"
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,sheet_name)
+               VALUES ('U_CONFIRM_REPLY','',2000,100,'')"""
+        )
         token = save_pending_label(conn, user_id="U_CONFIRM_REPLY", payload=valid_label())
     event = _text_event(
         "confirm-reply-failure",
         f"確認營養紀錄:{token}",
         user_id="U_CONFIRM_REPLY",
     )
-    monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "get_active_nutrition_target", lambda *_: None)
     monkeypatch.setattr(server, "sync_confirmed_nutrition_to_sheet", lambda *_: None)
     monkeypatch.setattr(server, "apply_confirmed_nutrition_to_legacy_dashboard", lambda *_: None)
@@ -5025,11 +5164,10 @@ def test_committed_confirmation_reply_failure_is_retriable(tmp_path, monkeypatch
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
     assert len(replies) == 1
-    reply_text = replies[0].text
-    assert "推算營養份數" in reply_text
-    assert "低脂蛋白 2.71份" in reply_text
-    assert "主食 0.53份" in reply_text
-    assert "尚未扣入個人計畫" in reply_text
+    assert replies[0].alt_text == "今日儀表板"
+    assert "今日飲食儀表板" in json.dumps(
+        json.loads(replies[0].as_json_string()), ensure_ascii=False
+    )
     assert refresh_users == ["U_CONFIRM_REPLY", "U_CONFIRM_REPLY"]
 
 
@@ -6847,6 +6985,15 @@ def test_bound_admin_authorization_fails_closed_on_database_error(tmp_path, monk
 def test_customer_meal_photo_confirm_postback_records_without_review_push(tmp_path, monkeypatch):
     db = tmp_path / "meal-photo-customer-confirm.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,sheet_name)
+               VALUES ('U_CUSTOMER','',2000,100,'')"""
+        )
+        conn.commit()
     refresh_users, replies = [], []
     monkeypatch.setattr(server, "_prepare_health_check_refresh_connection", lambda _conn: True)
     monkeypatch.setattr(
@@ -6882,7 +7029,10 @@ def test_customer_meal_photo_confirm_postback_records_without_review_push(tmp_pa
         webhook_event_id="CUSTOMER-CONFIRM-EVENT", timestamp=1784740620000,
     )
     server.handle_meal_photo_postback(event)
-    assert replies[-1].alt_text == "✅ 已記錄｜顧客確認・AI估算"
+    assert replies[-1].alt_text == "今日儀表板"
+    assert "今日飲食儀表板" in json.dumps(
+        json.loads(replies[-1].as_json_string()), ensure_ascii=False
+    )
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM food_exchange_approvals").fetchone()[0] == 0
@@ -7930,18 +8080,20 @@ def test_natural_food_log_ambiguous_choice_preserves_amount_and_logs_selected_fo
 ):
     db = tmp_path / "natural-food-ambiguous.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
     fixed_now = server.datetime(2026, 8, 10, 18, 45, tzinfo=server.TW_TZ)
     monkeypatch.setattr(server, "tw_now", lambda: fixed_now)
     now = utcish_now()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
         server.ensure_daily_food_ledger_schema(conn)
-        conn.execute("""CREATE TABLE health_profile (
-            user_id TEXT PRIMARY KEY,today_extra_cal REAL DEFAULT 0,
-            today_extra_pro REAL DEFAULT 0,today_food_items TEXT DEFAULT '',
-            today_date TEXT DEFAULT '',tdee REAL DEFAULT 2000,protein REAL DEFAULT 100
-        )""")
-        conn.execute("INSERT INTO health_profile VALUES ('U1',0,0,'','',2000,100)")
+        conn.execute(
+            """INSERT OR REPLACE INTO health_profile
+               (user_id,name,today_extra_cal,today_extra_pro,today_food_items,
+                today_date,tdee,protein,sheet_name)
+               VALUES ('U1','',0,0,'','',2000,100,'')"""
+        )
         for food_id, name, calories in (
             ("food_soy_a", "光泉無糖豆漿", 190.2),
             ("food_soy_b", "義美無糖豆漿", 180.0),
@@ -7996,7 +8148,8 @@ def test_natural_food_log_ambiguous_choice_preserves_amount_and_logs_selected_fo
     )
     server.handle_meal_photo_postback(selected)
     success = json.dumps(json.loads(replies[-1].as_json_string()), ensure_ascii=False)
-    assert "光泉無糖豆漿 400ml（晚餐）" in success
+    assert "今日飲食儀表板" in success
+    assert "光泉無糖豆漿" in success
     with sqlite3.connect(db) as conn:
         row = conn.execute(
             "SELECT food_id,consumed_amount,consumed_unit FROM food_logs WHERE user_id='U1'"
@@ -8009,18 +8162,20 @@ def test_natural_food_log_uses_private_exact_match_scales_ml_and_replays_once(
 ):
     db = tmp_path / "natural-food-log.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
     fixed_now = server.datetime(2026, 8, 10, 18, 30, tzinfo=server.TW_TZ)
     monkeypatch.setattr(server, "tw_now", lambda: fixed_now)
     now = utcish_now()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
         server.ensure_daily_food_ledger_schema(conn)
-        conn.execute("""CREATE TABLE health_profile (
-            user_id TEXT PRIMARY KEY,today_extra_cal REAL DEFAULT 0,
-            today_extra_pro REAL DEFAULT 0,today_food_items TEXT DEFAULT '',
-            today_date TEXT DEFAULT '',tdee REAL DEFAULT 2000,protein REAL DEFAULT 100
-        )""")
-        conn.execute("INSERT INTO health_profile VALUES ('U1',0,0,'','',2000,100)")
+        conn.execute(
+            """INSERT OR REPLACE INTO health_profile
+               (user_id,name,today_extra_cal,today_extra_pro,today_food_items,
+                today_date,tdee,protein,sheet_name)
+               VALUES ('U1','',0,0,'','',2000,100,'')"""
+        )
         foods = (
             ("food_private_soy", "U1", "private", 375, 190.2, 9.1, "private-soy"),
             ("food_public_soy", "system", "public", 400, 100, 1, "public-soy"),
@@ -8079,8 +8234,8 @@ def test_natural_food_log_uses_private_exact_match_scales_ml_and_replays_once(
 
     assert replies[-1].type == "flex"
     card_text = json.dumps(json.loads(replies[-1].as_json_string()), ensure_ascii=False)
-    assert "✅ 記錄成功" in card_text
-    assert "無糖豆漿 400ml（晚餐）" in card_text
+    assert "今日飲食儀表板" in card_text
+    assert "無糖豆漿" in card_text
     assert "202.9 kcal" in card_text
     assert "9.7 g" in card_text
     server.processed_messages.discard(event.message.id)
@@ -8118,6 +8273,7 @@ def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
     fixed_now = server.datetime(2026, 8, 10, 0, 5, tzinfo=server.TW_TZ)
     monkeypatch.setattr(server, "tw_now", lambda: fixed_now)
     now = utcish_now()
+    server.init_db()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
         fid = new_id("food")
@@ -8134,13 +8290,11 @@ def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
             (fid, now, now),
         )
         conn.execute(
-            """CREATE TABLE health_profile (
-                 user_id TEXT PRIMARY KEY,today_extra_cal REAL DEFAULT 0,
-                 today_extra_pro REAL DEFAULT 0,today_food_items TEXT DEFAULT '',
-                 today_date TEXT DEFAULT '',tdee REAL DEFAULT 2000,protein REAL DEFAULT 100
-               )"""
+            """INSERT OR REPLACE INTO health_profile
+               (user_id,name,today_extra_cal,today_extra_pro,today_food_items,
+                today_date,tdee,protein,sheet_name)
+               VALUES ('U1','',0,0,'','',2000,100,'')"""
         )
-        conn.execute("INSERT INTO health_profile VALUES ('U1',0,0,'','',2000,100)")
     replies = []
     monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, m: replies.append(m))
 
@@ -8184,14 +8338,11 @@ def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
     assert replies[-1].type == "flex"
     payload = json.loads(replies[-1].as_json_string())
     card_text = json.dumps(payload, ensure_ascii=False)
-    assert "✅ 記錄成功" in card_text
-    assert "舒肥雞胸 1.5份（午餐）" in card_text
-    assert "180.0 kcal" in card_text
-    assert "37.5 g" in card_text
-    assert "今日熱量累積" in card_text and "/ 2000" in card_text
-    assert "今日蛋白累積" in card_text and "/ 100" in card_text
-    assert "再記一餐" in card_text and "看今日進度" in card_text
-    assert "foodlog:v1:" in card_text and ":more" in card_text
+    assert "今日飲食儀表板" in card_text
+    assert "舒肥雞胸" in card_text
+    assert "已攝取 180 kcal" in card_text
+    assert "已攝取 37.5 g" in card_text
+    assert "記錄成功" not in card_text
     server.handle_meal_photo_postback(meal_event)
     assert replies[-1].type == "flex"
     replay_text = json.dumps(json.loads(replies[-1].as_json_string()), ensure_ascii=False)
@@ -8384,6 +8535,15 @@ def test_search_no_results_shows_guidance(tmp_path, monkeypatch):
 def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
     db = tmp_path / "combo.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,sheet_name)
+               VALUES ('U1','',2000,100,'')"""
+        )
+        conn.commit()
     refresh_users = []
     monkeypatch.setattr(
         server,
@@ -8421,7 +8581,7 @@ def test_breakfast_combo_logs_multiple_foods_at_once(tmp_path, monkeypatch):
     assert reply.type == "flex"
     raw = json.loads(reply.as_json_string())
     bubble_text = json.dumps(raw, ensure_ascii=False)
-    assert "已記錄" in bubble_text
+    assert "今日飲食儀表板" in bubble_text
     assert "穀麥高粱" in bubble_text
     assert "無糖優格" in bubble_text
 
@@ -9815,6 +9975,8 @@ def test_meal_photo_estimate_cards_disclose_low_fat_milk_assumption():
 def test_dashboard_frequent_breakfast_combo_logs_three_foods(tmp_path, monkeypatch):
     db = tmp_path / "combo-from-dashboard.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
     now = utcish_now()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
@@ -9843,6 +10005,10 @@ def test_dashboard_frequent_breakfast_combo_logs_three_foods(tmp_path, monkeypat
 
     assert len(replies) == 1
     assert replies[0].type == "flex"
+    assert replies[0].alt_text == "今日儀表板"
+    assert "今日飲食儀表板" in json.dumps(
+        json.loads(replies[0].as_json_string()), ensure_ascii=False
+    )
     with sqlite3.connect(db) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM food_logs WHERE user_id='U1' AND meal_slot='早餐'"
@@ -9924,6 +10090,15 @@ def test_breakfast_combo_missing_item_rolls_back_whole_combo(tmp_path, monkeypat
 def test_breakfast_combo2_logs_different_portions(tmp_path, monkeypatch):
     db = tmp_path / "combo2.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
+    monkeypatch.setattr(server, "gc", None)
+    server.init_db()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """INSERT INTO health_profile
+               (user_id,name,tdee,protein,sheet_name)
+               VALUES ('U1','',2000,100,'')"""
+        )
+        conn.commit()
     now = utcish_now()
     with sqlite3.connect(db) as conn:
         ensure_nutrition_schema(conn)
@@ -9955,7 +10130,7 @@ def test_breakfast_combo2_logs_different_portions(tmp_path, monkeypatch):
     assert reply.type == "flex"
     raw = json.loads(reply.as_json_string())
     bubble_text = json.dumps(raw, ensure_ascii=False)
-    assert "已記錄" in bubble_text
+    assert "今日飲食儀表板" in bubble_text
     assert "679" in bubble_text or "678" in bubble_text or "677" in bubble_text
 
     with sqlite3.connect(db) as conn:
