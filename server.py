@@ -14201,7 +14201,7 @@ def _handle_message_impl(event):
             apply_confirmed_nutrition_to_legacy_dashboard(uid, result)
             line_bot_api.reply_message(
                 event.reply_token, build_post_commit_food_dashboard(
-                    uid, committed_log_id=result.get("log_id")
+                    uid, committed_log_id=result["log"]["log_id"]
                 )
             )
         except ValueError as exc:
