@@ -86,9 +86,11 @@ def test_startup_accepts_legacy_delivery_status_contract_with_outcome_unknown():
         )
         connection.commit()
         ensure_vip_health_check_schema(connection)
-        assert connection.execute(
+        sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE name='vip_health_check_deliveries'"
-        ).fetchone()[0].count("outcome_unknown") == 1
+        ).fetchone()[0]
+        assert "outcome_unknown" not in sql
+        assert "status IN ('pending','failed','delivered')" in sql
     finally:
         connection.close()
 

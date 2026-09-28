@@ -2010,11 +2010,10 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             "dietitian_coaching_orders",
         })
     if "vip_health_check_deliveries" in rebuild_tables:
-        delivery_id_notnull = conn.execute(
-            "PRAGMA table_info(vip_health_check_deliveries)"
-        ).fetchall()[0][3]
-        if not delivery_id_notnull:
-            _rebuild_exact_table(conn, "vip_health_check_deliveries")
+        # A recognized successor contract is rebuilt to the current canonical
+        # contract. The graph preflight above rejects outcome_unknown rows
+        # before the first DROP, so no status is silently remapped.
+        _rebuild_exact_table(conn, "vip_health_check_deliveries")
     if "dietitian_coaching_orders" in rebuild_tables:
         _rebuild_exact_table(conn, "dietitian_coaching_orders")
 
