@@ -535,7 +535,14 @@ def _preflight_rebuild_contracts(conn: sqlite3.Connection) -> set[str]:
             "delivery_id TEXT PRIMARY KEY NOT NULL", "delivery_id TEXT PRIMARY KEY"
         ).replace(" status TEXT NOT NULL DEFAULT 'pending'\n          CHECK(status IN ('pending','failed','delivered'))",
                   " status TEXT NOT NULL DEFAULT 'pending'"),
-    )
+        # Existing staging/legacy databases may retain the historical
+        # outcome_unknown state. It is a compatible superset contract;
+        # accept it without rebuilding or rewriting delivery rows.
+        _CANONICAL_REBUILD_DDL["vip_health_check_deliveries"].replace(
+            "status IN ('pending','failed','delivered')",
+            "status IN ('pending','outcome_unknown','failed','delivered')",
+        ),
+        )
     variants["dietitian_coaching_orders"] += (
         _CANONICAL_REBUILD_DDL["dietitian_coaching_orders"].replace(
             "order_id TEXT PRIMARY KEY NOT NULL", "order_id TEXT PRIMARY KEY"),
@@ -1609,9 +1616,14 @@ def _verify_vip_health_check_schema_shape(conn: sqlite3.Connection) -> None:
         ).fetchone()
         table_sql = table_sql_row[0] if table_sql_row else ""
         actual_check_expressions = _extract_check_expressions(table_sql)
-        check_expressions_mismatch = (
-            actual_check_expressions != required_check_expressions[table_name]
-        )
+        accepted_check_expressions = {required_check_expressions[table_name]}
+        if table_name == "vip_health_check_deliveries":
+            accepted_check_expressions.add((
+                _normalize_schema_sql(
+                    "status IN ('pending','outcome_unknown','failed','delivered')"
+                ),
+            ))
+        check_expressions_mismatch = actual_check_expressions not in accepted_check_expressions
         forbidden_schema_words = set(_unquoted_schema_words(table_sql)) & {
             "collate", "conflict", "deferrable", "initially", "match",
             "strict", "without",

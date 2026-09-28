@@ -57,6 +57,42 @@ def test_connection_helper_fails_closed_when_transaction_started_with_fk_off():
         connection.close()
 
 
+def test_startup_accepts_legacy_delivery_status_contract_with_outcome_unknown():
+    from vip_health_check import configure_vip_health_check_connection, ensure_vip_health_check_schema
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        configure_vip_health_check_connection(connection)
+        ensure_vip_health_check_schema(connection)
+        connection.execute("DROP TABLE vip_health_check_deliveries")
+        connection.executescript(
+            """
+            CREATE TABLE vip_health_check_deliveries (
+                delivery_id TEXT PRIMARY KEY NOT NULL,
+                report_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                delivery_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending'
+                  CHECK(status IN ('pending','outcome_unknown','failed','delivered')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                delivered_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id)
+            );
+            CREATE INDEX idx_vip_health_check_deliveries_status
+                ON vip_health_check_deliveries(status, created_at);
+            """
+        )
+        connection.commit()
+        ensure_vip_health_check_schema(connection)
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='vip_health_check_deliveries'"
+        ).fetchone()[0].count("outcome_unknown") == 1
+    finally:
+        connection.close()
+
+
 def test_vip_write_fails_before_transaction_when_connection_was_not_configured():
     from vip_health_check import create_first_vip_health_check_case
 
