@@ -147,7 +147,7 @@ def _meal_name_without_explicit_price(value) -> str:
 
 
 def build_customer_home_contents(data: dict) -> dict:
-    """Render the customer's today view; keep feature navigation elsewhere."""
+    """Preserved v52 renderer for non-home compatibility and historical tests."""
     calories = data.get("extra_cal")
     calorie_goal = data.get("tdee")
     protein = data.get("extra_pro")
@@ -323,6 +323,14 @@ def build_customer_home_contents(data: dict) -> dict:
         },
         "styles": {"body": {"backgroundColor": "#FFFFFF"}},
     }
+
+
+def build_customer_balance_home_contents(data: dict) -> dict:
+    """Render the v53 balance card through one narrow v52-data adapter."""
+    from dashboard_balance_adapter import adapt_dashboard_data
+    from dashboard_flex import build_dashboard_flex
+
+    return build_dashboard_flex(adapt_dashboard_data(data))
 
 
 _SLOT_ORDER = ("早餐", "午餐", "晚餐", "點心")

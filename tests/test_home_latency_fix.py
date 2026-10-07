@@ -140,8 +140,8 @@ def test_registered_home_handler_uses_one_readonly_personal_snapshot_only(tmp_pa
     assert before == db.read_bytes()
     text = json.dumps(_payload(line.messages[0]), ensure_ascii=False)
     assert "U-HOME-A-午餐" in text and "U-HOME-A-晚餐" in text
-    assert "熱量 500 kcal｜蛋白質 40 g" in text
-    assert "熱量 600 kcal｜蛋白質 45 g" in text
+    assert "預留 500" in text
+    assert "預留 600" in text
 
 
 def test_home_next_request_reads_fresh_canonical_food_logs_without_ttl(tmp_path, monkeypatch):
@@ -149,7 +149,8 @@ def test_home_next_request_reads_fresh_canonical_food_logs_without_ttl(tmp_path,
 
     server.handle_message(_event("U-HOME-A", "HOME-FRESH-1"))
     first = json.dumps(_payload(line.messages[-1]), ensure_ascii=False)
-    assert "今天尚無已確認的飲食紀錄" in first
+    assert "今天還沒有紀錄" not in first  # two reserved subscription rows are visible
+    assert "已吃 0" in first
 
     today = server.tw_today().isoformat()
     with sqlite3.connect(db) as conn:
@@ -164,9 +165,9 @@ def test_home_next_request_reads_fresh_canonical_food_logs_without_ttl(tmp_path,
     server.handle_message(_event("U-HOME-A", "HOME-FRESH-2"))
     second = json.dumps(_payload(line.messages[-1]), ensure_ascii=False)
     assert "剛記錄的豆漿" in second
-    assert "123 / 1,800 kcal" in second
-    assert "9 / 100 g" in second
-    assert "今天尚無已確認的飲食紀錄" not in second
+    assert "已吃 123" in second
+    assert "蛋白質餘額" in second and "6 g" in second
+    assert "剛記錄的豆漿" in second
     assert counts["gc.open_by_key"] == 2
     assert counts["sheet-1.get_all_values"] == 2
 

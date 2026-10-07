@@ -152,15 +152,11 @@ def test_real_rendered_eaten_action_routes_through_registered_handler_to_idempot
     server.processed_messages.clear()
 
     rendered = server.build_dashboard_flex(uid).as_json_dict()
-    action = next(
-        action for action in _message_actions(rendered)
-        if action.get("text") == "午餐已吃"
-    )
-    assert action == {
-        "type": "message",
-        "label": "午餐已吃",
-        "text": "午餐已吃",
-    }
+    actions = _message_actions(rendered)
+    assert [action.get("text") for action in actions] == [
+        "我要紀錄飲食", "我要修改飲食紀錄", "一週趨勢", "功能選單",
+    ]
+    assert not any(action.get("text") == "午餐已吃" for action in actions)
     with sqlite3.connect(db_path) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM food_logs WHERE user_id=?", (uid,)
@@ -171,8 +167,9 @@ def test_real_rendered_eaten_action_routes_through_registered_handler_to_idempot
             (uid,),
         ).fetchone() == (0.0, 0.0, "")
 
-    server.handle_message(_event("HOME-EATEN-1", action["text"], uid))
-    server.handle_message(_event("HOME-EATEN-2", action["text"], uid))
+    # v53 does not add a fifth card entry, but the established text trigger stays routed.
+    server.handle_message(_event("HOME-EATEN-1", "午餐已吃", uid))
+    server.handle_message(_event("HOME-EATEN-2", "午餐已吃", uid))
 
     assert len(replies) == 2
     assert "已經確認過了" in replies[1][1].as_json_dict()["text"]
