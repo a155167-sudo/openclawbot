@@ -1,0 +1,7 @@
+{
+  "backend_origin": "https://openclawbot-production-production.up.railway.app",
+  "device_bearer_token": "REPLACE_WITH_DEVICE_TOKEN",
+  "store_id": "nanjing",
+  "workbook_id": "REPLACE_WITH_EXACT_BACKEND_EXPORT_WORKBOOK_ID",
+  "http_timeout_seconds": 8
+}

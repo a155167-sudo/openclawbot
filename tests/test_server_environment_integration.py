@@ -121,7 +121,7 @@ def test_form_endpoints_reject_before_reading_body(monkeypatch):
     assert survey_exc.value.status_code == 401
 
 
-def test_survey_endpoint_awards_two_one_point_links(monkeypatch, tmp_path):
+def test_survey_endpoint_awards_two_one_point_links(monkeypatch, tmp_path, capsys):
     db_path = tmp_path / "quota.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -165,6 +165,10 @@ def test_survey_endpoint_awards_two_one_point_links(monkeypatch, tmp_path):
     assert "集點卡 2 點" in message.text
     assert "https://reward/1" in message.text
     assert "https://reward/2" in message.text
+    output = capsys.readouterr().out
+    assert "U123" not in output
+    assert "系統綁定碼 UID" not in output
+    assert "survey_callback status=success" in output
     retry = reserve_survey_reward_links(
         str(db_path),
         "U123",
@@ -371,6 +375,54 @@ def test_server_source_contains_no_direct_legacy_account_resource_ids():
 
     for resource_id in forbidden:
         assert resource_id not in source
+
+
+class _GarminWorksheet:
+    def __init__(self, title):
+        self.title = title
+        self.update_calls = []
+
+    def update(self, *args):
+        self.update_calls.append(args)
+
+
+class _GarminWorkbook:
+    def __init__(self, titles=()):
+        self._worksheets = [_GarminWorksheet(title) for title in titles]
+        self.add_calls = []
+        self.lookup_calls = []
+        self.created_worksheet = _GarminWorksheet("Test_Garmin_Log")
+
+    def worksheets(self):
+        return self._worksheets
+
+    def add_worksheet(self, **kwargs):
+        self.add_calls.append(kwargs)
+
+    def worksheet(self, title):
+        self.lookup_calls.append(title)
+        return self.created_worksheet
+
+
+def test_production_startup_does_not_create_or_update_missing_garmin_test_sheet():
+    workbook = _GarminWorkbook()
+
+    result = server.setup_garmin_test_sheet(workbook, app_env="production")
+
+    assert result is None
+    assert workbook.add_calls == []
+    assert workbook.lookup_calls == []
+
+
+@pytest.mark.parametrize("app_env", ["legacy", "staging"])
+def test_nonproduction_startup_keeps_creating_missing_garmin_test_sheet(app_env):
+    workbook = _GarminWorkbook()
+
+    server.setup_garmin_test_sheet(workbook, app_env=app_env)
+
+    assert workbook.add_calls == [{"title": "Test_Garmin_Log", "rows": 500, "cols": 20}]
+    assert workbook.lookup_calls == ["Test_Garmin_Log"]
+    assert len(workbook.created_worksheet.update_calls) == 1
 
 
 def test_server_constants_are_loaded_from_app_settings():

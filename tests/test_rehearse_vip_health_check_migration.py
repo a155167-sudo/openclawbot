@@ -46,12 +46,14 @@ def test_rehearsal_migrates_only_online_backup_copy(tmp_path):
         "foreign_key_violation_count": 0,
     }
     assert result["candidate_checks"] == result["source_checks"]
-    assert result["vip_health_check_table_count"] == 8
+    assert result["preserved_row_fingerprints"] == {}
+    assert result["vip_health_check_table_count"] == 9
     assert result["vip_health_check_tables"] == [
         "vip_health_check_activation_events",
         "vip_health_check_audit_log",
         "vip_health_check_cases",
         "vip_health_check_deliveries",
+        "vip_health_check_notifications",
         "vip_health_check_reports",
         "vip_health_check_reviews",
         "vip_health_check_source_refs",

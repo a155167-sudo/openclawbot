@@ -16,10 +16,38 @@ from datetime import datetime, timedelta
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
+from health_check_rules import HEALTH_CHECK_DAY_RULE_MINIMUM_MEALS
+from nutrition_system import user_confirmed_meal_photo_trust_projection
+
 
 BENEFIT_KEY = "first_vip_baseline_check"
 FEATURE_FLAG = "VIP_HEALTH_CHECK_ENABLED"
 _TRUTHY = {"1", "true", "yes", "on"}
+
+
+def ensure_dietitian_health_check_draft_schema(conn: sqlite3.Connection) -> None:
+    """Run the formal numeric draft migration without committing caller state."""
+    from dietitian_health_check_migration import migrate_dietitian_health_check_draft_schema
+
+    migrate_dietitian_health_check_draft_schema(conn)
+
+
+def health_check_source_token(
+    conn: sqlite3.Connection, *, case_id: str, manifest_hash: str
+) -> str:
+    """Return an opaque observation token bound to persisted monotonic revision."""
+    row = conn.execute(
+        """SELECT revision,manifest_hash FROM dietitian_health_check_source_revisions
+           WHERE case_id=?""",
+        (case_id,),
+    ).fetchone()
+    if row is None or str(row[1]) != str(manifest_hash):
+        raise sqlite3.IntegrityError("missing or stale health-check source revision")
+    canonical = json.dumps(
+        {"case_id": case_id, "revision": int(row[0]), "manifest_hash": str(row[1])},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def require_vip_health_check_connection(
@@ -228,6 +256,566 @@ def _unquoted_schema_words(sql: str) -> tuple[str, ...]:
     return tuple(words)
 
 
+_CANONICAL_REBUILD_DDL = {
+    "vip_health_check_activation_events": """CREATE TABLE vip_health_check_activation_events (
+        activation_event_key TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL,
+        activation_type TEXT NOT NULL CHECK(activation_type IN (
+          'lifetime_first','historical_existing','renewal')),
+        prior_usage_status TEXT NOT NULL DEFAULT '', prior_expiry_date TEXT NOT NULL DEFAULT '',
+        occurred_at TEXT NOT NULL)""",
+    "vip_health_check_cases": """CREATE TABLE vip_health_check_cases (
+        case_id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL,
+        benefit_key TEXT NOT NULL CHECK (benefit_key='first_vip_baseline_check'),
+        first_vip_activation_id TEXT NOT NULL, activation_event_key TEXT NOT NULL,
+        window_started_at TEXT NOT NULL, window_ends_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'collecting' CHECK(status IN (
+          'collecting','ready_for_review','needs_more_info','approved_pending_delivery',
+          'delivery_failed','delivered','expired','cancelled')),
+        valid_day_count INTEGER NOT NULL DEFAULT 0 CHECK (valid_day_count BETWEEN 0 AND 7),
+        source_manifest_hash TEXT NOT NULL DEFAULT '', submitted_at TEXT NOT NULL DEFAULT '',
+        report_published_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, UNIQUE(user_id, benefit_key), UNIQUE(activation_event_key))""",
+    "vip_health_check_reviews": """CREATE TABLE vip_health_check_reviews (
+        review_id TEXT PRIMARY KEY NOT NULL, case_id TEXT NOT NULL,
+        review_version INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'draft'
+          CHECK(status IN ('draft','approved','superseded')),
+        ai_observations_json TEXT NOT NULL DEFAULT '{}', review_json TEXT NOT NULL DEFAULT '{}',
+        suggested_values_json TEXT NOT NULL DEFAULT '{}', limitations TEXT NOT NULL DEFAULT '',
+        source_manifest_hash TEXT NOT NULL, approved_by TEXT NOT NULL DEFAULT '',
+        approved_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(case_id, review_version), UNIQUE(case_id, review_id),
+        FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id))""",
+    "vip_health_check_reports": """CREATE TABLE vip_health_check_reports (
+        report_id TEXT PRIMARY KEY NOT NULL, case_id TEXT NOT NULL,
+        review_id TEXT NOT NULL UNIQUE,
+        report_kind TEXT NOT NULL DEFAULT 'baseline_3day'
+          CHECK(report_kind='baseline_3day'), report_version INTEGER NOT NULL,
+        report_json TEXT NOT NULL, source_manifest_hash TEXT NOT NULL,
+        published_by TEXT NOT NULL, published_at TEXT NOT NULL,
+        UNIQUE(case_id,report_kind,report_version),
+        FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id),
+        FOREIGN KEY(review_id) REFERENCES vip_health_check_reviews(review_id),
+        FOREIGN KEY(case_id,review_id) REFERENCES vip_health_check_reviews(case_id,review_id))""",
+    "vip_health_check_deliveries": """CREATE TABLE vip_health_check_deliveries (
+        delivery_id TEXT PRIMARY KEY NOT NULL, report_id TEXT NOT NULL, user_id TEXT NOT NULL,
+        delivery_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending'
+          CHECK(status IN ('pending','outcome_unknown','failed','delivered')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+        delivered_at TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id))""",
+    "dietitian_coaching_orders": """CREATE TABLE dietitian_coaching_orders (
+        order_id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, case_id TEXT NOT NULL,
+        product_type TEXT NOT NULL DEFAULT 'dietitian_coaching_4w'
+          CHECK(product_type='dietitian_coaching_4w'), operation_key TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'payment_pending' CHECK(status IN (
+          'payment_pending','payment_reported','coaching_active','coaching_paused',
+          'coaching_completed','coaching_refunded','coaching_cancelled','payment_rejected')),
+        quoted_amount INTEGER, requested_at TEXT NOT NULL,
+        payment_reported_at TEXT NOT NULL DEFAULT '', confirmed_by TEXT NOT NULL DEFAULT '',
+        confirmed_at TEXT NOT NULL DEFAULT '', starts_at TEXT NOT NULL DEFAULT '',
+        ends_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+        FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id))""",
+    "vip_health_check_valid_days": """CREATE TABLE vip_health_check_valid_days (
+        case_id TEXT NOT NULL, local_date TEXT NOT NULL, rule_version TEXT NOT NULL,
+        qualifying_meal_count INTEGER NOT NULL DEFAULT 0, completeness_status TEXT NOT NULL,
+        evaluated_at TEXT NOT NULL, PRIMARY KEY(case_id,local_date),
+        FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id))""",
+    "vip_health_check_source_refs": """CREATE TABLE vip_health_check_source_refs (
+        case_id TEXT NOT NULL, food_log_id TEXT NOT NULL, food_log_version INTEGER NOT NULL,
+        local_date TEXT NOT NULL, included_reason TEXT NOT NULL DEFAULT '', source_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL, PRIMARY KEY(case_id,food_log_id),
+        FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id))""",
+    "vip_health_check_audit_log": """CREATE TABLE vip_health_check_audit_log (
+        audit_id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT NOT NULL, actor_type TEXT NOT NULL,
+        actor_id TEXT NOT NULL DEFAULT '', from_status TEXT NOT NULL DEFAULT '', to_status TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+        FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id))""",
+    "vip_health_check_notifications": """CREATE TABLE vip_health_check_notifications (
+        notification_id TEXT PRIMARY KEY, case_id TEXT NOT NULL,
+        notification_kind TEXT NOT NULL CHECK(notification_kind='dietitian_ready_for_review'),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','delivered')),
+        attempts INTEGER NOT NULL DEFAULT 0, claim_token TEXT NOT NULL DEFAULT '',
+        lease_until TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, delivered_at TEXT NOT NULL DEFAULT '',
+        UNIQUE(case_id,notification_kind),
+        FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id))""",
+}
+
+
+def _table_contract(conn: sqlite3.Connection, table_name: str) -> tuple[object, ...]:
+    """Return an exact, formatting-independent table/FK/index/CHECK fingerprint."""
+    info = tuple(tuple(row[1:]) for row in conn.execute(f'PRAGMA table_xinfo("{table_name}")'))
+    fk_groups: dict[int, list[tuple[object, ...]]] = {}
+    for row in conn.execute(f'PRAGMA foreign_key_list("{table_name}")'):
+        fk_groups.setdefault(int(row[0]), []).append(tuple(row[1:]))
+    fks = tuple(sorted(tuple(rows) for rows in fk_groups.values()))
+    indexes = []
+    for row in conn.execute(f'PRAGMA index_list("{table_name}")'):
+        terms = tuple(
+            tuple(term[1:])
+            for term in conn.execute(f'PRAGMA index_xinfo("{row[1]}")')
+        )
+        # Autoindex names are allocation-order details; named objects remain exact.
+        stable_name = "<auto>" if str(row[1]).startswith("sqlite_autoindex_") else row[1]
+        indexes.append((stable_name, bool(row[2]), row[3], bool(row[4]), terms))
+    table_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+    ).fetchone()
+    sql = table_row[0] if table_row else ""
+    return (info, fks, tuple(sorted(indexes, key=repr)), _extract_check_expressions(sql),
+            tuple(sorted(set(_unquoted_schema_words(sql)) & {
+                "collate", "conflict", "deferrable", "initially", "match", "strict", "without"
+            })))
+
+
+def _reference_contract(ddl: str, indexes: tuple[str, ...] = ()) -> tuple[object, ...]:
+    shadow = sqlite3.connect(":memory:")
+    try:
+        # FK parent existence is not required to parse the child DDL.
+        shadow.execute(ddl)
+        for statement in indexes:
+            shadow.execute(statement)
+        name = shadow.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+        return _table_contract(shadow, name)
+    finally:
+        shadow.close()
+
+
+def ensure_vip_health_check_notification_schema(conn: sqlite3.Connection) -> None:
+    """Install the ready-notification outbox contract without committing caller state."""
+    table = "vip_health_check_notifications"
+    index_sql = (
+        "CREATE INDEX idx_vip_health_check_notifications_status "
+        "ON vip_health_check_notifications(status,updated_at)"
+    )
+    expected = _reference_contract(_CANONICAL_REBUILD_DDL[table], (index_sql,))
+    savepoint = "vip_health_check_notification_schema_" + uuid.uuid4().hex
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        present = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone() is not None
+        if not present:
+            conn.execute(_CANONICAL_REBUILD_DDL[table])
+            conn.execute(index_sql)
+        if _table_contract(conn, table) != expected:
+            raise sqlite3.IntegrityError("unsupported vip health-check notifications schema")
+        if conn.execute(f'PRAGMA foreign_key_check("{table}")').fetchone() is not None:
+            raise sqlite3.IntegrityError("invalid vip health-check notification foreign key")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
+def _preflight_graph_triggers(conn: sqlite3.Connection) -> None:
+    """Reject trigger drift anywhere in the graph before a rebuild can drop it."""
+    graph_tables = tuple(_CANONICAL_REBUILD_DDL)
+    for table_name in graph_tables:
+        actual = {
+            name: _normalize_schema_sql(sql).rstrip(";").replace(
+                "createtriggerifnotexists", "createtrigger", 1
+            )
+            for name, sql in conn.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+                (table_name,),
+            )
+        }
+        # Reports have shipped legacy variants and are validated by the dedicated
+        # report-route preflight, including its exact immutable definitions.
+        if table_name == "vip_health_check_reports":
+            continue
+        expected = {}
+        if actual != expected:
+            raise sqlite3.IntegrityError(
+                f"unsupported trigger contract on {table_name}: {sorted(actual)!r}"
+            )
+
+
+def _preflight_existing_c566_report_triggers(conn: sqlite3.Connection) -> None:
+    """Do not let CREATE IF NOT EXISTS conceal a missing shipped immutability guard."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_xinfo(vip_health_check_reports)")
+    }
+    foreign_keys = tuple(conn.execute("PRAGMA foreign_key_list(vip_health_check_reports)"))
+    if "review_id" not in columns or len(foreign_keys) != 4:
+        return
+    expected = {
+        "vip_health_check_reports_no_update": _normalize_schema_sql(
+            "CREATE TRIGGER vip_health_check_reports_no_update BEFORE UPDATE ON "
+            "vip_health_check_reports BEGIN SELECT RAISE(ABORT, "
+            "'published health-check reports are immutable'); END"
+        ),
+        "vip_health_check_reports_no_delete": _normalize_schema_sql(
+            "CREATE TRIGGER vip_health_check_reports_no_delete BEFORE DELETE ON "
+            "vip_health_check_reports BEGIN SELECT RAISE(ABORT, "
+            "'published health-check reports are immutable'); END"
+        ),
+    }
+    actual = {
+        name: _normalize_schema_sql(sql).rstrip(";").replace(
+            "createtriggerifnotexists", "createtrigger", 1
+        )
+        for name, sql in conn.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+            "AND tbl_name='vip_health_check_reports'"
+        )
+    }
+    if actual != expected:
+        raise sqlite3.IntegrityError(
+            "missing required immutable trigger or altered c566 report trigger"
+        )
+
+
+def _preflight_graph_rows(
+    conn: sqlite3.Connection, report_review_mapping: dict[str, str] | None = None
+) -> None:
+    """Copy the complete graph into canonical shadow tables to validate every row."""
+    order = (
+        "vip_health_check_activation_events",
+        "vip_health_check_cases",
+        "vip_health_check_valid_days",
+        "vip_health_check_source_refs",
+        "vip_health_check_reviews",
+        "vip_health_check_reports",
+        "vip_health_check_deliveries",
+        "vip_health_check_audit_log",
+        "vip_health_check_notifications",
+        "dietitian_coaching_orders",
+    )
+    existing = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    shadow = sqlite3.connect(":memory:")
+    try:
+        shadow.execute("PRAGMA foreign_keys=ON")
+        for table_name in order:
+            if table_name in existing:
+                shadow.execute(_CANONICAL_REBUILD_DDL[table_name])
+        for table_name in order:
+            if table_name not in existing:
+                continue
+            columns = tuple(
+                row[1] for row in conn.execute(f'PRAGMA table_xinfo("{table_name}")')
+            )
+            canonical_columns = tuple(
+                row[1] for row in shadow.execute(f'PRAGMA table_xinfo("{table_name}")')
+            )
+            if table_name == "vip_health_check_reports" and report_review_mapping is not None:
+                rows = []
+                for source in conn.execute('SELECT * FROM "vip_health_check_reports"'):
+                    values = dict(zip(columns, source))
+                    values["review_id"] = report_review_mapping[values["report_id"]]
+                    rows.append(tuple(values[column] for column in canonical_columns))
+                names = ",".join(f'"{column}"' for column in canonical_columns)
+                placeholders = ",".join("?" for _ in canonical_columns)
+                shadow.executemany(
+                    f'INSERT INTO "{table_name}" ({names}) VALUES ({placeholders})', rows
+                )
+                continue
+            if columns != canonical_columns:
+                raise sqlite3.IntegrityError(
+                    f"unsupported noncanonical row projection for {table_name}"
+                )
+            names = ",".join(f'"{column}"' for column in columns)
+            placeholders = ",".join("?" for _ in columns)
+            try:
+                shadow.executemany(
+                    f'INSERT INTO "{table_name}" ({names}) VALUES ({placeholders})',
+                    conn.execute(f'SELECT {names} FROM "{table_name}"'),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise sqlite3.IntegrityError(
+                    f"invalid canonical data in {table_name}: {exc}"
+                ) from exc
+    finally:
+        shadow.close()
+
+
+def _preflight_rebuild_contracts(conn: sqlite3.Connection) -> set[str]:
+    """Accept only canonical or exact c566 rebuild sources before the first DROP."""
+    variants: dict[str, tuple[str, ...]] = {
+        "vip_health_check_cases": (_CANONICAL_REBUILD_DDL["vip_health_check_cases"],),
+        "vip_health_check_reviews": (_CANONICAL_REBUILD_DDL["vip_health_check_reviews"],),
+        "vip_health_check_deliveries": (_CANONICAL_REBUILD_DDL["vip_health_check_deliveries"],),
+        "dietitian_coaching_orders": (_CANONICAL_REBUILD_DDL["dietitian_coaching_orders"],),
+    }
+    # Explicit replacements avoid accepting any other nullable column.
+    variants["vip_health_check_cases"] += (
+        _CANONICAL_REBUILD_DDL["vip_health_check_cases"].replace(
+            "case_id TEXT PRIMARY KEY NOT NULL", "case_id TEXT PRIMARY KEY"),
+    )
+    variants["vip_health_check_reviews"] += (
+        _CANONICAL_REBUILD_DDL["vip_health_check_reviews"].replace(
+            "review_id TEXT PRIMARY KEY NOT NULL", "review_id TEXT PRIMARY KEY"
+        ).replace(", UNIQUE(case_id, review_id)", ""),
+    )
+    canonical_delivery = _CANONICAL_REBUILD_DDL["vip_health_check_deliveries"]
+    previous_delivery = canonical_delivery.replace(
+        "('pending','outcome_unknown','failed','delivered')",
+        "('pending','failed','delivered')",
+    ).replace("\n        attempts", " attempts")
+    nullable_previous_delivery = previous_delivery.replace(
+        "delivery_id TEXT PRIMARY KEY NOT NULL", "delivery_id TEXT PRIMARY KEY"
+    )
+    variants["vip_health_check_deliveries"] += (
+        # Exact previous contracts are migrated atomically without changing rows.
+        previous_delivery,
+        canonical_delivery.replace(
+            "delivery_id TEXT PRIMARY KEY NOT NULL", "delivery_id TEXT PRIMARY KEY"
+        ),
+        nullable_previous_delivery,
+        # Exact older report-migration dependent schema (no status CHECK/index).
+        nullable_previous_delivery.replace(
+            " status TEXT NOT NULL DEFAULT 'pending'\n"
+            "          CHECK(status IN ('pending','failed','delivered'))",
+            " status TEXT NOT NULL DEFAULT 'pending'",
+        ),
+    )
+    variants["dietitian_coaching_orders"] += (
+        _CANONICAL_REBUILD_DDL["dietitian_coaching_orders"].replace(
+            "order_id TEXT PRIMARY KEY NOT NULL", "order_id TEXT PRIMARY KEY"),
+    )
+    named_indexes = {
+        "vip_health_check_cases": (
+            "CREATE INDEX idx_vip_health_check_cases_status ON vip_health_check_cases(status,updated_at)",
+        ),
+        "vip_health_check_reviews": (
+            "CREATE UNIQUE INDEX idx_vip_health_check_reviews_case_review ON vip_health_check_reviews(case_id,review_id)",
+        ),
+        "vip_health_check_deliveries": (
+            "CREATE INDEX idx_vip_health_check_deliveries_status ON vip_health_check_deliveries(status,created_at)",
+        ),
+        "dietitian_coaching_orders": (),
+    }
+    exact_unchanged = {
+        "vip_health_check_activation_events": (
+            "CREATE INDEX idx_vip_health_check_activation_user_time ON vip_health_check_activation_events(user_id,occurred_at)",
+        ),
+        "vip_health_check_valid_days": (),
+        "vip_health_check_source_refs": (
+            "CREATE INDEX idx_vip_health_check_source_date ON vip_health_check_source_refs(case_id,local_date)",
+        ),
+        "vip_health_check_audit_log": (),
+    }
+    for unchanged_table, indexes in exact_unchanged.items():
+        if _table_contract(conn, unchanged_table) != _reference_contract(
+            _CANONICAL_REBUILD_DDL[unchanged_table], indexes
+        ):
+            raise sqlite3.IntegrityError(
+                f"unsupported c566/current {unchanged_table} schema"
+            )
+
+    actual_vip_tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vip_health_check_%'"
+        )
+    }
+    expected_vip_tables = {
+        "vip_health_check_activation_events", "vip_health_check_cases",
+        "vip_health_check_valid_days", "vip_health_check_source_refs",
+        "vip_health_check_reviews", "vip_health_check_reports",
+        "vip_health_check_deliveries", "vip_health_check_audit_log",
+    }
+    if not expected_vip_tables.issubset(actual_vip_tables) or not actual_vip_tables <= (
+        expected_vip_tables | {"vip_health_check_notifications"}
+    ):
+        raise sqlite3.IntegrityError("unsupported VIP health-check table set before rebuild")
+    if "vip_health_check_notifications" in actual_vip_tables:
+        expected_notification = _reference_contract(
+            _CANONICAL_REBUILD_DDL["vip_health_check_notifications"],
+            ("CREATE INDEX idx_vip_health_check_notifications_status "
+             "ON vip_health_check_notifications(status,updated_at)",),
+        )
+        if _table_contract(conn, "vip_health_check_notifications") != expected_notification:
+            raise sqlite3.IntegrityError("unsupported c566 vip_health_check_notifications schema")
+    rebuild = set()
+    for table_name, ddls in variants.items():
+        actual = _table_contract(conn, table_name)
+        expected = {_reference_contract(ddl, named_indexes[table_name]) for ddl in ddls}
+        if table_name == "vip_health_check_deliveries":
+            expected.add(_reference_contract(ddls[-1], ()))
+        if actual not in expected:
+            if table_name == "vip_health_check_deliveries":
+                raise sqlite3.IntegrityError(
+                    "unsupported custom schema objects or index contract in legacy/c566/current "
+                    "vip_health_check_deliveries schema"
+                )
+            raise sqlite3.IntegrityError(f"unsupported legacy/c566/current {table_name} schema")
+        canonical = _reference_contract(ddls[0], named_indexes[table_name])
+        if actual != canonical:
+            null_row = conn.execute(
+                f'SELECT 1 FROM "{table_name}" WHERE "{tuple(conn.execute(f"PRAGMA table_info({table_name})"))[0][1]}" IS NULL LIMIT 1'
+            ).fetchone()
+            if null_row:
+                raise sqlite3.IntegrityError(f"NULL primary key in {table_name}")
+            rebuild.add(table_name)
+    _preflight_graph_triggers(conn)
+    return rebuild
+
+
+def _rebuild_exact_table(conn: sqlite3.Connection, table_name: str) -> None:
+    """Copy every declared column verbatim into the canonical table."""
+    ddl = _CANONICAL_REBUILD_DDL[table_name]
+    replacement = f"{table_name}_rebuild_{uuid.uuid4().hex}"
+    columns = tuple(row[1] for row in conn.execute(f'PRAGMA table_xinfo("{table_name}")'))
+    quoted_columns = ",".join(f'"{column}"' for column in columns)
+    conn.execute(ddl.replace(f"CREATE TABLE {table_name}", f"CREATE TABLE {replacement}", 1))
+    conn.execute(
+        f'INSERT INTO "{replacement}" ({quoted_columns}) '
+        f'SELECT {quoted_columns} FROM "{table_name}"'
+    )
+    conn.execute(f'DROP TABLE "{table_name}"')
+    conn.execute(f'ALTER TABLE "{replacement}" RENAME TO "{table_name}"')
+    if table_name == "vip_health_check_cases":
+        conn.execute("CREATE INDEX idx_vip_health_check_cases_status "
+                     "ON vip_health_check_cases(status,updated_at)")
+    elif table_name == "vip_health_check_reviews":
+        conn.execute("CREATE UNIQUE INDEX idx_vip_health_check_reviews_case_review "
+                     "ON vip_health_check_reviews(case_id,review_id)")
+    elif table_name == "vip_health_check_deliveries":
+        conn.execute("CREATE INDEX idx_vip_health_check_deliveries_status "
+                     "ON vip_health_check_deliveries(status,created_at)")
+
+
+def _rebuild_c566_dependency_graph(
+    conn: sqlite3.Connection,
+    report_review_mapping: dict[str, str] | None = None,
+) -> None:
+    """Rebuild any populated accepted predecessor FK graph without deferred debt.
+
+    SQLite tracks deferred violations caused by dropping a populated parent even
+    if a same-named valid graph is recreated before RELEASE.  Stage row values in
+    constraint-free TEMP tables, remove the graph child-to-parent, then recreate
+    it parent-to-child so no statement ever drops a referenced populated parent.
+    """
+    graph_tables = [
+        "vip_health_check_cases",
+        "vip_health_check_valid_days",
+        "vip_health_check_source_refs",
+        "vip_health_check_reviews",
+        "vip_health_check_reports",
+        "vip_health_check_deliveries",
+        "vip_health_check_audit_log",
+        "dietitian_coaching_orders",
+    ]
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='vip_health_check_notifications'"
+    ).fetchone():
+        graph_tables.append("vip_health_check_notifications")
+
+    if report_review_mapping is not None:
+        report_ids = {
+            row[0] for row in conn.execute(
+                "SELECT report_id FROM vip_health_check_reports"
+            )
+        }
+        if set(report_review_mapping) != report_ids:
+            raise sqlite3.IntegrityError("validated legacy report mapping changed")
+
+    staged: dict[str, tuple[str, str]] = {}
+    for table_name in graph_tables:
+        columns = tuple(
+            row[1] for row in conn.execute(f'PRAGMA table_xinfo("{table_name}")')
+        )
+        project_report = (
+            table_name == "vip_health_check_reports"
+            and report_review_mapping is not None
+        )
+        source_columns = columns
+        if project_report:
+            columns = (
+                "report_id", "case_id", "review_id", "report_kind", "report_version",
+                "report_json", "source_manifest_hash", "published_by", "published_at",
+            )
+        column_list = ",".join(f'"{column}"' for column in columns)
+        stage = f"vip_c566_stage_{uuid.uuid4().hex}"
+        if project_report:
+            assert report_review_mapping is not None
+            conn.execute(f'CREATE TEMP TABLE "{stage}" ({column_list})')
+            rows = []
+            for source in conn.execute('SELECT * FROM "vip_health_check_reports"'):
+                values = dict(zip(source_columns, source))
+                values["review_id"] = report_review_mapping[values["report_id"]]
+                rows.append(tuple(values[column] for column in columns))
+            conn.executemany(
+                f'INSERT INTO temp."{stage}" ({column_list}) '
+                f'VALUES ({",".join("?" for _ in columns)})',
+                rows,
+            )
+        else:
+            conn.execute(
+                f'CREATE TEMP TABLE "{stage}" AS '
+                f'SELECT {column_list} FROM "{table_name}"'
+            )
+        staged[table_name] = (stage, column_list)
+
+    drop_order = [
+        "vip_health_check_deliveries",
+        "vip_health_check_reports",
+        "vip_health_check_reviews",
+        "vip_health_check_valid_days",
+        "vip_health_check_source_refs",
+        "vip_health_check_audit_log",
+        "vip_health_check_notifications",
+        "dietitian_coaching_orders",
+        "vip_health_check_cases",
+    ]
+    for table_name in drop_order:
+        if table_name in staged:
+            conn.execute(f'DROP TABLE "{table_name}"')
+
+    create_order = [
+        "vip_health_check_cases",
+        "vip_health_check_valid_days",
+        "vip_health_check_source_refs",
+        "vip_health_check_reviews",
+        "vip_health_check_reports",
+        "vip_health_check_deliveries",
+        "vip_health_check_audit_log",
+        "vip_health_check_notifications",
+        "dietitian_coaching_orders",
+    ]
+    for table_name in create_order:
+        if table_name not in staged:
+            continue
+        stage, column_list = staged[table_name]
+        conn.execute(_CANONICAL_REBUILD_DDL[table_name])
+        conn.execute(
+            f'INSERT INTO "{table_name}" ({column_list}) '
+            f'SELECT {column_list} FROM temp."{stage}"'
+        )
+
+    conn.execute("CREATE INDEX idx_vip_health_check_cases_status "
+                 "ON vip_health_check_cases(status,updated_at)")
+    conn.execute("CREATE INDEX idx_vip_health_check_source_date "
+                 "ON vip_health_check_source_refs(case_id,local_date)")
+    conn.execute("CREATE UNIQUE INDEX idx_vip_health_check_reviews_case_review "
+                 "ON vip_health_check_reviews(case_id,review_id)")
+    conn.execute("CREATE INDEX idx_vip_health_check_deliveries_status "
+                 "ON vip_health_check_deliveries(status,created_at)")
+    if "vip_health_check_notifications" in staged:
+        conn.execute("CREATE INDEX idx_vip_health_check_notifications_status "
+                     "ON vip_health_check_notifications(status,updated_at)")
+    _execute_sql_script_without_implicit_commit(conn, """
+        CREATE TRIGGER vip_health_check_reports_no_update BEFORE UPDATE
+        ON vip_health_check_reports BEGIN
+          SELECT RAISE(ABORT, 'published health-check reports are immutable'); END;
+        CREATE TRIGGER vip_health_check_reports_no_delete BEFORE DELETE
+        ON vip_health_check_reports BEGIN
+          SELECT RAISE(ABORT, 'published health-check reports are immutable'); END;
+    """)
+    for stage, _ in staged.values():
+        conn.execute(f'DROP TABLE temp."{stage}"')
+
+
 def ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
     """以不提交 caller transaction 的 SAVEPOINT 執行 failure-atomic migration。"""
     configure_vip_health_check_connection(conn)
@@ -236,18 +824,19 @@ def ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
         _ensure_vip_health_check_schema(conn)
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception:
         conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-        conn.execute(f"PRAGMA defer_foreign_keys={previous_deferred}")
         raise
-    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-    conn.execute(f"PRAGMA defer_foreign_keys={previous_deferred}")
+    finally:
+        conn.execute(f"PRAGMA defer_foreign_keys={previous_deferred}")
 
 
 def _rebuild_legacy_reports_table(
-    conn: sqlite3.Connection, report_columns: set[str]
-) -> None:
+    conn: sqlite3.Connection, report_columns: set[str], *, dry_run: bool = False,
+    validated_mapping: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Rebuild legacy reports with real FKs without exposing partial schema/data."""
     def normalize_schema_sql(sql: str) -> str:
         return _normalize_schema_sql(sql)
@@ -297,6 +886,17 @@ def _rebuild_legacy_reports_table(
     }
     actual_column_order = tuple(item[0] for item in actual_table_info)
     expected_table_info = expected_table_info_by_columns.get(actual_column_order)
+    c566_table_info = (
+        ("report_id", "TEXT", 0, None, 1),
+        ("case_id", "TEXT", 1, None, 0),
+        ("review_id", "TEXT", 1, None, 0),
+        ("report_kind", "TEXT", 1, "'baseline_3day'", 0),
+        ("report_version", "INTEGER", 1, None, 0),
+        ("report_json", "TEXT", 1, None, 0),
+        ("source_manifest_hash", "TEXT", 1, None, 0),
+        ("published_by", "TEXT", 1, None, 0),
+        ("published_at", "TEXT", 1, None, 0),
+    )
     unique_fingerprints = {
         tuple(
             (item[2], bool(item[3]), str(item[4]).upper(), bool(item[5]))
@@ -306,11 +906,40 @@ def _rebuild_legacy_reports_table(
         for index_row in conn.execute("PRAGMA index_list(vip_health_check_reports)")
         if index_row[2] and index_row[3] == "u" and not index_row[4]
     }
-    expected_unique = {
+    legacy_unique = {
         (("case_id", False, "BINARY", True),
          ("report_kind", False, "BINARY", True),
          ("report_version", False, "BINARY", True))
     }
+    c566_unique = legacy_unique | {
+        (("review_id", False, "BINARY", True),)
+    }
+    foreign_key_groups: dict[int, list[tuple[object, ...]]] = {}
+    for row in conn.execute("PRAGMA foreign_key_list(vip_health_check_reports)"):
+        foreign_key_groups.setdefault(int(row[0]), []).append(tuple(row[1:]))
+    foreign_key_fingerprint = {
+        tuple(group) for group in foreign_key_groups.values()
+    }
+    c566_foreign_keys = {
+        ((0, "vip_health_check_cases", "case_id", "case_id", "NO ACTION", "NO ACTION", "NONE"),),
+        ((0, "vip_health_check_reviews", "review_id", "review_id", "NO ACTION", "NO ACTION", "NONE"),),
+        (
+            (0, "vip_health_check_reviews", "case_id", "case_id", "NO ACTION", "NO ACTION", "NONE"),
+            (1, "vip_health_check_reviews", "review_id", "review_id", "NO ACTION", "NO ACTION", "NONE"),
+        ),
+    }
+    is_c566_predecessor = (
+        actual_column_order == legacy_columns_with_review
+        and actual_table_info == c566_table_info
+        and unique_fingerprints == c566_unique
+        and foreign_key_fingerprint == c566_foreign_keys
+    )
+    is_earlier_legacy = (
+        expected_table_info is not None
+        and actual_table_info == expected_table_info
+        and unique_fingerprints == legacy_unique
+        and not foreign_key_fingerprint
+    )
     table_sql_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='vip_health_check_reports'"
     ).fetchone()
@@ -320,10 +949,7 @@ def _rebuild_legacy_reports_table(
     }
     if (
         set(report_columns) != set(actual_column_order)
-        or expected_table_info is None
-        or actual_table_info != expected_table_info
-        or unique_fingerprints != expected_unique
-        or conn.execute("PRAGMA foreign_key_list(vip_health_check_reports)").fetchall()
+        or not (is_earlier_legacy or is_c566_predecessor)
         or _extract_check_expressions(table_sql)
         or unsupported_words
     ):
@@ -390,36 +1016,89 @@ def _rebuild_legacy_reports_table(
                 f"unsupported custom schema objects on {table_name}: {unknown!r}"
             )
 
-    if "review_id" in report_columns:
-        review_join = """ON review.status='approved' AND (
-                 (report.review_id<>''
-                  AND review.review_id=report.review_id
-                  AND review.case_id=report.case_id
-                  AND review.review_version=report.report_version)
-                 OR
-                 (report.review_id=''
-                  AND review.case_id=report.case_id
-                  AND review.review_version=report.report_version)
-               )"""
-    else:
-        review_join = """ON review.case_id=report.case_id
-              AND review.review_version=report.report_version
-              AND review.status='approved'"""
+    if is_c566_predecessor:
+        actual_report_triggers = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND tbl_name='vip_health_check_reports'"
+            )
+        }
+        required_report_triggers = {
+            "vip_health_check_reports_no_update",
+            "vip_health_check_reports_no_delete",
+        }
+        if actual_report_triggers != required_report_triggers:
+            raise sqlite3.IntegrityError(
+                "unsupported custom schema objects on vip_health_check_reports: "
+                "missing required immutable trigger"
+            )
 
-    unresolved = conn.execute(
-        f"""SELECT report.report_id, COUNT(review.review_id)
-           FROM vip_health_check_reports AS report
-           LEFT JOIN vip_health_check_reviews AS review
-             {review_join}
-           GROUP BY report.report_id
-           HAVING COUNT(review.review_id)<>1
+    invalid_report = conn.execute(
+        """SELECT report_id FROM vip_health_check_reports
+           WHERE report_id IS NULL OR report_kind IS NULL
+              OR report_kind<>'baseline_3day'
            LIMIT 1"""
     ).fetchone()
-    if unresolved:
-        raise sqlite3.IntegrityError(
-            "legacy VIP health-check report has no unique approved review: "
-            f"{unresolved[0]}"
-        )
+    if invalid_report:
+        raise sqlite3.IntegrityError("invalid canonical data in vip_health_check_reports")
+    invalid_delivery = conn.execute(
+        """SELECT delivery_id FROM vip_health_check_deliveries
+           WHERE delivery_id IS NULL OR delivery_key IS NULL OR status IS NULL
+              OR status NOT IN ('pending','failed','delivered')
+           LIMIT 1"""
+    ).fetchone()
+    if invalid_delivery:
+        raise sqlite3.IntegrityError("invalid canonical data in vip_health_check_deliveries")
+
+    if validated_mapping is None:
+        mapping: dict[str, str] = {}
+        has_review_id = "review_id" in report_columns
+        select_columns = "report_id,case_id,report_version,source_manifest_hash"
+        if has_review_id:
+            select_columns += ",review_id"
+        for report_row in conn.execute(
+            f"SELECT {select_columns} FROM vip_health_check_reports"
+        ):
+            report_id, case_id, report_version, manifest_hash = report_row[:4]
+            persisted_review_id = report_row[4] if has_review_id else ""
+            candidates = conn.execute(
+                """SELECT review.review_id
+                   FROM vip_health_check_reviews AS review
+                   JOIN vip_health_check_cases AS health_case
+                     ON health_case.case_id=review.case_id
+                   WHERE review.case_id=? AND review.review_version=?
+                     AND review.status='approved'
+                     AND review.source_manifest_hash=?
+                     AND health_case.source_manifest_hash=?
+                     AND (?='' OR review.review_id=?)""",
+                (case_id, report_version, manifest_hash, manifest_hash,
+                 persisted_review_id, persisted_review_id),
+            ).fetchall()
+            if len(candidates) != 1:
+                raise sqlite3.IntegrityError(
+                    "legacy VIP health-check report has no unique approved review; "
+                    "identity or manifest mismatch: "
+                    f"{report_id}"
+                )
+            mapped_review_id = candidates[0][0]
+            if is_c566_predecessor and mapped_review_id != persisted_review_id:
+                raise sqlite3.IntegrityError(
+                    "c566 VIP health-check report identity or manifest mismatch: "
+                    f"{report_id}"
+                )
+            mapping[report_id] = mapped_review_id
+    else:
+        mapping = dict(validated_mapping)
+        report_ids = {
+            row[0] for row in conn.execute(
+                "SELECT report_id FROM vip_health_check_reports"
+            )
+        }
+        if set(mapping) != report_ids:
+            raise sqlite3.IntegrityError("validated legacy report mapping changed")
+
+    if dry_run:
+        return mapping
 
     suffix = uuid.uuid4().hex
     replacement = "vip_health_check_reports_rebuild_" + suffix
@@ -447,17 +1126,23 @@ def _rebuild_legacy_reports_table(
                 REFERENCES vip_health_check_reviews(case_id, review_id)
         )"""
     )
-    conn.execute(
-        f"""INSERT INTO {replacement}
+    source_columns = tuple(
+        row[1] for row in conn.execute("PRAGMA table_xinfo(vip_health_check_reports)")
+    )
+    copied_rows = []
+    for source in conn.execute("SELECT * FROM vip_health_check_reports"):
+        values = dict(zip(source_columns, source))
+        copied_rows.append((
+            values["report_id"], values["case_id"], mapping[values["report_id"]],
+            values["report_kind"], values["report_version"], values["report_json"],
+            values["source_manifest_hash"], values["published_by"], values["published_at"],
+        ))
+    insert_sql = f"""INSERT INTO {replacement}
                (report_id,case_id,review_id,report_kind,report_version,report_json,
                 source_manifest_hash,published_by,published_at)
-           SELECT report.report_id,report.case_id,review.review_id,report.report_kind,
-                  report.report_version,report.report_json,report.source_manifest_hash,
-                  report.published_by,report.published_at
-           FROM vip_health_check_reports AS report
-           JOIN vip_health_check_reviews AS review
-             {review_join}"""
-    )
+             VALUES (?,?,?,?,?,?,?,?,?)"""
+    for copied_row in copied_rows:
+        conn.execute(insert_sql, copied_row)
     conn.execute("DROP TABLE vip_health_check_reports")
     conn.execute(f"ALTER TABLE {replacement} RENAME TO vip_health_check_reports")
     _execute_sql_script_without_implicit_commit(
@@ -481,7 +1166,7 @@ def _rebuild_legacy_reports_table(
             report_id TEXT NOT NULL,
             user_id TEXT NOT NULL,
             delivery_key TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','failed','delivered')),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','outcome_unknown','failed','delivered')),
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
@@ -502,6 +1187,7 @@ def _rebuild_legacy_reports_table(
         """CREATE INDEX idx_vip_health_check_deliveries_status
            ON vip_health_check_deliveries(status, created_at)"""
     )
+    return mapping
 
 
 def _verify_vip_health_check_foreign_keys(conn: sqlite3.Connection) -> None:
@@ -873,7 +1559,9 @@ def _verify_vip_health_check_schema_shape(conn: sqlite3.Connection) -> None:
             _normalize_schema_sql("report_kind='baseline_3day'"),
         ),
         "vip_health_check_deliveries": (
-            _normalize_schema_sql("status IN ('pending','failed','delivered')"),
+            _normalize_schema_sql(
+                "status IN ('pending','outcome_unknown','failed','delivered')"
+            ),
         ),
         "vip_health_check_audit_log": (),
         "dietitian_coaching_orders": tuple(sorted((
@@ -1102,6 +1790,7 @@ def _verify_vip_health_check_schema_shape(conn: sqlite3.Connection) -> None:
 
 def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
     """建立 schema；必須由 ensure_vip_health_check_schema 的 SAVEPOINT 呼叫。"""
+    _preflight_existing_c566_report_triggers(conn)
     _execute_sql_script_without_implicit_commit(
         conn,
         """
@@ -1216,7 +1905,7 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             report_id TEXT NOT NULL,
             user_id TEXT NOT NULL,
             delivery_key TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','failed','delivered')),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','outcome_unknown','failed','delivered')),
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
@@ -1233,6 +1922,22 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             to_status TEXT NOT NULL,
             reason TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
+            FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS vip_health_check_notifications (
+            notification_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            notification_kind TEXT NOT NULL CHECK(notification_kind='dietitian_ready_for_review'),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','delivered')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            claim_token TEXT NOT NULL DEFAULT '',
+            lease_until TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            delivered_at TEXT NOT NULL DEFAULT '',
+            UNIQUE(case_id, notification_kind),
             FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id)
         );
 
@@ -1268,8 +1973,12 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
             ON vip_health_check_reviews(case_id, review_id);
         CREATE INDEX IF NOT EXISTS idx_vip_health_check_deliveries_status
             ON vip_health_check_deliveries(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_vip_health_check_notifications_status
+            ON vip_health_check_notifications(status, updated_at);
         """
     )
+
+    rebuild_tables = _preflight_rebuild_contracts(conn)
     report_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(vip_health_check_reports)")
     }
@@ -1288,12 +1997,72 @@ def _ensure_vip_health_check_schema(conn: sqlite3.Connection) -> None:
         ("review_id", "vip_health_check_reviews", "review_id"),
         ("case_id", "vip_health_check_reviews", "case_id"),
     }
-    if (
+    report_requires_rebuild = (
         "review_id" not in report_columns
         or not required_report_foreign_keys.issubset(report_foreign_keys)
         or "check(report_kind='baseline_3day')" not in normalized_report_schema
-    ):
-        _rebuild_legacy_reports_table(conn, report_columns)
+        or _table_contract(conn, "vip_health_check_reports")
+           != _reference_contract(_CANONICAL_REBUILD_DDL["vip_health_check_reports"])
+    )
+    report_review_mapping = None
+    if report_requires_rebuild:
+        # Validation-only pass is deliberately before every destructive DDL.
+        report_review_mapping = _rebuild_legacy_reports_table(
+            conn, report_columns, dry_run=True
+        )
+    else:
+        expected_triggers = {
+            "vip_health_check_reports_no_update": _normalize_schema_sql(
+                "CREATE TRIGGER vip_health_check_reports_no_update BEFORE UPDATE ON "
+                "vip_health_check_reports BEGIN SELECT RAISE(ABORT, "
+                "'published health-check reports are immutable'); END"
+            ),
+            "vip_health_check_reports_no_delete": _normalize_schema_sql(
+                "CREATE TRIGGER vip_health_check_reports_no_delete BEFORE DELETE ON "
+                "vip_health_check_reports BEGIN SELECT RAISE(ABORT, "
+                "'published health-check reports are immutable'); END"
+            ),
+        }
+        actual_triggers = {
+            name: _normalize_schema_sql(sql).rstrip(";").replace(
+                "createtriggerifnotexists", "createtrigger", 1
+            )
+            for name, sql in conn.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+                "AND tbl_name='vip_health_check_reports'"
+            )
+        }
+        if actual_triggers != expected_triggers:
+            raise sqlite3.IntegrityError("unsupported canonical report trigger set")
+
+    # Existing violations, including all seven inbound-case FK lanes, reject before DROP.
+    preflight_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if preflight_violations:
+        raise sqlite3.IntegrityError(
+            f"VIP health-check preflight foreign key violations: {preflight_violations!r}"
+        )
+    # Validate all rows against the destination graph before the first DROP.
+    # The identity-poor report route was semantically validated just above.
+    _preflight_graph_rows(conn, report_review_mapping)
+    conn.execute("PRAGMA defer_foreign_keys=ON")
+    parent_requires_rebuild = bool(
+        rebuild_tables & {"vip_health_check_cases", "vip_health_check_reviews"}
+    ) or report_requires_rebuild
+    if parent_requires_rebuild:
+        # Every accepted parent route uses one complete dependency-graph rebuild.
+        # Rebuilding reviews or reports alone creates the same deferred-FK debt as
+        # rebuilding cases while their populated children still reference them.
+        _rebuild_c566_dependency_graph(conn, report_review_mapping)
+        rebuild_tables.difference_update({
+            "vip_health_check_cases",
+            "vip_health_check_reviews",
+            "vip_health_check_deliveries",
+            "dietitian_coaching_orders",
+        })
+    if "vip_health_check_deliveries" in rebuild_tables:
+        _rebuild_exact_table(conn, "vip_health_check_deliveries")
+    if "dietitian_coaching_orders" in rebuild_tables:
+        _rebuild_exact_table(conn, "dietitian_coaching_orders")
 
     delivery_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(vip_health_check_deliveries)")
@@ -1417,6 +2186,10 @@ def create_first_vip_health_check_case(
         }
 
     case_id = "vhc_" + uuid.uuid4().hex
+    draft_revision_schema_installed = conn.execute(
+        """SELECT 1 FROM sqlite_master
+           WHERE type='table' AND name='dietitian_health_check_source_revisions'"""
+    ).fetchone() is not None
     conn.execute("SAVEPOINT create_first_vip_health_check_case")
     try:
         conn.execute(
@@ -1437,6 +2210,12 @@ def create_first_vip_health_check_case(
                 started_at,
             ),
         )
+        if draft_revision_schema_installed:
+            conn.execute(
+                """INSERT INTO dietitian_health_check_source_revisions
+                   (case_id,revision,manifest_hash,updated_at) VALUES (?,1,'',?)""",
+                (case_id, started_at),
+            )
         conn.execute(
             """INSERT INTO vip_health_check_audit_log
                (case_id,actor_type,actor_id,from_status,to_status,reason,created_at)
@@ -1476,6 +2255,40 @@ _TAIPEI = ZoneInfo("Asia/Taipei")
 _REFRESHABLE_CASE_STATUSES = {"collecting", "ready_for_review", "needs_more_info"}
 
 
+def refresh_user_health_check_case(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    evaluated_at: datetime,
+    minimum_meals_per_day: int = 2,
+    rule_version: str = "draft-confirmed-meals-v1",
+) -> dict[str, object] | None:
+    """Refresh the one open baseline case for a user, or no-op when none exists."""
+    require_vip_health_check_connection(conn)
+    principal = str(user_id or "").strip()
+    if not principal:
+        raise ValueError("user_id 不可空白")
+    statuses = sorted(_REFRESHABLE_CASE_STATUSES)
+    placeholders = ",".join("?" for _ in statuses)
+    rows = conn.execute(
+        f"""SELECT case_id FROM vip_health_check_cases
+            WHERE user_id=? AND status IN ({placeholders})
+            ORDER BY created_at,case_id LIMIT 2""",
+        (principal, *statuses),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise sqlite3.IntegrityError("multiple refreshable health-check cases")
+    return refresh_case_source_manifest(
+        conn,
+        case_id=str(rows[0][0]),
+        evaluated_at=evaluated_at,
+        minimum_meals_per_day=minimum_meals_per_day,
+        rule_version=rule_version,
+    )
+
+
 def _parse_ledger_time(value: str) -> datetime:
     text = str(value or "").strip()
     if text.endswith(("Z", "z")):
@@ -1496,6 +2309,36 @@ def _canonical_json_text(value: str) -> str:
         return str(value or "")
 
 
+def normalized_health_check_meal_slot(value: object) -> str:
+    """Return the canonical meal grouping label bound into new source hashes."""
+    return str(value or "").strip() or "unspecified"
+
+
+def health_check_source_hash_v2(
+    *,
+    food_log_id: object,
+    food_log_version: object,
+    nutrition_snapshot_json: object,
+    local_date: object,
+    normalized_meal_slot: object,
+    effective_revision_hash: object = "",
+) -> str:
+    """Bind timeline metadata without changing the historical v1 digest contract."""
+    payload = {
+        "schema_version": "vip_health_check_source_v2",
+        "food_log_id": str(food_log_id or ""),
+        "food_log_version": int(food_log_version),
+        "nutrition_snapshot_json": _canonical_json_text(str(nutrition_snapshot_json or "")),
+        "local_date": str(local_date or ""),
+        "normalized_meal_slot": normalized_health_check_meal_slot(normalized_meal_slot),
+        "trust_binding": str(effective_revision_hash or ""),
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def refresh_case_source_manifest(
     conn: sqlite3.Connection,
     *,
@@ -1510,54 +2353,98 @@ def refresh_case_source_manifest(
     驗收後可更換 rule version。函式刻意不查 `planned_meal_checks`，避免已轉成
     food_log 的一日樂食餐點被投影表重複計算。
     """
-    if not isinstance(minimum_meals_per_day, int) or not 1 <= minimum_meals_per_day <= 10:
+    if (
+        isinstance(minimum_meals_per_day, bool)
+        or not isinstance(minimum_meals_per_day, int)
+        or not 1 <= minimum_meals_per_day <= 10
+    ):
         raise ValueError("minimum_meals_per_day 必須介於 1～10")
     rule_version = str(rule_version or "").strip()
     if not rule_version:
         raise ValueError("rule_version 不可空白")
+    registered_minimum = HEALTH_CHECK_DAY_RULE_MINIMUM_MEALS.get(rule_version)
+    if registered_minimum is None:
+        raise ValueError("不支援的健檢有效日 rule_version")
+    if minimum_meals_per_day != registered_minimum:
+        raise ValueError("minimum_meals_per_day 與 rule_version 不匹配")
     evaluated_text = _iso_seconds(evaluated_at)
 
     conn.execute("SAVEPOINT refresh_case_source_manifest")
     try:
+        ensure_vip_health_check_notification_schema(conn)
+        ensure_dietitian_health_check_draft_schema(conn)
         case = conn.execute(
-            """SELECT user_id,window_started_at,window_ends_at,status
+            """SELECT user_id,window_started_at,window_ends_at,status,source_manifest_hash
                FROM vip_health_check_cases WHERE case_id=?""",
             (str(case_id or "").strip(),),
         ).fetchone()
         if not case:
             raise ValueError("找不到健檢案件")
-        user_id, window_start_text, window_end_text, current_status = case
+        user_id, window_start_text, window_end_text, current_status, prior_manifest_hash = case
         if current_status not in _REFRESHABLE_CASE_STATUSES:
             raise ValueError("案件已進入不可重建來源的狀態")
 
         window_start = _parse_ledger_time(window_start_text)
         window_end = _parse_ledger_time(window_end_text)
+        food_log_columns = {
+            str(column[1]) for column in conn.execute("PRAGMA table_info(food_logs)")
+        }
+        trust_type_sql = "trust_type" if "trust_type" in food_log_columns else "''"
+        trust_hash_sql = "trust_hash" if "trust_hash" in food_log_columns else "''"
         rows = conn.execute(
-            """SELECT log_id,consumed_at,meal_slot,nutrition_snapshot_json,version
+            f"""SELECT log_id,consumed_at,meal_slot,nutrition_snapshot_json,version,
+                       {trust_type_sql} AS trust_type,{trust_hash_sql} AS trust_hash
                FROM food_logs
                WHERE user_id=? AND confirmation_status='confirmed'
                  AND COALESCE(deleted_at,'')=''""",
             (user_id,),
         ).fetchall()
-
         included: list[dict[str, object]] = []
         by_date: dict[str, list[dict[str, object]]] = defaultdict(list)
-        for log_id, consumed_at, meal_slot, nutrition_snapshot_json, version in rows:
+        for (
+            log_id, consumed_at, meal_slot, nutrition_snapshot_json, version,
+            trust_type, trust_hash,
+        ) in rows:
+            trust = user_confirmed_meal_photo_trust_projection(
+                conn, str(log_id or ""), str(trust_type or "")
+            )
+            if trust["integrity_status"] == "integrity_verification_failed":
+                continue
             local_time = _parse_ledger_time(consumed_at)
             if not window_start <= local_time < window_end:
                 continue
             local_date = local_time.date().isoformat()
             version = int(version or 1)
-            source_material = (
-                f"{log_id}:{version}:"
-                f"{_canonical_json_text(nutrition_snapshot_json)}"
+            normalized_meal_slot = normalized_health_check_meal_slot(meal_slot)
+            effective_revision_hash = (
+                trust["effective_revision_hash"]
+                if trust["integrity_status"] == "verified"
+                else ""
+            )
+            source_hash = health_check_source_hash_v2(
+                food_log_id=log_id,
+                food_log_version=version,
+                nutrition_snapshot_json=nutrition_snapshot_json,
+                local_date=local_date,
+                normalized_meal_slot=normalized_meal_slot,
+                effective_revision_hash=effective_revision_hash,
             )
             item = {
                 "food_log_id": log_id,
                 "version": version,
                 "local_date": local_date,
-                "meal_slot": str(meal_slot or ""),
-                "source_hash": hashlib.sha256(source_material.encode("utf-8")).hexdigest(),
+                "meal_slot": normalized_meal_slot,
+                "source_hash": source_hash,
+                # Semantic completion evidence is distinct from the monotonic
+                # version/revision material used by the source CAS token.
+                "content": {
+                    "food_log_id": str(log_id or ""),
+                    "local_date": local_date,
+                    "meal_slot": normalized_meal_slot,
+                    "nutrition_snapshot_json": _canonical_json_text(
+                        str(nutrition_snapshot_json or "")
+                    ),
+                },
             }
             included.append(item)
             by_date[local_date].append(item)
@@ -1608,13 +2495,70 @@ def refresh_case_source_manifest(
             for local_date, items in sorted(by_date.items())
         )
         manifest_hash = hashlib.sha256("\n".join(manifest_lines).encode("utf-8")).hexdigest()
+        content_payload = {
+            "schema_version": "vip_health_check_source_content_v1",
+            "sources": [
+                item["content"]
+                for item in sorted(included, key=lambda row: str(row["food_log_id"]))
+            ],
+            "days": [
+                {
+                    "local_date": local_date,
+                    "meal_slots": sorted({
+                        str(item["meal_slot"] or "unspecified").strip() or "unspecified"
+                        for item in items
+                    }),
+                    "rule_version": rule_version,
+                }
+                for local_date, items in sorted(by_date.items())
+            ],
+        }
+        content_digest = hashlib.sha256(json.dumps(
+            content_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
 
-        next_status = "ready_for_review" if valid_day_count >= 3 else "collecting"
+        supplement_table_exists = conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='health_check_supplement_requests'"""
+        ).fetchone() is not None
+        active_supplement_count = 0
+        if supplement_table_exists:
+            active_supplement_count = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM health_check_supplement_requests
+                       WHERE case_id=? AND status='pending_customer'""",
+                    (case_id,),
+                ).fetchone()[0]
+            )
+        if active_supplement_count > 1:
+            raise sqlite3.IntegrityError("multiple active health-check supplement requests")
+        next_status = (
+            "needs_more_info"
+            if active_supplement_count == 1
+            else ("ready_for_review" if valid_day_count >= 3 else "collecting")
+        )
+        if str(prior_manifest_hash or "") != manifest_hash:
+            changed = conn.execute(
+                """UPDATE dietitian_health_check_source_revisions
+                   SET revision=revision+1,manifest_hash=?,updated_at=?
+                   WHERE case_id=? AND manifest_hash=?""",
+                (manifest_hash, evaluated_text, case_id, str(prior_manifest_hash or "")),
+            )
+            if changed.rowcount != 1:
+                raise sqlite3.IntegrityError("health-check source revision changed")
         conn.execute(
             """UPDATE vip_health_check_cases
                SET status=?,valid_day_count=?,source_manifest_hash=?,updated_at=? WHERE case_id=?""",
             (next_status, valid_day_count, manifest_hash, evaluated_text, case_id),
         )
+        if next_status == "ready_for_review":
+            conn.execute(
+                """INSERT OR IGNORE INTO vip_health_check_notifications
+                   (notification_id,case_id,notification_kind,status,attempts,claim_token,
+                    lease_until,last_error,created_at,updated_at,delivered_at)
+                   VALUES (?,?,'dietitian_ready_for_review','pending',0,'','','',?,?,'')""",
+                ("vhcn_" + uuid.uuid4().hex, case_id, evaluated_text, evaluated_text),
+            )
         if next_status != current_status:
             conn.execute(
                 """INSERT INTO vip_health_check_audit_log
@@ -1640,8 +2584,27 @@ def refresh_case_source_manifest(
         "source_count": len(included),
         "valid_day_count": valid_day_count,
         "source_manifest_hash": manifest_hash,
+        "source_content_digest": content_digest,
         "rule_version": rule_version,
     }
+
+
+def probe_current_health_check_source_manifest(
+    conn: sqlite3.Connection, *, case_id: str, evaluated_at: datetime,
+) -> dict[str, object]:
+    """Compute through the production refresh path and leave no persisted side effect."""
+    conn.execute("SAVEPOINT probe_current_health_check_source_manifest")
+    try:
+        result = refresh_case_source_manifest(
+            conn, case_id=case_id, evaluated_at=evaluated_at
+        )
+        conn.execute("ROLLBACK TO SAVEPOINT probe_current_health_check_source_manifest")
+        conn.execute("RELEASE SAVEPOINT probe_current_health_check_source_manifest")
+        return result
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT probe_current_health_check_source_manifest")
+        conn.execute("RELEASE SAVEPOINT probe_current_health_check_source_manifest")
+        raise
 
 
 def _json_object(value: Mapping[str, object], field: str) -> str:
@@ -1788,7 +2751,13 @@ def approve_health_check_review(
         raise ValueError("approved_by 不可空白")
     approved_text = _iso_seconds(approved_at)
     report_values = dict(report) if isinstance(report, Mapping) else {}
-    for field in ("good", "priority", "next_7_days", "limitations"):
+    report_contract = report_values.get("contract_version")
+    required_report_fields = (
+        ("good", "priority", "next_7_days", "comment", "limitations")
+        if report_contract == "dietitian_health_check_report_v2"
+        else ("good", "priority", "next_7_days", "limitations")
+    )
+    for field in required_report_fields:
         if not str(report_values.get(field) or "").strip():
             raise ValueError(f"報告缺少 {field}")
     report_json = _json_object(report_values, "report")
@@ -2058,6 +3027,44 @@ def get_customer_health_check_state(
         ).fetchone()
         if report_row:
             report = json.loads(report_row[0])
+    supplement_request = None
+    supplement_table_exists = conn.execute(
+        """SELECT 1 FROM sqlite_master
+           WHERE type='table' AND name='health_check_supplement_requests'"""
+    ).fetchone() is not None
+    if supplement_table_exists and row[1] == "needs_more_info":
+        supplements = conn.execute(
+            """SELECT s.supplement_request_id,s.expected_source_token,s.reason,
+                      s.required_content,s.requested_at,s.recipient_user_id,
+                      s.expected_review_version,r.review_version,r.case_id
+               FROM health_check_supplement_requests AS s
+               JOIN vip_health_check_reviews AS r ON r.review_id=s.review_id
+               WHERE s.case_id=? AND s.status='pending_customer'""",
+            (row[0],),
+        ).fetchall()
+        if len(supplements) != 1:
+            raise sqlite3.IntegrityError("invalid active customer supplement request")
+        supplement = supplements[0]
+        expected_token = str(supplement[1] or "")
+        if (
+            not str(supplement[0] or "").strip()
+            or len(expected_token) != 64
+            or any(character not in "0123456789abcdef" for character in expected_token)
+            or not str(supplement[2] or "").strip()
+            or not str(supplement[3] or "").strip()
+            or not str(supplement[4] or "").strip()
+            or supplement[5] != str(user_id or "").strip()
+            or supplement[6] != supplement[7]
+            or supplement[8] != row[0]
+        ):
+            raise sqlite3.IntegrityError("invalid customer supplement request binding")
+        supplement_request = {
+            "supplement_request_id": supplement[0],
+            "expected_source_token": expected_token,
+            "reason": supplement[2],
+            "required_content": supplement[3],
+            "requested_at": supplement[4],
+        }
     return {
         "case_id": row[0],
         "status": row[1],
@@ -2066,7 +3073,47 @@ def get_customer_health_check_state(
         "window_ends_at": row[4],
         "report_published_at": row[5],
         "report": report,
+        "supplement_request": supplement_request,
     }
+
+
+_CUSTOMER_COACHING_STATUSES = frozenset({
+    "payment_pending",
+    "payment_reported",
+    "coaching_active",
+    "coaching_paused",
+    "coaching_completed",
+    "coaching_refunded",
+    "coaching_cancelled",
+    "payment_rejected",
+})
+
+
+def get_customer_coaching_order_status(
+    conn: sqlite3.Connection, *, user_id: str,
+) -> dict[str, str] | None:
+    """Project the newest canonical coaching order bound to the same owner and case."""
+    owner = str(user_id or "").strip()
+    if not owner:
+        return None
+    row = conn.execute(
+        """SELECT orders.status,orders.starts_at,orders.ends_at
+           FROM dietitian_coaching_orders AS orders
+           JOIN vip_health_check_cases AS cases
+             ON cases.case_id=orders.case_id
+            AND cases.user_id=orders.user_id
+           WHERE orders.user_id=?
+             AND orders.product_type='dietitian_coaching_4w'
+           ORDER BY orders.updated_at DESC,orders.order_id DESC
+           LIMIT 1""",
+        (owner,),
+    ).fetchone()
+    if not row or any(not isinstance(value, str) for value in row):
+        return None
+    status, starts_at, ends_at = row
+    if status not in _CUSTOMER_COACHING_STATUSES:
+        return None
+    return {"status": status, "starts_at": starts_at, "ends_at": ends_at}
 
 
 def request_dietitian_coaching(

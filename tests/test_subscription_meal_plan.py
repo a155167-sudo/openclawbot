@@ -1,9 +1,15 @@
 import subscription_meal_plan as meal_plan
 import pytest
 from subscription_meal_plan import (
+    chunk_subscription_menu_text,
     ensure_light_bento_coverage,
+    get_subscription_form_uid,
     get_subscription_form_value,
 )
+
+
+def _utf16_units(text):
+    return len(text.encode("utf-16-le")) // 2
 
 
 def _dish(name, *, price=180):
@@ -16,6 +22,50 @@ def _dish(name, *, price=180):
         "category": "main",
         "carb_type": "高碳",
     }
+
+
+def test_subscription_uid_accepts_only_registered_exact_labels():
+    uid = "U" + "a" * 32
+
+    assert get_subscription_form_uid(
+        {"1. LINE UID (系統綁定用，請勿修改)": uid}
+    ) == uid
+    assert get_subscription_form_uid({"LINE UID": uid}) == uid
+    assert get_subscription_form_uid({"UID": uid}) == uid
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"1. LINE UID (系統綁定用，請勿修改)": ""},
+        {"1. LINE UID (系統綁定用，請勿修改)": "not-a-line-uid"},
+        {"LINE UID 額外說明": "U" + "a" * 32},
+        {"好友UID備註": "U" + "a" * 32},
+    ],
+)
+def test_subscription_uid_missing_invalid_or_unknown_fails_closed(payload):
+    assert get_subscription_form_uid(payload) == ""
+
+
+def test_subscription_uid_rejects_multiple_registered_aliases_instead_of_first_pick():
+    uid = "U" + "a" * 32
+
+    with pytest.raises(ValueError, match="multiple UID fields"):
+        get_subscription_form_uid(
+            {
+                "1. LINE UID (系統綁定用，請勿修改)": uid,
+                "UID": uid,
+            }
+        )
+
+    with pytest.raises(ValueError, match="multiple UID fields"):
+        get_subscription_form_uid(
+            {
+                "LINE UID": uid,
+                "UID": "U" + "b" * 32,
+            }
+        )
 
 
 def test_form_value_prefers_positive_new_column_over_disliked_column():
@@ -238,4 +288,43 @@ def test_all_eater_does_not_force_wrong_protein_or_duplicate_existing_light_bent
             safe_menu=[chicken_light, _dish("雞胸食蔬"), chicken_bento],
             pref_staple="都不挑食",
             liked_proteins=["雞"],
+        )
+
+
+def test_subscription_menu_chunks_keep_blocks_whole_and_respect_line_utf16_limit():
+    menu = "\n\n".join(
+        f"2026/10/{day:02d}（週一）\n午：🍱{day:02d}{'甲' * 16}\n晚：🍱{day:02d}{'乙' * 16}"
+        for day in range(1, 5)
+    )
+
+    chunks = chunk_subscription_menu_text(
+        menu,
+        heading="",
+        footer="",
+        max_chars=120,
+        max_messages=5,
+    )
+
+    assert len(chunks) == 4
+    assert all(chunk and _utf16_units(chunk) <= 120 for chunk in chunks)
+    joined = "\n".join(chunks)
+    for day in range(1, 5):
+        assert joined.count(f"2026/10/{day:02d}") == 1
+        assert joined.count(f"午：🍱{day:02d}{'甲' * 16}") == 1
+        assert joined.count(f"晚：🍱{day:02d}{'乙' * 16}") == 1
+
+
+def test_subscription_menu_chunker_rejects_total_over_five_message_capacity():
+    menu = "\n\n".join(
+        f"2026/10/{day:02d}\n午：{'甲' * 35}\n晚：{'乙' * 35}"
+        for day in range(1, 7)
+    )
+
+    with pytest.raises(ValueError, match="exceeds one LINE reply"):
+        chunk_subscription_menu_text(
+            menu,
+            heading="本期菜單",
+            footer="需要調整請找客服",
+            max_chars=100,
+            max_messages=5,
         )

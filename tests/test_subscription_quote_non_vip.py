@@ -1,6 +1,8 @@
 import json
 import os
+from dataclasses import replace
 from types import SimpleNamespace
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import pytest
 
@@ -9,6 +11,20 @@ os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
 os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy")
 
 import server
+
+TRUE_LIVE_FORM_TEMPLATE = (
+    "https://docs.google.com/forms/d/e/"
+    "1FAIpQLSedJcUGTmSqbnyVTA8xKeCsc9SX7D7tCOYX5B6CVP2BwiqwOA/viewform"
+    "?usp=pp_url&entry.1461831832={uid}"
+)
+
+
+def _install_true_live_form(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "APP_SETTINGS",
+        replace(server.APP_SETTINGS, subscription_form_url_template=TRUE_LIVE_FORM_TEMPLATE),
+    )
 
 
 def _text_event(message_id, text, user_id="U_QUOTE"):
@@ -20,6 +36,7 @@ def _text_event(message_id, text, user_id="U_QUOTE"):
 
 
 def _install_non_vip_gate(monkeypatch, replies):
+    _install_true_live_form(monkeypatch)
     monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: False)
     monkeypatch.setattr(
         server, "is_text_command_allowed_without_vip", lambda *_args: False
@@ -89,8 +106,109 @@ def test_non_vip_owned_self_pickup_sequence_renders_real_estimate_flex(monkeypat
     assert "外送費：$0" in rendered
     assert "本期合計：約 $4,080～$5,280" in rendered
     assert "可以，建立包月資料" in rendered
-    assert server.get_subscription_form_link(uid) in rendered
+    payload = replies[-1].as_json_dict()
+    form_uri = next(
+        item["action"]["uri"]
+        for item in payload["contents"]["footer"]["contents"]
+        if item.get("action", {}).get("type") == "uri"
+    )
+    query = parse_qs(urlsplit(form_uri).query)
+    assert query["entry.1461831832"] == [uid]
+    assert query["entry.2113240625"] == ["店面自取（免運費）"]
     assert server.pending_subscription_state[uid]["step"] == "estimated"
+
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
+    server.handle_message(_text_event("QUOTE-SELF-FORM", "填寫體質表單", uid))
+    form_text = replies[-1].text
+    form_uri = next(part for part in form_text.split() if part.startswith("https://"))
+    query = parse_qs(urlsplit(form_uri).query)
+    assert query["entry.2113240625"] == ["店面自取（免運費）"]
+
+
+def test_true_live_form_identity_prefills_and_replaces_estimate_fields(monkeypatch):
+    true_live_url = (
+        "https://docs.google.com/forms/d/e/"
+        "1FAIpQLSedJcUGTmSqbnyVTA8xKeCsc9SX7D7tCOYX5B6CVP2BwiqwOA/viewform"
+    )
+    settings = replace(
+        server.APP_SETTINGS,
+        subscription_form_url_template=(
+            true_live_url
+            + "?usp=pp_url&entry.1461831832={uid}"
+            + "&entry.2113240625=stale&entry.1759455659=old&source=regression"
+        ),
+    )
+    monkeypatch.setattr(server, "APP_SETTINGS", settings)
+
+    link = server.get_subscription_form_link(
+        "U LIVE & UID",
+        {"pickup_method": "外送", "address": "台北市 A 路 1 & 2 號"},
+    )
+    parsed = urlsplit(link)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    query = parse_qs(parsed.query)
+
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "docs.google.com"
+    assert parsed.path == urlsplit(true_live_url).path
+    assert query["entry.1461831832"] == ["U LIVE & UID"]
+    assert query["entry.2113240625"] == ["外送（依地址評估運費)"]
+    assert query["entry.1759455659"] == ["台北市 A 路 1 & 2 號"]
+    assert query["source"] == ["regression"]
+    assert sum(key == "entry.2113240625" for key, _ in query_pairs) == 1
+    assert sum(key == "entry.1759455659" for key, _ in query_pairs) == 1
+
+    pickup_link = server.get_subscription_form_link(
+        "U LIVE & UID", {"pickup_method": "自取", "address": "不應沿用"}
+    )
+    pickup_query = parse_qs(urlsplit(pickup_link).query)
+    assert pickup_query["entry.2113240625"] == ["店面自取（免運費）"]
+    assert "entry.1759455659" not in pickup_query
+
+
+def test_production_form_identity_prefills_verified_estimate_fields(monkeypatch):
+    production_url = (
+        "https://docs.google.com/forms/d/e/"
+        "1FAIpQLSfBMVFNZQ9yJN6Tjt8nY15ESkdMemkL0NJx80NRX8dthkulsQ/viewform"
+    )
+    settings = replace(
+        server.APP_SETTINGS,
+        subscription_form_url_template=(
+            production_url + "?usp=pp_url&entry.1461831832={uid}"
+        ),
+    )
+    monkeypatch.setattr(server, "APP_SETTINGS", settings)
+
+    link = server.get_subscription_form_link(
+        "U PROD SENTINEL",
+        {"pickup_method": "外送", "address": "正式表單唯讀預填測試地址"},
+    )
+    parsed = urlsplit(link)
+    query = parse_qs(parsed.query)
+
+    assert parsed.path == urlsplit(production_url).path
+    assert query["entry.1461831832"] == ["U PROD SENTINEL"]
+    assert query["entry.2113240625"] == ["外送（依地址評估運費)"]
+    assert query["entry.1759455659"] == ["正式表單唯讀預填測試地址"]
+
+
+def test_estimate_prefill_does_not_mix_verified_entries_into_a_different_form(monkeypatch):
+    settings = replace(
+        server.APP_SETTINGS,
+        subscription_form_url_template=(
+            "https://docs.google.com/forms/d/e/LEGACY-DIFFERENT-FORM/viewform"
+            "?usp=pp_url&entry.999={uid}"
+        ),
+    )
+    monkeypatch.setattr(server, "APP_SETTINGS", settings)
+
+    link = server.get_subscription_form_link(
+        "U_LEGACY",
+        {"pickup_method": "外送", "address": "台北市測試路1號"},
+    )
+    query = parse_qs(urlsplit(link).query)
+
+    assert query == {"usp": ["pp_url"], "entry.999": ["U_LEGACY"]}
 
 
 @pytest.mark.parametrize("active_vip", [False, True], ids=["non-vip", "vip"])
@@ -101,6 +219,7 @@ def test_registered_known_delivery_quote_keeps_checkout_total_and_cta(
     address = "台北市松山區南京東路四段133巷4弄5號"
     replies = []
     map_calls = []
+    _install_true_live_form(monkeypatch)
     monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: active_vip)
     monkeypatch.setattr(
         server, "is_text_command_allowed_without_vip", lambda *_args: False
@@ -145,7 +264,16 @@ def test_registered_known_delivery_quote_keeps_checkout_total_and_cta(
     assert "外送費：$300" in rendered
     assert "本期合計：約 $4,280～$5,480" in rendered
     assert "可以，建立包月資料" in rendered
-    assert server.get_subscription_form_link(uid) in rendered
+    payload = replies[-1].as_json_dict()
+    form_uri = next(
+        item["action"]["uri"]
+        for item in payload["contents"]["footer"]["contents"]
+        if item.get("action", {}).get("type") == "uri"
+    )
+    query = parse_qs(urlsplit(form_uri).query)
+    assert query["entry.1461831832"] == [uid]
+    assert query["entry.2113240625"] == ["外送（依地址評估運費)"]
+    assert query["entry.1759455659"] == [address]
     assert server.pending_subscription_state[uid]["step"] == "estimated"
 
 
@@ -198,7 +326,8 @@ def test_registered_delivery_quote_with_unknown_maps_result_is_not_checkout_read
     assert "可以，建立包月資料" not in rendered
     assert server.get_subscription_form_link(uid) not in rendered
     assert "重新選天數" in rendered
-    assert '"text": "找客服"' not in rendered
+    assert '"label": "找客服確認"' in rendered
+    assert '"text": "找客服"' in rendered
     assert server.pending_subscription_state[uid]["step"] == "estimated"
 
 

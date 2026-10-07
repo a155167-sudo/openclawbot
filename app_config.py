@@ -79,12 +79,14 @@ def _validate_public_base_url(value: str) -> str:
 class AppSettings:
     app_env: str
     enable_scheduler: bool
+    pair_reschedule_enabled: bool
     data_dir: str
     public_base_url: str
     admin_uid: str
     coach_uids: tuple[str, ...]
     liff_id: str
     spreadsheet_id: str
+    nanjing_printer_export_token: str
     form_webhook_secret: str
     survey_webhook_secret: str
     survey_reward_link_count: int
@@ -116,8 +118,13 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         raise ValueError(
             "APP_ENV 必須是 legacy、staging 或 production"
         )
+    printer_export_enabled = _parse_bool(
+        "NANJING_PRINTER_EXPORT_ENABLED",
+        environ.get("NANJING_PRINTER_EXPORT_ENABLED"),
+        default=True,
+    )
     if app_env != "legacy":
-        isolated_names = (
+        isolated_names = [
             "ADMIN_UID",
             "ADMIN_SECRET",
             "COACH_UIDS",
@@ -129,6 +136,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
             "LINE_CHANNEL_ACCESS_TOKEN",
             "LINE_CHANNEL_SECRET",
             "MEAL_PHOTO_IMAGE_SECRET",
+
             "OPENAI_API_KEY",
             "SPREADSHEET_ID",
             "SUBSCRIPTION_FORM_URL_TEMPLATE",
@@ -136,7 +144,9 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
             "SURVEY_REWARD_LINK_COUNT",
             "SURVEY_REWARD_POINTS_PER_LINK",
             "SURVEY_FORM_URL_TEMPLATE",
-        )
+        ]
+        if printer_export_enabled:
+            isolated_names.append("NANJING_PRINTER_EXPORT_TOKEN")
         missing = [
             name for name in isolated_names
             if not str(environ.get(name) or "").strip()
@@ -159,6 +169,11 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         environ.get("ENABLE_SCHEDULER"),
         default=scheduler_default,
     )
+    pair_reschedule_enabled = _parse_bool(
+        "PAIR_RESCHEDULE_ENABLED",
+        environ.get("PAIR_RESCHEDULE_ENABLED"),
+        default=False,
+    )
 
     admin_uid = _validate_line_uid(
         "ADMIN_UID", environ.get("ADMIN_UID") or LEGACY_ADMIN_UID
@@ -176,6 +191,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
     if not re.fullmatch(r"[0-9]{5,}-[A-Za-z0-9_-]+", liff_id):
         raise ValueError("LIFF_ID 格式無效")
 
+    google_credentials: dict[str, object] = {}
     if app_env != "legacy":
         try:
             google_credentials = json.loads(str(environ.get("GOOGLE_CREDENTIALS")))
@@ -215,6 +231,9 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
     )
     form_webhook_secret = str(environ.get("FORM_WEBHOOK_SECRET") or "")
     survey_webhook_secret = str(environ.get("SURVEY_WEBHOOK_SECRET") or "")
+    nanjing_printer_export_token = str(
+        environ.get("NANJING_PRINTER_EXPORT_TOKEN") or ""
+    )
     if app_env != "legacy":
         for name, secret in (
             ("FORM_WEBHOOK_SECRET", form_webhook_secret),
@@ -222,6 +241,21 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         ):
             if len(secret.encode("utf-8")) < 32:
                 raise ValueError(f"{name} 必須至少 32 bytes")
+        reused_secrets = {
+            str(environ.get(name) or "")
+            for name in (
+                "LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET",
+                "ADMIN_SECRET", "FORM_WEBHOOK_SECRET", "SURVEY_WEBHOOK_SECRET",
+            )
+        }
+        reused_secrets.add(str(google_credentials.get("private_key") or ""))
+        if printer_export_enabled and (
+            len(nanjing_printer_export_token.encode("utf-8")) < 32
+            or nanjing_printer_export_token in reused_secrets
+        ):
+            raise ValueError(
+                "NANJING_PRINTER_EXPORT_TOKEN 必須是獨立且至少 32 bytes 的裝置憑證"
+            )
 
     raw_reward_count = str(environ.get("SURVEY_REWARD_LINK_COUNT") or "1").strip()
     try:
@@ -250,6 +284,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
     return AppSettings(
         app_env=app_env,
         enable_scheduler=enable_scheduler,
+        pair_reschedule_enabled=pair_reschedule_enabled,
         data_dir=str(environ.get("DATA_DIR") or "data").strip(),
         public_base_url=public_base_url,
         admin_uid=admin_uid,
@@ -258,6 +293,7 @@ def load_settings(environ: Mapping[str, str]) -> AppSettings:
         spreadsheet_id=str(
             environ.get("SPREADSHEET_ID") or LEGACY_SPREADSHEET_ID
         ).strip(),
+        nanjing_printer_export_token=nanjing_printer_export_token,
         form_webhook_secret=form_webhook_secret,
         survey_webhook_secret=survey_webhook_secret,
         survey_reward_link_count=survey_reward_link_count,

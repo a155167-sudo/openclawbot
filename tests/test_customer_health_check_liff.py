@@ -128,7 +128,8 @@ def test_verify_line_id_token_marks_line_outage_as_temporarily_unavailable():
 
 
 def _customer_liff_client(
-    *, state, verifier=None, loader_error=None, raise_server_exceptions=True
+    *, state, verifier=None, loader_error=None, raise_server_exceptions=True,
+    customer_reschedule_enabled=False
 ):
     from customer_health_check_liff import create_customer_health_check_router
 
@@ -148,6 +149,7 @@ def _customer_liff_client(
             state_loader=load_state,
             token_verifier=verifier
             or (lambda _token, *, channel_id: "U1234567890abcdef1234567890abcdef"),
+            customer_reschedule_enabled=customer_reschedule_enabled,
         )
     )
     return TestClient(app, raise_server_exceptions=raise_server_exceptions), seen
@@ -179,6 +181,33 @@ def test_customer_liff_page_uses_id_token_and_never_client_supplied_user_id():
         assert status in response.text
     for impossible_status in ("ready_for_ai", "ai_processing", "dietitian_review"):
         assert impossible_status not in response.text
+
+
+def test_customer_liff_staging_reschedule_ui_reuses_verified_token_and_server_context():
+    client, _seen = _customer_liff_client(
+        state=None,
+        customer_reschedule_enabled=True,
+    )
+
+    response = client.get("/vip-health-check")
+
+    assert response.status_code == 200
+    assert "申請餐點改期" in response.text
+    assert "'/customer-reschedule/context'" in response.text
+    assert "Authorization:'Bearer '+idToken" in response.text
+    assert "user_id" not in response.text
+    assert "target_date" not in response.text
+    assert "source_date" in response.text
+
+
+def test_customer_liff_does_not_render_reschedule_ui_when_wiring_disabled():
+    client, _seen = _customer_liff_client(state=None)
+
+    response = client.get("/vip-health-check")
+
+    assert response.status_code == 200
+    assert "申請餐點改期" not in response.text
+    assert "/customer-reschedule/context" not in response.text
 
 
 def test_customer_state_api_requires_bearer_token():
@@ -385,3 +414,42 @@ def test_attach_customer_health_check_routes_registers_valid_dedicated_liff():
 
     assert attached is True
     assert TestClient(app).get("/vip-health-check").status_code == 200
+
+
+def test_attach_customer_health_check_routes_wires_reschedule_only_in_staging():
+    from customer_health_check_liff import attach_customer_health_check_routes
+
+    app = FastAPI()
+    attached = attach_customer_health_check_routes(
+        app,
+        enabled=True,
+        environ={
+            "APP_ENV": "staging",
+            "VIP_HEALTH_CHECK_LIFF_ID": "2009251085-customerCheckup",
+            "VIP_HEALTH_CHECK_LINE_LOGIN_CHANNEL_ID": "2009251085",
+            "CUSTOMER_RESCHEDULE_LIFF_ENABLED": "true",
+            "CUSTOMER_RESCHEDULE_LINE_LOGIN_CHANNEL_ID": "2009251085",
+        },
+        state_loader=lambda _user_id: None,
+    )
+
+    assert attached is True
+    assert "申請餐點改期" in TestClient(app).get("/vip-health-check").text
+
+
+def test_attach_customer_health_check_routes_rejects_reschedule_channel_mismatch():
+    from customer_health_check_liff import attach_customer_health_check_routes
+
+    with pytest.raises(ValueError, match="相同 LINE Login Channel"):
+        attach_customer_health_check_routes(
+            FastAPI(),
+            enabled=True,
+            environ={
+                "APP_ENV": "staging",
+                "VIP_HEALTH_CHECK_LIFF_ID": "2009251085-customerCheckup",
+                "VIP_HEALTH_CHECK_LINE_LOGIN_CHANNEL_ID": "2009251085",
+                "CUSTOMER_RESCHEDULE_LIFF_ENABLED": "true",
+                "CUSTOMER_RESCHEDULE_LINE_LOGIN_CHANNEL_ID": "9999999999",
+            },
+            state_loader=lambda _user_id: None,
+        )
