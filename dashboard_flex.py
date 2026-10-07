@@ -99,7 +99,7 @@ def compute(data):
 
 
 def _dot(color, border=None):
-    d = {"type": "box", "layout": "vertical", "contents": [], "width": "9px", "height": "9px",
+    d = {"type": "box", "layout": "vertical", "contents": [], "width": "6px", "height": "6px",
          "cornerRadius": "5px", "backgroundColor": color, "flex": 0}
     if border:
         d["borderColor"] = border
@@ -108,10 +108,14 @@ def _dot(color, border=None):
 
 
 def _legend(color, text, border=None):
+    # Budget for a narrow bubble; use SDK-v2/replay-safe pixel sizes for long values.
+    units = sum(2 if ord(char) > 127 else 1 for char in text)
+    size = "xxs" if units <= 10 else f"{max(1, 104 // units)}px"
     return {"type": "box", "layout": "horizontal", "flex": 1, "spacing": "xs",
             "alignItems": "center", "contents": [
                 _dot(color, border),
-                {"type": "text", "text": text, "size": "xs", "color": "#3E504D", "flex": 1}]}
+                {"type": "text", "text": text, "size": size, "color": "#3E504D", "flex": 1,
+                 "wrap": False, "maxLines": 1}]}
 
 
 def _bar(e_ratio, r_ratio, eat_color, height):
@@ -154,14 +158,14 @@ def build_dashboard_flex(data):
         left_txt = "餘額 0"
     elif c["state"] == "unknown":
         k_label, k_big, k_color = "熱量餘額", "未知", C_TEAL
-        left_txt = "可自由運用 未知"
+        left_txt = "可用 未知"
     else:
         k_label, k_big, k_color = "熱量餘額", _kcal(max(c["left_k"], 0)), C_TEAL
-        left_txt = f"可自由運用 {_kcal(max(c['left_k'], 0))}"
+        left_txt = f"可用 {_kcal(max(c['left_k'], 0))}"
 
     legends = [_legend(eat_color, f"已吃 {_kcal(c['ek']) if c['ek'] is not None else '未知'}")]
     if c["has_sub"]:
-        legends.append(_legend(C_YELLOW, f"包月預留 {_kcal(c['rk']) if c['rk'] is not None else '未知'}"))
+        legends.append(_legend(C_YELLOW, f"預留 {_kcal(c['rk']) if c['rk'] is not None else '未知'}"))
     legends.append(_legend(C_TRACK, left_txt, border="#C9C3B2"))
 
     body = [
@@ -174,7 +178,7 @@ def build_dashboard_flex(data):
             {"type": "text", "text": "目標未設定" if no_target else f"目標 {_kcal(c['tk'])}", "size": "xs", "color": C_SUB,
              "align": "end", "gravity": "bottom"}]},
         _bar(c["e_ratio"], c["r_ratio"], eat_color, "14px"),
-        {"type": "box", "layout": "horizontal", "spacing": "md", "margin": "md", "contents": legends},
+        {"type": "box", "layout": "horizontal", "spacing": "xs", "margin": "md", "contents": legends},
 
         {"type": "box", "layout": "baseline", "margin": "xl", "contents": [
             {"type": "text", "text": "蛋白質餘額" if c["tp"] > 0 else "今日蛋白質", "size": "sm",
@@ -252,8 +256,8 @@ def build_dashboard_flex(data):
     def wrap_text(node):
         if isinstance(node, dict):
             if node.get("type") == "text":
-                node["wrap"] = True
-                if sum(ch.isdigit() for ch in node.get("text", "")) >= 5:
+                node.setdefault("wrap", True)
+                if node["wrap"] and sum(ch.isdigit() for ch in node.get("text", "")) >= 5:
                     node["size"] = "sm"
             for value in node.values():
                 wrap_text(value)

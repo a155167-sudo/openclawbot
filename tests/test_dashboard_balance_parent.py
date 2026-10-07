@@ -26,7 +26,9 @@ def test_large_numeric_texts_are_complete_and_wrap():
     bubble=build_dashboard_flex(_data(target_kcal=2000000,target_protein=100000,records=[_record(kcal=1234567.5,protein=98765.3)]))
     numeric=[n for n in _walk(bubble) if n.get('type')=='text' and any(x.isdigit() for x in n.get('text',''))]
     assert numeric
-    assert all(n.get('wrap') is True for n in numeric)
+    assert all(n.get('wrap') is True or
+               (n.get('wrap') is False and n.get('maxLines') == 1 and
+                (n.get('size') == 'xxs' or n.get('size', '').endswith('px'))) for n in numeric)
 
 
 def test_v52_idless_log_matches_identified_schedule_without_double_count(tmp_path, monkeypatch):

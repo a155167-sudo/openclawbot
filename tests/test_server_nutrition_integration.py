@@ -9947,8 +9947,14 @@ def test_dashboard_large_nutrition_numbers_remain_complete_and_wrapped(tmp_path,
     }
     matching = [node for node in text_nodes if node["text"] in expected]
     assert {node["text"] for node in matching} == expected
-    assert all(node.get("wrap") is True for node in matching)
-    assert all(node.get("size") in {"xxs", "sm"} for node in matching)
+    for node in matching:
+        if node['text'] == '已吃 1,234,568':
+            # Compact legends retain the whole value on one line, including SDK replay.
+            assert node.get('wrap') is False and node.get('maxLines') == 1
+            assert node.get('size') == '7px'
+        else:
+            assert node.get('wrap') is True
+            assert node.get('size') in {'xxs', 'sm'}
 
 
 def test_dashboard_with_profile_uses_canonical_log_names_without_delimiter_xp(tmp_path, monkeypatch):

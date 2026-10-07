@@ -64,7 +64,7 @@ def test_real_home_route_removes_only_explicit_price_and_shows_planned_nutrition
     assert "NT$120" not in serialized and "$180" not in serialized
     assert "520 kcal" in serialized
     assert "預留 未知" in serialized
-    assert "包月預留" in serialized
+    assert [item['contents'][1]['text'] for item in payload['contents']['body']['contents'][2]['contents']] == ['已吃 520', '預留 未知', '可用 未知']
 
 
 @pytest.mark.parametrize("meal", ("", "無", "尚未安排"))

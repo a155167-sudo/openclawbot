@@ -64,7 +64,7 @@ def test_spec_02_two_uneaten_subscription_meals_are_both_reserved():
     result = compute(data)
     text = _text(build_dashboard_flex(data))
     assert (result["ek"], result["rk"], result["left_k"]) == (0, 1391, 609)
-    assert "預留 650" in text and "預留 741" in text and "包月預留 1,391" in text
+    assert "預留 650" in text and "預留 741" in text and "預留 1,391" in text
 
 
 # SPEC 3
