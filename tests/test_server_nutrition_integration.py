@@ -399,8 +399,10 @@ def test_explicit_text_nutrition_logs_once_and_returns_canonical_dashboard(
     rendered = json.dumps(first, ensure_ascii=False)
     assert "今日總覽" in rendered
     assert "鮪魚蛋吐司" in rendered
-    assert '"text": "350 ' in rendered and "🔥 熱量" in rendered
-    assert '"text": "17 ' in rendered and "🥩 蛋白質" in rendered
+    assert '"text": "今日已吃"' in rendered and '"text": "350"' in rendered
+    assert '"text": "已吃 350"' in rendered
+    assert '"text": "今日蛋白質"' in rendered and '"text": "17 g"' in rendered
+    assert "目標未設定" in rendered
     assert "記錄成功" not in rendered
     with sqlite3.connect(db) as conn:
         rows = conn.execute(
@@ -558,16 +560,17 @@ def test_backdated_post_commit_dashboard_acknowledges_trusted_log_without_changi
     assert "補登鮪魚蛋吐司" in rendered
     assert "350 kcal" in rendered
     assert "17 g" in rendered
-    assert '"text": "0 / ' in rendered and "🔥 熱量" in rendered
+    assert '"text": "熱量餘額"' in rendered and '"text": "2,000"' in rendered
+    assert '"text": "已吃 0"' in rendered
 
 
 @pytest.mark.parametrize(
-    ("protein", "display", "threshold"),
-    [(79.94, "79.9", False), (79.95, "80", False),
-     (79.96, "80", False), (80.0, "80", True)],
+    ("protein", "balance_display", "threshold"),
+    [(79.94, "20.1", False), (79.95, "20", False),
+     (79.96, "20", False), (80.0, "20", True)],
 )
 def test_dashboard_display_rounding_does_not_change_protein_threshold(
-    tmp_path, monkeypatch, protein, display, threshold,
+    tmp_path, monkeypatch, protein, balance_display, threshold,
 ):
     db = tmp_path / f"protein-boundary-{protein}.db"
     monkeypatch.setattr(server, "DB_PATH", str(db))
@@ -591,7 +594,9 @@ def test_dashboard_display_rounding_does_not_change_protein_threshold(
     assert dashboard["extra_pro"] == pytest.approx(protein)
     assert dashboard["task_protein_80"] is threshold
     rendered = json.dumps(server.build_dashboard_flex("U-BOUNDARY").as_json_dict(), ensure_ascii=False)
-    assert f'"text": "{display} / ' in rendered and "🥩 蛋白質" in rendered
+    assert '"text": "蛋白質餘額"' in rendered
+    assert f'"text": "{balance_display} g"' in rendered
+    assert '"text": "/ 100 g"' in rendered
 
 
 def test_explicit_text_dashboard_render_failure_reports_committed_without_retry_prompt(
@@ -1582,7 +1587,9 @@ def test_recorded_updated_replay_repairs_failed_health_check_projection(
     import re as regex
     for payload in payloads:
         numeric_tokens = set(regex.findall(r"(?<![\d.])\d+(?:\.\d+)?(?![\d.])", "\n".join(visible_texts(payload))))
-        assert {"590", "38"}.issubset(numeric_tokens)
+        # v53 displays latest meal calories plus remaining protein (100 - 38).
+        # The canonical exact 590/38 snapshot remains asserted below from DB.
+        assert {"590", "62"}.issubset(numeric_tokens)
         assert not {"680", "35", "510", "31"}.intersection(numeric_tokens)
     assert "mealrev:v1:" not in rendered
     assert "foodlog:v1:" not in rendered
@@ -8758,8 +8765,9 @@ def test_natural_food_log_uses_private_exact_match_scales_ml_and_replays_once(
     card_text = json.dumps(json.loads(replies[-1].as_json_string()), ensure_ascii=False)
     assert "今日總覽" in card_text
     assert "無糖豆漿" in card_text
-    assert '"text": "202.9 / ' in card_text and "🔥 熱量" in card_text
-    assert '"text": "9.7 / ' in card_text and "🥩 蛋白質" in card_text
+    assert '"text": "熱量餘額"' in card_text and '"text": "1,797"' in card_text
+    assert '"text": "已吃 203"' in card_text
+    assert '"text": "蛋白質餘額"' in card_text and '"text": "90.3 g"' in card_text
     server.processed_messages.discard(event.message.id)
     server._handle_message_impl(event)
     with sqlite3.connect(db) as conn:
@@ -8862,8 +8870,9 @@ def test_search_and_quick_relog_creates_food_log(tmp_path, monkeypatch):
     card_text = json.dumps(payload, ensure_ascii=False)
     assert "今日總覽" in card_text
     assert "舒肥雞胸" in card_text
-    assert '"text": "180 / ' in card_text and "🔥 熱量" in card_text
-    assert '"text": "37.5 / ' in card_text and "🥩 蛋白質" in card_text
+    assert '"text": "熱量餘額"' in card_text and '"text": "1,820"' in card_text
+    assert '"text": "已吃 180"' in card_text
+    assert '"text": "蛋白質餘額"' in card_text and '"text": "62.5 g"' in card_text
     assert "記錄成功" not in card_text
     server.handle_meal_photo_postback(meal_event)
     assert replies[-1].type == "flex"
@@ -9233,8 +9242,8 @@ def test_dashboard_counts_verified_ai_photo_and_labels_estimate_without_profile(
     )
     texts = [node["text"] for node in text_nodes]
     assert payload["contents"]["body"]["contents"]
-    assert any(item.startswith("680 ") for item in texts) and "🔥 熱量" in texts
-    assert any(item.startswith("35 ") for item in texts) and "🥩 蛋白質" in texts
+    assert "今日已吃" in texts and "680" in texts and "已吃 680" in texts
+    assert "今日蛋白質" in texts and "35 g" in texts
     assert "含 AI 估算紀錄，非營養師審核結果" in texts
     assert texts.count("含 AI 估算紀錄，非營養師審核結果") == 1
     estimate_notice = next(node for node in text_nodes if node["text"] == "含 AI 估算紀錄，非營養師審核結果")
@@ -9380,8 +9389,8 @@ def test_dashboard_mixes_ordinary_approved_and_ai_once_and_fails_closed_on_ai_ta
 
     _, text_nodes = _dashboard_flex_text_nodes(server.build_dashboard_flex("U-MIXED"))
     texts = [node["text"] for node in text_nodes]
-    assert any(item.startswith("835 ") for item in texts) and "🔥 熱量" in texts
-    assert any(item.startswith("52 ") for item in texts) and "🥩 蛋白質" in texts
+    assert "熱量餘額" in texts and "1,165" in texts and "已吃 835" in texts
+    assert "蛋白質餘額" in texts and "48 g" in texts and "/ 100 g" in texts
     assert texts.count("含 AI 估算紀錄，非營養師審核結果") == 1
 
     with sqlite3.connect(db) as conn:
@@ -9538,8 +9547,8 @@ def test_approval_and_source_tamper_cannot_fall_back_to_raw_snapshot(tmp_path, m
         server.build_dashboard_flex("U-APPROVAL-TAMPER")
     )
     approved_texts = [node["text"] for node in approved_text_nodes]
-    assert any(item.startswith("55 ") for item in approved_texts) and "🔥 熱量" in approved_texts
-    assert any(item.startswith("7 ") for item in approved_texts) and "🥩 蛋白質" in approved_texts
+    assert "今日已吃" in approved_texts and "55" in approved_texts and "已吃 55" in approved_texts
+    assert "今日蛋白質" in approved_texts and "7 g" in approved_texts
     assert "含 AI 估算，非營養師核准" not in approved_texts
 
     with sqlite3.connect(db) as conn:
@@ -9838,8 +9847,9 @@ def test_dashboard_uses_food_ledger_without_creating_placeholder_health_profile(
     assert "鮭魚食蔬" in rendered
     assert "663" in rendered
     assert "35.3" in rendered
-    assert rendered.count("尚未設定") == 2
-    assert rendered.count("剩餘無法計算") == 2
+    assert '"text": "今日已吃"' in rendered and '"text": "663"' in rendered
+    assert '"text": "今日蛋白質"' in rendered and '"text": "35.3 g"' in rendered
+    assert "目標未設定" in rendered
 
     with sqlite3.connect(db) as conn:
         assert conn.execute(
@@ -9880,12 +9890,11 @@ def test_dashboard_without_profile_keeps_delimiter_in_single_food_name(tmp_path,
     flex = server.build_dashboard_flex("U-SINGLE-FOOD")
     assert flex is not None
     rendered = json.dumps(flex.as_json_dict(), ensure_ascii=False)
-    assert '"text": "雞胸、青花菜"' in rendered
-    assert "今日飲食紀錄" in rendered
-    assert '"text": "200 kcal / 未設目標"' in rendered and "🔥 熱量" in rendered
-    assert '"text": "20 g / 未設目標"' in rendered and "🥩 蛋白質" in rendered
-    assert rendered.count("尚未設定") == 2
-    assert rendered.count("剩餘無法計算") == 2
+    assert '"text": "早餐｜雞胸、青花菜"' in rendered
+    assert "今日紀錄" in rendered
+    assert '"text": "今日已吃"' in rendered and '"text": "200"' in rendered
+    assert '"text": "今日蛋白質"' in rendered and '"text": "20 g"' in rendered
+    assert "目標未設定" in rendered
     assert "含 AI 估算，非營養師核准" not in rendered
     assert "今日已記錄" not in rendered
 
@@ -9919,6 +9928,11 @@ def test_dashboard_large_nutrition_numbers_remain_complete_and_wrapped(tmp_path,
         "tdee": 2000000,
         "extra_pro": 98765.25,
         "protein_goal": 100000,
+        "balance_records": [{
+            "slot": "早餐", "name": "大量測試餐",
+            "kcal": 1234567.5, "protein": 98765.25,
+            "source_type": "official_menu", "ai_estimated": False,
+        }],
     })
     monkeypatch.setattr(server, "get_dashboard_data", lambda _user_id, *, scope="full": dashboard)
 
@@ -9926,16 +9940,20 @@ def test_dashboard_large_nutrition_numbers_remain_complete_and_wrapped(tmp_path,
         server.build_dashboard_flex("U-LARGE-DASHBOARD")
     )
     expected = {
-        "1,234,567.5 / 2,000,000 kcal",
-        "剩 765,432.5 kcal",
-        # The displayed remainder uses the same rounded operands as the row.
-        "98,765.3 / 100,000 g",
-        "剩 1,234.7 g",
+        # v53 intentionally renders kcal as integers and grams to one decimal.
+        "765,432", "目標 2,000,000", "已吃 1,234,568",
+        "1234.8 g", "/ 100000 g",
     }
     matching = [node for node in text_nodes if node["text"] in expected]
     assert {node["text"] for node in matching} == expected
-    assert all(node.get("wrap") is True for node in matching)
-    assert all(node.get("size") in {"xxs", "sm"} for node in matching)
+    for node in matching:
+        if node["text"] == "已吃 1,234,568":
+            # Compact legends retain the whole value on one line, including SDK replay.
+            assert node.get("wrap") is False and node.get("maxLines") == 1
+            assert node.get("size") == "7px"
+        else:
+            assert node.get("wrap") is True
+            assert node.get("size") in {"xxs", "sm"}
 
 
 def test_dashboard_with_profile_uses_canonical_log_names_without_delimiter_xp(tmp_path, monkeypatch):

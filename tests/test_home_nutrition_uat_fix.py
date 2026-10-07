@@ -44,16 +44,27 @@ def _home(**overrides):
 
 
 def test_real_home_route_removes_only_explicit_price_and_shows_planned_nutrition(monkeypatch):
-    monkeypatch.setattr(server, "get_dashboard_data", lambda _uid, *, scope="full": _home())
+    data = _home()
+    data["balance_records"] = [{
+        "slot": "午餐", "name": data["today_lunch"], "kcal": 520, "protein": 42,
+        "source_type": "planned_meal", "subscription_meal_id": "d1:午餐",
+    }]
+    data["balance_sub_meals"] = [
+        {"slot": "午餐", "name": data["today_lunch"], "kcal": 520, "protein": 42,
+         "subscription_meal_id": "d1:午餐"},
+        {"slot": "晚餐", "name": data["today_dinner"], "kcal": None, "protein": None,
+         "subscription_meal_id": "d1:晚餐"},
+    ]
+    monkeypatch.setattr(server, "get_dashboard_data", lambda _uid, *, scope="full": data)
 
     payload = server.build_dashboard_flex("U-UAT").as_json_dict()
     serialized = json.dumps(payload, ensure_ascii=False)
 
     assert "香草雞胸 150g" in serialized
     assert "NT$120" not in serialized and "$180" not in serialized
-    assert "熱量 520 kcal｜蛋白質 42 g" in serialized
-    assert "熱量 未知｜蛋白質 未知" in serialized
-    assert "已吃" in serialized and "未吃" in serialized
+    assert "520 kcal" in serialized
+    assert "營養待補" in serialized
+    assert "部分包月餐營養未提供，餘額可能偏高" in serialized
 
 
 @pytest.mark.parametrize("meal", ("", "無", "尚未安排"))

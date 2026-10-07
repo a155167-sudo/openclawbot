@@ -934,7 +934,8 @@ def _daily_food_rows(conn: sqlite3.Connection, user_id: str, date_text: str) -> 
                   fl.approved_exchange_json,fc.fingerprint,a.food_fingerprint,
                   a.suggestion_rule_version,a.approved_exchange_hash,fl.exchange_approval_id,
                   a.approved_exchange_json,fl.trust_type,fl.exchange_snapshot_json,
-                  fl.trust_payload_json,fc.owner_user_id,a.food_id,fl.user_id
+                  fl.trust_payload_json,fc.owner_user_id,a.food_id,fl.user_id,
+                  fl.operation_key
            FROM food_logs fl
            JOIN food_catalog fc ON fc.food_id=fl.food_id
            LEFT JOIN food_exchange_approvals a ON a.approval_id=fl.exchange_approval_id
@@ -999,6 +1000,11 @@ def _ledger_item_from_row(conn: sqlite3.Connection, row) -> dict:
     # not flag approval-less ordinary/AI flows as invalid approval attempts.
     if row[17] and approval["is_meal_photo_origin"] and not approval["is_valid"]:
         trust_integrity_status = "integrity_verification_failed"
+    operation_key = str(row[25] or "")
+    subscription_meal_id = (
+        operation_key[len("planned-meal:"):]
+        if operation_key.startswith("planned-meal:") else ""
+    )
     return {
         "log_id": row[0], "food_id": row[1], "product_name": row[2],
         "source_type": row[3], "consumed_at": row[4], "meal_slot": row[5] or "",
@@ -1011,6 +1017,7 @@ def _ledger_item_from_row(conn: sqlite3.Connection, row) -> dict:
         "nutrition_authority": nutrition_authority,
         "is_meal_photo_origin": is_meal_photo_origin,
         "is_nutrition_countable": bool(not is_meal_photo_origin or nutrition_authority),
+        "subscription_meal_id": subscription_meal_id,
         "is_confirmed_ai_nutrition_v2": bool(
             _safe_json_object(row[20]).get("rule_version") == "ai-vision-nutrition-estimate-v1"
             or _safe_json_object(row[21]).get("schema_version") == "meal-photo-user-confirmation-v2"
@@ -7597,6 +7604,11 @@ def mark_planned_meal_as_eaten(user_id: str, meal_slot: str):
                 consumed_at=tw_now().isoformat(timespec="seconds"), servings=1,
                 nutrition={"calories_kcal": cal, "protein_g": pro},
                 source_type="planned_meal",
+                operation_key=(
+                    f"planned-meal:{d.get('lunch_subscription_meal_id' if meal_slot == '午餐' else 'dinner_subscription_meal_id')}"
+                    if d.get("lunch_subscription_meal_id" if meal_slot == "午餐" else "dinner_subscription_meal_id")
+                    else f"planned-meal-legacy:{user_id}:{today}:{meal_slot}"
+                ),
             )
             _sync_health_profile_from_ledger_conn(conn, user_id, today)
             c.execute(
@@ -8156,6 +8168,7 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
         return left + right if left is not None and right is not None else None
 
     today_lunch, today_dinner, today_workout = "尚未安排", "尚未安排", "無"
+    subscription_dispatch_id = ""
     lunch_cal = lunch_pro = dinner_cal = dinner_pro = None
     planned_cal = planned_pro = 0
     today_date_str = tw_today().strftime("%Y/%m/%d")
@@ -8180,6 +8193,9 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
                         lunch_pro = _to_nutrition_number(_pick_first(row, ["午餐蛋白"], None))
                         dinner_cal = _to_nutrition_number(_pick_first(row, ["晚餐熱量"], None))
                         dinner_pro = _to_nutrition_number(_pick_first(row, ["晚餐蛋白"], None))
+                        subscription_dispatch_id = str(
+                            _pick_first(row, ["Dispatch_Row_ID", "dispatch_row_id"], "") or ""
+                        ).strip()
                         planned_cal_raw = _pick_first(row, ["今日排餐總熱量"], None)
                         planned_pro_raw = _pick_first(row, ["今日排餐總蛋白"], None)
                         planned_cal = (
@@ -8261,6 +8277,32 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
     dinner_checked = "晚餐" in checked_slots
 
     food_list = list(ledger_names)
+    balance_records = [
+        {
+            "slot": item.get("meal_slot") or "其他",
+            "name": item.get("product_name") or "未命名紀錄",
+            "kcal": (item.get("nutrition") or {}).get("calories_kcal"),
+            "protein": (item.get("nutrition") or {}).get("protein_g"),
+            "source_type": item.get("source_type") or "",
+            "subscription_meal_id": item.get("subscription_meal_id") or "",
+            "ai_estimated": (item.get("nutrition_authority") == "user_confirmed_ai_nutrition_v2"
+                             or item.get("source_type") == "ai_text_estimate"),
+        }
+        for item in dashboard_items
+    ]
+    balance_sub_meals = []
+    for slot, meal, calories, meal_protein in (
+        ("午餐", today_lunch, lunch_cal, lunch_pro),
+        ("晚餐", today_dinner, dinner_cal, dinner_pro),
+    ):
+        if str(meal or "").strip() in {"", "無", "尚未安排"}:
+            continue
+        balance_sub_meals.append({
+            "slot": slot, "name": meal, "kcal": calories, "protein": meal_protein,
+            "subscription_meal_id": (
+                f"{subscription_dispatch_id}:{slot}" if subscription_dispatch_id else ""
+            ),
+        })
     recorded_count = len(food_list)
     task_logged_once = recorded_count >= 1 or any(
         value is not None and value > 0 for value in (extra_cal, extra_pro)
@@ -8348,6 +8390,9 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
         "today_lunch": today_lunch, "today_dinner": today_dinner, "today_workout": today_workout,
         "lunch_cal": lunch_cal, "lunch_pro": lunch_pro, "dinner_cal": dinner_cal, "dinner_pro": dinner_pro,
         "food_list": food_list, "recorded_count": recorded_count, "lunch_checked": lunch_checked,
+        "balance_records": balance_records, "balance_sub_meals": balance_sub_meals,
+        "lunch_subscription_meal_id": f"{subscription_dispatch_id}:午餐" if subscription_dispatch_id else "",
+        "dinner_subscription_meal_id": f"{subscription_dispatch_id}:晚餐" if subscription_dispatch_id else "",
         "dinner_checked": dinner_checked, "workout_done": workout_done, "task_logged_once": task_logged_once,
         "task_two_meals": task_two_meals, "task_protein_80": task_protein_80, "frequent_foods": frequent_foods,
         "future_days": future_days,
@@ -8701,15 +8746,16 @@ def _build_legacy_dashboard_flex(user_id: str):
 
 
 def build_dashboard_flex(user_id: str):
-    """顧客首頁只呈現今天；功能導覽由六格選單承接。"""
+    """顧客首頁只呈現今天；功能導覽由三個既有入口承接。"""
     from linebot.models import FlexSendMessage
+    from customer_navigation import build_customer_balance_home_contents
 
     data = get_dashboard_data(user_id, scope="home")
     if not data:
         return None
     return FlexSendMessage(
         alt_text="今日總覽",
-        contents=build_customer_home_contents(data),
+        contents=build_customer_balance_home_contents(data),
     )
 
 
