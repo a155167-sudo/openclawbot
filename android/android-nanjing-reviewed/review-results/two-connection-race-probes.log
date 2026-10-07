@@ -1,0 +1,7 @@
+customer_claim_races=100 PASS
+summary_claim_races=100 PASS
+whole_customer_socket_races=30 PASS
+whole_summary_socket_races=30 PASS
+stale_summary_completion=PASS
+customer_busy_no_socket=PASS (suite node)
+summary_busy_no_socket=PASS

@@ -1,0 +1,13 @@
+{
+  "name": "member-menu-v1",
+  "chatBarText": "選單",
+  "image": "member_rich_menu.png",
+  "tiles": [
+    {"label": "今日總覽", "action": {"type": "message", "text": "首頁"}},
+    {"label": "記一餐",   "action": {"type": "message", "text": "我要紀錄飲食"}},
+    {"label": "包月菜單", "action": {"type": "message", "text": "查看菜單"}},
+    {"label": "改期",     "action": {"type": "uri", "uri": "https://liff.line.me/請填入該頻道的改期LIFF_ID"}},
+    {"label": "訂單狀況", "action": {"type": "uri", "uri": "https://請填入目前圖文選單「訂單狀況」的連結"}},
+    {"label": "集點卡",   "action": {"type": "uri", "uri": "https://請填入目前圖文選單「集點卡」的連結"}}
+  ]
+}

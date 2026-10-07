@@ -1,0 +1,14 @@
+# Candidate-only Railway settings template. DO NOT apply without a new authorization/review gate.
+# Exact frozen target: project 1220dbe3-b2ea-4119-b21b-0ccdb86a4286
+# environment 82b0ba15-61ce-4a89-b37c-585c29ecedee
+# service a7fa088c-1fe6-4aa9-b9d7-1b5858691bcd; volume mount /app/data
+APP_ENV=staging
+DATA_DIR=/app/data
+ENABLE_SCHEDULER=false
+VIP_HEALTH_CHECK_ENABLED=false
+VIP_HEALTH_CHECK_MAINTENANCE_ENABLED=true
+VIP_HEALTH_CHECK_RECOVERY_WORKER_ENABLED=true
+VIP_HEALTH_CHECK_RECOVERY_INTERVAL_SECONDS=900
+VIP_HEALTH_CHECK_RECOVERY_LIMIT=20
+DIETITIAN_HEALTH_CHECK_DELIVERY_RECOVERY_ENABLED=false
+# Keep any independent enrollment/delivery/sender flags false. Never set DB_PATH elsewhere.

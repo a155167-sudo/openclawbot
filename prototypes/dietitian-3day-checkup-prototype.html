@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f5f4ef">
+  <title>一日樂食｜營養師工作台原型</title>
+  <style>
+    :root {
+      --bg:#f5f4ef; --surface:#fffdf8; --ink:#24312c; --muted:#708078;
+      --line:#dfe4df; --green:#216a55; --green-2:#e4f1eb; --amber:#a86516;
+      --amber-2:#fbefd9; --red:#a8473c; --red-2:#f8e6e2; --blue:#376d82;
+      --shadow:0 10px 28px rgba(39,55,48,.08); --radius:18px;
+    }
+    * { box-sizing:border-box; }
+    [hidden] { display:none !important; }
+    html,body { margin:0; min-height:100%; background:var(--bg); color:var(--ink); }
+    body { font-family:"Microsoft JhengHei","Noto Sans TC","PingFang TC",sans-serif; }
+    button,input,textarea { font:inherit; }
+    button { cursor:pointer; }
+    .app { width:min(100%,480px); min-height:100vh; margin:auto; background:var(--bg); padding-bottom:92px; }
+    .topbar { position:sticky; top:0; z-index:20; display:flex; align-items:center; justify-content:space-between; padding:14px 16px 12px; background:rgba(245,244,239,.96); border-bottom:1px solid rgba(223,228,223,.8); backdrop-filter:blur(12px); }
+    .brand { display:flex; align-items:center; gap:10px; }
+    .brand-mark { width:38px; height:38px; display:grid; place-items:center; border-radius:12px; background:var(--green); color:white; font-weight:800; }
+    .brand strong { display:block; font-size:16px; letter-spacing:.03em; }
+    .brand small { color:var(--muted); font-size:11px; }
+    .prototype { border:1px solid #c7d7cf; background:#edf5f1; color:var(--green); border-radius:999px; padding:6px 9px; font-size:11px; font-weight:700; }
+    main { padding:16px; }
+    .view { display:none; }
+    .view.active { display:block; }
+    .overview { display:flex; align-items:flex-end; justify-content:space-between; margin:3px 0 14px; }
+    h1,h2,h3,p { margin-top:0; }
+    h1 { font-size:25px; line-height:1.25; margin-bottom:5px; }
+    .sub { margin:0; color:var(--muted); font-size:13px; }
+    .date { color:var(--muted); font-size:12px; }
+    .metrics { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:16px; }
+    .metric { min-height:88px; padding:13px 11px; border:1px solid var(--line); border-radius:16px; background:var(--surface); }
+    .metric b { display:block; font-size:25px; line-height:1; margin:7px 0 6px; }
+    .metric span { color:var(--muted); font-size:11px; }
+    .metric.wait b { color:var(--amber); }
+    .metric.more b { color:var(--blue); }
+    .metric.done b { color:var(--green); }
+    .tabs { display:flex; gap:7px; overflow:auto; scrollbar-width:none; margin:0 -16px 15px; padding:0 16px; }
+    .tabs::-webkit-scrollbar { display:none; }
+    .tab { flex:none; min-height:42px; border:1px solid var(--line); border-radius:999px; padding:0 15px; background:var(--surface); color:var(--muted); font-weight:700; font-size:13px; }
+    .tab.active { border-color:var(--green); background:var(--green); color:white; }
+    .section-label { display:flex; align-items:center; justify-content:space-between; margin:17px 1px 9px; }
+    .section-label h2 { margin:0; font-size:15px; }
+    .section-label span { color:var(--muted); font-size:11px; }
+    .case-list { display:grid; gap:11px; }
+    .case { width:100%; text-align:left; border:1px solid var(--line); border-radius:var(--radius); background:var(--surface); padding:15px; box-shadow:0 2px 0 rgba(40,55,48,.02); }
+    .case:focus-visible,.tab:focus-visible,.action:focus-visible,.link-btn:focus-visible { outline:3px solid rgba(33,106,85,.24); outline-offset:2px; }
+    .case-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+    .person { display:flex; gap:11px; align-items:center; }
+    .avatar { flex:none; width:42px; height:42px; display:grid; place-items:center; border-radius:50%; background:#e6e3d7; color:#4d5c55; font-weight:800; }
+    .person strong { display:block; font-size:16px; }
+    .person small { color:var(--muted); font-size:12px; }
+    .wait-time { font-size:11px; color:var(--amber); background:var(--amber-2); border-radius:999px; padding:5px 8px; white-space:nowrap; }
+    .wait-time.red { color:var(--red); background:var(--red-2); }
+    .case-meta { display:grid; grid-template-columns:1fr 1fr; gap:7px; margin:13px 0 11px; }
+    .case-meta div { background:#f2f3ef; border-radius:10px; padding:8px 9px; font-size:12px; }
+    .case-meta b { display:block; margin-top:2px; color:var(--ink); }
+    .insight { display:flex; gap:8px; align-items:flex-start; border-top:1px solid var(--line); padding-top:11px; color:#506159; font-size:12px; line-height:1.5; }
+    .insight i { font-style:normal; color:var(--green); font-weight:800; }
+    .empty { padding:36px 20px; text-align:center; color:var(--muted); border:1px dashed #cbd2cc; border-radius:var(--radius); background:rgba(255,255,255,.35); }
+    .back { border:0; background:transparent; color:var(--green); padding:8px 4px; font-weight:800; min-height:44px; }
+    .detail-title { display:flex; justify-content:space-between; align-items:start; margin-bottom:13px; }
+    .status { border-radius:999px; padding:6px 9px; font-size:11px; font-weight:800; background:var(--amber-2); color:var(--amber); }
+    .panel { border:1px solid var(--line); border-radius:var(--radius); background:var(--surface); padding:15px; margin-bottom:12px; }
+    .panel h2 { font-size:15px; margin-bottom:12px; }
+    .profile-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .profile-grid div { padding:9px; background:#f2f3ef; border-radius:10px; font-size:11px; color:var(--muted); }
+    .profile-grid b { display:block; color:var(--ink); font-size:13px; margin-top:3px; }
+    .progress { display:flex; align-items:center; gap:10px; margin-top:11px; }
+    .progress-track { height:8px; flex:1; overflow:hidden; border-radius:999px; background:#e8ebe7; }
+    .progress-track i { display:block; width:82%; height:100%; background:var(--green); border-radius:inherit; }
+    .progress span { font-size:12px; font-weight:800; color:var(--green); }
+    .day-tabs { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; margin-bottom:11px; }
+    .day-tab { min-height:42px; border:1px solid var(--line); border-radius:11px; background:#f2f3ef; color:var(--muted); font-weight:800; font-size:12px; }
+    .day-tab.active { background:var(--green-2); color:var(--green); border-color:#a9c9ba; }
+    .meal-list { display:grid; gap:8px; }
+    .meal { display:grid; grid-template-columns:75px 1fr; gap:11px; align-items:center; padding:8px; border:1px solid var(--line); border-radius:13px; }
+    .meal-photo { width:75px; height:64px; border-radius:10px; position:relative; overflow:hidden; background:linear-gradient(145deg,#d5b481,#f2e3bd); }
+    .meal-photo::before { content:""; position:absolute; width:45px; height:45px; border-radius:50%; background:#f9f7ee; box-shadow:inset 0 0 0 5px rgba(255,255,255,.55); left:15px; top:10px; }
+    .meal-photo::after { content:""; position:absolute; width:18px; height:13px; border-radius:50%; background:#669463; left:29px; top:25px; box-shadow:10px 4px 0 #ca8851,-7px 8px 0 #e3c367; }
+    .meal-photo.alt { background:linear-gradient(145deg,#a9b98c,#ede1b6); }
+    .meal-photo.dark { background:linear-gradient(145deg,#95735a,#dfc19d); }
+    .meal strong { font-size:13px; }
+    .meal p { margin:4px 0 0; font-size:12px; color:#586861; line-height:1.45; }
+    .meal .uncertain { color:var(--amber); }
+    .facts { display:grid; gap:8px; }
+    .fact { display:grid; grid-template-columns:86px 1fr; gap:8px; align-items:center; font-size:12px; }
+    .fact-label { color:var(--muted); }
+    .bar { height:8px; background:#e8ebe7; border-radius:999px; overflow:hidden; }
+    .bar i { display:block; height:100%; border-radius:inherit; background:var(--green); }
+    .bar.amber i { background:#d59a45; }
+    .warning { background:var(--amber-2); border:1px solid #eed3a3; border-radius:13px; padding:12px; font-size:12px; line-height:1.55; color:#745023; }
+    .warning strong { display:block; margin-bottom:4px; color:#784911; }
+    label { display:block; color:#4e5d56; font-size:12px; font-weight:800; margin:13px 0 6px; }
+    textarea { width:100%; min-height:88px; resize:vertical; border:1px solid #cfd7d1; border-radius:12px; background:#fff; color:var(--ink); padding:11px; line-height:1.55; font-size:13px; }
+    textarea:focus { outline:3px solid rgba(33,106,85,.13); border-color:var(--green); }
+    .draft-note { color:var(--muted); font-size:11px; line-height:1.5; margin:10px 0 0; }
+    .preview-btn { width:100%; min-height:44px; border:1px solid #aac8ba; border-radius:12px; background:var(--green-2); color:var(--green); font-weight:800; margin-top:12px; }
+    .bottom-actions { position:fixed; z-index:25; left:50%; bottom:0; width:min(100%,480px); transform:translateX(-50%); display:grid; grid-template-columns:1fr 1fr 1.25fr; gap:8px; padding:10px 14px calc(10px + env(safe-area-inset-bottom)); background:rgba(255,253,248,.97); border-top:1px solid var(--line); backdrop-filter:blur(12px); }
+    .action { min-height:48px; border-radius:12px; border:1px solid var(--line); background:white; color:#58665f; font-weight:800; font-size:13px; }
+    .action.primary { background:var(--green); border-color:var(--green); color:white; }
+    .action.warn { color:var(--amber); border-color:#e3c38e; background:#fffaf1; }
+    .sheet { position:fixed; z-index:40; inset:0; display:none; align-items:flex-end; justify-content:center; background:rgba(25,35,31,.44); padding-top:25px; }
+    .sheet.open { display:flex; }
+    .sheet-card { width:min(100%,480px); max-height:92vh; overflow:auto; background:var(--surface); border-radius:24px 24px 0 0; padding:18px 16px calc(20px + env(safe-area-inset-bottom)); box-shadow:0 -15px 50px rgba(16,28,22,.2); }
+    .sheet-handle { width:44px; height:5px; border-radius:99px; background:#d6dbd7; margin:0 auto 17px; }
+    .sheet-head { display:flex; justify-content:space-between; gap:10px; }
+    .sheet-head h2 { margin-bottom:5px; font-size:19px; }
+    .close { width:38px; height:38px; border:0; border-radius:50%; background:#edf0ed; color:#526059; font-size:20px; }
+    .choice-list { display:grid; gap:8px; margin:15px 0; }
+    .choice { display:flex; gap:9px; align-items:center; min-height:48px; border:1px solid var(--line); border-radius:12px; background:white; padding:10px 12px; font-size:13px; }
+    .choice input { accent-color:var(--green); width:18px; height:18px; }
+    .full { width:100%; }
+    .report { border:1px solid var(--line); border-radius:18px; overflow:hidden; }
+    .report-head { padding:18px; color:white; background:var(--green); }
+    .report-head small { opacity:.82; }
+    .report-body { padding:16px; }
+    .report-block { margin-bottom:15px; }
+    .report-block b { display:block; font-size:12px; color:var(--green); margin-bottom:5px; }
+    .report-block p { margin:0; font-size:13px; line-height:1.6; }
+    .toast { position:fixed; z-index:60; left:50%; bottom:92px; transform:translate(-50%,18px); width:min(calc(100% - 32px),440px); padding:13px 15px; border-radius:13px; color:white; background:#26362f; box-shadow:var(--shadow); opacity:0; pointer-events:none; transition:.22s ease; font-size:13px; }
+    .toast.show { opacity:1; transform:translate(-50%,0); }
+    .prototype-note { margin-top:16px; border:1px dashed #bcc9c2; border-radius:14px; padding:12px; font-size:11px; color:var(--muted); line-height:1.55; }
+    @media (min-width:700px) { body{padding:22px 0}.app{border-radius:25px;min-height:calc(100vh - 44px);box-shadow:0 18px 60px rgba(36,49,44,.13);overflow:hidden}.bottom-actions{bottom:22px;border-radius:0 0 25px 25px}.topbar{border-radius:25px 25px 0 0}.sheet{align-items:center}.sheet-card{border-radius:24px;max-height:84vh}.sheet-handle{display:none} }
+    @media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto!important; transition:none!important; } }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><div class="brand-mark">日</div><div><strong>一日樂食</strong><small>營養師工作台</small></div></div>
+    <span class="prototype">互動原型</span>
+  </header>
+
+  <main>
+    <section id="queueView" class="view active">
+      <div class="overview">
+        <div><h1>健檢案件</h1><p class="sub">先處理等待最久、資料完整的案件</p></div>
+        <span class="date">9月2日</span>
+      </div>
+
+      <div class="metrics">
+        <div class="metric wait"><span>待營養師處理</span><b id="pendingCount">3</b><span>最早一件已等18小時</span></div>
+        <div class="metric more"><span>等顧客補資料</span><b>1</b><span>收到後再審核</span></div>
+        <div class="metric done"><span>今天已送出報告</span><b id="doneCount">2</b><span>報告已完成</span></div>
+      </div>
+
+      <div class="tabs" role="tablist" aria-label="案件篩選">
+        <button class="tab active" data-filter="pending">待審核</button>
+        <button class="tab" data-filter="more">待補件</button>
+        <button class="tab" data-filter="approved">待投遞</button>
+        <button class="tab" data-filter="failed">投遞失敗</button>
+        <button class="tab" data-filter="done">已完成</button>
+      </div>
+
+      <div class="section-label"><h2 id="listTitle">待審核・3件</h2><span>依等待時間排序</span></div>
+      <div id="caseList" class="case-list">
+        <!-- 靜態假案件：即使檔案預覽器停用 JavaScript，也能看懂首頁內容。 -->
+        <button class="case" data-id="chen"><div class="case-head"><div class="person"><span class="avatar">陳</span><div><strong>陳○○</strong><small>目標：減脂</small></div></div><span class="wait-time red">已等待18小時</span></div><div class="case-meta"><div>紀錄完成<b>3/3天・8餐</b></div><div>資料完整度<b>82%</b></div></div><div class="insight"><i>AI</i><span>早餐蛋白質偏少；晚餐主食沒有明顯過量</span></div></button>
+        <button class="case" data-id="lin"><div class="case-head"><div class="person"><span class="avatar">林</span><div><strong>林○○</strong><small>目標：控制體重</small></div></div><span class="wait-time">已等待6小時</span></div><div class="case-meta"><div>紀錄完成<b>3/3天・7餐</b></div><div>資料完整度<b>76%</b></div></div><div class="insight"><i>AI</i><span>蔬菜頻率偏低；兩餐未確認醬汁</span></div></button>
+        <button class="case" data-id="wang"><div class="case-head"><div class="person"><span class="avatar">王</span><div><strong>王○○</strong><small>目標：吃得更健康</small></div></div><span class="wait-time">已等待2小時</span></div><div class="case-meta"><div>紀錄完成<b>3/3天・9餐</b></div><div>資料完整度<b>91%</b></div></div><div class="insight"><i>AI</i><span>紀錄完整；含糖飲料出現2次</span></div></button>
+      </div>
+      <div class="prototype-note">這是完全獨立的假資料原型：不連接 LINE、不讀取正式顧客資料、不呼叫 AI，也不會送出任何訊息。</div>
+    </section>
+
+    <section id="detailView" class="view">
+      <button class="back" id="backBtn">‹ 返回案件清單</button>
+      <div class="detail-title"><div><h1 id="detailName">陳○○</h1><p class="sub" id="detailSubtitle">3日飲食健檢・目標減脂</p></div><span class="status" id="detailStatus">待審核</span></div>
+
+      <section class="panel">
+        <h2>顧客與案件摘要</h2>
+        <div class="profile-grid">
+          <div>紀錄期間<b id="profilePeriod">9/1、9/3、9/6</b></div><div>完成內容<b id="profileCompletion">3天・8餐</b></div>
+          <div>身高／體重<b id="profileBody">165 cm／68 kg</b></div><div>疾病／用藥<b id="profileHealth">無／NA</b></div>
+        </div>
+        <div class="progress"><div class="progress-track"><i id="detailProgressBar"></i></div><span id="detailProgressText">完整度 82%</span></div>
+      </section>
+
+      <section class="panel">
+        <h2>三天餐點紀錄</h2>
+        <div class="day-tabs">
+          <button class="day-tab active" data-day="1">第1天・9/1</button>
+          <button class="day-tab" data-day="2">第2天・9/3</button>
+          <button class="day-tab" data-day="3">第3天・9/6</button>
+        </div>
+        <div id="mealList" class="meal-list"></div>
+      </section>
+
+      <section class="panel">
+        <h2>AI 初步整理</h2>
+        <div class="facts" id="factsList">
+          <div class="fact"><span class="fact-label">早餐蛋白質</span><div class="bar amber"><i style="width:33%"></i></div><b>1/3天</b></div>
+          <div class="fact"><span class="fact-label">主餐蛋白質</span><div class="bar"><i style="width:75%"></i></div><b>6/8餐</b></div>
+          <div class="fact"><span class="fact-label">蔬菜出現</span><div class="bar amber"><i style="width:62%"></i></div><b>5/8餐</b></div>
+          <div class="fact"><span class="fact-label">含糖飲料</span><div class="bar amber"><i style="width:18%"></i></div><b>1次</b></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="warning"><strong>資料限制</strong><span id="limitationsText">第3天早餐未記錄；2餐醬汁攝取量不確定。水果可能未拍攝，因此不可直接判定完全沒有食用，也不應把目前熱量估算視為完整每日攝取。</span></div>
+      </section>
+
+      <section class="panel">
+        <h2>營養師最後審核</h2>
+        <label for="good">做得好的地方</label>
+        <textarea id="good">午餐與晚餐大多有穩定蛋白質來源，主食份量沒有看到明顯過量。</textarea>
+        <label for="priority">最優先改善</label>
+        <textarea id="priority">早餐蛋白質出現頻率較低。比起先取消晚餐澱粉，更建議優先改善早餐內容。</textarea>
+        <label for="actionPlan">接下來 7 天的行動</label>
+        <textarea id="actionPlan">每天早餐增加一份蛋白質來源，例如蛋、無糖豆漿、鮮奶或無糖優格。</textarea>
+        <label for="comment">營養師個人點評</label>
+        <textarea id="comment">你的晚餐主食目前不是最主要問題，先把早餐吃完整，通常會比一味減少澱粉更容易持續。</textarea>
+        <button class="preview-btn" id="previewBtn">預覽顧客收到的報告</button>
+        <p class="draft-note">以上文字為 AI 草稿。營養師按下「核准報告」後會鎖定版本並等待獨立投遞；核准不等於顧客已收到。</p>
+      </section>
+    </section>
+  </main>
+
+  <div id="bottomActions" class="bottom-actions" hidden>
+    <button class="action warn" id="requestMoreBtn">要求補件</button>
+    <button class="action" id="saveBtn">儲存草稿</button>
+    <button class="action primary" id="approveBtn">核准報告</button>
+    <button class="action warn" id="deliveryFailBtn" hidden>模擬送達失敗</button>
+    <button class="action primary" id="deliverySuccessBtn" hidden>模擬送達成功</button>
+    <button class="action primary" id="retryDeliveryBtn" hidden>重送同一份核准報告</button>
+  </div>
+</div>
+
+<div class="sheet" id="moreSheet" aria-hidden="true">
+  <div class="sheet-card">
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><div><h2>要求顧客補資料</h2><p class="sub">選擇後，原型會模擬案件移到「待補件」。</p></div><button class="close" data-close="moreSheet">×</button></div>
+    <div class="choice-list">
+      <label class="choice"><input type="checkbox" value="飲料與點心"><span>補充三天的飲料與點心</span></label>
+      <label class="choice"><input type="checkbox" value="醬汁"><span>確認醬汁實際攝取量</span></label>
+      <label class="choice"><input type="checkbox" value="早餐"><span>補充未記錄的早餐</span></label>
+      <label class="choice"><input type="checkbox" value="基本資料"><span>確認疾病、用藥或過敏資料</span></label>
+    </div>
+    <label for="moreNote">補充說明</label><textarea id="moreNote" placeholder="例如：請回想第2天火鍋醬料大約使用多少。"></textarea>
+    <button class="action primary full" id="sendMoreBtn">送出補件要求</button>
+  </div>
+</div>
+
+<div class="sheet" id="reportSheet" aria-hidden="true">
+  <div class="sheet-card">
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><div><h2>顧客報告預覽</h2><p class="sub">這是待核准版本；核准後仍需由獨立投遞流程送達 LINE。</p></div><button class="close" data-close="reportSheet">×</button></div>
+    <div class="report">
+      <div class="report-head"><small>陳○○的個人報告</small><h2 style="margin:5px 0 0">3 日飲食健檢完成</h2></div>
+      <div class="report-body">
+        <div class="report-block"><b>紀錄概況</b><p>完成3個紀錄日・8餐<br>資料完整度82%・主要目標：減脂</p></div>
+        <div class="report-block"><b>你做得好的地方</b><p id="reportGood"></p></div>
+        <div class="report-block"><b>最值得優先調整</b><p id="reportPriority"></p></div>
+        <div class="report-block"><b>接下來7天只做一件事</b><p id="reportAction"></p></div>
+        <div class="report-block"><b>營養師點評</b><p id="reportComment"></p></div>
+      </div>
+    </div>
+    <button class="action primary full" style="margin-top:12px" data-close="reportSheet">返回編輯</button>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status"></div>
+<script>
+  const cases = {
+    pending:[
+      {id:'demo-chen',name:'陳○○',goal:'減脂',wait:'已等待18小時',hot:true,days:'3/3天・8餐',complete:'82%',insight:'早餐蛋白質偏少；晚餐主食沒有明顯過量'},
+      {id:'demo-lin',name:'林○○',goal:'控制體重',wait:'已等待6小時',days:'3/3天・7餐',complete:'76%',insight:'蔬菜頻率偏低；兩餐未確認醬汁'},
+      {id:'demo-wang',name:'王○○',goal:'吃得更健康',wait:'已等待2小時',days:'3/3天・9餐',complete:'91%',insight:'紀錄完整；含糖飲料出現2次'}
+    ],
+    more:[{id:'huang',name:'黃○○',goal:'提升運動表現',wait:'已等顧客1天',days:'3/3天・6餐',complete:'61%',insight:'等待補充運動日飲料與點心'}],
+    approved:[],
+    failed:[],
+    done:[
+      {id:'liu',name:'劉○○',goal:'減脂',wait:'今日10:20完成',days:'3/3天・8餐',complete:'84%',insight:'已送達：早餐增加蛋白質'},
+      {id:'tsai',name:'蔡○○',goal:'控制體重',wait:'今日09:45完成',days:'3/3天・9餐',complete:'93%',insight:'已送達：午餐增加蔬菜'}
+    ]
+  };
+  let meals = {
+    1:[['早餐','無糖豆漿、飯糰','已由顧客確認',''],['午餐','雞腿、白飯、高麗菜、滷蛋','醬汁攝取量不確定','alt'],['晚餐','牛肉麵、小菜','已由顧客確認','dark']],
+    2:[['早餐','吐司、黑咖啡','未看到明確蛋白質來源','dark'],['午餐','雞胸、地瓜、花椰菜','已由顧客確認','alt'],['晚餐','火鍋肉片、蔬菜、冬粉','沾醬份量不確定','']],
+    3:[['早餐','未記錄','不能視為沒有吃','dark'],['午餐','自助餐：魚、白飯、青菜','已由顧客確認',''],['晚餐','鮭魚、糙米、蔬菜','已由顧客確認','alt']]
+  };
+  const initialChenMeals=JSON.parse(JSON.stringify(meals));
+  const apiMode=document.documentElement.dataset.apiMode==='readonly';
+  let currentFilter='pending'; let currentCase=null; let localWorkflowRevision=0;
+  const statusLabels={pending:'待審核',more:'待補件',approved:'已核准・待投遞',failed:'投遞失敗',done:'已送達・完成'};
+  const $=s=>document.querySelector(s); const $$=s=>[...document.querySelectorAll(s)];
+  function readonlyFetch(url){
+    if(!String(url).startsWith('/api/health-checks')) throw new Error('唯讀原型拒絕非健檢API網址');
+    return fetch(url,{method:'GET',credentials:'same-origin'});
+  }
+  const initialChenFacts=$('#factsList').innerHTML;
+  const initialChenDraft={good:$('#good').value,priority:$('#priority').value,action:$('#actionPlan').value,comment:$('#comment').value};
+  const draftFields=['good','priority','actionPlan','comment'];
+  function captureApprovedSnapshot(){return Object.freeze(Object.fromEntries(draftFields.map(id=>[id,$('#'+id).value])))}
+  function applyApprovedSnapshot(caseItem){if(!caseItem.approvedSnapshot)return;draftFields.forEach(id=>$('#'+id).value=caseItem.approvedSnapshot[id]||'')}
+  function showToast(text){const el=$('#toast');el.textContent=text;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2200)}
+  function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
+  function safePercent(value){const number=Number.parseFloat(value);return Number.isFinite(number)?Math.max(0,Math.min(100,number)):0}
+  function renderCases(){
+    const list=$('#caseList'), items=cases[currentFilter];
+    const labels={pending:'待審核',more:'待補件',approved:'待投遞',failed:'投遞失敗',done:'已完成'};
+    $('#listTitle').textContent=`${labels[currentFilter]}・${items.length}件`;
+    if(!items.length){list.innerHTML='<div class="empty">目前沒有案件</div>';return;}
+    list.innerHTML=items.map(c=>`<button class="case" data-id="${escapeHtml(c.id)}"><div class="case-head"><div class="person"><span class="avatar">${escapeHtml(c.name[0])}</span><div><strong>${escapeHtml(c.name)}</strong><small>目標：${escapeHtml(c.goal)}</small></div></div><span class="wait-time ${c.hot?'red':''}">${escapeHtml(c.wait)}</span></div><div class="case-meta"><div>紀錄完成<b>${escapeHtml(c.days)}</b></div><div>資料完整度<b>${escapeHtml(c.complete)}</b></div></div><div class="insight"><i>AI</i><span>${escapeHtml(c.insight)}</span></div></button>`).join('');
+    $$('.case').forEach(el=>el.addEventListener('click',()=>openCase(el.dataset.id)));
+  }
+  function renderMeals(day){
+    $('#mealList').innerHTML=meals[day].map((m,i)=>`<div class="meal"><div class="meal-photo ${['dark','alt'].includes(m[3])?m[3]:''}"></div><div><strong>${escapeHtml(m[0])}</strong><p>${escapeHtml(m[1])}<br><span class="${m[2].includes('不確定')||m[2].includes('不能')?'uncertain':''}">${escapeHtml(m[2])}</span></p></div></div>`).join('');
+  }
+  function resetDetailForCase(caseItem){
+    $('#profilePeriod').textContent=apiMode?'資料載入中':'離線示範';
+    $('#profileCompletion').textContent=caseItem.days.replace('/3天','天');
+    $('#profileBody').textContent=caseItem.id==='demo-chen'?'165 cm／68 kg':'NA';
+    $('#profileHealth').textContent=caseItem.id==='demo-chen'?'無／NA':'NA／NA';
+    $('#detailProgressText').textContent=`完整度 ${caseItem.complete}`;
+    $('#detailProgressBar').style.width=caseItem.complete;
+    if(!apiMode && caseItem.id==='demo-chen'){
+      meals=JSON.parse(JSON.stringify(initialChenMeals));
+      $('#factsList').innerHTML=initialChenFacts;
+      $('#limitationsText').textContent='第3天早餐未記錄；2餐醬汁攝取量不確定。水果可能未拍攝，因此不可直接判定完全沒有食用，也不應把目前熱量估算視為完整每日攝取。';
+      $('#good').value=initialChenDraft.good;$('#priority').value=initialChenDraft.priority;$('#actionPlan').value=initialChenDraft.action;$('#comment').value=initialChenDraft.comment;
+    }else{
+      const detailState=apiMode?'完整內容載入中':'完整內容僅在唯讀 MVP 顯示';
+      meals={1:[['資料狀態',detailState,'不會沿用其他顧客資料','']],2:[['資料狀態',detailState,'不會沿用其他顧客資料','']],3:[['資料狀態',detailState,'不會沿用其他顧客資料','']]};
+      $('#factsList').innerHTML=`<div class="fact"><span class="fact-label">案件完整度</span><div class="bar"><i style="width:${safePercent(caseItem.complete)}%"></i></div><b>${escapeHtml(caseItem.complete)}</b></div>`;
+      $('#limitationsText').textContent=apiMode?'正在讀取這位顧客的獨立示範資料。':'離線檔案僅保留陳○○完整操作範例；此案件不會顯示或沿用其他顧客內容。';
+      $('#good').value=`案件摘要：${caseItem.insight}`;$('#priority').value='';$('#actionPlan').value='';$('#comment').value='';
+    }
+    $$('.day-tab').forEach((tab,index)=>{tab.textContent=`第${index+1}天`;tab.classList.toggle('active',index===0);});
+    renderMeals(1);
+  }
+  function applyApiDetail(data){
+    const detail=data.detail||{};
+    $('#profilePeriod').textContent=(detail.period||[]).join('、')||'NA';
+    $('#profileCompletion').textContent=`${data.record_days}天・${data.meal_count}餐`;
+    $('#profileBody').textContent=detail.height_cm?`${detail.height_cm} cm／${detail.weight_kg} kg`:'NA';
+    $('#profileHealth').textContent=`${detail.conditions||'NA'}／${detail.medications||'NA'}`;
+    $('#detailProgressText').textContent=`完整度 ${data.completeness}%`;
+    $('#detailProgressBar').style.width=`${data.completeness}%`;
+    if(detail.days?.length){
+      detail.days.forEach((day,index)=>{
+        const key=String(index+1); const tab=document.querySelector(`[data-day="${key}"]`);
+        if(tab) tab.textContent=day.label;
+        meals[key]=day.meals.map(m=>[m.slot,m.foods,m.review,m.tone==='default'?'':m.tone]);
+      });
+      renderMeals(1);
+    }
+    if(detail.metrics?.length){
+      $('#factsList').innerHTML=detail.metrics.map(m=>`<div class="fact"><span class="fact-label">${escapeHtml(m.label)}</span><div class="bar ${m.tone==='amber'?'amber':''}"><i style="width:${safePercent(m.percent)}%"></i></div><b>${escapeHtml(m.value)}</b></div>`).join('');
+    }
+    $('#limitationsText').textContent=detail.limitations||'目前沒有額外資料限制。';
+    if(detail.draft){ $('#good').value=detail.draft.good||'';$('#priority').value=detail.draft.priority||'';$('#actionPlan').value=detail.draft.action||'';$('#comment').value=detail.draft.comment||''; }
+  }
+  async function openCase(id){
+    currentCase=cases[currentFilter].find(c=>c.id===id) || cases.pending[0];
+    if(!currentCase)return;
+    const requestCase=currentCase, detailRevision=localWorkflowRevision;
+    resetDetailForCase(currentCase);
+    applyApprovedSnapshot(currentCase);
+    $('#detailName').textContent=currentCase.name;
+    $('#detailSubtitle').textContent=`3日飲食健檢・目標${currentCase.goal}`;
+    $('#detailStatus').textContent=statusLabels[currentFilter];
+    $('#queueView').classList.remove('active'); $('#detailView').classList.add('active');
+    setActionMode(currentFilter);
+    renderMeals(1); window.scrollTo(0,0);
+    if(apiMode && !requestCase.approvedSnapshot){
+      try{ const response=await readonlyFetch(`/api/health-checks/${encodeURIComponent(id)}`); if(!response.ok) throw new Error('detail');const data=await response.json();if(currentCase!==requestCase||localWorkflowRevision!==detailRevision||requestCase.approvedSnapshot)return;applyApiDetail(data); }
+      catch(error){ showToast('目前使用離線示範內容'); }
+    }
+  }
+  function mapApiCase(c){
+    const wait=c.status==='pending'?`已等待${c.waiting_hours}小時`:c.status==='more'?'等待顧客補資料':'今天已完成';
+    return {id:c.case_id,name:c.customer_name,goal:c.goal,wait,hot:c.waiting_hours>=12,days:`${c.record_days}/3天・${c.meal_count}餐`,complete:`${c.completeness}%`,insight:c.insight};
+  }
+  async function hydrateCasesFromApi(){
+    if(!apiMode) return;
+    const revisionAtStart=localWorkflowRevision;
+    try{
+      const entries=await Promise.all(['pending','more','done'].map(async status=>{const r=await readonlyFetch(`/api/health-checks?status=${status}`);if(!r.ok)throw new Error(status);return [status,(await r.json()).items.map(mapApiCase)]}));
+      if(localWorkflowRevision!==revisionAtStart)return;
+      entries.forEach(([status,items])=>cases[status]=items);
+      $('#pendingCount').textContent=cases.pending.length; $('#doneCount').textContent=cases.done.length; renderCases();
+    }catch(error){ showToast('API未連線，顯示內建假資料'); }
+  }
+  function setActionMode(filter){
+    const locked=['approved','failed','done'].includes(filter);draftFields.map(id=>$('#'+id)).forEach(field=>field.readOnly=locked);
+    $('#bottomActions').hidden=filter==='done';
+    $('#requestMoreBtn').hidden=filter!=='pending';$('#saveBtn').hidden=filter!=='pending';$('#approveBtn').hidden=filter!=='pending';
+    $('#approveBtn').disabled=false;$('#approveBtn').textContent='核准報告';
+    $('#deliveryFailBtn').hidden=filter!=='approved';$('#deliverySuccessBtn').hidden=filter!=='approved';$('#retryDeliveryBtn').hidden=filter!=='failed';
+  }
+  function moveCurrentCase(from,to,wait,insight){
+    if(!currentCase)return;
+    localWorkflowRevision+=1;
+    cases[from]=cases[from].filter(c=>c.id!==currentCase.id);
+    currentCase={...currentCase,wait,insight,reviewStatus:to};cases[to].unshift(currentCase);currentFilter=to;
+    $$('.tab').forEach(tab=>tab.classList.toggle('active',tab.dataset.filter===to));
+    $('#detailStatus').textContent=statusLabels[to];setActionMode(to);
+    $('#pendingCount').textContent=cases.pending.length;$('#doneCount').textContent=cases.done.length;
+  }
+  function goBack(){ $('#detailView').classList.remove('active');$('#queueView').classList.add('active');$('#bottomActions').hidden=true;renderCases();window.scrollTo(0,0); }
+  $$('.tab').forEach(tab=>tab.addEventListener('click',()=>{currentFilter=tab.dataset.filter;$$('.tab').forEach(x=>x.classList.toggle('active',x===tab));renderCases()}));
+  $$('.day-tab').forEach(tab=>tab.addEventListener('click',()=>{$$('.day-tab').forEach(x=>x.classList.toggle('active',x===tab));renderMeals(tab.dataset.day)}));
+  $('#backBtn').addEventListener('click',goBack);
+  $('#saveBtn').addEventListener('click',()=>showToast('草稿已儲存（原型示意）'));
+  $('#requestMoreBtn').addEventListener('click',()=>openSheet('moreSheet'));
+  $('#previewBtn').addEventListener('click',()=>{const draft=currentCase?.approvedSnapshot||{good:$('#good').value,priority:$('#priority').value,actionPlan:$('#actionPlan').value,comment:$('#comment').value};$('#reportGood').textContent=draft.good;$('#reportPriority').textContent=draft.priority;$('#reportAction').textContent=draft.actionPlan;$('#reportComment').textContent=draft.comment;openSheet('reportSheet');});
+  $('#approveBtn').addEventListener('click',()=>{if(!currentCase)return;currentCase.approvedSnapshot=captureApprovedSnapshot();moveCurrentCase('pending','approved','剛剛核准','核准版本已鎖定；等待獨立投遞');showToast('報告已核准；等待獨立投遞，不視為已送達');});
+  $('#deliveryFailBtn').addEventListener('click',()=>{moveCurrentCase('approved','failed','剛剛失敗','保留同一核准版本；等待安全重送');showToast('投遞失敗；不重算報告');});
+  $('#deliverySuccessBtn').addEventListener('click',()=>{moveCurrentCase('approved','done','剛剛送達','同一核准版本已成功送達');showToast('顧客已收到核准報告');});
+  $('#retryDeliveryBtn').addEventListener('click',()=>{moveCurrentCase('failed','approved','剛剛重送','重送同一份核准報告；未重新產生');showToast('已將同一核准版本重新排入投遞');});
+  $('#sendMoreBtn').addEventListener('click',()=>{ if(currentCase){cases.pending=cases.pending.filter(c=>c.id!==currentCase.id);cases.more.unshift({...currentCase,wait:'剛剛送出',insight:'等待顧客補充資料'});$('#pendingCount').textContent=cases.pending.length;}closeSheet('moreSheet');showToast('已送出補件要求（原型示意）');setTimeout(goBack,900); });
+  function openSheet(id){const el=$('#'+id);el.classList.add('open');el.setAttribute('aria-hidden','false')}
+  function closeSheet(id){const el=$('#'+id);el.classList.remove('open');el.setAttribute('aria-hidden','true')}
+  $$('[data-close]').forEach(b=>b.addEventListener('click',()=>closeSheet(b.dataset.close)));
+  $$('.sheet').forEach(s=>s.addEventListener('click',e=>{if(e.target===s)closeSheet(s.id)}));
+  document.addEventListener('keydown',e=>{if(e.key==='Escape')$$('.sheet.open').forEach(s=>closeSheet(s.id))});
+  renderCases(); renderMeals(1); hydrateCasesFromApi();
+</script>
+</body>
+</html>
