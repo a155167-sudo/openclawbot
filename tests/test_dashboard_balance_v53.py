@@ -206,18 +206,20 @@ def test_unknown_nutrition_is_not_coerced_to_zero_or_claimed_as_precise_balance(
     assert "營養待補" in text
 
 
-def test_balance_flex_roundtrips_installed_line_sdk_and_preserves_three_actions():
+def test_balance_flex_roundtrips_installed_line_sdk_and_preserves_four_actions():
     payload = build_dashboard_flex(_data())
     serialized = FlexSendMessage(alt_text="今日總覽", contents=BubbleContainer.new_from_json_dict(payload)).as_json_dict()
     assert serialized["contents"]["type"] == "bubble"
     assert _actions(payload) == [
         {"type": "message", "label": "記一餐", "text": "我要紀錄飲食"},
         {"type": "message", "label": "今日明細", "text": "我要修改飲食紀錄"},
+        {"type": "message", "label": "一週趨勢", "text": "一週趨勢"},
         {"type": "message", "label": "功能選單", "text": "功能選單"},
     ]
 
 
 class _Sheet:
+    id = 17
     def __init__(self, title, values):
         self.title = title
         self.values = values
@@ -226,6 +228,7 @@ class _Sheet:
 
 
 class _Book:
+    id = "test-spreadsheet-no-network"
     def __init__(self, sheet):
         self.sheet = sheet
     def worksheet(self, title):
@@ -258,9 +261,10 @@ def _install_db(tmp_path, monkeypatch, uid, rows, *, target=2000, protein=120, d
                 source_type=item.get("source_type", "manual"), operation_key=item.get("operation_key", item["name"]),
                 publish_catalog=False)
         conn.commit()
-    headers = ["實際日期", "午餐安排", "晚餐安排", "運動", "午餐熱量", "午餐蛋白", "晚餐熱量", "晚餐蛋白", "Dispatch_Row_ID"]
+    headers = ["實際日期", "週期與星期", "午餐安排", "午餐熱量", "午餐蛋白", "晚餐安排", "晚餐熱量", "晚餐蛋白", "今日排餐總熱量", "今日排餐總蛋白", "熱量剩餘 / 蛋白質需補", "單日金額", "明日預定課表", "列印狀態", "Dispatch_Row_ID", "Order_ID", "Menu_Version"]
     values = [["【VIP 客戶檔案】", "姓名: 整合會員", f"User_ID: {uid}"], headers,
-              [today_slash, "包月午餐", "包月晚餐", "無", "650", "42", "741", "45", dispatch_id]]
+              [today_slash, "三", "包月午餐", "650", "42", "包月晚餐", "741", "45", "1391", "87", "", "", "無", "待列印", dispatch_id, "", ""]]
+    monkeypatch.setattr(server, "SPREADSHEET_ID", _Book.id)
     monkeypatch.setattr(server, "gc", _GC(_Book(_Sheet("member-sheet", values))))
     return path
 

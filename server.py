@@ -8010,6 +8010,72 @@ def compute_achievement_snapshot(user_id: str, dashboard: dict = None) -> dict:
     }
 
 
+def _countable_dashboard_items(conn, user_id: str, date_text: str) -> list:
+    """v52's canonical countable projection, reused without adding any writers."""
+    ledger_rows = _daily_food_rows(conn, user_id, date_text)
+    ledger_items = [_ledger_item_from_row(conn, row) for row in ledger_rows]
+    dashboard_items = []
+    for row, item in zip(ledger_rows, ledger_items):
+        if not item.get("is_nutrition_countable", True):
+            continue
+        if item.get("is_meal_photo_origin"):
+            if item.get("nutrition_authority") not in {
+                "approved_exchange", "user_confirmed_ai_nutrition_v2",
+            }:
+                continue
+        elif str(row[17] or "").strip():
+            continue
+        dashboard_items.append(item)
+    return dashboard_items
+
+
+def get_weekly_trend_data(user_id: str, *, days: int = 7) -> dict:
+    from weekly_trend import read_weekly_trend
+    return read_weekly_trend(
+        db_path=DB_PATH, user_id=user_id, today=tw_today(),
+        project_items=_countable_dashboard_items, days=days,
+    )
+
+
+def build_weekly_trend_flex(user_id: str):
+    from linebot.models import FlexSendMessage
+    from weekly_trend import build_weekly_trend_contents
+    data = get_weekly_trend_data(user_id)
+    return FlexSendMessage(
+        alt_text="一週趨勢",
+        contents=build_weekly_trend_contents(
+            data["days"], calorie_goal=data["calorie_goal"], protein_goal=data["protein_goal"],
+        ),
+    )
+
+
+def _subscription_dispatch_expected(conn, user_id: str, today: str) -> bool:
+    """Read entitlement evidence only; a health-check VIP is not a subscription."""
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    if "subscription_orders" not in tables:
+        return False
+    try:
+        order = conn.execute(
+            "SELECT id FROM subscription_orders WHERE user_id=? AND status='activated' "
+            "AND COALESCE(formalized_at,'')<>'' ORDER BY id DESC LIMIT 1", (user_id,)
+        ).fetchone()
+        if not order:
+            return False
+        if "subscription_menu_entitlements" not in tables:
+            return True  # A known subscription with unverifiable entitlement is not zero.
+        entitlement = conn.execute(
+            "SELECT status,expires_on FROM subscription_menu_entitlements "
+            "WHERE user_id=? AND order_id=?", (user_id, order[0])
+        ).fetchone()
+        if not entitlement:
+            return True
+        return entitlement[0] == "active" and str(entitlement[1] or "") >= today
+    except sqlite3.Error:
+        return True  # Do not silently hide an unreadable subscription schema.
+
+
 def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
     """取得儀表板資料；首頁 scope 跳過未渲染的課表、常吃與成就工作。"""
     if scope not in {"full", "home"}:
@@ -8034,6 +8100,10 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
                             today_food_items, today_date, sheet_name
                      FROM health_profile WHERE user_id=?""", (user_id,))
         hp = c.fetchone()
+        subscription_expected = (
+            _subscription_dispatch_expected(conn, user_id, today_str)
+            if home_only and (not hp or not str(hp[7] or "").strip()) else False
+        )
 
         ledger_rows = _daily_food_rows(conn, user_id, today_str)
         ledger_items = [
@@ -8173,11 +8243,38 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
     planned_cal = planned_pro = 0
     today_date_str = tw_today().strftime("%Y/%m/%d")
     
-    if gc and (sheet_name or home_only):
+    # Read the same personal dispatch worksheet as the Android printer.
+    # Neither Master nor an old activation menu may revive a moved meal.
+    subscription_source_status = "unavailable" if subscription_expected else "not_configured"
+    if home_only and sheet_name:
+        subscription_source_status = "unavailable"
+        if gc:
+            try:
+                from dashboard_dispatch_source import read_dispatch_day
+                dispatch = read_dispatch_day(
+                    book=gc.open_by_key(SPREADSHEET_ID), db_path=DB_PATH,
+                    user_id=user_id, sheet_name=sheet_name,
+                    workbook_id=SPREADSHEET_ID, service_date=tw_today().isoformat(),
+                )
+                subscription_source_status = dispatch["status"]
+                if subscription_source_status == "ok":
+                    for meal in dispatch["meals"]:
+                        if meal["slot"] == "午餐":
+                            today_lunch, lunch_cal, lunch_pro = meal["name"], meal["kcal"], meal["protein"]
+                        elif meal["slot"] == "晚餐":
+                            today_dinner, dinner_cal, dinner_pro = meal["name"], meal["kcal"], meal["protein"]
+                        meal_id = meal.get("subscription_meal_id", "")
+                        if meal_id:
+                            subscription_dispatch_id = meal_id.rsplit(":", 1)[0]
+                    planned_cal = _known_sum(lunch_cal, dinner_cal)
+                    planned_pro = _known_sum(lunch_pro, dinner_pro)
+            except Exception as exc:
+                print(f"⚠️ Dashboard 出單來源核對失敗: {type(exc).__name__}")
+
+    if not home_only and gc and sheet_name:
         try:
             book = gc.open_by_key(SPREADSHEET_ID)
-            sheet_resolver = get_existing_user_sheet if home_only else get_or_create_user_sheet
-            user_sheet, resolved_sheet_name, resolved_source = sheet_resolver(book, user_id, name, sheet_name)
+            user_sheet, resolved_sheet_name, resolved_source = get_or_create_user_sheet(book, user_id, name, sheet_name)
             if user_sheet:
                 if resolved_sheet_name != sheet_name and not home_only:
                     sheet_name = resolved_sheet_name
@@ -8209,40 +8306,6 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
                             else _to_nutrition_number(planned_pro_raw)
                         )
                         break
-
-            # Home must never rebuild a personal worksheet.  When its mapped
-            # worksheet is missing or owner-unverified, recover only today's
-            # row from one read-only Master snapshot, bound by the full UID.
-            if home_only and not user_sheet:
-                api_sheet = book.worksheet("Master_API_View")
-                for master_row in api_sheet.get_all_records():
-                    master_uid = str(master_row.get("User_ID", "")).strip()
-                    master_date = normalize_date_str(master_row.get("Date", ""))
-                    if master_uid != user_id or master_date != normalize_date_str(today_date_str):
-                        continue
-                    today_lunch = str(master_row.get("Lunch_Item", "")).strip() or "尚未安排"
-                    today_dinner = str(master_row.get("Dinner_Item", "")).strip() or "尚未安排"
-                    today_workout = (
-                        str(master_row.get("Tomorrow_Training", "")).strip()
-                        or str(master_row.get("Plan_Week", "")).strip()
-                        or str(master_row.get("Sport_Type", "")).strip()
-                        or "無"
-                    )
-                    lunch_cal = _to_nutrition_number(master_row.get("Lunch_Calories"))
-                    lunch_pro = _to_nutrition_number(master_row.get("Lunch_Protein"))
-                    dinner_cal = _to_nutrition_number(master_row.get("Dinner_Calories"))
-                    dinner_pro = _to_nutrition_number(master_row.get("Dinner_Protein"))
-                    lunch_dish = next((dish for dish in MAIN_DISHES if dish.get("name") == today_lunch), None)
-                    dinner_dish = next((dish for dish in MAIN_DISHES if dish.get("name") == today_dinner), None)
-                    if lunch_dish:
-                        lunch_cal = lunch_cal if lunch_cal is not None else _to_nutrition_number(lunch_dish.get("cal"))
-                        lunch_pro = lunch_pro if lunch_pro is not None else _to_nutrition_number(lunch_dish.get("pro"))
-                    if dinner_dish:
-                        dinner_cal = dinner_cal if dinner_cal is not None else _to_nutrition_number(dinner_dish.get("cal"))
-                        dinner_pro = dinner_pro if dinner_pro is not None else _to_nutrition_number(dinner_dish.get("pro"))
-                    planned_cal = _known_sum(lunch_cal, dinner_cal)
-                    planned_pro = _known_sum(lunch_pro, dinner_pro)
-                    break
 
             if not home_only and today_workout in ["", "無", "尚未安排"]:
                 try:
@@ -8391,6 +8454,7 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
         "lunch_cal": lunch_cal, "lunch_pro": lunch_pro, "dinner_cal": dinner_cal, "dinner_pro": dinner_pro,
         "food_list": food_list, "recorded_count": recorded_count, "lunch_checked": lunch_checked,
         "balance_records": balance_records, "balance_sub_meals": balance_sub_meals,
+        "subscription_source_status": subscription_source_status,
         "lunch_subscription_meal_id": f"{subscription_dispatch_id}:午餐" if subscription_dispatch_id else "",
         "dinner_subscription_meal_id": f"{subscription_dispatch_id}:晚餐" if subscription_dispatch_id else "",
         "dinner_checked": dinner_checked, "workout_done": workout_done, "task_logged_once": task_logged_once,
@@ -18240,6 +18304,17 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
 
     if non_vip_subscription_quote_kind is not None:
         return _handle_subscription_quote_text(event, non_vip_subscription_quote_kind)
+
+    # v52 read-only navigation retains handle_message's VIP boundary, but must
+    # run before pending edit handlers so a button cannot become a food rename.
+    if msg in {"一週趨勢", "本週趨勢", "週趨勢"}:
+        try:
+            trend = build_weekly_trend_flex(uid)
+        except Exception as exc:
+            print(f"⚠️ 一週趨勢產生失敗: {type(exc).__name__}")
+            trend = TextSendMessage(text="⚠️ 一週趨勢暫時無法顯示，請稍後再試。")
+        line_bot_api.reply_message(event.reply_token, trend)
+        return
 
     # 飲食帳本編輯的文字輸入（營養數值、修改品項、私人食品名稱）優先於 AI 對話。
     ledger_state = get_daily_food_edit_state(uid)

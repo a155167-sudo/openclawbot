@@ -138,6 +138,7 @@ def _btn(label, color, style):
     actions = {
         "記一餐": "我要紀錄飲食",
         "今日明細": "我要修改飲食紀錄",
+        "一週趨勢": "一週趨勢",
         "功能選單": "功能選單",
     }
     return {"type": "button", "style": style, "color": color, "height": "md", "flex": 1,
@@ -240,6 +241,10 @@ def build_dashboard_flex(data):
         body.append({"type": "text", "text": "含 AI 估算紀錄，非營養師審核結果", "size": "xxs",
                      "color": "#6B5A2A", "margin": "lg"})
 
+    if data.get("subscription_source_unavailable"):
+        body.append({"type": "text", "text": "包月出單資料暫時無法核對，未計入預留，餘額可能偏高。",
+                     "size": "xxs", "color": C_SUB, "margin": "lg", "wrap": True})
+
     if c["has_unknown_sub"]:
         body.append({"type": "text", "text": "部分包月餐營養未提供，餘額可能偏高", "size": "xxs",
                      "color": C_SUB, "margin": "lg", "wrap": True})
@@ -260,6 +265,7 @@ def build_dashboard_flex(data):
             {"type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
                 _btn("記一餐", C_GREEN, "primary"), _btn("今日明細", "#F2EEE2", "secondary")]},
             {"type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
+                _btn("一週趨勢", "#F2EEE2", "secondary"),
                 _btn("功能選單", C_YELLOW, "secondary")]}]},
     }
     # LINE must retain full values on narrow clients and unusually large totals.

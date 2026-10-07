@@ -49,9 +49,11 @@ def run_cases(server, root):
     out=[]; examples={}
     class Sheet:
         title = 'member-sheet'
+        id = 17
         def __init__(self, values): self.values=values
         def get_all_values(self): return self.values
     class Book:
+        id = 'test-spreadsheet-no-network'
         def __init__(self, values): self.sheet=Sheet(values)
         def worksheet(self,name):
             if name!='member-sheet': raise KeyError(name)
@@ -65,9 +67,9 @@ def run_cases(server, root):
         byslot={m['slot']:m for m in meals}
         lunch=byslot.get('午餐',{});dinner=byslot.get('晚餐',{})
         values=[['【VIP 客戶檔案】','姓名: 情境測試',f'User_ID: {uid}'],
-                ['實際日期','午餐安排','晚餐安排','運動','午餐熱量','午餐蛋白','晚餐熱量','晚餐蛋白','Dispatch_Row_ID'],
-                ['2026/10/07',lunch.get('name','無'),dinner.get('name','無'),'無',lunch.get('k',''),lunch.get('p',''),dinner.get('k',''),dinner.get('p',''),'synthetic-dispatch-'+str(number)]]
-        with patch.multiple(server, DB_PATH=str(db), DB_DIR=str(root), gc=GC(values), tw_today=lambda:frozen.date(),tw_now=lambda:frozen):
+                ['實際日期','週期與星期','午餐安排','午餐熱量','午餐蛋白','晚餐安排','晚餐熱量','晚餐蛋白','今日排餐總熱量','今日排餐總蛋白','熱量剩餘 / 蛋白質需補','單日金額','明日預定課表','列印狀態','Dispatch_Row_ID','Order_ID','Menu_Version'],
+                ['2026/10/07','三',lunch.get('name','無'),lunch.get('k',''),lunch.get('p',''),dinner.get('name','無'),dinner.get('k',''),dinner.get('p',''),'','','','','無','待列印','synthetic-dispatch-'+str(number),'synthetic-order-'+str(number),'synthetic-menu-v1']]
+        with patch.multiple(server, DB_PATH=str(db), DB_DIR=str(root), gc=GC(values), SPREADSHEET_ID=Book.id, tw_today=lambda:frozen.date(),tw_now=lambda:frozen):
             server.init_db()
             with sqlite3.connect(db) as conn:
                 conn.execute('INSERT INTO health_profile(user_id,name,tdee,protein,today_date,sheet_name) VALUES (?,?,?,?,?,?)',(uid,'情境測試',tk,tp,'2026-10-07','member-sheet'))
@@ -85,9 +87,10 @@ def run_cases(server, root):
             assert buttons == [
                 {'type':'message','label':'記一餐','text':'我要紀錄飲食'},
                 {'type':'message','label':'今日明細','text':'我要修改飲食紀錄'},
+                {'type':'message','label':'一週趨勢','text':'一週趨勢'},
                 {'type':'message','label':'功能選單','text':'功能選單'},
             ]
-            assert '一週趨勢' not in text
+            assert '一週趨勢' in text
             assert '下一餐建議' not in text
             if number==1: assert c['left_k']==1300 and '包月預留' not in text
             if number==2: assert (c['ek'],c['rk'],c['left_k'])==(0,1391,609) and all(not x['eaten'] for x in data['sub_meals'])

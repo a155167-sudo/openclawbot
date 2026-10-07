@@ -1,4 +1,4 @@
-"""Native registered-handler acceptance for the Nanjing three-button dashboard.
+"""Native registered-handler acceptance for the Nanjing four-button dashboard.
 
 Uses the suite's isolated DATA_DIR and no-network conftest; no authorization mock.
 """
@@ -78,15 +78,22 @@ def test_three_rendered_home_buttons_reach_native_registered_handlers(real_vip, 
     def no_ai(*args, **kwargs):
         raise AssertionError('Dashboard navigation must not invoke AI')
     monkeypatch.setattr(server, 'get_ai_response_with_memory', no_ai)
+    monkeypatch.setattr(
+        server, 'check_permission_and_quota',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError('Dashboard navigation must not debit or inspect AI quota')
+        ),
+    )
     card=server.build_dashboard_flex(uid)
     assert card is not None
     payload=card.as_json_dict()
     rendered=[node['action'] for node in _walk(payload) if node.get('type')=='button']
-    assert [a['label'] for a in rendered]==['記一餐','今日明細','功能選單']
+    assert [a['label'] for a in rendered]==['記一餐','今日明細','一週趨勢','功能選單']
     actions = {a['label']:a['text'] for a in rendered}
     assert actions == {
         "記一餐": "我要紀錄飲食",
         "今日明細": "我要修改飲食紀錄",
+        "一週趨勢": "一週趨勢",
         "功能選單": "功能選單",
     }
 
@@ -102,17 +109,24 @@ def test_three_rendered_home_buttons_reach_native_registered_handlers(real_vip, 
             ).fetchone()[0],
         )
 
-    for number, label in enumerate(("記一餐", "今日明細", "功能選單"), 1):
-        server.handle_message(_event(number, actions[label], uid))
+    server.handle_message(_event(1, actions["記一餐"], uid))
+    server.handle_message(_event(2, actions["今日明細"], uid))
+    trend_db_before = db_path.read_bytes()
+    server.handle_message(_event(3, actions["一週趨勢"], uid))
+    assert db_path.read_bytes() == trend_db_before
+    server.handle_message(_event(4, actions["功能選單"], uid))
 
-    assert len(transport.replies) == 3
+    assert len(transport.replies) == 4
     add_meal = transport.replies[0][1].as_json_dict()
     details = transport.replies[1][1].as_json_dict()
-    menu = transport.replies[2][1].as_json_dict()
+    trend = transport.replies[2][1].as_json_dict()
+    menu = transport.replies[3][1].as_json_dict()
     assert add_meal["type"] == "text"
     assert "餐別、餐點和份量" in add_meal["text"]
     assert details["type"] == "flex"
     assert "今天的紀錄" in json.dumps(details, ensure_ascii=False)
+    assert trend["type"] == "flex"
+    assert trend["altText"] == "一週趨勢"
     assert menu["type"] == "flex"
     assert menu["altText"] == "功能選單"
 

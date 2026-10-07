@@ -154,7 +154,7 @@ def test_real_rendered_eaten_action_routes_through_registered_handler_to_idempot
     rendered = server.build_dashboard_flex(uid).as_json_dict()
     actions = _message_actions(rendered)
     assert [action.get("text") for action in actions] == [
-        "我要紀錄飲食", "我要修改飲食紀錄", "功能選單",
+        "我要紀錄飲食", "我要修改飲食紀錄", "一週趨勢", "功能選單",
     ]
     assert not any(action.get("text") == "午餐已吃" for action in actions)
     with sqlite3.connect(db_path) as conn:
@@ -167,7 +167,7 @@ def test_real_rendered_eaten_action_routes_through_registered_handler_to_idempot
             (uid,),
         ).fetchone() == (0.0, 0.0, "")
 
-    # The three-button card adds no eaten control; preserve the established text trigger.
+    # The four-button card adds no eaten control; preserve the established text trigger.
     server.handle_message(_event("HOME-EATEN-1", "午餐已吃", uid))
     server.handle_message(_event("HOME-EATEN-2", "午餐已吃", uid))
 

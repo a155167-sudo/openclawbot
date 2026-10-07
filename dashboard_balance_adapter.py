@@ -94,4 +94,5 @@ def adapt_dashboard_data(data: dict) -> dict:
         "target_protein": _number(data.get("protein_goal")),
         "records": records,
         "sub_meals": sub_meals,
+        "subscription_source_unavailable": data.get("subscription_source_status") in {"unavailable", "ambiguous"},
     }
