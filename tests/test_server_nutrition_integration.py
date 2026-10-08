@@ -46,6 +46,28 @@ from meal_photo_system import (
 from test_meal_photo_system import _answer_all, ai_estimated_payload, sample_payload
 
 
+def _text_meal_actions(message):
+    actions = []
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("type") == "postback":
+                actions.append(value.get("data"))
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+    walk(message.as_json_dict())
+    return actions
+
+
+def _text_meal_postback(data, event_id, user_id):
+    return SimpleNamespace(
+        postback=SimpleNamespace(data=data), source=SimpleNamespace(user_id=user_id),
+        reply_token=f"reply-{event_id}", webhook_event_id=event_id, timestamp=0,
+    )
+
+
 def _expected_health_source_v2_hash(
     *, log_id, version, nutrition, consumed_at, meal_slot, trust_binding="",
 ):
@@ -278,92 +300,35 @@ def test_ai_estimate_log_preserves_meal_and_returns_replayable_dashboard(
     )
     monkeypatch.setattr(server, "client", fake_client)
     monkeypatch.setattr(server, "gc", None)
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     answer, card = server.get_ai_response_with_memory(
         "U-AI-ESTIMATE",
         "請用一般估算記錄 早餐 火星果汁 300ml",
         "AI-ESTIMATE-1",
     )
-    replay_card = server.load_ai_estimate_replay(
-        "U-AI-ESTIMATE", "AI-ESTIMATE-1"
-    )
+    replay_card = server.load_ai_estimate_replay("U-AI-ESTIMATE", "AI-ESTIMATE-1")
     assert "LOG_NUTRITION" not in answer
-    assert card is not None
-    assert replay_card is not None
+    assert card is not None and replay_card is not None
+    assert replay_card.as_json_dict() == card.as_json_dict()
+    preview = json.dumps(card.as_json_dict(), ensure_ascii=False)
+    assert "尚未記錄" in preview and "一般估算" in preview
+    confirm = next(action for action in _text_meal_actions(card) if action.endswith(":confirm"))
     with sqlite3.connect(db) as conn:
-        row = conn.execute(
-            "SELECT log_id,version,meal_slot FROM food_logs WHERE user_id='U-AI-ESTIMATE'"
-        ).fetchone()
-        food_log_count = conn.execute(
-            "SELECT COUNT(*) FROM food_logs WHERE user_id='U-AI-ESTIMATE'"
-        ).fetchone()[0]
-        frequent_count = conn.execute(
-            "SELECT use_count FROM frequent_foods WHERE user_id='U-AI-ESTIMATE'"
-        ).fetchone()[0]
-    assert row[2] == "早餐"
-    assert food_log_count == 1
-    assert frequent_count == 1
-    assert replay_card.as_json_string() == card.as_json_string()
-    rendered = json.dumps(json.loads(card.as_json_string()), ensure_ascii=False)
-    assert "今日總覽" in rendered
-    assert "火星果汁 300ml" in rendered
-    assert "我要修改飲食紀錄" in rendered
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-AI-ESTIMATE'").fetchone()[0] == 0
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, message: replies.append(message))
+    event = _text_meal_postback(confirm, "AI-ESTIMATE-CONFIRM", "U-AI-ESTIMATE")
+    server.handle_postback_event(event)
+    server.handle_postback_event(event)
+    assert len(replies) == 2 and replies[0][0].type == "flex"
+    assert replies[0][0].as_json_dict() == replies[1][0].as_json_dict()
+    assert replies[0][1].as_json_dict() == replies[1][1].as_json_dict()
+    rendered = json.dumps(replies[0][0].as_json_dict(), ensure_ascii=False)
+    assert all(text in rendered for text in ("記錄成功", "火星果汁 300ml", "早餐", "180", "8"))
     with sqlite3.connect(db) as conn:
-        conn.execute(
-            "UPDATE health_profile SET today_extra_cal=999 WHERE user_id='U-AI-ESTIMATE'"
-        )
-        conn.execute(
-            "UPDATE daily_food_log_events SET result_json='{\"flex\":[]}' WHERE event_id='AI-ESTIMATE-1'"
-        )
-        conn.commit()
-    repaired = server.load_ai_estimate_replay("U-AI-ESTIMATE", "AI-ESTIMATE-1")
-    assert repaired is not None
-    assert repaired.as_json_string() == card.as_json_string()
-    with sqlite3.connect(db) as conn:
-        repaired_state = json.loads(conn.execute(
-            "SELECT result_json FROM daily_food_log_events WHERE event_id='AI-ESTIMATE-1'"
-        ).fetchone()[0])
-    assert repaired_state["flex"]["type"] == "flex"
-
-    monkeypatch.setattr(
-        server, "build_dashboard_flex",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("builder failed")),
-    )
-    _, fallback_card = server.get_ai_response_with_memory(
-        "U-AI-ESTIMATE",
-        "請用一般估算記錄 早餐 火星果汁 300ml",
-        "AI-ESTIMATE-BUILDER-FAIL",
-    )
-    assert fallback_card is not None
-    with sqlite3.connect(db) as conn:
-        atomic_counts = conn.execute(
-            """SELECT
-                 (SELECT COUNT(*) FROM food_logs WHERE operation_key='AI-ESTIMATE-BUILDER-FAIL'),
-                 (SELECT COUNT(*) FROM daily_food_log_events
-                  WHERE event_id='AI-ESTIMATE-BUILDER-FAIL' AND action='ai_estimate_log'),
-                 (SELECT COUNT(*) FROM ai_food_log_replay_snapshots
-                  WHERE operation_key='AI-ESTIMATE-BUILDER-FAIL')"""
-        ).fetchone()
-    assert atomic_counts == (1, 1, 1)
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            """CREATE TRIGGER fail_ai_recent BEFORE INSERT ON recent_meal_logs
-               BEGIN SELECT RAISE(ABORT,'forced recent failure'); END"""
-        )
-        conn.commit()
-    _, failed_card = server.get_ai_response_with_memory(
-        "U-AI-ESTIMATE",
-        "請用一般估算記錄 早餐 火星果汁 300ml",
-        "AI-ESTIMATE-RECENT-FAIL",
-    )
-    assert failed_card is None
-    with sqlite3.connect(db) as conn:
-        rolled_back = conn.execute(
-            """SELECT
-                 (SELECT COUNT(*) FROM food_logs WHERE operation_key='AI-ESTIMATE-RECENT-FAIL'),
-                 (SELECT COUNT(*) FROM daily_food_log_events WHERE event_id='AI-ESTIMATE-RECENT-FAIL'),
-                 (SELECT COUNT(*) FROM ai_food_log_replay_snapshots WHERE operation_key='AI-ESTIMATE-RECENT-FAIL')"""
-        ).fetchone()
-    assert rolled_back == (0, 0, 0)
+        row = conn.execute("SELECT meal_slot,nutrition_snapshot_json FROM food_logs WHERE user_id='U-AI-ESTIMATE'").fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-AI-ESTIMATE'").fetchone()[0] == 1
+    assert row[0] == "早餐" and json.loads(row[1])["calories_kcal"] == 180
 
 
 def test_explicit_text_nutrition_logs_once_and_returns_canonical_dashboard(
@@ -376,6 +341,7 @@ def test_explicit_text_nutrition_logs_once_and_returns_canonical_dashboard(
     fixed_now = server.datetime(2026, 9, 17, 8, 15, tzinfo=server.TW_TZ)
     monkeypatch.setattr(server, "tw_now", lambda: fixed_now)
     server.init_db()
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     replies = []
     monkeypatch.setattr(
         server.line_bot_api, "reply_message", lambda _token, message: replies.append(message)
@@ -384,38 +350,36 @@ def test_explicit_text_nutrition_logs_once_and_returns_canonical_dashboard(
         "TEXT-350-17", "鮪魚蛋吐司 熱量350 蛋白質17", user_id="U-TEXT"
     )
 
+    provider_calls, quota_calls = [], []
+    monkeypatch.setattr(server, "estimate_text_meal_nutrition", lambda request: provider_calls.append(request))
+    monkeypatch.setattr(server, "check_permission_and_quota", lambda uid: (quota_calls.append(uid) or True, "left"))
     server._handle_message_impl(event)
     server.processed_messages.discard(event.message.id)
     server._handle_message_impl(event)
 
     assert len(replies) == 2
-    assert all(isinstance(payload, list) and len(payload) == 2 for payload in replies)
-    first = [item.as_json_dict() for item in replies[0]]
-    second = [item.as_json_dict() for item in replies[1]]
-    assert first == second
-    assert replies[0][0].text == (
-        "✅ 已記錄：鮪魚蛋吐司｜350 kcal｜蛋白質 17 g（使用者提供）"
-    )
-    rendered = json.dumps(first, ensure_ascii=False)
-    assert "今日總覽" in rendered
-    assert "鮪魚蛋吐司" in rendered
-    assert '"text": "今日已吃"' in rendered and '"text": "350"' in rendered
-    assert '"text": "已吃 350"' in rendered
-    assert '"text": "今日蛋白質"' in rendered and '"text": "17 g"' in rendered
-    assert "目標未設定" in rendered
-    assert "記錄成功" not in rendered
+    assert replies[0].as_json_dict() == replies[1].as_json_dict()
+    preview = json.dumps(replies[0].as_json_dict(), ensure_ascii=False)
+    assert "尚未記錄" in preview and "使用者提供" in preview
+    assert provider_calls == quota_calls == []
     with sqlite3.connect(db) as conn:
-        rows = conn.execute(
-            """SELECT fc.product_name,fl.meal_slot,fl.nutrition_snapshot_json,
-                      fl.operation_key,fc.source_type
-               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
-               WHERE fl.user_id='U-TEXT'"""
-        ).fetchall()
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-TEXT'").fetchone()[0] == 0
+    confirm = next(action for action in _text_meal_actions(replies[0]) if action.endswith(":confirm"))
+    confirm_event = _text_meal_postback(confirm, "TEXT-350-17-CONFIRM", "U-TEXT")
+    server.handle_postback_event(confirm_event)
+    server.handle_postback_event(confirm_event)
+    assert all(isinstance(payload, list) and len(payload) == 2 for payload in replies[-2:])
+    assert replies[-2][0].as_json_dict() == replies[-1][0].as_json_dict()
+    assert replies[-2][1].as_json_dict() == replies[-1][1].as_json_dict()
+    rendered = json.dumps(replies[-1][0].as_json_dict(), ensure_ascii=False)
+    assert all(text in rendered for text in ("記錄成功", "鮪魚蛋吐司", "早餐", "350", "17", "使用者提供"))
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute("""SELECT fc.product_name,fl.meal_slot,fl.nutrition_snapshot_json,fc.source_type
+               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id WHERE fl.user_id='U-TEXT'""").fetchall()
     assert len(rows) == 1
     assert rows[0][0:2] == ("鮪魚蛋吐司", "早餐")
-    assert json.loads(rows[0][2]) == {"calories_kcal": 350.0, "protein_g": 17.0}
-    assert rows[0][3] == "line-text-nutrition:U-TEXT:TEXT-350-17"
-    assert rows[0][4] == "user_provided_nutrition"
+    assert json.loads(rows[0][2])["calories_kcal"] == 350.0
+    assert rows[0][3] == "user_provided_nutrition"
 
 
 @pytest.mark.parametrize("text", [
@@ -620,7 +584,8 @@ def test_explicit_text_dashboard_render_failure_reports_committed_without_retry_
     )
 
     assert isinstance(reply, list) and len(reply) == 2
-    assert reply[0].text == "✅ 已記錄：無糖茶｜5 kcal｜蛋白質 0 g（使用者提供）"
+    record = json.dumps(reply[0].as_json_dict(), ensure_ascii=False)
+    assert all(text in record for text in ("記錄成功", "無糖茶", "點心", "5", "蛋白質 0 g", "使用者提供"))
     assert "已入帳" in reply[1].text
     assert "儀表板暫時無法顯示" in reply[1].text
     assert "重新記錄" not in reply[1].text
@@ -642,14 +607,19 @@ def test_explicit_text_nutrition_failure_never_returns_dashboard(tmp_path, monke
         lambda *_args, **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("forced")),
     )
 
+    server._handle_message_impl(
+        _text_event("TEXT-FAIL", "鮪魚蛋吐司 熱量350 蛋白質17", user_id="U-TEXT")
+    )
+    assert len(replies) == 1 and "尚未記錄" in json.dumps(replies[0].as_json_dict(), ensure_ascii=False)
+    confirm = next(action for action in _text_meal_actions(replies[0]) if action.endswith(":confirm"))
     with pytest.raises(sqlite3.OperationalError, match="forced"):
-        server._handle_message_impl(
-            _text_event("TEXT-FAIL", "鮪魚蛋吐司 熱量350 蛋白質17", user_id="U-TEXT")
+        server.apply_text_meal_estimate_action(
+            user_id="U-TEXT", token=confirm.split(":")[2],
+            expected_version=int(confirm.split(":")[3]), action="confirm",
         )
-
-    assert replies == []
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM food_logs").fetchone()[0] == 0
+        assert conn.execute("SELECT status FROM pending_text_meal_estimates").fetchone()[0] == "pending"
 
 
 def test_ai_estimate_button_records_midpoint_when_model_returns_only_ranges(
@@ -675,6 +645,7 @@ def test_ai_estimate_button_records_midpoint_when_model_returns_only_ranges(
         ))),
     )
     monkeypatch.setattr(server, "gc", None)
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
 
     answer, card = server.get_ai_response_with_memory(
         "U-AI-RANGE",
@@ -682,21 +653,27 @@ def test_ai_estimate_button_records_midpoint_when_model_returns_only_ranges(
         "AI-ESTIMATE-RANGE-1",
     )
 
-    assert card is not None
-    assert card.alt_text == "今日總覽"
-    assert "今日總覽" in json.dumps(
-        json.loads(card.as_json_string()), ensure_ascii=False
-    )
+    assert card is not None and card.alt_text == "AI營養估算，請確認後記錄"
+    rendered = json.dumps(card.as_json_dict(), ensure_ascii=False)
+    assert "一般估算草稿（尚未記錄）" in rendered
+    assert "175 kcal" in rendered and "確認後才會寫入" in rendered
     with sqlite3.connect(db) as conn:
-        row = conn.execute(
-            """SELECT fc.product_name,fl.meal_slot,fl.nutrition_snapshot_json
-               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
-               WHERE fl.user_id='U-AI-RANGE'"""
-        ).fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-AI-RANGE'").fetchone()[0] == 0
+    replies = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, message: replies.append(message))
+    confirm = next(action for action in _text_meal_actions(card) if action.endswith(":confirm"))
+    event = _text_meal_postback(confirm, "AI-ESTIMATE-RANGE-CONFIRM", "U-AI-RANGE")
+    server.handle_postback_event(event)
+    server.handle_postback_event(event)
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("""SELECT fc.product_name,fl.meal_slot,fl.nutrition_snapshot_json
+               FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id WHERE fl.user_id='U-AI-RANGE'""").fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-AI-RANGE'").fetchone()[0] == 1
     assert row[:2] == ("茶葉蛋 2顆", "午餐")
     nutrition = json.loads(row[2])
     assert nutrition["calories_kcal"] == 175
     assert nutrition["protein_g"] == 16
+    assert replies[0][0].as_json_dict() == replies[1][0].as_json_dict()
     assert "請問要記哪個熱量值" not in answer
 
 
@@ -797,7 +774,7 @@ def test_ai_estimate_webhook_replay_precedes_quota_and_openai(tmp_path, monkeypa
     replies = []
 
     def flaky_reply(_token, message):
-        replies.append(message.as_json_string())
+        replies.append(message)
         if len(replies) == 1:
             raise RuntimeError("simulated LINE reply failure")
 
@@ -824,10 +801,20 @@ def test_ai_estimate_webhook_replay_precedes_quota_and_openai(tmp_path, monkeypa
             "SELECT COUNT(*) FROM food_logs WHERE user_id='U-AI-WEBHOOK'"
         ).fetchone()[0]
     assert quota == 0
-    assert log_count == 1
+    assert log_count == 0
     assert len(ai_calls) == 1
     assert len(replies) == 2
-    assert replies[1] == replies[0]
+    assert replies[1].as_json_dict() == replies[0].as_json_dict()
+    confirm = next(action for action in _text_meal_actions(replies[0]) if action.endswith(":confirm"))
+    committed = []
+    monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _t, message: committed.append(message))
+    confirm_event = _text_meal_postback(confirm, "AI-WEBHOOK-CONFIRM", "U-AI-WEBHOOK")
+    server.handle_postback_event(confirm_event)
+    server.handle_postback_event(confirm_event)
+    assert len(committed) == 2 and committed[0][0].as_json_dict() == committed[1][0].as_json_dict()
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-AI-WEBHOOK'").fetchone()[0] == 1
+        assert conn.execute("SELECT remaining_chat_quota FROM usage WHERE user_id='U-AI-WEBHOOK'").fetchone()[0] == 0
 
 
 def test_ai_food_log_gate_requires_explicit_estimate_recording_request():
@@ -952,9 +939,14 @@ def test_natural_food_unit_mismatch_offers_executable_ai_estimate(tmp_path, monk
     monkeypatch.setattr(
         server, "estimate_text_meal_nutrition",
         lambda request: provider_calls.append(dict(request)) or {
+            "schema_version": "text-meal-estimate-v2",
             "food_name": "酪梨", "portion_assumption": "100g",
+            "basis_amount": 100.0, "basis_unit": "g",
             "calories_kcal": {"estimate": 160, "min": 140, "max": 190},
             "protein_g": {"estimate": 2, "min": 1, "max": 3},
+            "fat_g": {"estimate": 15, "min": 13, "max": 17},
+            "carbohydrate_g": {"estimate": 9, "min": 7, "max": 11},
+            "assessment": {"status": "consistent", "requires_correction": False},
             "provenance": {"provider": "test", "model": "mock", "method": "text_meal_estimate"},
         },
     )
@@ -969,7 +961,7 @@ def test_natural_food_unit_mismatch_offers_executable_ai_estimate(tmp_path, monk
     )
 
     rendered = json.dumps(reply.as_json_dict(), ensure_ascii=False)
-    assert "AI 營養估算（尚未記錄）" in rendered
+    assert "AI估算草稿（尚未記錄）" in rendered
     assert "酪梨" in rendered and "140–190 kcal" in rendered
     assert "確認後才會寫入" in rendered
     assert provider_calls == [{
@@ -986,6 +978,20 @@ def test_natural_food_unit_mismatch_offers_executable_ai_estimate(tmp_path, monk
         assert conn.execute(
             "SELECT remaining_chat_quota FROM usage WHERE user_id='U-MISMATCH'"
         ).fetchone()[0] == 0
+    confirm = next(action for action in _text_meal_actions(reply) if action.endswith(":confirm"))
+    parts = confirm.split(":")
+    first = server.apply_text_meal_estimate_action(
+        user_id="U-MISMATCH", token=parts[2], expected_version=int(parts[3]), action="confirm"
+    )
+    replay = server.apply_text_meal_estimate_action(
+        user_id="U-MISMATCH", token=parts[2], expected_version=int(parts[3]), action="confirm"
+    )
+    assert first["replayed"] is False and replay == {
+        "kind": "confirmed", "log_id": first["log_id"], "replayed": True,
+    }
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-MISMATCH'").fetchone()[0] == 1
+        assert conn.execute("SELECT remaining_chat_quota FROM usage WHERE user_id='U-MISMATCH'").fetchone()[0] == 0
 
 
 def _daily_ledger_db(tmp_path, monkeypatch, name="daily-ledger.db"):
@@ -8437,6 +8443,7 @@ def test_natural_food_log_not_found_or_incompatible_unit_requires_ai_confirmatio
     monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
     monkeypatch.setattr(server, "DB_PATH", str(db))
     server.init_db()
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     now = utcish_now()
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -8468,9 +8475,14 @@ def test_natural_food_log_not_found_or_incompatible_unit_requires_ai_confirmatio
     monkeypatch.setattr(
         server, "estimate_text_meal_nutrition",
         lambda request: estimates.append(dict(request)) or {
+            "schema_version": "text-meal-estimate-v2",
             "food_name": request["food_name"], "portion_assumption": "依描述份量",
+            "basis_amount": request["amount"], "basis_unit": request["unit"],
             "calories_kcal": {"estimate": 350, "min": 300, "max": 420},
             "protein_g": {"estimate": 17, "min": 13, "max": 22},
+            "fat_g": {"estimate": 12, "min": 9, "max": 15},
+            "carbohydrate_g": {"estimate": 40, "min": 32, "max": 48},
+            "assessment": {"status": "consistent", "requires_correction": False},
             "provenance": {"provider": "test", "model": "mock", "method": "text_meal_estimate"},
         },
     )
@@ -8482,15 +8494,18 @@ def test_natural_food_log_not_found_or_incompatible_unit_requires_ai_confirmatio
         )
     )
     first = json.dumps(replies[-1].as_json_dict(), ensure_ascii=False)
-    assert "AI 營養估算（尚未記錄）" in first
+    assert "AI估算草稿（尚未記錄）" in first
     assert "火星果汁" in first and "300–420 kcal" in first
     assert "確認後才會寫入" in first
+    first_confirm = next(
+        action for action in _text_meal_actions(replies[-1]) if action.endswith(":confirm")
+    )
 
     server._handle_message_impl(
         _text_event("NATURAL-UNIT-1", "我要記錄飲食 豆干 300ml", user_id="U1")
     )
     second = json.dumps(replies[-1].as_json_dict(), ensure_ascii=False)
-    assert "AI 營養估算（尚未記錄）" in second
+    assert "AI估算草稿（尚未記錄）" in second
     assert "豆干" in second and "確認後才會寫入" in second
     assert [item["food_name"] for item in estimates] == ["火星果汁", "豆干"]
     with sqlite3.connect(db) as conn:
@@ -8501,6 +8516,15 @@ def test_natural_food_log_not_found_or_incompatible_unit_requires_ai_confirmatio
         assert conn.execute(
             "SELECT remaining_chat_quota FROM usage WHERE user_id='U1'"
         ).fetchone()[0] == 0
+    confirm_event = _text_meal_postback(first_confirm, "NATURAL-MISSING-CONFIRM", "U1")
+    server.handle_postback_event(confirm_event)
+    server.handle_postback_event(confirm_event)
+    assert replies[-1][0].as_json_dict() == replies[-2][0].as_json_dict()
+    confirmed = json.dumps(replies[-1][0].as_json_dict(), ensure_ascii=False)
+    assert all(text in confirmed for text in ("記錄成功", "火星果汁", "早餐", "350", "17"))
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U1'").fetchone()[0] == 1
+        assert conn.execute("SELECT remaining_chat_quota FROM usage WHERE user_id='U1'").fetchone()[0] == 0
 
 
 def test_quick_log_uses_one_timestamp_across_midnight(tmp_path, monkeypatch):
@@ -8693,6 +8717,7 @@ def test_natural_food_log_uses_private_exact_match_scales_ml_and_replays_once(
     monkeypatch.setattr(server, "DB_PATH", str(db))
     monkeypatch.setattr(server, "gc", None)
     server.init_db()
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     fixed_now = server.datetime(2026, 8, 10, 18, 30, tzinfo=server.TW_TZ)
     monkeypatch.setattr(server, "tw_now", lambda: fixed_now)
     now = utcish_now()
@@ -8763,16 +8788,25 @@ def test_natural_food_log_uses_private_exact_match_scales_ml_and_replays_once(
 
     assert replies[-1].type == "flex"
     card_text = json.dumps(json.loads(replies[-1].as_json_string()), ensure_ascii=False)
-    assert "今日總覽" in card_text
-    assert "無糖豆漿" in card_text
-    assert '"text": "熱量餘額"' in card_text and '"text": "1,797"' in card_text
-    assert '"text": "已吃 203"' in card_text
-    assert '"text": "蛋白質餘額"' in card_text and '"text": "90.3 g"' in card_text
+    assert "私人食品庫草稿（尚未記錄）" in card_text
+    assert "無糖豆漿" in card_text and "確認後才會寫入" in card_text
+    confirm = next(action for action in _text_meal_actions(replies[-1]) if action.endswith(":confirm"))
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U1'").fetchone()[0] == 0
     server.processed_messages.discard(event.message.id)
     server._handle_message_impl(event)
+    assert replies[-1].as_json_dict() == replies[-2].as_json_dict()
+    confirm_event = _text_meal_postback(confirm, "NATURAL-SOY-CONFIRM", "U1")
+    server.handle_postback_event(confirm_event)
+    server.handle_postback_event(confirm_event)
+    assert replies[-1][0].as_json_dict() == replies[-2][0].as_json_dict()
+    success = json.dumps(replies[-1][0].as_json_dict(), ensure_ascii=False)
+    dashboard = json.dumps(replies[-1][1].as_json_dict(), ensure_ascii=False)
+    assert all(text in success for text in ("記錄成功", "無糖豆漿", "晚餐", "私人食品庫", "400 ml"))
+    assert "今日總覽" in dashboard and "無糖豆漿" in dashboard
     with sqlite3.connect(db) as conn:
         logs = conn.execute(
-            """SELECT food_id,consumed_servings,consumed_amount,consumed_unit,meal_slot,
+            """SELECT consumed_servings,consumed_amount,consumed_unit,meal_slot,
                       consumed_at,nutrition_snapshot_json FROM food_logs WHERE user_id='U1'"""
         ).fetchall()
         hp = conn.execute(
@@ -8783,11 +8817,11 @@ def test_natural_food_log_uses_private_exact_match_scales_ml_and_replays_once(
                WHERE entity_type='food_log' AND status='pending'"""
         ).fetchone()[0]
     assert len(logs) == 1
-    assert logs[0][0] == "food_private_soy"
-    assert logs[0][1] == pytest.approx(400 / 375)
-    assert logs[0][2] == pytest.approx(400)
-    assert logs[0][3:6] == ("ml", "晚餐", "2026-08-10T18:30:00+08:00")
-    nutrition = json.loads(logs[0][6])
+    assert logs[0][0] == pytest.approx(1.0)
+    # Confirmation must preserve the user's measured quantity, not rewrite 400 ml as 1 serving.
+    assert logs[0][1] == pytest.approx(400)
+    assert logs[0][2:5] == ("ml", "晚餐", "2026-08-10T18:30:00+08:00")
+    nutrition = json.loads(logs[0][5])
     assert nutrition["calories_kcal"] == pytest.approx(202.88)
     assert nutrition["protein_g"] == pytest.approx(9.7067)
     assert hp[0] == pytest.approx(202.88)

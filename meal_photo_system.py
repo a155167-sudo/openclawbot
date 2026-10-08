@@ -22,6 +22,7 @@ from nutrition_system import (
     user_confirmed_meal_photo_estimate_is_valid,
     user_confirmed_meal_photo_trust_projection,
 )
+from nutrition_estimate_checks import assess_nutrition
 
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
@@ -68,6 +69,18 @@ def _estimate_number(value: Any, field: str, maximum: float) -> float:
     if not math.isfinite(number) or number < 0 or number > maximum:
         raise ValueError(f"{field} 超出合理範圍")
     return number
+
+
+def _validate_provided_nutrition(calories_kcal: Any, protein_g: Any) -> None:
+    assessment = assess_nutrition({
+        "calories_kcal": calories_kcal,
+        "protein_g": protein_g,
+        "fat_g": None,
+        "carbohydrate_g": None,
+    })
+    if assessment.get("requires_correction"):
+        reason = str(assessment.get("reason") or "已提供的營養數值不合理")
+        raise ValueError(f"AI營養估算合理性核對失敗：{reason}")
 
 
 def _normalize_ai_estimate(value: Any) -> dict[str, Any]:
@@ -123,6 +136,9 @@ def _normalize_ai_estimate(value: Any) -> dict[str, Any]:
         if minimum > estimate or estimate > maximum or minimum == maximum:
             raise ValueError(f"{field} 估算值必須落在非零寬度區間內")
         totals[field] = {"estimate": estimate, "min": minimum, "max": maximum}
+    _validate_provided_nutrition(
+        totals["calories_kcal"]["estimate"], totals["protein_g"]["estimate"]
+    )
     provenance = value.get("provenance")
     if not isinstance(provenance, Mapping) or set(provenance) != {
         "provider", "model", "method", "nutrition_basis"
@@ -1033,6 +1049,7 @@ def create_meal_photo_revision_draft(
     snapshot = dict(estimate or {})
     if not meal_photo_estimate_snapshot_is_valid(snapshot) or snapshot.get("rule_version") != "ai-vision-nutrition-estimate-v1":
         raise ValueError("revision AI營養估算完整性驗證失敗")
+    _validate_provided_nutrition(snapshot.get("calories_kcal"), snapshot.get("protein_g"))
     row = conn.execute(
         """SELECT l.version,l.source_image_ref,l.trust_hash,l.confirmation_status,
                   COALESCE(l.deleted_at,''),f.source_type,f.owner_user_id

@@ -58,12 +58,16 @@ def _install_fake_client(monkeypatch, *, payload=None, raw=None, finish_reason="
     return completions
 
 
-def _canonical_payload(name="木耳"):
+def _canonical_payload(name="木耳", amount=20, unit="g"):
     return {
         "food_name": name,
-        "portion_assumption": "20 g",
+        "portion_assumption": f"{amount} {unit}",
+        "basis_amount": amount,
+        "basis_unit": unit,
         "calories_kcal": {"estimate": 5, "min": 3, "max": 8, "unit": "kcal"},
         "protein_g": {"estimate": 0.3, "min": 0.1, "max": 0.6, "unit": "g"},
+        "fat_g": {"estimate": 0.2, "min": 0.1, "max": 0.3, "unit": "g"},
+        "carbohydrate_g": {"estimate": 0.7, "min": 0.4, "max": 1.0, "unit": "g"},
     }
 
 
@@ -92,14 +96,15 @@ def test_provider_adapter_requests_strict_range_schema_and_matching_prompt(monke
     assert response_format["json_schema"]["strict"] is True
     schema = response_format["json_schema"]["schema"]
     assert set(schema["required"]) == {
-        "food_name", "portion_assumption", "calories_kcal", "protein_g"
+        "food_name", "portion_assumption", "basis_amount", "basis_unit",
+        "calories_kcal", "protein_g", "fat_g", "carbohydrate_g",
     }
-    for field, unit in (("calories_kcal", "kcal"), ("protein_g", "g")):
+    for field, unit in (("calories_kcal", "kcal"), ("protein_g", "g"), ("fat_g", "g"), ("carbohydrate_g", "g")):
         nutrient = schema["properties"][field]
         assert set(nutrient["required"]) == {"estimate", "min", "max", "unit"}
         assert nutrient["properties"]["unit"]["enum"] == [unit]
     prompt = call["messages"][0]["content"]
-    assert all(token in prompt for token in ("estimate", "min", "max", "kcal", "protein_g"))
+    assert all(token in prompt for token in ("estimate", "min", "max", "basis_amount", "四項營養"))
 
 
 def test_provider_adapter_normalizes_explicit_equivalent_wrapper_and_range_shape(monkeypatch):
@@ -107,10 +112,14 @@ def test_provider_adapter_normalizes_explicit_equivalent_wrapper_and_range_shape
         "result": {
             "food_name": "木耳",
             "portion_assumption": "20 g",
+            "basis_amount": 20,
+            "basis_unit": "g",
             "nutrition": {
                 "calories_kcal": 5,
                 "calories_kcal_range": {"min": 3, "max": 8, "unit": "kcal"},
                 "protein_g": {"estimate": 0.3, "range": {"min": 0.1, "max": 0.6}, "unit": "g"},
+                "fat_g": {"estimate": 0.2, "min": 0.1, "max": 0.3, "unit": "g"},
+                "carbohydrate_g": {"estimate": 0.7, "min": 0.4, "max": 1.0, "unit": "g"},
                 "confidence": 0.8,
             },
             "metadata": {"trace": "ignored"},
@@ -125,9 +134,10 @@ def test_provider_adapter_normalizes_explicit_equivalent_wrapper_and_range_shape
     assert estimate["food_name"] == "木耳"
     assert estimate["calories_kcal"] == {"estimate": 5.0, "min": 3.0, "max": 8.0}
     assert estimate["protein_g"] == {"estimate": 0.3, "min": 0.1, "max": 0.6}
-    assert estimate["provenance"] == {
-        "provider": "openai", "model": "gpt-4o-mini", "method": "text_meal_estimate"
-    }
+    assert estimate["provenance"]["provider"] == "openai"
+    assert estimate["provenance"]["model"] == "gpt-4o-mini"
+    assert estimate["provenance"]["method"] == "text_meal_estimate"
+    assert estimate["provenance"]["trace_id"]
 
 
 def test_raw_http_adapter_rejects_conflicting_top_level_and_nested_nutrition(monkeypatch):
@@ -363,9 +373,9 @@ def test_missing_ranges_keeps_batch_atomic_refunds_real_quota_and_blames_system(
         server, "check_permission_and_quota", server._DEFAULT_CHECK_PERMISSION_AND_QUOTA
     )
     fake = _install_sequence_client(monkeypatch, [
-        _canonical_payload("木耳"),
+        _canonical_payload("木耳", 1, "cup"),
         {
-            "food_name": "青菜", "portion_assumption": "20 g",
+            "food_name": "青菜", "portion_assumption": "1 cup",
             "calories_kcal": 5, "protein_g": 0.3,
         },
     ])
@@ -374,7 +384,7 @@ def test_missing_ranges_keeps_batch_atomic_refunds_real_quota_and_blames_system(
         _postback(_action(card, "➕ 新增食材")["data"], "REQUEST-PROVIDER-CONTRACT")
     )
 
-    server.handle_message(_text("木耳20g、青菜20g", "MISSING-RANGES"))
+    server.handle_message(_text("木耳1杯、青菜1杯", "MISSING-RANGES"))
 
     assert "系統估算未完成" in replies[-1].text
     assert "原草稿保留" in replies[-1].text
@@ -402,7 +412,7 @@ def test_four_item_batch_uses_real_adapter_four_times_but_one_net_quota(
     )
     names = ["木耳", "牛番茄", "金針菇", "青菜"]
     fake = _install_sequence_client(
-        monkeypatch, [_canonical_payload(name) for name in names]
+        monkeypatch, [_canonical_payload(name, 1, "cup") for name in names]
     )
     card = build_meal_photo_estimate_bubble(draft)
     server.handle_postback_event(
@@ -410,7 +420,7 @@ def test_four_item_batch_uses_real_adapter_four_times_but_one_net_quota(
     )
 
     server.handle_message(
-        _text("木耳20g、牛番茄1/6顆、金針菇20g、青菜20g", "ADAPTER-BATCH-FOUR")
+        _text("木耳1杯、牛番茄1杯、金針菇1杯、青菜1杯", "ADAPTER-BATCH-FOUR")
     )
 
     assert len(fake.calls) == 4

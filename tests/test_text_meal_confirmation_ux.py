@@ -40,19 +40,42 @@ def _db(tmp_path, monkeypatch, *, mock_quota=True):
 
 def test_explicit_user_values_reply_with_short_success_then_dashboard_and_replay_once(tmp_path, monkeypatch):
     db = _db(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "has_active_vip_access", lambda _uid: True)
     replies = []
     monkeypatch.setattr(server.line_bot_api, "reply_message", lambda _token, reply: replies.append(reply))
     server.processed_messages.clear()
     event = _text_event("DIRECT-1", "鮪魚蛋吐司 熱量350大卡 蛋白質17g")
+    provider_calls, quota_calls = [], []
+    monkeypatch.setattr(server, "estimate_text_meal_nutrition", lambda request: provider_calls.append(request))
+    monkeypatch.setattr(server, "check_permission_and_quota", lambda uid: (quota_calls.append(uid) or True, "left"))
 
     server._handle_message_impl(event)
     server.processed_messages.clear()
     server._handle_message_impl(event)
 
     assert len(replies) == 2
-    for payload in replies:
+    assert replies[0].as_json_dict() == replies[1].as_json_dict()
+    rendered = json.dumps(replies[0].as_json_dict(), ensure_ascii=False)
+    assert "使用者提供草稿（尚未記錄）" in rendered and "確認後才會寫入" in rendered
+    assert provider_calls == quota_calls == []
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-TEXT'").fetchone()[0] == 0
+    actions = []
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("type") == "postback": actions.append(value.get("data"))
+            for child in value.values(): walk(child)
+        elif isinstance(value, list):
+            for child in value: walk(child)
+    walk(replies[0].as_json_dict())
+    confirm = next(action for action in actions if action.endswith(":confirm"))
+    confirm_event = _postback(confirm, "DIRECT-CONFIRM")
+    server.handle_postback_event(confirm_event)
+    server.handle_postback_event(confirm_event)
+    for payload in replies[-2:]:
         assert isinstance(payload, list) and len(payload) == 2
-        assert payload[0].text == "✅ 已記錄：鮪魚蛋吐司｜350 kcal｜蛋白質 17 g（使用者提供）"
+        success = json.dumps(payload[0].as_json_dict(), ensure_ascii=False)
+        assert all(text in success for text in ("記錄成功", "鮪魚蛋吐司", "350", "17", "使用者提供"))
         assert payload[1].text == "DASHBOARD"
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-TEXT'").fetchone()[0] == 1
@@ -160,10 +183,16 @@ def test_food_questions_and_bare_non_food_do_not_start_text_estimate():
 
 def _mock_estimate(food_name="鮪魚蛋吐司"):
     return {
+        "schema_version": "text-meal-estimate-v2",
         "food_name": food_name,
         "portion_assumption": "1 份（一般份量）",
+        "basis_amount": 1.0,
+        "basis_unit": "serving",
         "calories_kcal": {"estimate": 350, "min": 300, "max": 420},
         "protein_g": {"estimate": 17, "min": 13, "max": 22},
+        "fat_g": {"estimate": 12, "min": 9, "max": 15},
+        "carbohydrate_g": {"estimate": 40, "min": 32, "max": 48},
+        "assessment": {"status": "consistent", "requires_correction": False},
         "provenance": {"provider": "test", "model": "mock", "method": "text_meal_estimate"},
     }
 
