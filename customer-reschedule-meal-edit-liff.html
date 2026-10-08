@@ -6,7 +6,7 @@
 </style><script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 <script>window.__MEAL_DRAFT_RUNTIME__ = null; /* __MEAL_DRAFT_RUNTIME_MARKER__ */</script></head>
 <body><main><div class="card"><div class="tag">營養估算草稿（尚未記錄）</div><h1 id="name">載入中…</h1><div id="source" class="muted"></div>
-<form id="form" class="hidden"><label>餐別<select id="slot"><option>早餐</option><option>午餐</option><option>晚餐</option><option>點心</option></select></label>
+<form id="form" class="hidden"><label>餐別<select id="slot" required><option value="" disabled>請選擇餐別</option><option>早餐</option><option>午餐</option><option>晚餐</option><option>點心</option></select></label>
 <div id="singlePortion" class="grid"><label>份量<input id="amount" type="number" inputmode="decimal" min="0.0001" step="any"></label><label>單位<input id="unit" readonly></label></div><section id="ingredients" class="hidden"><h2>食材明細</h2><p class="muted">每項食材保留自己的份量與單位；g 和 ml 不會合併。</p><div id="ingredientList"></div></section>
 <div class="grid"><label>熱量 kcal<input id="calories_kcal" type="number" inputmode="decimal" min="0" step="any"></label><label>蛋白質 g<input id="protein_g" type="number" inputmode="decimal" min="0" step="any"></label><label>脂肪 g（未知可留空）<input id="fat_g" type="number" inputmode="decimal" min="0" step="any"></label><label>碳水 g（未知可留空）<input id="carbohydrate_g" type="number" inputmode="decimal" min="0" step="any"></label></div>
 <p class="muted">修改只會更新草稿，不會記錄、不會重跑 AI，也不會扣額度。回到聊天後仍要按「確認記錄」。</p><button id="save" type="submit">儲存並回傳聊天室</button></form>
@@ -38,8 +38,9 @@ function renderPhotoItems(d){
 function fill(d){
   draft=d;dirty.clear();baseAmount=Number(d.amount);baseNutrition={...d.nutrition};
   $('name').textContent=d.food_name;$('source').textContent=`來源：${d.source_label}`;$('slot').value=d.meal_slot;
-  fields.forEach(f=>{$(f).readOnly=false;$(f).value=d.display[f]||''});
-  if(d.draft_type==='photo')renderPhotoItems(d);else{$('amount').value=d.amount;$('unit').value=d.unit}
+  const semanticItems=d.draft_type==='text-semantic-items';
+  fields.forEach(f=>{$(f).readOnly=semanticItems;$(f).value=d.display[f]||''});
+  if(d.draft_type==='photo'||draft.draft_type==='text-semantic-items')renderPhotoItems(d);else{$('amount').value=d.amount;$('unit').value=d.unit}
   $('form').classList.remove('hidden');
 }
 fields.forEach(f=>$(f).addEventListener('input',()=>dirty.add(f)));
@@ -51,10 +52,14 @@ $('amount').addEventListener('input',()=>{
 });
 async function api(url,opt){const r=await fetch(url,{cache:'no-store',credentials:'omit',...opt});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.detail||'連線失敗');return data}
 async function canSendToOriginalPrivateChat(){
-  if(!liff.isInClient||!liff.isInClient()||!liff.isApiAvailable||!liff.isApiAvailable('sendMessages')||!liff.getContext||!liff.permission||!liff.permission.query)return false;
-  const context=liff.getContext();
-  if(!context||context.type!=='utou'||(context.source&&context.source.type!=='user'))return false;
-  try{const permission=await liff.permission.query('chat_message.write');return (permission&&String(permission.state||permission.status||permission))==='granted'}catch(e){return false}
+  try{
+    // sendMessages is NOT an accepted isApiAvailable API name (LIFF SDK contract).
+    if(!liff.isInClient||!liff.isInClient()||typeof liff.sendMessages!=='function'||!liff.getContext||!liff.permission||!liff.permission.query)return false;
+    const context=liff.getContext();
+    if(!context||context.type!=='utou'||(context.source&&context.source.type!=='user'))return false;
+    const permission=await liff.permission.query('chat_message.write');
+    return (permission&&String(permission.state||permission.status||permission))==='granted';
+  }catch(e){return false}
 }
 async function deliver(){
   if(!receipt)return;const command=receipt.return_command;$('command').textContent=command;$('fallback').classList.remove('hidden');
@@ -65,10 +70,12 @@ $('retry').addEventListener('click',deliver);
 $('form').addEventListener('submit',async e=>{
   e.preventDefault();if(receipt){await deliver();return}
   try{
+    if(!$('slot').value)throw new Error('請選擇餐別');
     $('save').disabled=true;const nutrition={};fields.forEach(f=>nutrition[f]=numberOrNull($(f)));
-    const items=draft.draft_type==='photo'?[...document.querySelectorAll('.ingredient')].map(box=>{const base=draft.items[Number(box.dataset.index)];return {...base,amount:positiveAmount(box.querySelector('.itemAmount')),unit:box.querySelector('.itemUnit').value}}):null;
-    const amount=draft.draft_type==='photo'?null:positiveAmount($('amount'));
-    receipt=await api('/customer-reschedule/meal-draft',{method:'PUT',headers:auth(),body:JSON.stringify({draft_type:draft.draft_type||'text',token:draft.token,version:draft.version,amount,unit:draft.draft_type==='photo'?'':$('unit').value,meal_slot:$('slot').value,nutrition,items})});
+    const itemDraft=draft.draft_type==='photo'||draft.draft_type==='text-semantic-items';
+    const items=itemDraft?[...document.querySelectorAll('.ingredient')].map(box=>{const base=draft.items[Number(box.dataset.index)];return {...base,amount:positiveAmount(box.querySelector('.itemAmount')),unit:box.querySelector('.itemUnit').value}}):null;
+    const amount=itemDraft?null:positiveAmount($('amount'));
+    receipt=await api('/customer-reschedule/meal-draft',{method:'PUT',headers:auth(),body:JSON.stringify({draft_type:draft.draft_type||'text',token:draft.token,version:draft.version,amount,unit:itemDraft?'':$('unit').value,meal_slot:$('slot').value,nutrition,items})});
     $('save').textContent='重送回傳指令';await deliver();
   }catch(e){status(`儲存失敗：${e.message}`);$('save').disabled=false}
 });

@@ -4,6 +4,10 @@
 data 結構見 SPEC.md 第 2 節。
 """
 
+from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
+
 C_TEAL = "#1F4A47"      # 主文字
 C_GREEN = "#2E7D6B"     # 已吃
 C_YELLOW = "#F5C842"    # 包月預留 / 品牌黃
@@ -19,12 +23,19 @@ MAX_ROWS = 6
 
 
 def _kcal(n):
-    return f"{int(round(n)):,}"
+    try:
+        rounded = Decimal(str(n)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return str(n)
+    return f"{int(rounded):,}"
 
 
 def _g(n):
-    n = round(n, 1)
-    return f"{int(n)}" if n == int(n) else f"{n}"
+    try:
+        rounded = Decimal(str(n)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return str(n)
+    return f"{rounded:,.1f}"
 
 
 def _pct(x):
@@ -32,8 +43,18 @@ def _pct(x):
     return f"{round(x * 100, 1)}%"
 
 
-def compute(data):
-    """純計算，方便單元測試。"""
+def compute(data, *, now=None):
+    """純計算；傳入時間時依 Asia/Taipei 套用時段提示。"""
+    taipei = ZoneInfo("Asia/Taipei")
+    if now is None:
+        # 保留純計算呼叫的既有日間語意；正式 renderer 會明確注入台北時間。
+        hour = 0
+    else:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=taipei)
+        else:
+            now = now.astimezone(taipei)
+        hour = now.hour
     tk = data.get("target_kcal") or 0
     tp = data.get("target_protein") or 0
     eaten = data.get("records", [])
@@ -83,17 +104,21 @@ def compute(data):
     elif state == "sub_over":
         # 包月超標提示優先；預留不是已吃，不可說「熱量已達標」
         hint = f"今天的包月餐合計比目標多 {_kcal(-left_k)} kcal，包月餐照常吃，其他時間盡量不加餐即可。"
-        if protein_short:
+        if protein_short and hour < 17:
             hint += f"吃完包月餐後蛋白質還差 {_g(left_p)} g，可以補一杯無糖豆漿。"
+        elif protein_short and hour < 21:
+            hint += "今天蛋白質攝取較少，可依食慾適量補充，不必一次補足目標。"
     elif state == "unknown":
         hint = "部分紀錄的營養資料未知，暫時無法計算精確餘額。"
-    elif protein_short:
+    elif protein_short and hour < 17:
         if ek >= tk:
             hint = f"熱量已達標，蛋白質還差 {_g(left_p)} g。可以補一杯無糖豆漿或一顆茶葉蛋。"
         elif left_k <= 0:
             hint = f"吃完包月餐後熱量剛好達標，蛋白質還差 {_g(left_p)} g，可以補一杯無糖豆漿。"
         else:
             hint = f"蛋白質還差 {_g(left_p)} g，剩下的熱量建議優先選高蛋白、低熱量的食物，例如雞胸、豆腐、無糖豆漿。"
+    elif protein_short and hour < 21:
+        hint = "今天蛋白質攝取較少，可依食慾適量補充，不必一次補足目標。"
 
     return dict(tk=tk, tp=tp, ek=ek, ep=ep, rk=rk, rp=rp, left_k=left_k, left_p=left_p,
                 state=state, e_ratio=e_ratio, r_ratio=r_ratio, ep_ratio=ep_ratio,
@@ -145,8 +170,8 @@ def _btn(label, color, style):
             "action": {"type": "message", "label": label, "text": actions[label]}}
 
 
-def build_dashboard_flex(data):
-    c = compute(data)
+def build_dashboard_flex(data, *, now=None):
+    c = compute(data, now=now or datetime.now(ZoneInfo("Asia/Taipei")))
     over = c["state"] == "over"
     eat_color = C_OVER if over else C_GREEN
 

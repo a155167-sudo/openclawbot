@@ -190,7 +190,7 @@ def create_customer_reschedule_router(
         )
 
     def _meal_projection(draft: Mapping[str, object]) -> dict[str, object]:
-        if draft.get("draft_type") == "photo":
+        if draft.get("draft_type") in {"photo", "text-semantic-items"}:
             return dict(draft)
         estimate = draft.get("estimate") if isinstance(draft.get("estimate"), Mapping) else {}
         request_data = draft.get("request") if isinstance(draft.get("request"), Mapping) else {}
@@ -200,7 +200,11 @@ def create_customer_reschedule_router(
         for field in ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g"):
             item = estimate.get(field) if isinstance(estimate, Mapping) else None
             if isinstance(item, Mapping) and item.get("min") is not None and item.get("max") is not None:
-                value = (float(item["min"]) + float(item["max"])) / 2
+                value = (
+                    float(item["estimate"])
+                    if estimate.get("schema_version") == "semantic-meal-estimate-v1"
+                    else (float(item["min"]) + float(item["max"])) / 2
+                )
                 initial = item.get("estimate")
             else:
                 value = initial = None
