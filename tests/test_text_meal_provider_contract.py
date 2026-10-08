@@ -13,6 +13,9 @@ from tests.test_photo_ingredient_controls import _action, _postback, _text
 from tests.test_photo_natural_ingredient_batch import _setup
 
 
+_NATIVE_HAS_ACTIVE_VIP_ACCESS = server.has_active_vip_access
+
+
 class FakeCompletions:
     def __init__(self, *, content="", finish_reason="stop", refusal=None):
         self.calls = []
@@ -79,6 +82,16 @@ def _install_sequence_client(monkeypatch, payloads):
         SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
     return completions
+
+
+def _install_native_vip_usage(db, *, quota):
+    """Seed the real admission/quota contract instead of bypassing authorization."""
+    _install_usage(db, quota=quota)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE usage SET status='vip', expiry_date='2099-12-31' WHERE user_id='U1'"
+        )
+        conn.commit()
 
 
 def test_provider_adapter_requests_strict_range_schema_and_matching_prompt(monkeypatch):
@@ -368,7 +381,9 @@ def test_missing_ranges_keeps_batch_atomic_refunds_real_quota_and_blames_system(
     tmp_path, monkeypatch
 ):
     db, token, draft, replies = _setup(tmp_path, monkeypatch)
-    _install_usage(db, quota=1)
+    _install_native_vip_usage(db, quota=1)
+    assert _NATIVE_HAS_ACTIVE_VIP_ACCESS("U1") is True
+    monkeypatch.setattr(server, "has_active_vip_access", _NATIVE_HAS_ACTIVE_VIP_ACCESS)
     monkeypatch.setattr(
         server, "check_permission_and_quota", server._DEFAULT_CHECK_PERMISSION_AND_QUOTA
     )
@@ -406,7 +421,9 @@ def test_four_item_batch_uses_real_adapter_four_times_but_one_net_quota(
     tmp_path, monkeypatch
 ):
     db, token, draft, replies = _setup(tmp_path, monkeypatch)
-    _install_usage(db, quota=1)
+    _install_native_vip_usage(db, quota=1)
+    assert _NATIVE_HAS_ACTIVE_VIP_ACCESS("U1") is True
+    monkeypatch.setattr(server, "has_active_vip_access", _NATIVE_HAS_ACTIVE_VIP_ACCESS)
     monkeypatch.setattr(
         server, "check_permission_and_quota", server._DEFAULT_CHECK_PERMISSION_AND_QUOTA
     )

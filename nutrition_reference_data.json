@@ -1,6 +1,7 @@
 {
-  "version": "nutrition-reference-2",
-  "verified_at": "2026-10-08T01:15:00+00:00",
+  "version": "nutrition-reference-3-tw-official",
+  "verified_at": "2026-10-08T10:32:59+08:00",
+  "source_policy": "Taiwan regulator data first; exact aliases and compatible units only; never infer g-to-ml density.",
   "items": [
     {
       "food_code": "A0550601",
@@ -52,22 +53,11 @@
       "publisher": "TFDA",
       "source_type": "government_food_composition",
       "reference_label": "TFDA一般參考值，非個別品牌實測",
+      "source_note": "TFDA欄位是每100克含量；每單位重亦標為240.0克。官方資料未提供毫升基準或密度，不得用於ml請求。",
+      "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+      "retrieved_at": "2026-10-08T10:32:59+08:00",
+      "evidence_sha256": "c6b1974def2fa546d75e200e6726b42f453a6e1e4fff672526bfc89fe352c522",
       "source_url": "https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=0&id=2078"
-    },
-    {
-      "reference_id": "silk-unsweet-soymilk-web-2026-10-08",
-      "name": "Silk Unsweet Soymilk（產品標示一般參考）",
-      "aliases": ["無糖豆漿", "豆漿(無糖)"],
-      "state": "以 Silk Unsweet Soymilk 產品營養標示作毫升份量的一般參考",
-      "basis_amount": 240,
-      "basis_unit": "ml",
-      "nutrition": {"calories_kcal": 90, "protein_g": 8.0, "fat_g": 4.5, "carbohydrate_g": 4.0},
-      "publisher": "Silk",
-      "source_product": "Unsweet Soymilk",
-      "source_type": "manufacturer_nutrition_label",
-      "reference_label": "Silk產品標示一般參考，非本次飲品或個別品牌實測",
-      "source_note": "Nutrition Facts 表列每240ml為90 kcal；同頁行銷文案寫80 calories，兩處不一致，採結構化 Nutrition Facts 表。",
-      "source_url": "https://www.silk.com/plant-based-products/soymilk/unsweet-soymilk"
     },
     {
       "food_code": "K0111101",

@@ -655,7 +655,7 @@ def test_ai_estimate_button_records_midpoint_when_model_returns_only_ranges(
 
     assert card is not None and card.alt_text == "AI營養估算，請確認後記錄"
     rendered = json.dumps(card.as_json_dict(), ensure_ascii=False)
-    assert "一般估算草稿（尚未記錄）" in rendered
+    assert "營養估算草稿（尚未記錄）" in rendered
     assert "175 kcal" in rendered and "確認後才會寫入" in rendered
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-AI-RANGE'").fetchone()[0] == 0
@@ -961,8 +961,8 @@ def test_natural_food_unit_mismatch_offers_executable_ai_estimate(tmp_path, monk
     )
 
     rendered = json.dumps(reply.as_json_dict(), ensure_ascii=False)
-    assert "AI估算草稿（尚未記錄）" in rendered
-    assert "酪梨" in rendered and "140–190 kcal" in rendered
+    assert "營養估算草稿（尚未記錄）" in rendered
+    assert "酪梨" in rendered and "估算範圍 140–190" in rendered
     assert "確認後才會寫入" in rendered
     assert provider_calls == [{
         "food_name": "酪梨", "amount": 100.0,
@@ -8494,8 +8494,8 @@ def test_natural_food_log_not_found_or_incompatible_unit_requires_ai_confirmatio
         )
     )
     first = json.dumps(replies[-1].as_json_dict(), ensure_ascii=False)
-    assert "AI估算草稿（尚未記錄）" in first
-    assert "火星果汁" in first and "300–420 kcal" in first
+    assert "營養估算草稿（尚未記錄）" in first
+    assert "火星果汁" in first and "估算範圍 300–420" in first
     assert "確認後才會寫入" in first
     first_confirm = next(
         action for action in _text_meal_actions(replies[-1]) if action.endswith(":confirm")
@@ -8505,7 +8505,7 @@ def test_natural_food_log_not_found_or_incompatible_unit_requires_ai_confirmatio
         _text_event("NATURAL-UNIT-1", "我要記錄飲食 豆干 300ml", user_id="U1")
     )
     second = json.dumps(replies[-1].as_json_dict(), ensure_ascii=False)
-    assert "AI估算草稿（尚未記錄）" in second
+    assert "營養估算草稿（尚未記錄）" in second
     assert "豆干" in second and "確認後才會寫入" in second
     assert [item["food_name"] for item in estimates] == ["火星果汁", "豆干"]
     with sqlite3.connect(db) as conn:
@@ -8793,7 +8793,7 @@ def test_natural_food_log_uses_private_exact_match_scales_ml_and_replays_once(
 
     assert replies[-1].type == "flex"
     card_text = json.dumps(json.loads(replies[-1].as_json_string()), ensure_ascii=False)
-    assert "私人食品庫草稿（尚未記錄）" in card_text
+    assert "營養估算草稿（尚未記錄）" in card_text
     assert "無糖豆漿" in card_text and "確認後才會寫入" in card_text
     confirm = next(action for action in _text_meal_actions(replies[-1]) if action.endswith(":confirm"))
     with sqlite3.connect(db) as conn:

@@ -194,7 +194,7 @@ from meal_photo_system import (
     apply_meal_photo_action,
     build_confirmed_meal_photo_record_actions,
     build_meal_photo_confirmation_bubble,
-    build_meal_photo_estimate_bubble,
+    build_meal_photo_estimate_bubble as _legacy_build_meal_photo_estimate_bubble,
     build_meal_photo_recorded_bubble,
     cancel_meal_photo_revision_draft,
     clear_meal_photo_image_ref,
@@ -695,6 +695,21 @@ def ensure_daily_food_ledger_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS meal_draft_return_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            draft_token TEXT NOT NULL,
+            request_token TEXT NOT NULL,
+            from_version INTEGER NOT NULL,
+            draft_version INTEGER NOT NULL,
+            request_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            delivered_at TEXT NOT NULL DEFAULT '',
+            origin_source_type TEXT NOT NULL DEFAULT 'user',
+            origin_source_id TEXT NOT NULL DEFAULT '',
+            UNIQUE(user_id,draft_token,from_version)
+        );
         CREATE TABLE IF NOT EXISTS photo_ingredient_batch_quota_ops (
             batch_key TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -737,6 +752,23 @@ def ensure_daily_food_ledger_schema(conn: sqlite3.Connection) -> None:
     draft_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(pending_text_meal_estimates)")
     }
+    receipt_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(meal_draft_return_receipts)")
+    }
+    if "request_hash" not in receipt_columns:
+        conn.execute("ALTER TABLE meal_draft_return_receipts ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
+    if "request_token" not in receipt_columns:
+        conn.execute("ALTER TABLE meal_draft_return_receipts ADD COLUMN request_token TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE meal_draft_return_receipts SET request_token=draft_token WHERE request_token='' ")
+    if "origin_source_type" not in receipt_columns:
+        conn.execute("ALTER TABLE meal_draft_return_receipts ADD COLUMN origin_source_type TEXT NOT NULL DEFAULT 'user'")
+    if "origin_source_id" not in receipt_columns:
+        conn.execute("ALTER TABLE meal_draft_return_receipts ADD COLUMN origin_source_id TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE meal_draft_return_receipts SET origin_source_id=user_id WHERE origin_source_id='' ")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_meal_draft_return_request "
+        "ON meal_draft_return_receipts(user_id,request_token,from_version)"
+    )
     for column in ("lease_owner", "lease_expires_at"):
         if column not in draft_columns:
             conn.execute(
@@ -3515,6 +3547,9 @@ elif CUSTOMER_RESCHEDULE_LIFF_ENABLED:
         sheet_factory=RESCHEDULE_SHEET_ADAPTER_FACTORY,
         html_path=Path(__file__).with_name('customer-reschedule-normal-liff.html'),
         semantic_pending_request_loader=normal_semantic_pending_request,
+        meal_edit_html_path=Path(__file__).with_name('customer-reschedule-meal-edit-liff.html'),
+        meal_draft_loader=lambda user_id, token: get_meal_draft_for_liff(user_id, token),
+        meal_draft_saver=lambda **kwargs: save_meal_draft_from_liff(**kwargs),
     )
 
 
@@ -14543,16 +14578,15 @@ def _natural_photo_ingredient_batch_reply(
                 quota_batch_key=batch_key, quota_batch_owner=batch_owner,
             )
         except Exception as exc:
-            _fail_photo_ingredient_batch_children(
+            batch_refunded = _fail_photo_ingredient_batch_children(
                 conn, user_id=user_id, child_tokens=child_tokens,
                 batch_key=batch_key, batch_owner=batch_owner,
             )
             if isinstance(exc, TextMealProviderError) and batch_owner:
-                refund = conn.execute(
-                    "SELECT status FROM text_meal_estimate_quota_ledger WHERE attempt_id=? AND user_id=?",
-                    (batch_owner, user_id),
-                ).fetchone()
-                exc.quota_refunded = bool(refund and refund[0] == "refunded")
+                # Use the atomic cleanup operation's result.  Re-querying through
+                # this long-lived connection can observe a stale transaction
+                # snapshot even though the refund transaction committed.
+                exc.quota_refunded = bool(batch_refunded)
             raise
         child_tokens.append(child["token"])
         ai = child["estimate"]
@@ -14607,6 +14641,508 @@ def _natural_photo_ingredient_batch_reply(
     )
 
 
+def build_meal_photo_estimate_bubble(draft, *, allow_admin_review=False):
+    bubble = _legacy_build_meal_photo_estimate_bubble(
+        draft, allow_admin_review=allow_admin_review
+    )
+    if draft.get("workflow_version") != "user_confirmed_ai_nutrition_v2" or allow_admin_review:
+        return bubble
+    estimate = draft.get("estimate") or {}
+    override = (draft.get("review") or {}).get("liff_customer_nutrition_override")
+    formal_nutrition = override if isinstance(override, dict) else estimate
+    bubble["header"]["contents"][0]["text"] = "營養估算草稿（尚未記錄）"
+    bubble["header"]["contents"].append({
+        "type": "text", "text": "來源：AI 照片估算", "size": "xxs",
+        "color": "#777777", "wrap": True,
+    })
+    body = bubble["body"]["contents"]
+    secondary_ingredient_controls = [
+        item for item in bubble.get("footer", {}).get("contents", [])
+        if isinstance(item, dict) and isinstance(item.get("action"), dict)
+        and item["action"].get("label") in {"調整一下", "➕ 新增食材"}
+    ]
+    if secondary_ingredient_controls:
+        body.append({
+            "type": "box", "layout": "vertical", "spacing": "xs",
+            "contents": secondary_ingredient_controls,
+        })
+    def _formal_photo_value(field, unit):
+        value = formal_nutrition.get(field)
+        if value is None:
+            return "未知"
+        return (
+            f"{int(float(value) + 0.5)} {unit}"
+            if field == "calories_kcal" else f"{float(value):.1f} {unit}"
+        )
+    body.append({
+        "type": "text",
+        "text": (
+            f"實際入帳：熱量 {_formal_photo_value('calories_kcal', 'kcal')}｜"
+            f"蛋白質 {_formal_photo_value('protein_g', 'g')}｜"
+            f"脂肪 {_formal_photo_value('fat_g', 'g')}｜"
+            f"碳水 {_formal_photo_value('carbohydrate_g', 'g')}"
+        ),
+        "size": "sm", "wrap": True, "color": "#7A4E00",
+    })
+    token, version = str(draft.get("token") or ""), int(draft.get("version") or 0)
+    edit_uri = f"https://liff.line.me/{CUSTOMER_RESCHEDULE_LIFF_ID}?" + urlencode({
+        "view": "meal-edit", "token": token,
+    })
+    wire_version = 2 if isinstance(override, dict) else 1
+    bubble["footer"]["contents"] = [
+        {"type": "button", "style": "primary", "color": "#0F766E", "action": {
+            "type": "postback", "label": "確認記錄",
+            "data": f"mp:v{wire_version}:{token}:{version}:confirm_estimate",
+            "displayText": "確認照片並記錄這餐",
+        }},
+        {"type": "button", "style": "secondary", "action": {
+            "type": "uri", "label": "修改", "uri": edit_uri,
+        }},
+        {"type": "button", "style": "secondary", "action": {
+            "type": "postback", "label": "取消", "data": f"mp:v{wire_version}:{token}:{version}:cancel",
+            "displayText": "取消這筆餐點照片記錄",
+        }},
+    ]
+    return bubble
+
+
+def _photo_liff_item_projection(item):
+    matched = re.fullmatch(
+        r"\s*約?\s*(\d+(?:\.\d+)?|半)\s*([A-Za-z\u4e00-\u9fff]{1,10})\s*",
+        str(item.get("portion") or ""), re.I,
+    )
+    unit = ""
+    amount = None
+    if matched:
+        unit = {"份": "serving"}.get(matched.group(2).lower(), matched.group(2).lower())
+        amount = 0.5 if matched.group(1) == "半" else float(matched.group(1))
+    return {
+        "item_id": str(item.get("item_id") or ""), "name": str(item.get("name") or ""),
+        "amount": amount, "unit": unit,
+        "calories_kcal": float(item["calories_kcal"]),
+        "protein_g": float(item["protein_g"]),
+        "fat_g": None if item.get("fat_g") is None else float(item["fat_g"]),
+        "carbohydrate_g": (
+            None if item.get("carbohydrate_g") is None else float(item["carbohydrate_g"])
+        ),
+    }
+
+
+def _photo_meal_liff_projection(draft):
+    estimate = draft.get("estimate") or {}
+    items = [_photo_liff_item_projection(item) for item in estimate.get("estimate_items") or []]
+    initial = (draft.get("review") or {}).get("liff_initial_ai") or {
+        field: estimate.get(field) for field in DAILY_FOOD_NUTRIENT_FIELDS
+    }
+    customer_override = (draft.get("review") or {}).get("liff_customer_nutrition_override")
+    nutrition = (
+        {field: customer_override.get(field) for field in DAILY_FOOD_NUTRIENT_FIELDS}
+        if isinstance(customer_override, dict)
+        else {field: estimate.get(field) for field in DAILY_FOOD_NUTRIENT_FIELDS}
+    )
+    return {
+        "draft_type": "photo", "token": draft["token"], "version": draft["version"],
+        "expires_at": draft["expires_at"], "status": draft["status"],
+        "food_name": "餐點照片", "meal_slot": draft.get("meal_slot"),
+        "source_label": "AI 照片估算", "items": items,
+        "nutrition": nutrition, "initial_ai": initial,
+        "display": {field: "" if value is None else (
+            str(int(float(value) + 0.5)) if field == "calories_kcal" else f"{float(value):.1f}"
+        ) for field, value in nutrition.items()},
+    }
+
+
+def get_meal_draft_for_liff(user_id, token):
+    token = str(token or "")
+    if re.fullmatch(r"[0-9a-f]{12}", token):
+        with sqlite3.connect(DB_PATH) as conn:
+            return _photo_meal_liff_projection(
+                get_meal_photo_draft(conn, user_id=str(user_id), token=token)
+            )
+    return get_text_meal_estimate_draft(str(user_id), token)
+
+
+def save_photo_meal_draft_from_liff(
+    *, user_id, token, expected_version, meal_slot, items, nutrition=None,
+):
+    """CAS-edit each photo ingredient independently; no AI/quota/log side effects."""
+    user_id, token = str(user_id or "").strip(), str(token or "").strip()
+    if meal_slot == "宵夜":
+        meal_slot = "點心"
+    if meal_slot not in {"早餐", "午餐", "晚餐", "點心"}:
+        raise ValueError("餐別無效")
+    if not isinstance(items, list) or not items:
+        raise ValueError("照片食材明細不可空白")
+    now = tw_now()
+    now_text = now.isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        ensure_meal_photo_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        draft = get_meal_photo_draft(conn, user_id=user_id, token=token)
+        supplied_nutrition = (
+            {field: _ledger_number(nutrition.get(field)) for field in DAILY_FOOD_NUTRIENT_FIELDS}
+            if isinstance(nutrition, dict) else None
+        )
+        request_hash = hashlib.sha256(json.dumps(
+            {"meal_slot": meal_slot, "items": items, "nutrition": supplied_nutrition}, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode()).hexdigest()
+        replay = conn.execute(
+            """SELECT receipt_id,draft_version,expires_at,request_hash FROM meal_draft_return_receipts
+               WHERE user_id=? AND draft_token=? AND from_version=?""",
+            (user_id, token, int(expected_version)),
+        ).fetchone()
+        if replay:
+            if replay[2] <= now_text:
+                raise ValueError("草稿回傳憑證已逾時")
+            if replay[3] != request_hash or draft["version"] != int(replay[1]):
+                raise ValueError("這張估算卡已更新，請使用最新版本")
+            conn.commit()
+            return {"draft": draft, "receipt_id": replay[0], "return_command": f"#草稿回傳 {replay[0]}"}
+        if draft["status"] != "estimated" or draft["version"] != int(expected_version):
+            raise ValueError("這張估算卡已更新，請使用最新版本")
+        if draft["expires_at"] <= now_text:
+            raise ValueError("這筆估算已逾時，請重新上傳照片")
+        review = dict(draft.get("review") or {})
+        estimate = dict(draft["estimate"])
+        observed = json.loads(json.dumps(draft.get("payload") or {}, ensure_ascii=False))
+        original_items = review.get("liff_initial_items") or estimate.get("estimate_items") or []
+        initial_ai = review.get("liff_initial_ai") or {
+            field: estimate.get(field) for field in DAILY_FOOD_NUTRIENT_FIELDS
+        }
+        original_by_id = {str(item.get("item_id")): dict(item) for item in original_items}
+        submitted = []
+        for raw in items:
+            if not isinstance(raw, dict) or str(raw.get("item_id")) not in original_by_id:
+                raise ValueError("照片食材識別資料無效")
+            base = original_by_id[str(raw["item_id"])]
+            base_projection = _photo_liff_item_projection(base)
+            if base_projection["amount"] is None:
+                raise ValueError("這項食材原始份量無法安全換算")
+            unit = str(raw.get("unit") or "").lower()
+            if unit != base_projection["unit"]:
+                raise ValueError("各食材原始單位必須保持一致，不可混合 g/ml")
+            amount_value = _ledger_number(raw.get("amount"), allow_none=False)
+            if amount_value <= 0:
+                raise ValueError("食材份量必須大於 0")
+            ratio = amount_value / float(base_projection["amount"])
+            updated = dict(base)
+            updated["portion"] = f"{amount_value:g} {unit}"
+            for field in ("calories_kcal", "protein_g"):
+                updated[field] = float(base[field]) * ratio
+                range_key = f"{field}_range"
+                if isinstance(base.get(range_key), dict):
+                    updated[range_key] = {key: float(base[range_key][key]) * ratio for key in ("min", "max")}
+            submitted.append(updated)
+        if len(submitted) != len(original_items) or len({item["item_id"] for item in submitted}) != len(submitted):
+            raise ValueError("照片食材明細不完整")
+        for field in ("calories_kcal", "protein_g"):
+            old_point = float(estimate[field])
+            new_point = math.fsum(float(item[field]) for item in submitted)
+            old_range = estimate[f"{field}_range"]
+            estimate[f"{field}_range"] = {
+                **old_range, "min": max(0.0, new_point - (old_point - float(old_range["min"]))),
+                "max": new_point + (float(old_range["max"]) - old_point),
+            }
+            estimate[field] = new_point
+        estimate["estimate_items"] = submitted
+        ai_observed = dict(observed.get("ai_estimate") or {})
+        ai_observed["items"] = submitted
+        ai_observed["reconciliation"] = "items_sum_v1"
+        for field in ("calories_kcal", "protein_g"):
+            ai_observed[field] = {
+                "estimate": estimate[field],
+                "min": estimate[f"{field}_range"]["min"],
+                "max": estimate[f"{field}_range"]["max"],
+            }
+        observed["ai_estimate"] = ai_observed
+        review.update({
+            "liff_initial_ai": initial_ai,
+            "liff_initial_items": original_items,
+        })
+        if supplied_nutrition is not None:
+            review["liff_customer_nutrition_override"] = supplied_nutrition
+        changed = conn.execute(
+            """UPDATE pending_meal_photo_drafts SET observed_payload_json=?,estimate_json=?,review_json=?,meal_slot=?,
+                      version=version+1,updated_at=?
+               WHERE token=? AND user_id=? AND status='estimated' AND version=?""",
+            (json.dumps(observed, ensure_ascii=False, sort_keys=True, allow_nan=False),
+             json.dumps(estimate, ensure_ascii=False, sort_keys=True, allow_nan=False),
+             json.dumps(review, ensure_ascii=False, sort_keys=True, allow_nan=False),
+             meal_slot, now_text, token, user_id, int(expected_version)),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("這張估算卡已更新，請使用最新版本")
+        receipt_id = secrets.token_hex(24)
+        receipt_expiry = min(datetime.fromisoformat(draft["expires_at"]), now + timedelta(minutes=10)).isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO meal_draft_return_receipts
+               (receipt_id,user_id,draft_token,request_token,from_version,draft_version,
+                request_hash,created_at,expires_at,origin_source_type,origin_source_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (receipt_id, user_id, token, token, int(expected_version), int(expected_version) + 1,
+             request_hash, now_text, receipt_expiry, "user", user_id),
+        )
+        conn.commit()
+        saved = get_meal_photo_draft(conn, user_id=user_id, token=token)
+    return {"draft": saved, "receipt_id": receipt_id, "return_command": f"#草稿回傳 {receipt_id}"}
+
+
+def _promote_photo_customer_override_to_confirmed_log(conn, draft, result):
+    """Make an explicit whole-meal customer override the formal log authority.
+
+    The immutable AI/items baseline remains on the draft for audit and future
+    scaling.  Once a customer supplied any of the four whole-meal values, the
+    formal ledger is deliberately classified as customer-authoritative rather
+    than continuing to claim the stricter AI-photo trust envelope.
+    """
+    override = (draft.get("review") or {}).get("liff_customer_nutrition_override")
+    if not isinstance(override, dict) or result.get("kind") not in {"recorded", "recorded_updated"}:
+        return
+    nutrition = {
+        field: _ledger_number(override.get(field))
+        for field in DAILY_FOOD_NUTRIENT_FIELDS
+    }
+    log_id = str(result.get("log_id") or "")
+    row = conn.execute(
+        "SELECT food_id,user_id FROM food_logs WHERE log_id=?", (log_id,)
+    ).fetchone()
+    if not row or str(row[1]) != str(draft.get("user_id") or ""):
+        raise ValueError("照片營養手動值無法綁定正式紀錄")
+    log_columns = {item[1] for item in conn.execute("PRAGMA table_info(food_logs)")}
+    assignments = [
+        "nutrition_snapshot_json=?", "exchange_snapshot_json='{}'",
+        "trust_type=''", "trust_payload_json='{}'", "trust_hash=''",
+    ]
+    values = [json.dumps(nutrition, ensure_ascii=False, sort_keys=True, allow_nan=False)]
+    if "nutrient_sources_json" in log_columns:
+        assignments.append("nutrient_sources_json=?")
+        values.append(json.dumps(
+            {field: "customer_meal_override" for field in DAILY_FOOD_NUTRIENT_FIELDS},
+            ensure_ascii=False, sort_keys=True,
+        ))
+    values.append(log_id)
+    conn.execute(f"UPDATE food_logs SET {','.join(assignments)} WHERE log_id=?", values)
+    conn.execute(
+        """UPDATE food_catalog
+           SET source_type='user_meal_photo_customer_override',
+               exchange_json='{}',exchange_review_status='customer_confirmed',
+               verification_status='customer_confirmed',updated_at=?
+           WHERE food_id=? AND owner_user_id=?""",
+        (tw_now().isoformat(timespec="seconds"), str(row[0]), str(row[1])),
+    )
+
+
+def save_meal_draft_from_liff(**kwargs):
+    if re.fullmatch(r"[0-9a-f]{12}", str(kwargs.get("token") or "")):
+        result = save_photo_meal_draft_from_liff(
+            user_id=kwargs.get("user_id"), token=kwargs.get("token"),
+            expected_version=kwargs.get("expected_version"), meal_slot=kwargs.get("meal_slot"),
+            items=kwargs.get("items"), nutrition=kwargs.get("nutrition"),
+        )
+        return {**result, "draft": _photo_meal_liff_projection(result["draft"])}
+    return save_text_meal_draft_from_liff(**{key: kwargs.get(key) for key in (
+        "user_id", "token", "expected_version", "amount", "unit", "meal_slot", "nutrition"
+    )})
+
+
+def save_text_meal_draft_from_liff(
+    *, user_id, token, expected_version, amount, unit, meal_slot, nutrition,
+):
+    """CAS-save a LIFF edit and mint an owner-bound chat return receipt.
+
+    This path only updates the pending draft.  It never writes food_logs, invokes
+    AI, or debits quota.  A repeated HTTP save recovers the same receipt.
+    """
+    user_id, token = str(user_id or "").strip(), str(token or "").strip()
+    unit = {"毫升": "ml", "cc": "ml", "克": "g", "公克": "g", "份": "serving"}.get(
+        str(unit or "").strip().lower(), str(unit or "").strip().lower()
+    )
+    if meal_slot == "宵夜":
+        meal_slot = "點心"
+    if meal_slot not in {"早餐", "午餐", "晚餐", "點心"}:
+        raise ValueError("餐別無效")
+    amount_value = _ledger_number(amount, allow_none=False)
+    if amount_value <= 0 or unit not in {"ml", "g", "serving", "package"}:
+        raise ValueError("份量或單位無效")
+    supplied = {}
+    for field in DAILY_FOOD_NUTRIENT_FIELDS:
+        supplied[field] = _ledger_number((nutrition or {}).get(field))
+    request_hash = hashlib.sha256(json.dumps(
+        {"amount": amount_value, "unit": unit, "meal_slot": meal_slot, "nutrition": supplied},
+        sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()
+    now = tw_now()
+    now_text = now.isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        replay = conn.execute(
+            """SELECT receipt_id,draft_token,draft_version,expires_at,request_hash
+               FROM meal_draft_return_receipts
+               WHERE user_id=? AND request_token=? AND from_version=?""",
+            (user_id, token, int(expected_version)),
+        ).fetchone()
+        if replay:
+            if replay[3] <= now_text:
+                raise ValueError("草稿回傳憑證已逾時")
+            if replay[4] != request_hash:
+                raise ValueError("這張估算卡已更新，請使用最新版本")
+            current_token = str(replay[1])
+            row = conn.execute(
+                """SELECT token,user_id,source_message_id,request_json,estimate_json,
+                          portion_multiplier,meal_slot,status,version,confirmed_log_id,expires_at
+                   FROM pending_text_meal_estimates WHERE token=? AND user_id=? AND version=?""",
+                (current_token, user_id, int(replay[2])),
+            ).fetchone()
+            if not row:
+                raise ValueError("這張估算卡已更新，請使用最新版本")
+            # A receipt made by a prior runtime may still point at a legacy
+            # capability.  Rotate the draft and every dependent token binding in
+            # this same write transaction before returning a current card.
+            if len(current_token) in {24, 32}:
+                rotated_token = _new_text_meal_token()
+                changed = conn.execute(
+                    """UPDATE pending_text_meal_estimates SET token=?,updated_at=?
+                       WHERE token=? AND user_id=? AND status='pending' AND version=?""",
+                    (rotated_token, now_text, current_token, user_id, int(replay[2])),
+                )
+                if changed.rowcount != 1:
+                    raise ValueError("這張估算卡已更新，請使用最新版本")
+                conn.execute(
+                    "UPDATE text_meal_provider_attempts SET token=? WHERE token=? AND user_id=?",
+                    (rotated_token, current_token, user_id),
+                )
+                conn.execute(
+                    "UPDATE text_meal_estimate_quota_ledger SET token=? WHERE token=? AND user_id=?",
+                    (rotated_token, current_token, user_id),
+                )
+                conn.execute(
+                    "UPDATE meal_draft_return_receipts SET draft_token=? "
+                    "WHERE draft_token=? AND user_id=?",
+                    (rotated_token, current_token, user_id),
+                )
+                current_token = rotated_token
+                row = conn.execute(
+                    """SELECT token,user_id,source_message_id,request_json,estimate_json,
+                              portion_multiplier,meal_slot,status,version,confirmed_log_id,expires_at
+                       FROM pending_text_meal_estimates WHERE token=? AND user_id=? AND version=?""",
+                    (current_token, user_id, int(replay[2])),
+                ).fetchone()
+            conn.commit()
+            return {"draft": _text_meal_draft_from_row(row), "receipt_id": replay[0],
+                    "return_command": f"#草稿回傳 {replay[0]}"}
+        row = conn.execute(
+            """SELECT token,user_id,source_message_id,request_json,estimate_json,
+                      portion_multiplier,meal_slot,status,version,confirmed_log_id,expires_at
+               FROM pending_text_meal_estimates WHERE token=? AND user_id=?""",
+            (token, user_id),
+        ).fetchone()
+        if not row:
+            raise PermissionError("forbidden")
+        draft = _text_meal_draft_from_row(row)
+        if draft["status"] != "pending" or draft["version"] != int(expected_version):
+            raise ValueError("這張估算卡已更新，請使用最新版本")
+        if draft["expires_at"] <= now_text:
+            raise ValueError("這筆估算已逾時，請重新描述餐點")
+        estimate = draft["estimate"]
+        if unit != str(estimate.get("basis_unit") or "").lower():
+            raise ValueError("新份量單位必須和原始估算一致")
+        original = (estimate.get("provenance") or {}).get("original_estimate")
+        if not isinstance(original, dict):
+            original = json.loads(json.dumps(estimate, ensure_ascii=False))
+        for field, value in supplied.items():
+            estimate[field] = None if value is None else {
+                "estimate": value, "min": value, "max": value,
+                "unit": "kcal" if field == "calories_kcal" else "g",
+            }
+        estimate["basis_amount"] = amount_value
+        estimate["basis_unit"] = unit
+        estimate["portion_assumption"] = f"{amount_value:g} {unit}（顧客修改）"
+        estimate["assessment"] = assess_nutrition(supplied)
+        estimate["provenance"] = {
+            "provider": "none", "model": "none", "method": "customer_revision",
+            "source_label": "顧客修改", "original_estimate": original,
+        }
+        next_token = token if len(token) == 40 else _new_text_meal_token()
+        changed = conn.execute(
+            """UPDATE pending_text_meal_estimates SET token=?,estimate_json=?,portion_multiplier=1,
+                      meal_slot=?,version=version+1,updated_at=?
+               WHERE token=? AND user_id=? AND status='pending' AND version=?""",
+            (next_token, json.dumps(estimate, ensure_ascii=False, sort_keys=True, allow_nan=False),
+             meal_slot, now_text, token, user_id, int(expected_version)),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("這張估算卡已更新，請使用最新版本")
+        if next_token != token:
+            conn.execute(
+                "UPDATE text_meal_provider_attempts SET token=? WHERE token=? AND user_id=?",
+                (next_token, token, user_id),
+            )
+            conn.execute(
+                "UPDATE text_meal_estimate_quota_ledger SET token=? WHERE token=? AND user_id=?",
+                (next_token, token, user_id),
+            )
+        receipt_id = secrets.token_hex(24)
+        receipt_expiry = min(
+            datetime.fromisoformat(draft["expires_at"]), now + timedelta(minutes=10)
+        ).isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO meal_draft_return_receipts
+               (receipt_id,user_id,draft_token,request_token,from_version,draft_version,
+                request_hash,created_at,expires_at,origin_source_type,origin_source_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (receipt_id, user_id, next_token, token, int(expected_version), int(expected_version) + 1,
+             request_hash, now_text, receipt_expiry, "user", user_id),
+        )
+        conn.commit()
+    return {"draft": get_text_meal_estimate_draft(user_id, next_token), "receipt_id": receipt_id,
+            "return_command": f"#草稿回傳 {receipt_id}"}
+
+
+def consume_meal_draft_return_command(user_id, command, *, source_type="user", source_id=None):
+    match = re.fullmatch(r"#草稿回傳\s+([0-9a-f]{48})", str(command or "").strip())
+    if not match:
+        return None
+    now_text = tw_now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        row = conn.execute(
+            """SELECT draft_token,draft_version,expires_at,origin_source_type,origin_source_id
+               FROM meal_draft_return_receipts
+               WHERE receipt_id=? AND user_id=?""",
+            (match.group(1), str(user_id)),
+        ).fetchone()
+        if not row:
+            raise PermissionError("這個草稿回傳指令不屬於你")
+        if row[2] <= now_text:
+            raise ValueError("草稿回傳指令已逾時，請重新開啟最新草稿")
+        actual_source_id = str(user_id) if source_id is None else str(source_id)
+        if str(source_type or "") != str(row[3]) or actual_source_id != str(row[4]):
+            raise PermissionError("這個草稿回傳指令不屬於此對話")
+        if re.fullmatch(r"[0-9a-f]{12}", str(row[0])):
+            draft = get_meal_photo_draft(conn, user_id=str(user_id), token=str(row[0]))
+            if draft["status"] != "estimated" or draft["version"] != int(row[1]):
+                raise ValueError("草稿版本已更新，請使用最新草稿")
+            from linebot.models import FlexSendMessage
+            card = FlexSendMessage(
+                alt_text="餐點照片估算完成，請確認記錄",
+                contents=build_meal_photo_estimate_bubble(draft),
+            )
+        else:
+            draft = get_text_meal_estimate_draft(str(user_id), row[0])
+            if draft["status"] != "pending" or draft["version"] != int(row[1]):
+                raise ValueError("草稿版本已更新，請使用最新草稿")
+            card = build_text_meal_estimate_flex(draft)
+        conn.execute(
+            "UPDATE meal_draft_return_receipts SET delivered_at=? WHERE receipt_id=?",
+            (now_text, match.group(1)),
+        )
+        conn.commit()
+    return card
+
+
 def build_text_meal_estimate_flex(draft):
     from linebot.models import FlexSendMessage
     estimate = draft["estimate"]
@@ -14615,12 +15151,17 @@ def build_text_meal_estimate_flex(draft):
         item = estimate.get(field)
         return None if not isinstance(item, dict) or item.get(key) is None else float(item[key]) * multiplier
     def nutrient_text(label, field, unit):
-        point = scaled(field, "estimate")
-        if point is None:
+        low = scaled(field, "min")
+        high = scaled(field, "max")
+        if low is None or high is None:
             return f"{label}：未知"
-        if fixed:
-            return f"{label}：{point:g} {unit}"
-        return f"{label}範圍：{scaled(field, 'min'):g}–{scaled(field, 'max'):g} {unit}"
+        midpoint = (low + high) / 2
+        shown = str(int(midpoint + 0.5)) if field == "calories_kcal" else f"{midpoint:.1f}"
+        if fixed or low == high:
+            return f"{label}：{shown} {unit}（實際入帳）"
+        range_low = str(int(low + 0.5)) if field == "calories_kcal" else f"{low:.1f}"
+        range_high = str(int(high + 0.5)) if field == "calories_kcal" else f"{high:.1f}"
+        return f"{label}：{shown} {unit}（實際入帳）｜估算範圍 {range_low}–{range_high}"
     token, version = draft["token"], draft["version"]
     # Only the 40-hex v3 capability is rollback-opaque. Untouched legacy rows
     # keep their old wire protocol until a current-runtime edit rotates them.
@@ -14631,12 +15172,15 @@ def build_text_meal_estimate_flex(draft):
         "official_reference", "owner_private_catalog", "customer_revision",
     }
     source_label = str((estimate.get("provenance") or {}).get("source_label") or "AI估算")
+    edit_query = urlencode({"view": "meal-edit", "token": token})
+    edit_uri = f"https://liff.line.me/{CUSTOMER_RESCHEDULE_LIFF_ID}?{edit_query}"
     contents = {
         "type": "bubble", "size": "kilo",
         "header": {"type": "box", "layout": "vertical", "backgroundColor": "#FFF7ED",
-                   "contents": [{"type": "text", "text": f"{source_label}草稿（尚未記錄）", "weight": "bold", "color": "#9A3412"}]},
+                   "contents": [{"type": "text", "text": "營養估算草稿（尚未記錄）", "weight": "bold", "color": "#9A3412"}]},
         "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
             {"type": "text", "text": estimate["food_name"], "weight": "bold", "wrap": True},
+            {"type": "text", "text": f"來源：{source_label}", "size": "xxs", "color": "#777777", "wrap": True},
             {"type": "text", "text": f"餐別：{draft.get('meal_slot') or '未指定'}", "size": "sm"},
             {"type": "text", "text": f"份量假設：{estimate['portion_assumption']} × {multiplier:g}", "size": "sm", "wrap": True},
             {"type": "text", "text": nutrient_text("熱量", "calories_kcal", "kcal"), "size": "sm"},
@@ -14654,8 +15198,7 @@ def build_text_meal_estimate_flex(draft):
         ]},
         "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
             {"type": "button", "style": "primary", "action": {"type": "postback", "label": "確認記錄", "data": f"tmest:v{wire_version}:{token}:{version}:confirm"}},
-            {"type": "button", "action": {"type": "postback", "label": "修改份量", "data": f"tmest:v{wire_version}:{token}:{version}:amount"}},
-            {"type": "button", "action": {"type": "postback", "label": "自己輸入數值", "data": f"tmest:v{wire_version}:{token}:{version}:manual"}},
+            {"type": "button", "action": {"type": "uri", "label": "修改", "uri": edit_uri}},
             {"type": "button", "action": {"type": "postback", "label": "取消", "data": f"tmest:v{wire_version}:{token}:{version}:cancel"}},
         ]},
     }
@@ -14902,7 +15445,9 @@ def _extract_natural_food_log_body(text):
     meal_slot = ""
     body = ""
     meal_match = re.match(
-        r"^(早餐|午餐|晚餐|點心|宵夜)\s*(?:吃(?:了)?|喝(?:了)?)\s*(.+)$", message
+        r"^(?:我)?(早餐|午餐|晚餐|點心|宵夜)\s*(?:我)?\s*"
+        r"(?:吃(?:了)?|喝(?:了)?)\s*(.+)$",
+        message,
     )
     if meal_match:
         meal_slot, body = meal_match.group(1), meal_match.group(2)
@@ -17635,7 +18180,7 @@ def handle_postback_event(event):
     # Already-rendered meal-photo controls are owner/token/version checked by
     # apply_meal_photo_action.  Let their registered callback complete even if
     # the entitlement lookup has since changed; this also permits cancel/remove.
-    if data.startswith(("mp:v1:", "mpc:v1:", "mpr:v1:")):
+    if data.startswith(("mp:v1:", "mp:v2:", "mpc:v1:", "mpr:v1:")):
         return handle_meal_photo_postback(event)
     if admin_authorization is not True and not has_active_vip_access(uid):
         return
@@ -18090,9 +18635,9 @@ def handle_meal_photo_postback(event):
         return
 
     start = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):start", data)
-    cancel = re.fullmatch(r"mp:v1:([0-9a-f]{12}):(\d+):cancel", data)
+    cancel = re.fullmatch(r"mp:v(?:1|2):([0-9a-f]{12}):(\d+):cancel", data)
     confirm_estimate = re.fullmatch(
-        r"mp:v1:([0-9a-f]{12}):(\d+):confirm_estimate", data
+        r"mp:v(?:1|2):([0-9a-f]{12}):(\d+):confirm_estimate", data
     )
     request_adjust = re.fullmatch(
         r"mp:v1:([0-9a-f]{12}):(\d+):request_adjust", data
@@ -18314,6 +18859,9 @@ def handle_meal_photo_postback(event):
                 applied = apply_meal_photo_action(
                     conn, event_id=event_id, user_id=uid, token=token,
                     expected_version=version, action="confirm_estimate",
+                )
+                _promote_photo_customer_override_to_confirmed_log(
+                    conn, applied["draft"], applied["result"]
                 )
                 draft, result = applied["draft"], applied["result"]
             elif request_adjust:
@@ -21946,6 +22494,20 @@ def handle_message(event):
         if privileged_intent and not privileged_authorized and not valid_vip_activation:
             return
         has_vip = has_active_vip_access(user_id)
+        if re.fullmatch(r"#草稿回傳\s+[0-9a-f]{48}", message):
+            if not has_vip:
+                return
+            if str(getattr(event.source, "type", "") or "") != "user":
+                return
+            try:
+                returned_draft = consume_meal_draft_return_command(
+                    user_id, message, source_type="user", source_id=str(user_id),
+                )
+                if returned_draft is not None:
+                    line_bot_api.reply_message(event.reply_token, returned_draft)
+            except (PermissionError, ValueError) as exc:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"⚠️ {exc}"))
+            return
         if not has_vip and raw_message == "我的方案":
             order_status = build_subscription_order_status_message(user_id)
             if order_status is not None:

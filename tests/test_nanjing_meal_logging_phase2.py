@@ -129,37 +129,54 @@ def test_ai_four_nutrients_reach_draft_and_ledger_while_inconsistent_cannot_conf
 
 
 def test_reference_grams_is_zero_ai_draft_but_500ml_soy_uses_ai(tmp_path, monkeypatch):
-    # Retain the baseline node. Generic soy now has cited ml data; an
-    # unlisted branded soy must still fall back, without borrowing that label.
-    _db, _replies = _setup(tmp_path, monkeypatch)
-    calls = []
-    monkeypatch.setattr(server, "create_text_meal_estimate_draft", lambda **kw: calls.append(kw) or {"status": "pending", "token": "ai", "version": 1, "estimate": _provider_payload(), "portion_multiplier": 1})
-    monkeypatch.setattr(server, "build_text_meal_estimate_flex", lambda draft: draft)
+    # TFDA supplies grams only: a measured ml amount must retain the user's
+    # quantity and use the real AI draft/quota workflow, never guessed density.
+    db, _replies = _setup(tmp_path, monkeypatch)
+    transport_calls = _fake_provider(monkeypatch, _provider_payload())
 
     reference = server.build_natural_food_log_reply(
         user_id="U-NANJING", message_id="REF-1", event=SimpleNamespace(webhook_event_id="REF-E"),
         request={"food_name": "白飯", "amount": 200.0, "unit": "g", "meal_slot": "午餐"},
     )
-    assert reference["estimate"]["provenance"]["method"] == "official_reference"
-    assert calls == []
+    assert reference.type == "flex"
+    with sqlite3.connect(db) as conn:
+        official = json.loads(conn.execute(
+            "SELECT estimate_json FROM pending_text_meal_estimates WHERE source_message_id='REF-1'"
+        ).fetchone()[0])
+        assert conn.execute(
+            "SELECT remaining_chat_quota FROM usage WHERE user_id='U-NANJING'"
+        ).fetchone()[0] == 3
+    assert official["provenance"]["method"] == "official_reference"
+    assert transport_calls == []
 
-    soy = server.build_natural_food_log_reply(
-        user_id="U-NANJING", message_id="SOY-ML", event=SimpleNamespace(webhook_event_id="SOY-E"),
-        request={"food_name": "無糖豆漿", "amount": 500.0, "unit": "ml", "meal_slot": "宵夜"},
-    )
-    assert soy["estimate"]["provenance"]["method"] == "official_reference"
-    assert soy["estimate"]["calories_kcal"]["estimate"] == pytest.approx(187.5)
-    assert soy["request"]["meal_slot"] == "點心"
-    assert soy["estimate"]["provenance"]["source"]["publisher"] == "Silk"
-    assert calls == []
-    server.build_natural_food_log_reply(
-        user_id="U-NANJING", message_id="BRANDED-SOY", event=SimpleNamespace(webhook_event_id="BRANDED-SOY-E"),
-        request={"food_name": "未收錄品牌無糖豆漿", "amount": 500.0, "unit": "ml", "meal_slot": "早餐"},
-    )
-    assert len(calls) == 1
-    assert calls[0]['request']['food_name'] == '未收錄品牌無糖豆漿'
-    assert calls[0]['request']['amount'] == 500
-    assert calls[0]['request']['unit'] == 'ml'
+    # The no-verb form is valid after the registered 「記一餐」entry handler.
+    server.handle_message(SimpleNamespace(
+        message=SimpleNamespace(id="ENTER-SOY", text="記一餐"),
+        source=SimpleNamespace(user_id="U-NANJING"), reply_token="reply-enter-soy",
+        webhook_event_id="ENTER-SOY-E",
+    ))
+    server.handle_message(SimpleNamespace(
+        message=SimpleNamespace(id="SOY-ML", text="午餐 無糖豆漿500ml"),
+        source=SimpleNamespace(user_id="U-NANJING"), reply_token="reply-soy-ml",
+        webhook_event_id="SOY-E",
+    ))
+    assert _replies[-1].type == "flex"
+    assert len(transport_calls) == 1
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            """SELECT request_json,estimate_json,status
+               FROM pending_text_meal_estimates WHERE source_message_id='SOY-ML'"""
+        ).fetchone()
+        quota = conn.execute(
+            "SELECT remaining_chat_quota FROM usage WHERE user_id='U-NANJING'"
+        ).fetchone()[0]
+    saved_request, estimate = json.loads(row[0]), json.loads(row[1])
+    assert row[2] == "pending"
+    assert saved_request["amount"] == 500 and saved_request["unit"] == "ml"
+    assert saved_request["meal_slot"] == "午餐"
+    assert estimate["basis_amount"] == 500 and estimate["basis_unit"] == "ml"
+    assert estimate["provenance"]["method"] == "text_meal_estimate"
+    assert quota == 2
 
 
 def test_exact_private_food_is_zero_ai_confirmation_draft(tmp_path, monkeypatch):

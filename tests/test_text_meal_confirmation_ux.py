@@ -56,7 +56,7 @@ def test_explicit_user_values_reply_with_short_success_then_dashboard_and_replay
     assert len(replies) == 2
     assert replies[0].as_json_dict() == replies[1].as_json_dict()
     rendered = json.dumps(replies[0].as_json_dict(), ensure_ascii=False)
-    assert "使用者提供草稿（尚未記錄）" in rendered and "確認後才會寫入" in rendered
+    assert "營養估算草稿（尚未記錄）" in rendered and "確認後才會寫入" in rendered
     assert provider_calls == quota_calls == []
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U-TEXT'").fetchone()[0] == 0

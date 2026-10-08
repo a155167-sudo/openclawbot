@@ -17,26 +17,27 @@ def load_reference():
 
 @pytest.mark.parametrize("amount", [100, 250, 400, 500])
 def test_unsweetened_soymilk_scales_official_ml_label(amount):
-    result = load_reference().resolve_reference(
+    # Historical test ID retained for baseline traceability. Round2 explicitly
+    # retires the foreign-brand ml label: TFDA publishes mass, not density.
+    module = load_reference()
+    assert module.resolve_reference(
         {"food_name": "無糖豆漿", "amount": amount, "unit": "ml"}
+    ) is None
+    result = module.resolve_reference(
+        {"food_name": "無糖豆漿", "amount": amount, "unit": "g"}
     )
-
-    ratio = amount / 240
-    assert result["nutrition"] == pytest.approx(
-        {
-            "calories_kcal": 90 * ratio,
-            "protein_g": 8 * ratio,
-            "fat_g": 4.5 * ratio,
-            "carbohydrate_g": 4 * ratio,
-        }
-    )
-    assert result["source"]["basis_amount"] == 240
-    assert result["source"]["basis_unit"] == "ml"
-    assert result["source"]["publisher"] == "Silk"
-    assert result["source"]["source_type"] == "manufacturer_nutrition_label"
-    assert "一般參考" in result["portion_assumption"]
-    assert "非本次飲品" in result["portion_assumption"]
-    assert "TFDA" not in result["portion_assumption"]
+    ratio = amount / 100
+    assert result["nutrition"] == pytest.approx({
+        "calories_kcal": 35 * ratio,
+        "protein_g": 3.6 * ratio,
+        "fat_g": 1.9 * ratio,
+        "carbohydrate_g": 0.7 * ratio,
+    })
+    assert result["source"]["basis_amount"] == 100
+    assert result["source"]["basis_unit"] == "g"
+    assert result["source"]["publisher"] == "TFDA"
+    assert result["source"]["source_type"] == "government_food_composition"
+    assert "TFDA一般參考值" in result["portion_assumption"]
 
 
 def test_unsweetened_soymilk_ml_accepts_only_declared_exact_aliases():
@@ -44,6 +45,9 @@ def test_unsweetened_soymilk_ml_accepts_only_declared_exact_aliases():
 
     assert module.resolve_reference(
         {"food_name": "豆漿(無糖)", "amount": 100, "unit": "毫升"}
+    ) is None  # Alias normalization must not invent mass-to-volume density.
+    assert module.resolve_reference(
+        {"food_name": "豆漿(無糖)", "amount": 100, "unit": "g"}
     ) is not None
     for name in ["品牌無糖豆漿", "Silk無糖豆漿", "濃無糖豆漿", "無糖豆漿飲品"]:
         assert module.resolve_reference(

@@ -30,7 +30,12 @@ def test_phone_card_has_slot_and_exact_four_actions(tmp_path, monkeypatch):
     text = json.dumps(card, ensure_ascii=False)
     assert "餐別：午餐" in text
     labels = [x["action"]["label"] for x in card["contents"]["footer"]["contents"]]
-    assert labels == ["確認記錄", "修改份量", "自己輸入數值", "取消"]
+    # Historical ID preserved; approved Round2 contract replaces four buttons.
+    assert labels == ["確認記錄", "修改", "取消"]
+    edit = card["contents"]["footer"]["contents"][1]["action"]
+    assert edit["type"] == "uri"
+    assert "view=meal-edit" in edit["uri"]
+    assert draft["token"] in edit["uri"]
 
 
 def test_confirm_uses_true_range_midpoint_not_provider_estimate(tmp_path, monkeypatch):
@@ -196,7 +201,10 @@ def test_real_handlers_amount_followup_then_confirm_reply_record_card_before_das
     draft = server.create_text_meal_estimate_draft(user_id="U-NANJING", message_id="PHONE-1", request={
         "food_name": "豆漿", "amount": 500, "unit": "ml", "meal_slot": "午餐"})
     card = server.build_text_meal_estimate_flex(draft)
-    amount_action = next(x for x in _postback_actions(card) if x.endswith(":amount"))
+    # New cards open LIFF. Preserve this real-handler regression for an old
+    # already-issued chat-edit callback rather than fabricate a new UI button.
+    assert "view=meal-edit" in json.dumps(card.as_json_dict())
+    amount_action = f"tmest:v3:{draft['token']}:{draft['version']}:amount"
     server.handle_postback_event(_postback(amount_action, "AMOUNT-START"))
     state = server.get_daily_food_edit_state("U-NANJING")
     assert state["input_type"] == "text_meal_amount"

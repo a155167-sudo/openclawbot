@@ -1,4 +1,9 @@
-"""Versioned TFDA reference lookup: exact food identity and compatible units only."""
+"""Taiwan-first nutrition references: exact food identity and units only.
+
+Composition rows are never used to infer a mass/volume conversion.  In
+particular, a TFDA ``per 100 g`` soy-milk row cannot answer an ``ml`` request
+unless a separately sourced volume reference exists in the data file.
+"""
 import json
 import math
 from pathlib import Path
@@ -28,6 +33,7 @@ def resolve_reference(request):
         'food_code', 'reference_id', 'name', 'state', 'source_url',
         'basis_amount', 'basis_unit', 'publisher', 'source_product',
         'source_type', 'source_note', 'reference_label', 'source_label',
+        'dataset_url', 'retrieved_at', 'evidence_sha256',
     )
     source = {key: item[key] for key in source_fields if key in item}
     source.update(type='reference', version=document['version'])

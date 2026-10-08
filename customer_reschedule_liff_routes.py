@@ -84,6 +84,9 @@ def create_customer_reschedule_router(
     offload_blocking_submit: bool = False,
     normal_flow: bool = False,
     sheet_factory: Callable[[Any, int], object] | None = None,
+    meal_edit_html_path: str | Path | None = None,
+    meal_draft_loader: Callable[[str, str], Mapping[str, object]] | None = None,
+    meal_draft_saver: Callable[..., Mapping[str, object]] | None = None,
 ) -> APIRouter:
     """Build a router for the customer reschedule LIFF.
 
@@ -120,6 +123,7 @@ def create_customer_reschedule_router(
     router = APIRouter()
     _now = now_factory or (lambda: datetime.now(ZoneInfo("Asia/Taipei")))
     page_path = Path(html_path) if html_path is not None else _HTML_PATH
+    meal_page_path = Path(meal_edit_html_path) if meal_edit_html_path is not None else None
 
     # --- authentication helper -------------------------------------------
     def _authenticate(
@@ -164,8 +168,10 @@ def create_customer_reschedule_router(
 
     # --- page ------------------------------------------------------------
     @router.get("/customer-reschedule", response_class=HTMLResponse)
-    def reschedule_page() -> HTMLResponse:
-        html = page_path.read_text(encoding="utf-8")
+    def reschedule_page(request: Request) -> HTMLResponse:
+        meal_edit = request.query_params.get("view") == "meal-edit"
+        selected_path = meal_page_path if meal_edit and meal_page_path is not None else page_path
+        html = selected_path.read_text(encoding="utf-8")
         runtime = json.dumps(
             {"liffId": liff_id, "channelId": channel_id},
             ensure_ascii=False,
@@ -174,11 +180,88 @@ def create_customer_reschedule_router(
         html = html.replace(
             "null; /* __CUSTOMER_RESCHEDULE_RUNTIME__ */",
             f"{runtime};",
+        ).replace(
+            "null; /* __MEAL_DRAFT_RUNTIME_MARKER__ */",
+            f"{runtime};",
         )
         return HTMLResponse(
             html,
             headers=NO_STORE_HEADERS,
         )
+
+    def _meal_projection(draft: Mapping[str, object]) -> dict[str, object]:
+        if draft.get("draft_type") == "photo":
+            return dict(draft)
+        estimate = draft.get("estimate") if isinstance(draft.get("estimate"), Mapping) else {}
+        request_data = draft.get("request") if isinstance(draft.get("request"), Mapping) else {}
+        nutrition: dict[str, float | None] = {}
+        display: dict[str, str] = {}
+        initial_ai: dict[str, float | None] = {}
+        for field in ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g"):
+            item = estimate.get(field) if isinstance(estimate, Mapping) else None
+            if isinstance(item, Mapping) and item.get("min") is not None and item.get("max") is not None:
+                value = (float(item["min"]) + float(item["max"])) / 2
+                initial = item.get("estimate")
+            else:
+                value = initial = None
+            nutrition[field] = value
+            initial_ai[field] = None if initial is None else float(initial)
+            display[field] = "" if value is None else (
+                str(int(value + 0.5)) if field == "calories_kcal" else f"{value:.1f}"
+            )
+        provenance = estimate.get("provenance") if isinstance(estimate, Mapping) else {}
+        return {
+            "token": draft.get("token"), "version": draft.get("version"),
+            "expires_at": draft.get("expires_at"), "status": draft.get("status"),
+            "food_name": estimate.get("food_name", "") if isinstance(estimate, Mapping) else "",
+            "amount": estimate.get("basis_amount", request_data.get("amount")) if isinstance(estimate, Mapping) else request_data.get("amount"),
+            "unit": estimate.get("basis_unit", request_data.get("unit")) if isinstance(estimate, Mapping) else request_data.get("unit"),
+            "meal_slot": draft.get("meal_slot") or request_data.get("meal_slot"),
+            "nutrition": nutrition, "display": display, "initial_ai": initial_ai,
+            "source_label": provenance.get("source_label", "AI估算") if isinstance(provenance, Mapping) else "AI估算",
+        }
+
+    @router.get("/customer-reschedule/meal-draft", response_class=JSONResponse)
+    def read_meal_draft(token: str, authorization: str | None = Header(default=None)) -> JSONResponse:
+        denied, user_id = _authenticate(authorization)
+        if denied is not None:
+            return denied
+        if meal_draft_loader is None:
+            return JSONResponse({"detail": "草稿編輯未啟用"}, status_code=404, headers=NO_STORE_HEADERS)
+        try:
+            return JSONResponse(_meal_projection(meal_draft_loader(str(user_id), str(token))), headers=NO_STORE_HEADERS)
+        except PermissionError:
+            return JSONResponse({"detail": "forbidden"}, status_code=403, headers=NO_STORE_HEADERS)
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=409, headers=NO_STORE_HEADERS)
+
+    @router.put("/customer-reschedule/meal-draft", response_class=JSONResponse)
+    async def save_meal_draft(request: Request, authorization: str | None = Header(default=None)) -> JSONResponse:
+        denied, user_id = _authenticate(authorization)
+        if denied is not None:
+            return denied
+        if meal_draft_saver is None:
+            return JSONResponse({"detail": "草稿編輯未啟用"}, status_code=404, headers=NO_STORE_HEADERS)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("草稿格式無效")
+            result = meal_draft_saver(
+                user_id=str(user_id), token=str(payload.get("token") or ""),
+                expected_version=int(payload.get("version")), amount=payload.get("amount"),
+                unit=str(payload.get("unit") or ""), meal_slot=str(payload.get("meal_slot") or ""),
+                nutrition=payload.get("nutrition") if isinstance(payload.get("nutrition"), dict) else {},
+                items=payload.get("items") if isinstance(payload.get("items"), list) else None,
+                draft_type=str(payload.get("draft_type") or "text"),
+            )
+            return JSONResponse({
+                "draft": _meal_projection(result["draft"]), "return_command": result["return_command"],
+                "receipt_id": result["receipt_id"], "delivery_confirmed": False,
+            }, headers=NO_STORE_HEADERS)
+        except PermissionError:
+            return JSONResponse({"detail": "forbidden"}, status_code=403, headers=NO_STORE_HEADERS)
+        except (ValueError, KeyError, TypeError) as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=409, headers=NO_STORE_HEADERS)
 
     # --- preview (read-only) ---------------------------------------------
     @router.get("/customer-reschedule/context", response_class=JSONResponse)
@@ -992,6 +1075,9 @@ def attach_customer_reschedule_liff_routes(
     sheet_factory: Callable[[Any, int], object] | None = None,
     html_path: str | Path | None = None,
     semantic_pending_request_loader: Callable[[Any, int, str, str, str, datetime], Mapping[str, object] | None] | None = None,
+    meal_edit_html_path: str | Path | None = None,
+    meal_draft_loader: Callable[[str, str], Mapping[str, object]] | None = None,
+    meal_draft_saver: Callable[..., Mapping[str, object]] | None = None,
 ) -> bool:
     """Mount opt-in staging or production normal-flow routes; never production QA.
 
@@ -1023,6 +1109,9 @@ def attach_customer_reschedule_liff_routes(
             sheet_factory=sheet_factory,
             html_path=html_path,
             semantic_pending_request_loader=semantic_pending_request_loader,
+            meal_edit_html_path=meal_edit_html_path,
+            meal_draft_loader=meal_draft_loader,
+            meal_draft_saver=meal_draft_saver,
         )
     )
     return True

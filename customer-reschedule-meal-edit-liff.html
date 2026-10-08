@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>修改營養估算草稿</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1f2937;background:#f7f8f5}body{margin:0}main{max-width:560px;margin:auto;padding:18px}.card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px}.tag{color:#9a3412;font-weight:700}.muted{font-size:12px;color:#6b7280}label{display:block;margin-top:13px;font-size:14px}input,select,button{width:100%;box-sizing:border-box;margin-top:5px;padding:12px;border:1px solid #bbb;border-radius:9px;font-size:16px}button{background:#06c755;color:white;border:0;font-weight:700;margin-top:18px}button.secondary{background:#fff;color:#166534;border:1px solid #166534}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.ingredient{margin-top:12px;padding:12px;border:1px solid #e5e7eb;border-radius:10px}.ingredient strong{display:block}.status{white-space:pre-wrap;margin-top:14px}.hidden{display:none}code{display:block;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:8px;margin-top:8px;user-select:all}
+</style><script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<script>window.__MEAL_DRAFT_RUNTIME__ = null; /* __MEAL_DRAFT_RUNTIME_MARKER__ */</script></head>
+<body><main><div class="card"><div class="tag">營養估算草稿（尚未記錄）</div><h1 id="name">載入中…</h1><div id="source" class="muted"></div>
+<form id="form" class="hidden"><label>餐別<select id="slot"><option>早餐</option><option>午餐</option><option>晚餐</option><option>點心</option></select></label>
+<div id="singlePortion" class="grid"><label>份量<input id="amount" type="number" inputmode="decimal" min="0.0001" step="any"></label><label>單位<input id="unit" readonly></label></div><section id="ingredients" class="hidden"><h2>食材明細</h2><p class="muted">每項食材保留自己的份量與單位；g 和 ml 不會合併。</p><div id="ingredientList"></div></section>
+<div class="grid"><label>熱量 kcal<input id="calories_kcal" type="number" inputmode="decimal" min="0" step="any"></label><label>蛋白質 g<input id="protein_g" type="number" inputmode="decimal" min="0" step="any"></label><label>脂肪 g（未知可留空）<input id="fat_g" type="number" inputmode="decimal" min="0" step="any"></label><label>碳水 g（未知可留空）<input id="carbohydrate_g" type="number" inputmode="decimal" min="0" step="any"></label></div>
+<p class="muted">修改只會更新草稿，不會記錄、不會重跑 AI，也不會扣額度。回到聊天後仍要按「確認記錄」。</p><button id="save" type="submit">儲存並回傳聊天室</button></form>
+<div id="status" class="status" role="status" aria-live="polite"></div><section id="fallback" class="hidden"><p>草稿已儲存，但尚未確認 Bot 收到。請複製下方指令，貼回原本的官方帳號聊天室：</p><code id="command"></code><button id="retry" class="secondary">重送同一個回傳指令</button></section></div></main>
+<script>(function(){
+const runtime=window.__MEAL_DRAFT_RUNTIME__||{}, qs=new URLSearchParams(location.search), token=qs.get('token')||'';
+const fields=['calories_kcal','protein_g','fat_g','carbohydrate_g'];
+let idToken='',draft=null,receipt=null,baseAmount=0,baseNutrition={},dirty=new Set();
+const $=id=>document.getElementById(id), status=t=>{$('status').textContent=t||''};
+function auth(){return {Authorization:`Bearer ${idToken}`,'Content-Type':'application/json'}}
+function numberOrNull(el){if(el.value.trim()==='')return null;const n=Number(el.value);if(!Number.isFinite(n)||n<0)throw new Error('營養數值必須是非負數字');return n}
+function positiveAmount(el){if(el.value.trim()==='')throw new Error('食材份量不可空白');const n=Number(el.value);if(!Number.isFinite(n)||n<=0)throw new Error('食材份量必須大於 0');return n}
+function showNumber(field,value){return field==='calories_kcal'?String(Math.round(value)):value.toFixed(1)}
+function renderPhotoItems(d){
+  $('singlePortion').classList.add('hidden');$('ingredients').classList.remove('hidden');$('ingredientList').textContent='';
+  d.items.forEach((item,index)=>{const box=document.createElement('div');box.className='ingredient';box.innerHTML=`<strong></strong><div class="grid"><label>份量<input class="itemAmount" type="number" inputmode="decimal" min="0.0001" step="any"></label><label>單位<input class="itemUnit" readonly></label></div>`;box.querySelector('strong').textContent=item.name;box.querySelector('.itemAmount').value=item.amount==null?'':item.amount;box.querySelector('.itemUnit').value=item.unit||'無法安全換算';box.querySelector('.itemAmount').disabled=item.amount==null;box.dataset.index=String(index);$('ingredientList').appendChild(box)});
+  $('ingredientList').addEventListener('input',()=>{
+    const boxes=[...document.querySelectorAll('.ingredient')], amounts=[];
+    try{boxes.forEach(box=>amounts.push(positiveAmount(box.querySelector('.itemAmount'))))}catch(e){status(e.message);return}
+    status('');
+    fields.forEach(field=>{
+      if(dirty.has(field))return;
+      let total=0,known=true;
+      boxes.forEach((box,index)=>{const base=d.items[Number(box.dataset.index)],value=base[field];if(value==null||!base.amount){known=false;return}total+=Number(value)*amounts[index]/Number(base.amount)});
+      $(field).value=known?showNumber(field,total):'';
+    });
+  });
+}
+function fill(d){
+  draft=d;dirty.clear();baseAmount=Number(d.amount);baseNutrition={...d.nutrition};
+  $('name').textContent=d.food_name;$('source').textContent=`來源：${d.source_label}`;$('slot').value=d.meal_slot;
+  fields.forEach(f=>{$(f).readOnly=false;$(f).value=d.display[f]||''});
+  if(d.draft_type==='photo')renderPhotoItems(d);else{$('amount').value=d.amount;$('unit').value=d.unit}
+  $('form').classList.remove('hidden');
+}
+fields.forEach(f=>$(f).addEventListener('input',()=>dirty.add(f)));
+$('amount').addEventListener('input',()=>{
+  const raw=$('amount').value.trim();if(raw===''){status('份量不可空白');return}
+  const next=Number(raw);if(!Number.isFinite(next)||next<=0||!baseAmount){status('份量必須大於 0');return}
+  status('');const ratio=next/baseAmount;
+  fields.forEach(f=>{if(baseNutrition[f]!=null&&!dirty.has(f))$(f).value=showNumber(f,Number(baseNutrition[f])*ratio);else if(baseNutrition[f]==null&&!dirty.has(f))$(f).value=''});
+});
+async function api(url,opt){const r=await fetch(url,{cache:'no-store',credentials:'omit',...opt});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.detail||'連線失敗');return data}
+async function canSendToOriginalPrivateChat(){
+  if(!liff.isInClient||!liff.isInClient()||!liff.isApiAvailable||!liff.isApiAvailable('sendMessages')||!liff.getContext||!liff.permission||!liff.permission.query)return false;
+  const context=liff.getContext();
+  if(!context||context.type!=='utou'||(context.source&&context.source.type!=='user'))return false;
+  try{const permission=await liff.permission.query('chat_message.write');return (permission&&String(permission.state||permission.status||permission))==='granted'}catch(e){return false}
+}
+async function deliver(){
+  if(!receipt)return;const command=receipt.return_command;$('command').textContent=command;$('fallback').classList.remove('hidden');
+  if(!await canSendToOriginalPrivateChat()){status('草稿已儲存，但目前不是原本的一對一聊天室，或尚未授權傳送訊息。請複製回傳指令貼回原官方帳號。');return}
+  try{await liff.sendMessages([{type:'text',text:command}]);status('回傳指令已交給 LINE；請回聊天室確認 Bot 是否已回覆新版草稿。尚未看到新版草稿前，不代表已送達。');$('retry').textContent='聊天室尚未收到？重送同一指令'}catch(e){status('草稿已儲存，但 LINE 傳送失敗。請複製指令，或重送同一指令；不會重複保存或扣額度。')}
+}
+$('retry').addEventListener('click',deliver);
+$('form').addEventListener('submit',async e=>{
+  e.preventDefault();if(receipt){await deliver();return}
+  try{
+    $('save').disabled=true;const nutrition={};fields.forEach(f=>nutrition[f]=numberOrNull($(f)));
+    const items=draft.draft_type==='photo'?[...document.querySelectorAll('.ingredient')].map(box=>{const base=draft.items[Number(box.dataset.index)];return {...base,amount:positiveAmount(box.querySelector('.itemAmount')),unit:box.querySelector('.itemUnit').value}}):null;
+    const amount=draft.draft_type==='photo'?null:positiveAmount($('amount'));
+    receipt=await api('/customer-reschedule/meal-draft',{method:'PUT',headers:auth(),body:JSON.stringify({draft_type:draft.draft_type||'text',token:draft.token,version:draft.version,amount,unit:draft.draft_type==='photo'?'':$('unit').value,meal_slot:$('slot').value,nutrition,items})});
+    $('save').textContent='重送回傳指令';await deliver();
+  }catch(e){status(`儲存失敗：${e.message}`);$('save').disabled=false}
+});
+async function boot(){try{if(!runtime.liffId||!token)throw new Error('入口資料不完整');await liff.init({liffId:runtime.liffId});if(!liff.isLoggedIn()){liff.login();return}idToken=liff.getIDToken()||'';if(!idToken)throw new Error('未取得 LINE 登入憑證');fill(await api(`/customer-reschedule/meal-draft?token=${encodeURIComponent(token)}`,{headers:auth()}))}catch(e){status(`載入失敗：${e.message}`)}}
+window.__MEAL_DRAFT_TEST__={fill,deliver,setReceipt:value=>{receipt=value}};
+if(!runtime.disableAutoBoot)boot();
+})();</script></body></html>
