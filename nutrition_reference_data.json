@@ -1,11 +1,86 @@
 {
-  "version": "tfda-verified-1",
-  "verified_at": "2026-10-07T21:35:23+00:00",
+  "version": "nutrition-reference-2",
+  "verified_at": "2026-10-08T01:15:00+00:00",
   "items": [
-    {"food_code":"A0550601","name":"白飯","aliases":["白飯","白米飯"],"state":"熟白飯，不含配菜油醬","basis_amount":100,"basis_unit":"g","nutrition":{"calories_kcal":183,"protein_g":3.1,"fat_g":0.3,"carbohydrate_g":41.0},"source_url":"https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=0&id=78"},
-    {"food_code":"K01001","name":"雞蛋平均值（生）","aliases":["生雞蛋","生全蛋"],"state":"生全蛋去殼，不套用熟重","basis_amount":100,"basis_unit":"g","nutrition":{"calories_kcal":135,"protein_g":12.7,"fat_g":8.9,"carbohydrate_g":1.6},"source_url":"https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=1&id=134"},
-    {"food_code":"I04024","name":"去皮清肉平均值（生雞胸）","aliases":["生去皮雞胸肉","生雞胸肉"],"state":"生雞胸去皮，不套用熟重","basis_amount":100,"basis_unit":"g","nutrition":{"calories_kcal":119,"protein_g":23.3,"fat_g":2.1,"carbohydrate_g":0.0},"source_url":"https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=1&id=101"},
-    {"food_code":"H1150201","name":"豆漿（無糖）","aliases":["無糖豆漿","豆漿(無糖)"],"state":"一般黃豆無糖豆漿，僅克重；無密度不換算毫升","basis_amount":100,"basis_unit":"g","nutrition":{"calories_kcal":35,"protein_g":3.6,"fat_g":1.9,"carbohydrate_g":0.7},"source_url":"https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=0&id=2078"},
-    {"food_code":"K0111101","name":"雞水煮蛋","aliases":["水煮蛋","雞水煮蛋"],"state":"雞水煮全蛋去殼，不含油醬","basis_amount":100,"basis_unit":"g","nutrition":{"calories_kcal":144,"protein_g":14.0,"fat_g":9.2,"carbohydrate_g":1.7},"source_url":"https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=0&id=1327"}
+    {
+      "food_code": "A0550601",
+      "name": "白飯",
+      "aliases": ["白飯", "白米飯"],
+      "state": "熟白飯，不含配菜油醬",
+      "basis_amount": 100,
+      "basis_unit": "g",
+      "nutrition": {"calories_kcal": 183, "protein_g": 3.1, "fat_g": 0.3, "carbohydrate_g": 41.0},
+      "publisher": "TFDA",
+      "source_type": "government_food_composition",
+      "reference_label": "TFDA一般參考值，非個別品牌實測",
+      "source_url": "https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=0&id=78"
+    },
+    {
+      "food_code": "K01001",
+      "name": "雞蛋平均值（生）",
+      "aliases": ["生雞蛋", "生全蛋"],
+      "state": "生全蛋去殼，不套用熟重",
+      "basis_amount": 100,
+      "basis_unit": "g",
+      "nutrition": {"calories_kcal": 135, "protein_g": 12.7, "fat_g": 8.9, "carbohydrate_g": 1.6},
+      "publisher": "TFDA",
+      "source_type": "government_food_composition",
+      "reference_label": "TFDA一般參考值，非個別品牌實測",
+      "source_url": "https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=1&id=134"
+    },
+    {
+      "food_code": "I04024",
+      "name": "去皮清肉平均值（生雞胸）",
+      "aliases": ["生去皮雞胸肉", "生雞胸肉"],
+      "state": "生雞胸去皮，不套用熟重",
+      "basis_amount": 100,
+      "basis_unit": "g",
+      "nutrition": {"calories_kcal": 119, "protein_g": 23.3, "fat_g": 2.1, "carbohydrate_g": 0.0},
+      "publisher": "TFDA",
+      "source_type": "government_food_composition",
+      "reference_label": "TFDA一般參考值，非個別品牌實測",
+      "source_url": "https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=1&id=101"
+    },
+    {
+      "food_code": "H1150201",
+      "name": "豆漿（無糖）",
+      "aliases": ["無糖豆漿", "豆漿(無糖)"],
+      "state": "一般黃豆無糖豆漿，僅克重；無密度不換算毫升",
+      "basis_amount": 100,
+      "basis_unit": "g",
+      "nutrition": {"calories_kcal": 35, "protein_g": 3.6, "fat_g": 1.9, "carbohydrate_g": 0.7},
+      "publisher": "TFDA",
+      "source_type": "government_food_composition",
+      "reference_label": "TFDA一般參考值，非個別品牌實測",
+      "source_url": "https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=0&id=2078"
+    },
+    {
+      "reference_id": "silk-unsweet-soymilk-web-2026-10-08",
+      "name": "Silk Unsweet Soymilk（產品標示一般參考）",
+      "aliases": ["無糖豆漿", "豆漿(無糖)"],
+      "state": "以 Silk Unsweet Soymilk 產品營養標示作毫升份量的一般參考",
+      "basis_amount": 240,
+      "basis_unit": "ml",
+      "nutrition": {"calories_kcal": 90, "protein_g": 8.0, "fat_g": 4.5, "carbohydrate_g": 4.0},
+      "publisher": "Silk",
+      "source_product": "Unsweet Soymilk",
+      "source_type": "manufacturer_nutrition_label",
+      "reference_label": "Silk產品標示一般參考，非本次飲品或個別品牌實測",
+      "source_note": "Nutrition Facts 表列每240ml為90 kcal；同頁行銷文案寫80 calories，兩處不一致，採結構化 Nutrition Facts 表。",
+      "source_url": "https://www.silk.com/plant-based-products/soymilk/unsweet-soymilk"
+    },
+    {
+      "food_code": "K0111101",
+      "name": "雞水煮蛋",
+      "aliases": ["水煮蛋", "雞水煮蛋"],
+      "state": "雞水煮全蛋去殼，不含油醬",
+      "basis_amount": 100,
+      "basis_unit": "g",
+      "nutrition": {"calories_kcal": 144, "protein_g": 14.0, "fat_g": 9.2, "carbohydrate_g": 1.7},
+      "publisher": "TFDA",
+      "source_type": "government_food_composition",
+      "reference_label": "TFDA一般參考值，非個別品牌實測",
+      "source_url": "https://consumer.fda.gov.tw/Food/tfndDetail.aspx?nodeID=178&f=0&id=1327"
+    }
   ]
 }

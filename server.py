@@ -10116,6 +10116,8 @@ def classify_service_scope_text(user_id, text):
     """
     value = str(text or "").strip()
     normalized = _service_scope_normalized_text(value)
+    if normalized == "記一餐":
+        return "service"
     if normalized in _SERVICE_SCOPE_SOCIAL_EXACT:
         return "social"
     # Safety-sensitive language must never be turned into an off-topic refusal.
@@ -13125,15 +13127,44 @@ def finish_text_meal_input(user_id, version, status):
     return changed.rowcount == 1
 
 
+def _new_text_meal_token():
+    """Return a 160-bit token that e388's 24/32-hex parser cannot consume."""
+    return uuid.uuid4().hex + uuid.uuid4().hex[:8]
+
+
+def _text_meal_source_label(method, source=None):
+    source = source if isinstance(source, dict) else {}
+    if method == "official_reference":
+        explicit = str(source.get("source_label") or source.get("reference_label") or "").strip()
+        if explicit:
+            return explicit
+        publisher = str(source.get("publisher") or "").strip()
+        if publisher == "TFDA":
+            return "TFDA官方參考"
+        if publisher:
+            return f"{publisher}產品標示一般參考"
+        return "一般營養參考"
+    return {
+        "user_provided_nutrition": "使用者提供",
+        "owner_private_catalog": "私人食品庫",
+        "legacy_ai_log_nutrition": "一般估算",
+    }.get(method, "一般估算")
+
+
 def create_fixed_text_meal_draft(*, user_id, message_id, request, method="user_provided_nutrition"):
     """Create/replay a deterministic, zero-provider and zero-quota confirmation draft."""
     user_id, message_id = str(user_id).strip(), str(message_id).strip()
     if not user_id or not message_id:
         raise ValueError("記餐草稿缺少身份")
-    nutrition = {
-        field: _ledger_number(request.get(field))
-        for field in ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g")
-    }
+    nutrition = {}
+    for field in ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g"):
+        raw_value = request.get(field)
+        checked = _ledger_number(raw_value)
+        nutrition[field] = (
+            float(raw_value)
+            if method == "official_reference" and checked is not None
+            else checked
+        )
     if nutrition["calories_kcal"] is None or nutrition["protein_g"] is None:
         raise ValueError("記餐草稿缺少熱量或蛋白質")
     food_name = " ".join(str(request.get("food_name") or "").split())
@@ -13142,13 +13173,7 @@ def create_fixed_text_meal_draft(*, user_id, message_id, request, method="user_p
         meal_slot = "點心"
     if not food_name or meal_slot not in {"早餐", "午餐", "晚餐", "點心"}:
         raise ValueError("記餐草稿格式無效")
-    source_labels = {
-        "user_provided_nutrition": "使用者提供",
-        "official_reference": "TFDA官方參考",
-        "owner_private_catalog": "私人食品庫",
-        "legacy_ai_log_nutrition": "一般估算",
-    }
-    source_label = source_labels.get(method, "一般估算")
+    source_label = _text_meal_source_label(method, request.get("source"))
     amount = _ledger_number(request.get("amount"), allow_none=False) if request.get("amount") is not None else 1.0
     unit = str(request.get("unit") or "serving")
     assumption = str(request.get("portion_assumption") or f"{amount:g} {unit}")
@@ -13181,7 +13206,7 @@ def create_fixed_text_meal_draft(*, user_id, message_id, request, method="user_p
     now = tw_now()
     now_text = now.isoformat(timespec="seconds")
     expires = (now + timedelta(minutes=30)).isoformat(timespec="seconds")
-    token = uuid.uuid4().hex  # Full-length IDs also fail closed in the old 24-hex callback parser.
+    token = _new_text_meal_token()
     with sqlite3.connect(DB_PATH, timeout=10) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -13295,8 +13320,8 @@ def build_food_log_success_messages(user_id, committed_log_id, *, source_label="
         alt_text=f"✅ 記錄成功：{row[0]}",
         contents={
             "type": "bubble", "size": "kilo",
-            "header": {"type": "box", "layout": "vertical", "backgroundColor": "#06C755",
-                       "contents": [{"type": "text", "text": "✅ 記錄成功", "weight": "bold", "color": "#FFFFFF"}]},
+            "header": {"type": "box", "layout": "vertical", "backgroundColor": "#F7F3E8",
+                       "contents": [{"type": "text", "text": "✅ 記錄成功", "weight": "bold", "color": "#1F5132"}]},
             "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
                 {"type": "text", "text": str(row[0]), "weight": "bold", "wrap": True},
                 {"type": "text", "text": f"餐別：{row[2] or '未指定'}｜份量：{portion_text}", "size": "sm", "wrap": True},
@@ -13654,7 +13679,7 @@ def create_text_meal_estimate_draft(
     if not user_id or not message_id:
         raise ValueError("估算請求缺少身份")
     request = _validate_text_meal_request(request)
-    new_token = uuid.uuid4().hex  # Full-length IDs also fail closed in the old 24-hex callback parser.
+    new_token = _new_text_meal_token()
     attempt_id = uuid.uuid4().hex
     now = tw_now()
     now_text = now.isoformat(timespec="seconds")
@@ -14597,11 +14622,13 @@ def build_text_meal_estimate_flex(draft):
             return f"{label}：{point:g} {unit}"
         return f"{label}範圍：{scaled(field, 'min'):g}–{scaled(field, 'max'):g} {unit}"
     token, version = draft["token"], draft["version"]
-    wire_version = 2 if len(token) == 32 else 1
+    # Only the 40-hex v3 capability is rollback-opaque. Untouched legacy rows
+    # keep their old wire protocol until a current-runtime edit rotates them.
+    wire_version = 3 if len(token) == 40 else (2 if len(token) == 32 else 1)
     method = str((estimate.get("provenance") or {}).get("method") or "")
     fixed = method in {
         "user_provided_nutrition", "legacy_ai_log_nutrition",
-        "official_reference", "owner_private_catalog",
+        "official_reference", "owner_private_catalog", "customer_revision",
     }
     source_label = str((estimate.get("provenance") or {}).get("source_label") or "AI估算")
     contents = {
@@ -14610,25 +14637,122 @@ def build_text_meal_estimate_flex(draft):
                    "contents": [{"type": "text", "text": f"{source_label}草稿（尚未記錄）", "weight": "bold", "color": "#9A3412"}]},
         "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
             {"type": "text", "text": estimate["food_name"], "weight": "bold", "wrap": True},
+            {"type": "text", "text": f"餐別：{draft.get('meal_slot') or '未指定'}", "size": "sm"},
             {"type": "text", "text": f"份量假設：{estimate['portion_assumption']} × {multiplier:g}", "size": "sm", "wrap": True},
             {"type": "text", "text": nutrient_text("熱量", "calories_kcal", "kcal"), "size": "sm"},
             {"type": "text", "text": nutrient_text("蛋白質", "protein_g", "g"), "size": "sm"},
             {"type": "text", "text": nutrient_text("脂肪", "fat_g", "g"), "size": "sm"},
             {"type": "text", "text": nutrient_text("碳水", "carbohydrate_g", "g"), "size": "sm"},
-            *([{"type": "text", "text": "⚠️ 四項營養與熱量不一致，請修改或取消，不能直接確認。", "size": "xs", "color": "#B91C1C", "wrap": True}]
-              if (estimate.get("assessment") or {}).get("requires_correction") else []),
+            *([{"type": "text", "text": (
+                "⚠️ 數值較異常；尚未入帳。若數值正確，請再按「確認記錄」完成；也可修改或取消。"
+                if (estimate.get("assessment") or {}).get("customer_anomaly_acknowledged")
+                else "⚠️ 數值較異常；請再次確認。按第一次確認只會解除警示，不會入帳。"
+              ), "size": "xs", "color": "#B91C1C", "wrap": True}]
+              if ((estimate.get("assessment") or {}).get("requires_correction")
+                  or (estimate.get("assessment") or {}).get("customer_anomaly_acknowledged")) else []),
             {"type": "text", "text": "確認後才會寫入；實際依店家與份量而異。", "size": "xs", "color": "#777777", "wrap": True},
         ]},
         "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
-            *([] if (estimate.get("assessment") or {}).get("requires_correction") else [
-                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "確認記錄", "data": f"tmest:v{wire_version}:{token}:{version}:confirm"}}
-            ]),
-            {"type": "button", "action": {"type": "postback", "label": "調整為 0.5 份", "data": f"tmest:v{wire_version}:{token}:{version}:portion:0.5"}},
-            {"type": "button", "action": {"type": "postback", "label": "調整為 1.5 份", "data": f"tmest:v{wire_version}:{token}:{version}:portion:1.5"}},
+            {"type": "button", "style": "primary", "action": {"type": "postback", "label": "確認記錄", "data": f"tmest:v{wire_version}:{token}:{version}:confirm"}},
+            {"type": "button", "action": {"type": "postback", "label": "修改份量", "data": f"tmest:v{wire_version}:{token}:{version}:amount"}},
+            {"type": "button", "action": {"type": "postback", "label": "自己輸入數值", "data": f"tmest:v{wire_version}:{token}:{version}:manual"}},
             {"type": "button", "action": {"type": "postback", "label": "取消", "data": f"tmest:v{wire_version}:{token}:{version}:cancel"}},
         ]},
     }
     return FlexSendMessage(alt_text="AI營養估算，請確認後記錄", contents=contents)
+
+
+def apply_text_meal_custom_input(*, user_id, token, expected_version, mode, text):
+    """Apply deterministic owner/version-bound edits; never invokes a provider."""
+    if mode not in {"amount", "nutrition"}:
+        raise ValueError("草稿修改模式不支援")
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        ensure_daily_food_ledger_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT token,user_id,source_message_id,request_json,estimate_json,
+                      portion_multiplier,meal_slot,status,version,confirmed_log_id,expires_at
+               FROM pending_text_meal_estimates WHERE token=? AND user_id=?""",
+            (str(token), str(user_id)),
+        ).fetchone()
+        if not row:
+            raise ValueError("找不到這筆估算")
+        draft = _text_meal_draft_from_row(row)
+        if draft["status"] != "pending" or draft["version"] != int(expected_version):
+            raise ValueError("這張估算卡已更新，請使用最新版本")
+        if str(draft["expires_at"]) < tw_now().isoformat(timespec="seconds"):
+            conn.execute(
+                "UPDATE pending_text_meal_estimates SET status='expired',estimate_json='{}' "
+                "WHERE token=? AND user_id=? AND status='pending' AND version=?",
+                (token, user_id, int(expected_version)),
+            )
+            conn.commit()
+            raise ValueError("這筆估算已逾時，請重新描述餐點")
+        estimate = draft["estimate"]
+        provenance = estimate.get("provenance") or {}
+        original = provenance.get("original_estimate")
+        if not isinstance(original, dict):
+            original = json.loads(json.dumps(estimate, ensure_ascii=False))
+        if mode == "amount":
+            matched = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(ml|毫升|cc|g|克|公克|份)\s*", str(text), re.I)
+            if not matched:
+                raise ValueError("請輸入份量，例如：400 ml")
+            amount = _ledger_number(matched.group(1), allow_none=False)
+            if amount <= 0:
+                raise ValueError("份量必須大於 0")
+            unit = {"毫升": "ml", "cc": "ml", "克": "g", "公克": "g", "份": "serving"}.get(matched.group(2).lower(), matched.group(2).lower())
+            basis_unit = str(estimate.get("basis_unit") or "").lower()
+            if unit != basis_unit:
+                raise ValueError("新份量單位必須和原始估算一致")
+            basis = _ledger_number(estimate.get("basis_amount"), allow_none=False)
+            if basis <= 0:
+                raise ValueError("原始份量基準無效")
+            ratio = amount / basis
+            for field in ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g"):
+                item = estimate.get(field)
+                if isinstance(item, dict):
+                    estimate[field] = {**item, **{key: float(item[key]) * ratio for key in ("estimate", "min", "max")}}
+            estimate["basis_amount"] = amount
+            estimate["basis_unit"] = unit
+            estimate["portion_assumption"] = f"{amount:g} {unit}（依原始基準等比例調整）"
+            estimate["provenance"] = {**provenance, "original_estimate": original}
+        else:
+            matched = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:大卡|kcal|卡)\s*(\d+(?:\.\d+)?)\s*(?:公克|克|g)\s*", str(text), re.I)
+            if not matched:
+                raise ValueError("請輸入熱量與蛋白質，例如：180 大卡 16 克")
+            calories = _ledger_number(matched.group(1), allow_none=False)
+            protein = _ledger_number(matched.group(2), allow_none=False)
+            estimate["calories_kcal"] = {"estimate": calories, "min": calories, "max": calories, "unit": "kcal"}
+            estimate["protein_g"] = {"estimate": protein, "min": protein, "max": protein, "unit": "g"}
+            estimate["fat_g"] = None
+            estimate["carbohydrate_g"] = None
+            estimate["assessment"] = assess_nutrition({"calories_kcal": calories, "protein_g": protein})
+            estimate["provenance"] = {
+                "provider": "none", "model": "none", "method": "customer_revision",
+                "source_label": "顧客修改", "original_estimate": original,
+            }
+        now = tw_now().isoformat(timespec="seconds")
+        next_token = token if len(str(token)) == 40 else _new_text_meal_token()
+        changed = conn.execute(
+            """UPDATE pending_text_meal_estimates SET token=?,estimate_json=?,portion_multiplier=1,
+                      version=version+1,updated_at=?
+               WHERE token=? AND user_id=? AND status='pending' AND version=?""",
+            (next_token, json.dumps(estimate, ensure_ascii=False, sort_keys=True, allow_nan=False),
+             now, token, user_id, int(expected_version)),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("這張估算卡已更新，請使用最新版本")
+        if next_token != token:
+            conn.execute(
+                "UPDATE text_meal_provider_attempts SET token=? WHERE token=? AND user_id=?",
+                (next_token, token, user_id),
+            )
+            conn.execute(
+                "UPDATE text_meal_estimate_quota_ledger SET token=? WHERE token=? AND user_id=?",
+                (next_token, token, user_id),
+            )
+        conn.commit()
+    return get_text_meal_estimate_draft(user_id, next_token)
 
 
 def apply_text_meal_estimate_action(*, user_id, token, expected_version, action, multiplier=None):
@@ -14670,19 +14794,56 @@ def apply_text_meal_estimate_action(*, user_id, token, expected_version, action,
             value = _ledger_number(multiplier, allow_none=False)
             if value not in {0.5, 1.0, 1.5, 2.0}:
                 raise ValueError("份量調整不支援")
-            conn.execute("UPDATE pending_text_meal_estimates SET portion_multiplier=?,version=version+1,updated_at=? WHERE token=? AND user_id=? AND status='pending' AND version=?", (value, now, token, user_id, expected_version))
+            next_token = token if len(str(token)) == 40 else _new_text_meal_token()
+            changed = conn.execute("UPDATE pending_text_meal_estimates SET token=?,portion_multiplier=?,version=version+1,updated_at=? WHERE token=? AND user_id=? AND status='pending' AND version=?", (next_token, value, now, token, user_id, expected_version))
+            if changed.rowcount != 1:
+                raise ValueError("這張估算卡已更新，請使用最新版本")
+            if next_token != token:
+                conn.execute("UPDATE text_meal_provider_attempts SET token=? WHERE token=? AND user_id=?", (next_token, token, user_id))
+                conn.execute("UPDATE text_meal_estimate_quota_ledger SET token=? WHERE token=? AND user_id=?", (next_token, token, user_id))
             conn.commit()
-            return {"kind": "preview", "draft": get_text_meal_estimate_draft(user_id, token)}
+            return {"kind": "preview", "draft": get_text_meal_estimate_draft(user_id, next_token)}
         if action != "confirm":
             raise ValueError("估算操作不支援")
         estimate = draft["estimate"]
-        if (estimate.get("assessment") or {}).get("requires_correction"):
-            raise ValueError("營養估算不一致，請修改或取消後重新估算")
+        scale = _ledger_number(draft["portion_multiplier"], allow_none=False)
+        committed_nutrition = {
+            field: (None if not isinstance(estimate.get(field), dict) else
+                    _ledger_number(((_ledger_number(estimate[field]["min"], allow_none=False) / 2)
+                                    + (_ledger_number(estimate[field]["max"], allow_none=False) / 2))
+                                   * scale, allow_none=False))
+            for field in ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g")
+        }
+        midpoint_assessment = assess_nutrition(committed_nutrition)
+        assessment = dict(estimate.get("assessment") or {})
+        warning_digest = hashlib.sha256(json.dumps(committed_nutrition, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        needs_warning = bool(assessment.get("requires_correction") or midpoint_assessment.get("requires_correction"))
+        estimate["assessment"] = {**assessment, "midpoint_assessment": midpoint_assessment}
+        if needs_warning and assessment.get("customer_warning_digest") != warning_digest:
+            assessment = dict(estimate["assessment"])
+            assessment["requires_correction"] = False
+            assessment["customer_anomaly_acknowledged"] = True
+            assessment["customer_warning_digest"] = warning_digest
+            estimate["assessment"] = assessment
+            next_token = token if len(str(token)) == 40 else _new_text_meal_token()
+            changed = conn.execute(
+                """UPDATE pending_text_meal_estimates SET token=?,estimate_json=?,version=version+1,updated_at=?
+                   WHERE token=? AND user_id=? AND status='pending' AND version=?""",
+                (next_token, json.dumps(estimate, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                 now, token, user_id, int(expected_version)),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("這張估算卡已更新，請使用最新版本")
+            if next_token != token:
+                conn.execute("UPDATE text_meal_provider_attempts SET token=? WHERE token=? AND user_id=?", (next_token, token, user_id))
+                conn.execute("UPDATE text_meal_estimate_quota_ledger SET token=? WHERE token=? AND user_id=?", (next_token, token, user_id))
+            conn.commit()
+            return {"kind": "preview", "draft": get_text_meal_estimate_draft(user_id, next_token)}
         scale = draft["portion_multiplier"]
         estimate_method = str((estimate.get("provenance") or {}).get("method") or "")
         fixed_values = estimate_method in {
             "user_provided_nutrition", "legacy_ai_log_nutrition",
-            "official_reference", "owner_private_catalog",
+            "official_reference", "owner_private_catalog", "customer_revision",
         }
         source_type = {
             "user_provided_nutrition": "user_provided_nutrition",
@@ -14693,11 +14854,7 @@ def apply_text_meal_estimate_action(*, user_id, token, expected_version, action,
         result = create_daily_food_log(
             conn, user_id=user_id, product_name=estimate["food_name"],
             meal_slot=draft["meal_slot"], consumed_at=now, servings=scale,
-            nutrition={
-                field: (None if not isinstance(estimate.get(field), dict)
-                        else estimate[field]["estimate"] * scale)
-                for field in ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g")
-            }, source_type=source_type,
+            nutrition=committed_nutrition, source_type=source_type,
             operation_key=f"text-meal-estimate:{token}", publish_catalog=False,
             consumed_amount=(float(estimate["basis_amount"]) * scale if estimate.get("basis_amount") is not None else None),
             consumed_unit=str(estimate.get("basis_unit") or "serving"),
@@ -17509,16 +17666,32 @@ def handle_meal_photo_postback(event):
 
     # ── tmest:v1 文字餐點 AI 草稿；owner/version 綁定，確認才寫入 ──
     text_estimate_action = re.fullmatch(
-        r"tmest:v(?:1|2):((?:[0-9a-f]{24}|[0-9a-f]{32})):(\d+):(confirm|cancel|portion:(0\.5|1(?:\.0)?|1\.5|2(?:\.0)?))",
+        r"tmest:(?:v(?:1|2):([0-9a-f]{24}|[0-9a-f]{32})|v3:([0-9a-f]{40})):(\d+):(confirm|cancel|amount|manual|portion:(0\.5|1(?:\.0)?|1\.5|2(?:\.0)?))",
         data,
     )
     if text_estimate_action:
-        token = text_estimate_action.group(1)
-        version = int(text_estimate_action.group(2))
-        raw_action = text_estimate_action.group(3)
+        token = text_estimate_action.group(1) or text_estimate_action.group(2)
+        version = int(text_estimate_action.group(3))
+        raw_action = text_estimate_action.group(4)
         action = "portion" if raw_action.startswith("portion:") else raw_action
-        multiplier = float(text_estimate_action.group(4)) if action == "portion" else None
+        multiplier = float(text_estimate_action.group(5)) if action == "portion" else None
         try:
+            if action in {"amount", "manual"}:
+                draft = get_text_meal_estimate_draft(uid, token)
+                if draft["status"] != "pending" or draft["version"] != version:
+                    raise ValueError("這張估算卡已更新，請使用最新版本")
+                set_daily_food_edit_state(
+                    uid, token, version,
+                    "text_meal_amount" if action == "amount" else "text_meal_nutrition",
+                    payload={"token": token, "version": version},
+                )
+                reply = TextSendMessage(text=(
+                    "請輸入實際份量，例如：400 ml。將依原始估算基準等比例調整，不會再次呼叫 AI。"
+                    if action == "amount" else
+                    "請輸入熱量與蛋白質，例如：180 大卡 16 克。脂肪與碳水未提供時會保持未知。"
+                ))
+                line_bot_api.reply_message(event.reply_token, reply)
+                return
             result = apply_text_meal_estimate_action(
                 user_id=uid, token=token, expected_version=version,
                 action=action, multiplier=multiplier,
@@ -18780,7 +18953,21 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
     if ledger_state:
         clear_after_reply = False
         try:
-            if ledger_state["input_type"] == "meal_photo_revision_request":
+            if ledger_state["input_type"] in {"text_meal_amount", "text_meal_nutrition"}:
+                if msg in {"取消", "取消修改", "取消修正"}:
+                    clear_after_reply = True
+                    reply = TextSendMessage(text="✅ 已取消修改；原草稿沒有變更。")
+                else:
+                    revised = apply_text_meal_custom_input(
+                        user_id=uid,
+                        token=ledger_state["payload"].get("token") or ledger_state["log_id"],
+                        expected_version=ledger_state["expected_version"],
+                        mode="amount" if ledger_state["input_type"] == "text_meal_amount" else "nutrition",
+                        text=msg,
+                    )
+                    clear_after_reply = True
+                    reply = build_text_meal_estimate_flex(revised)
+            elif ledger_state["input_type"] == "meal_photo_revision_request":
                 if not CONFIRMED_MEAL_PHOTO_REVISION_WRITER_ENABLED:
                     clear_after_reply = True
                     reply = TextSendMessage(text="⚠️ 這項修改功能目前未啟用。")
@@ -19427,7 +19614,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         finish_text_meal_input(uid, input_state["version"], "cancelled")
         input_state = None  # Navigation keeps its original handler; it is never a meal.
     if input_state and input_state["status"] == "awaiting_food":
-        if msg == "我要紀錄飲食":
+        if msg in {"我要紀錄飲食", "記一餐"}:
             arm_text_meal_input(uid, msg_id)
             line_bot_api.reply_message(
                 event.reply_token,
@@ -21097,11 +21284,11 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             return
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
-    elif msg == "我要紀錄飲食":
+    elif msg in {"我要紀錄飲食", "記一餐"}:
         arm_text_meal_input(uid, msg_id)
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="請在下一則訊息回覆餐別、餐點和份量（例如：午餐半個雞肉便當），或直接傳餐點照片。輸入「取消」可離開；我會先提供草稿，經你確認後才記錄。"),
+            TextSendMessage(text="請在下一則訊息回覆餐別、餐點和份量（例如：午餐半個雞肉便當），也可以直接傳餐點照片。輸入「取消」可離開；我會先提供草稿，經你確認後才記錄。"),
         )
         return
     elif msg == "運費怎麼算":

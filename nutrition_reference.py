@@ -24,8 +24,14 @@ def resolve_reference(request):
     item = matches[0]
     ratio = amount / item['basis_amount']
     nutrition = {key: None if value is None else value * ratio for key, value in item['nutrition'].items()}
+    source_fields = (
+        'food_code', 'reference_id', 'name', 'state', 'source_url',
+        'basis_amount', 'basis_unit', 'publisher', 'source_product',
+        'source_type', 'source_note', 'reference_label', 'source_label',
+    )
+    source = {key: item[key] for key in source_fields if key in item}
+    source.update(type='reference', version=document['version'])
     return {'food_name': request['food_name'], 'amount': amount, 'unit': unit,
-            'portion_assumption': f"{amount:g}{unit}；{item['state']}；TFDA一般參考值，非個別品牌實測",
+            'portion_assumption': f"{amount:g}{unit}；{item['state']}；{item['reference_label']}",
             'nutrition': nutrition,
-            'source': {key: item[key] for key in ('food_code', 'name', 'state', 'source_url', 'basis_amount', 'basis_unit')}
-                      | {'type': 'reference', 'version': document['version']}}
+            'source': source}

@@ -8521,7 +8521,12 @@ def test_natural_food_log_not_found_or_incompatible_unit_requires_ai_confirmatio
     server.handle_postback_event(confirm_event)
     assert replies[-1][0].as_json_dict() == replies[-2][0].as_json_dict()
     confirmed = json.dumps(replies[-1][0].as_json_dict(), ensure_ascii=False)
-    assert all(text in confirmed for text in ("記錄成功", "火星果汁", "早餐", "350", "17"))
+    # Phone-approved contract uses the actual range midpoint, not provider estimate.
+    assert all(text in confirmed for text in ("記錄成功", "火星果汁", "早餐", "360", "17.5"))
+    with sqlite3.connect(db) as conn:
+        saved = json.loads(conn.execute("SELECT nutrition_snapshot_json FROM food_logs WHERE user_id='U1'").fetchone()[0])
+    assert saved['calories_kcal'] == (300 + 420) / 2
+    assert saved['protein_g'] == (13 + 22) / 2
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM food_logs WHERE user_id='U1'").fetchone()[0] == 1
         assert conn.execute("SELECT remaining_chat_quota FROM usage WHERE user_id='U1'").fetchone()[0] == 0

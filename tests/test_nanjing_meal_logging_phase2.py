@@ -113,13 +113,24 @@ def test_ai_four_nutrients_reach_draft_and_ledger_while_inconsistent_cannot_conf
         request={"food_name": "無糖豆漿", "amount": 500, "unit": "ml", "meal_slot": "點心"},
     )
     assert blocked["estimate"]["assessment"]["status"] == "inconsistent"
-    with pytest.raises(ValueError, match="不一致"):
-        server.apply_text_meal_estimate_action(
-            user_id="U-NANJING", token=blocked["token"], expected_version=1, action="confirm"
-        )
+    # Approved phone contract: the first confirmation MUST NOT commit an
+    # anomalous finite estimate; a fresh version-bound second confirmation may.
+    warning = server.apply_text_meal_estimate_action(
+        user_id="U-NANJING", token=blocked["token"], expected_version=1, action="confirm")
+    assert warning['kind'] == 'preview'
+    with sqlite3.connect(db) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM food_logs').fetchone()[0] == 1
+    fresh = warning['draft']
+    committed = server.apply_text_meal_estimate_action(
+        user_id="U-NANJING", token=fresh['token'], expected_version=fresh['version'], action="confirm")
+    assert committed['kind'] == 'confirmed'
+    with sqlite3.connect(db) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM food_logs').fetchone()[0] == 2
 
 
 def test_reference_grams_is_zero_ai_draft_but_500ml_soy_uses_ai(tmp_path, monkeypatch):
+    # Retain the baseline node. Generic soy now has cited ml data; an
+    # unlisted branded soy must still fall back, without borrowing that label.
     _db, _replies = _setup(tmp_path, monkeypatch)
     calls = []
     monkeypatch.setattr(server, "create_text_meal_estimate_draft", lambda **kw: calls.append(kw) or {"status": "pending", "token": "ai", "version": 1, "estimate": _provider_payload(), "portion_multiplier": 1})
@@ -136,8 +147,19 @@ def test_reference_grams_is_zero_ai_draft_but_500ml_soy_uses_ai(tmp_path, monkey
         user_id="U-NANJING", message_id="SOY-ML", event=SimpleNamespace(webhook_event_id="SOY-E"),
         request={"food_name": "無糖豆漿", "amount": 500.0, "unit": "ml", "meal_slot": "宵夜"},
     )
-    assert soy["token"] == "ai"
-    assert calls[0]["request"]["meal_slot"] == "點心"
+    assert soy["estimate"]["provenance"]["method"] == "official_reference"
+    assert soy["estimate"]["calories_kcal"]["estimate"] == pytest.approx(187.5)
+    assert soy["request"]["meal_slot"] == "點心"
+    assert soy["estimate"]["provenance"]["source"]["publisher"] == "Silk"
+    assert calls == []
+    server.build_natural_food_log_reply(
+        user_id="U-NANJING", message_id="BRANDED-SOY", event=SimpleNamespace(webhook_event_id="BRANDED-SOY-E"),
+        request={"food_name": "未收錄品牌無糖豆漿", "amount": 500.0, "unit": "ml", "meal_slot": "早餐"},
+    )
+    assert len(calls) == 1
+    assert calls[0]['request']['food_name'] == '未收錄品牌無糖豆漿'
+    assert calls[0]['request']['amount'] == 500
+    assert calls[0]['request']['unit'] == 'ml'
 
 
 def test_exact_private_food_is_zero_ai_confirmation_draft(tmp_path, monkeypatch):

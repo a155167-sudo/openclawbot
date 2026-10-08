@@ -21,7 +21,7 @@ def test_verified_cooked_rice_scales_exact_requested_grams():
 
 def test_reference_rejects_unverified_density_and_distinct_foods():
     module = load_reference()
-    for name, unit in [('無糖豆漿', 'ml'), ('燕麥豆漿', 'g'), ('熟雞胸肉', 'g'),
+    for name, unit in [('燕麥豆漿', 'g'), ('熟雞胸肉', 'g'),
                        ('雞胸肉', 'g'), ('白飯加雞肉', 'g'), ('品牌無糖豆漿', 'g'),
                        ('水煮蛋白', 'g')]:
         assert module.resolve_reference({'food_name': name, 'amount': 500, 'unit': unit}) is None

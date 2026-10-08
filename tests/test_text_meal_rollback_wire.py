@@ -4,7 +4,7 @@ import pytest
 import server
 from tests.test_nanjing_meal_logging_flow import _setup,_estimate,_postback,_postback_actions
 
-OLD_WIRE=re.compile(r'tmest:v1:([0-9a-f]{24}):(\d+):(confirm|cancel|portion:(0\.5|1(?:\.0)?|1\.5|2(?:\.0)?))')
+OLD_WIRE=re.compile(r'tmest:v(?:1|2):([0-9a-f]{24}|[0-9a-f]{32}):(\d+):(confirm|cancel|portion:(0\.5|1(?:\.0)?|1\.5|2(?:\.0)?))')
 
 @pytest.mark.parametrize('fixed',[True,False])
 def test_new_drafts_cannot_be_confirmed_through_legacy_wire(tmp_path,monkeypatch,fixed):
@@ -16,12 +16,12 @@ def test_new_drafts_cannot_be_confirmed_through_legacy_wire(tmp_path,monkeypatch
     else:
         monkeypatch.setattr(server,'estimate_text_meal_nutrition',lambda *a,**k:_estimate())
         draft=server.create_text_meal_estimate_draft(user_id='U-NANJING',message_id='wire',request=request)
-    assert len(draft['token'])==32
+    assert len(draft['token'])==40
     actions=_postback_actions(server.build_text_meal_estimate_flex(draft))
-    assert actions and all(x.startswith('tmest:v2:') for x in actions)
+    assert actions and all(x.startswith('tmest:v3:') for x in actions)
     assert all(not OLD_WIRE.fullmatch(x) for x in actions)
     # Even replacing only the wire version cannot make this token valid to old runtime.
-    assert all(not OLD_WIRE.fullmatch(x.replace('tmest:v2:','tmest:v1:',1)) for x in actions)
+    assert all(not OLD_WIRE.fullmatch(x.replace('tmest:v3:',prefix,1)) for x in actions for prefix in ('tmest:v1:','tmest:v2:'))
     confirm=next(x for x in actions if x.endswith(':confirm'))
     server.handle_postback_event(_postback(confirm,'wire-confirm'))
     server.handle_postback_event(_postback(confirm,'wire-confirm'))

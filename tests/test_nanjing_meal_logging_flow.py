@@ -91,7 +91,7 @@ def test_nanjing_four_slot_time_boundaries():
 def test_entry_durably_awaits_bare_next_food_and_restart_replay_is_one_draft(tmp_path, monkeypatch):
     db, replies = _setup(tmp_path, monkeypatch)
     calls = []
-    monkeypatch.setattr(server, "estimate_text_meal_nutrition", lambda request: calls.append(dict(request)) or _estimate())
+    monkeypatch.setattr(server, "estimate_text_meal_nutrition", lambda request: calls.append(dict(request)) or _estimate(request['food_name']))
     monkeypatch.setattr(server, "check_permission_and_quota", lambda _uid: (True, "left"))
 
     server._handle_message_impl(_text_event("ENTER-1", "我要紀錄飲食"))
@@ -103,7 +103,9 @@ def test_entry_durably_awaits_bare_next_food_and_restart_replay_is_one_draft(tmp
     assert row == ("U-NANJING", "awaiting_food", 1)
     assert "下一則" in replies[-1].text
 
-    followup = _text_event("FOOD-1", "無糖豆漿500ml")
+    # Keep testing the AI lane and durable replay. Generic soy now has a
+    # cited ml reference; its zero-provider entry is tested separately.
+    followup = _text_event("FOOD-1", "測試豆飲500ml")
     server._handle_message_impl(followup)
     server.processed_messages.clear()  # 模擬程序重啟後 LINE redelivery
     server._handle_message_impl(followup)
