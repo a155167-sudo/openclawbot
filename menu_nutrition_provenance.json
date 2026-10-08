@@ -1,0 +1,1581 @@
+{
+  "schema_version": 1,
+  "scope": "staging-only menu nutrition data update; no DB schema change",
+  "source": {
+    "path": "/home/win-xi/menu-nutrition-audit-20261009-v2/comparison-v2.json",
+    "sha256": "d2a595432548a8f58b4d505c4a90fba67cb970ff020dfd370072c4016be4da33",
+    "embedded_summary_source_hash": "815ac02458af06d8478e661c48b884ad7abc9f45cf1db787541727e92db8ff44"
+  },
+  "policy": {
+    "updated_fields_only": [
+      "calories_kcal",
+      "protein_g",
+      "fat_g",
+      "carbohydrate_g"
+    ],
+    "matched_update_count": 58,
+    "all_updates_provisional": true,
+    "no_menu_item_added": true,
+    "generic_multigrain_rice_is_logging_reference_only": true
+  },
+  "updates": [
+    {
+      "name": "豆腐便當",
+      "original_name": "豆腐便當",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 536.0,
+        "protein_g": 32.0,
+        "fat_g": 23.0,
+        "carbohydrate_g": 26.0
+      },
+      "new": {
+        "calories_kcal": 545.985,
+        "protein_g": 28.68,
+        "fat_g": 10.489,
+        "carbohydrate_g": 87.4055
+      },
+      "provisional": true,
+      "assumption": "五穀飯180g：通用熟飯營養值暫定（使用者指定FatSecret五穀米，非店內實測）",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 558.743,
+        "difference_kcal": 12.758000000000038,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鷹嘴豆便當",
+      "original_name": "鷹嘴豆便當",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 502.0,
+        "protein_g": 23.0,
+        "fat_g": 23.0,
+        "carbohydrate_g": 28.0
+      },
+      "new": {
+        "calories_kcal": 592.385,
+        "protein_g": 27.26,
+        "fat_g": 9.009,
+        "carbohydrate_g": 104.6055
+      },
+      "provisional": true,
+      "assumption": "五穀飯180g：通用熟飯營養值暫定（使用者指定FatSecret五穀米，非店內實測）；鷹嘴豆100g：份量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 608.543,
+        "difference_kcal": 16.158000000000015,
+        "reason": ""
+      }
+    },
+    {
+      "name": "雞肉便當",
+      "original_name": "雞肉便當",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 484.0,
+        "protein_g": 35.0,
+        "fat_g": 19.0,
+        "carbohydrate_g": 17.0
+      },
+      "new": {
+        "calories_kcal": 604.585,
+        "protein_g": 43.16,
+        "fat_g": 14.289,
+        "carbohydrate_g": 77.2055
+      },
+      "provisional": true,
+      "assumption": "五穀飯180g：通用熟飯營養值暫定（使用者指定FatSecret五穀米，非店內實測）；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 610.063,
+        "difference_kcal": 5.477999999999952,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豬肉便當",
+      "original_name": "豬肉便當",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 508.0,
+        "protein_g": 28.0,
+        "fat_g": 25.0,
+        "carbohydrate_g": 17.0
+      },
+      "new": {
+        "calories_kcal": 597.985,
+        "protein_g": 35.52,
+        "fat_g": 17.169,
+        "carbohydrate_g": 77.2055
+      },
+      "provisional": true,
+      "assumption": "五穀飯180g：通用熟飯營養值暫定（使用者指定FatSecret五穀米，非店內實測）；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 605.423,
+        "difference_kcal": 7.437999999999988,
+        "reason": ""
+      }
+    },
+    {
+      "name": "牛肉便當",
+      "original_name": "牛肉便當",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 511.0,
+        "protein_g": 29.0,
+        "fat_g": 24.0,
+        "carbohydrate_g": 19.0
+      },
+      "new": {
+        "calories_kcal": 592.585,
+        "protein_g": 33.96,
+        "fat_g": 17.709,
+        "carbohydrate_g": 77.2055
+      },
+      "provisional": true,
+      "assumption": "五穀飯180g：通用熟飯營養值暫定（使用者指定FatSecret五穀米，非店內實測）；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 604.043,
+        "difference_kcal": 11.45799999999997,
+        "reason": ""
+      }
+    },
+    {
+      "name": "番牛便當",
+      "original_name": "番牛便當",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 551.0,
+        "protein_g": 31.0,
+        "fat_g": 24.0,
+        "carbohydrate_g": 27.0
+      },
+      "new": {
+        "calories_kcal": 608.385,
+        "protein_g": 33.96,
+        "fat_g": 17.209,
+        "carbohydrate_g": 83.2055
+      },
+      "provisional": true,
+      "assumption": "五穀飯180g：通用熟飯營養值暫定（使用者指定FatSecret五穀米，非店內實測）；番茄燉牛肉120g：份量及組成暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 623.543,
+        "difference_kcal": 15.158000000000015,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鱸魚便當",
+      "original_name": "鱸魚便當",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 459.0,
+        "protein_g": 29.0,
+        "fat_g": 19.0,
+        "carbohydrate_g": 17.0
+      },
+      "new": {
+        "calories_kcal": 565.585,
+        "protein_g": 36.06,
+        "fat_g": 13.359,
+        "carbohydrate_g": 77.2055
+      },
+      "provisional": true,
+      "assumption": "五穀飯180g：通用熟飯營養值暫定（使用者指定FatSecret五穀米，非店內實測）；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 573.293,
+        "difference_kcal": 7.70799999999997,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鮭魚便當",
+      "original_name": "鮭魚便當",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 484.0,
+        "protein_g": 28.0,
+        "fat_g": 22.0,
+        "carbohydrate_g": 17.0
+      },
+      "new": {
+        "calories_kcal": 606.485,
+        "protein_g": 32.725,
+        "fat_g": 19.469,
+        "carbohydrate_g": 77.2055
+      },
+      "provisional": true,
+      "assumption": "五穀飯180g：通用熟飯營養值暫定（使用者指定FatSecret五穀米，非店內實測）；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 614.943,
+        "difference_kcal": 8.45799999999997,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豆腐食蔬",
+      "original_name": "豆腐食蔬",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 428.0,
+        "protein_g": 29.0,
+        "fat_g": 20.0,
+        "carbohydrate_g": 23.0
+      },
+      "new": {
+        "calories_kcal": 475.605,
+        "protein_g": 26.729,
+        "fat_g": 12.242,
+        "carbohydrate_g": 66.8395
+      },
+      "provisional": true,
+      "assumption": "本輪核准值仍以 provisional 部署資料追蹤，待店內實測確認",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 484.452,
+        "difference_kcal": 8.84699999999998,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鷹嘴豆食蔬",
+      "original_name": "鷹嘴豆食蔬",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 394.0,
+        "protein_g": 20.0,
+        "fat_g": 19.0,
+        "carbohydrate_g": 24.0
+      },
+      "new": {
+        "calories_kcal": 492.605,
+        "protein_g": 22.729,
+        "fat_g": 9.742,
+        "carbohydrate_g": 81.4895
+      },
+      "provisional": true,
+      "assumption": "鷹嘴豆100g：份量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 504.552,
+        "difference_kcal": 11.947000000000003,
+        "reason": ""
+      }
+    },
+    {
+      "name": "雞肉食蔬",
+      "original_name": "雞肉食蔬",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 376.0,
+        "protein_g": 32.0,
+        "fat_g": 15.0,
+        "carbohydrate_g": 14.0
+      },
+      "new": {
+        "calories_kcal": 504.805,
+        "protein_g": 38.629,
+        "fat_g": 15.022,
+        "carbohydrate_g": 54.0895
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 506.072,
+        "difference_kcal": 1.266999999999996,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豬肉食蔬",
+      "original_name": "豬肉食蔬",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 400.0,
+        "protein_g": 25.0,
+        "fat_g": 21.0,
+        "carbohydrate_g": 14.0
+      },
+      "new": {
+        "calories_kcal": 498.205,
+        "protein_g": 30.989,
+        "fat_g": 17.902,
+        "carbohydrate_g": 54.0895
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 501.432,
+        "difference_kcal": 3.2270000000000323,
+        "reason": ""
+      }
+    },
+    {
+      "name": "牛肉食蔬",
+      "original_name": "牛肉食蔬",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 403.0,
+        "protein_g": 26.0,
+        "fat_g": 21.0,
+        "carbohydrate_g": 15.0
+      },
+      "new": {
+        "calories_kcal": 492.805,
+        "protein_g": 29.429,
+        "fat_g": 18.442,
+        "carbohydrate_g": 54.0895
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 500.052,
+        "difference_kcal": 7.247000000000014,
+        "reason": ""
+      }
+    },
+    {
+      "name": "番牛食蔬",
+      "original_name": "番牛食蔬",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 443.0,
+        "protein_g": 28.0,
+        "fat_g": 21.0,
+        "carbohydrate_g": 24.0
+      },
+      "new": {
+        "calories_kcal": 508.605,
+        "protein_g": 29.429,
+        "fat_g": 17.942,
+        "carbohydrate_g": 60.0895
+      },
+      "provisional": true,
+      "assumption": "番茄燉牛肉120g：份量及組成暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 519.552,
+        "difference_kcal": 10.947000000000003,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鱸魚食蔬",
+      "original_name": "鱸魚食蔬",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 351.0,
+        "protein_g": 25.0,
+        "fat_g": 15.0,
+        "carbohydrate_g": 14.0
+      },
+      "new": {
+        "calories_kcal": 465.805,
+        "protein_g": 31.529,
+        "fat_g": 14.092,
+        "carbohydrate_g": 54.0895
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 469.302,
+        "difference_kcal": 3.497000000000014,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鮭魚食蔬",
+      "original_name": "鮭魚食蔬",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 376.0,
+        "protein_g": 24.0,
+        "fat_g": 19.0,
+        "carbohydrate_g": 14.0
+      },
+      "new": {
+        "calories_kcal": 506.705,
+        "protein_g": 28.194,
+        "fat_g": 20.202,
+        "carbohydrate_g": 54.0895
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 510.952,
+        "difference_kcal": 4.247000000000014,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豆腐低碳",
+      "original_name": "豆腐低碳",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 315.0,
+        "protein_g": 29.0,
+        "fat_g": 20.0,
+        "carbohydrate_g": 23.0
+      },
+      "new": {
+        "calories_kcal": 350.21,
+        "protein_g": 28.27,
+        "fat_g": 12.366,
+        "carbohydrate_g": 35.418
+      },
+      "provisional": true,
+      "assumption": "本輪核准值仍以 provisional 部署資料追蹤，待店內實測確認",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 366.046,
+        "difference_kcal": 15.836000000000013,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鷹嘴豆低碳",
+      "original_name": "鷹嘴豆低碳",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 281.0,
+        "protein_g": 20.0,
+        "fat_g": 20.0,
+        "carbohydrate_g": 25.0
+      },
+      "new": {
+        "calories_kcal": 367.21,
+        "protein_g": 24.27,
+        "fat_g": 9.866,
+        "carbohydrate_g": 50.068
+      },
+      "provisional": true,
+      "assumption": "鷹嘴豆100g：份量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 386.14599999999996,
+        "difference_kcal": 18.93599999999998,
+        "reason": ""
+      }
+    },
+    {
+      "name": "雞肉低碳",
+      "original_name": "雞肉低碳",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 264.0,
+        "protein_g": 32.0,
+        "fat_g": 16.0,
+        "carbohydrate_g": 14.0
+      },
+      "new": {
+        "calories_kcal": 379.41,
+        "protein_g": 40.17,
+        "fat_g": 15.146,
+        "carbohydrate_g": 22.668
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 387.66600000000005,
+        "difference_kcal": 8.256000000000029,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豬肉低碳",
+      "original_name": "豬肉低碳",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 288.0,
+        "protein_g": 25.0,
+        "fat_g": 22.0,
+        "carbohydrate_g": 14.0
+      },
+      "new": {
+        "calories_kcal": 372.81,
+        "protein_g": 32.53,
+        "fat_g": 18.026,
+        "carbohydrate_g": 22.668
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 383.02600000000007,
+        "difference_kcal": 10.216000000000065,
+        "reason": ""
+      }
+    },
+    {
+      "name": "牛肉低碳",
+      "original_name": "牛肉低碳",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 290.0,
+        "protein_g": 26.0,
+        "fat_g": 21.0,
+        "carbohydrate_g": 15.0
+      },
+      "new": {
+        "calories_kcal": 367.41,
+        "protein_g": 30.97,
+        "fat_g": 18.566,
+        "carbohydrate_g": 22.668
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 381.64599999999996,
+        "difference_kcal": 14.235999999999933,
+        "reason": ""
+      }
+    },
+    {
+      "name": "番牛低碳",
+      "original_name": "番牛低碳",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 330.0,
+        "protein_g": 28.0,
+        "fat_g": 21.0,
+        "carbohydrate_g": 24.0
+      },
+      "new": {
+        "calories_kcal": 383.21,
+        "protein_g": 30.97,
+        "fat_g": 18.066,
+        "carbohydrate_g": 28.668
+      },
+      "provisional": true,
+      "assumption": "番茄燉牛肉120g：份量及組成暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 401.14599999999996,
+        "difference_kcal": 17.93599999999998,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鱸魚低碳",
+      "original_name": "鱸魚低碳",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 238.0,
+        "protein_g": 26.0,
+        "fat_g": 16.0,
+        "carbohydrate_g": 14.0
+      },
+      "new": {
+        "calories_kcal": 340.41,
+        "protein_g": 33.07,
+        "fat_g": 14.216,
+        "carbohydrate_g": 22.668
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 350.89599999999996,
+        "difference_kcal": 10.485999999999933,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鮭魚低碳",
+      "original_name": "鮭魚低碳",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 263.0,
+        "protein_g": 25.0,
+        "fat_g": 19.0,
+        "carbohydrate_g": 14.0
+      },
+      "new": {
+        "calories_kcal": 381.31,
+        "protein_g": 29.735,
+        "fat_g": 20.326,
+        "carbohydrate_g": 22.668
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 392.54600000000005,
+        "difference_kcal": 11.236000000000047,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豆腐沙拉",
+      "original_name": "豆腐沙拉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 392.0,
+        "protein_g": 25.0,
+        "fat_g": 16.0,
+        "carbohydrate_g": 19.0
+      },
+      "new": {
+        "calories_kcal": 463.225,
+        "protein_g": 22.804,
+        "fat_g": 18.269,
+        "carbohydrate_g": 56.1655
+      },
+      "provisional": true,
+      "assumption": "沙拉醬15g：份量及營養估算暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 480.299,
+        "difference_kcal": 17.073999999999955,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鷹嘴豆沙拉",
+      "original_name": "鷹嘴豆沙拉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 358.0,
+        "protein_g": 16.0,
+        "fat_g": 16.0,
+        "carbohydrate_g": 21.0
+      },
+      "new": {
+        "calories_kcal": 480.225,
+        "protein_g": 18.804,
+        "fat_g": 15.769,
+        "carbohydrate_g": 70.8155
+      },
+      "provisional": true,
+      "assumption": "鷹嘴豆100g：份量暫定；沙拉醬15g：份量及營養估算暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 500.399,
+        "difference_kcal": 20.173999999999978,
+        "reason": ""
+      }
+    },
+    {
+      "name": "雞肉沙拉",
+      "original_name": "雞肉沙拉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 341.0,
+        "protein_g": 28.0,
+        "fat_g": 12.0,
+        "carbohydrate_g": 10.0
+      },
+      "new": {
+        "calories_kcal": 492.425,
+        "protein_g": 34.704,
+        "fat_g": 21.049,
+        "carbohydrate_g": 43.4155
+      },
+      "provisional": true,
+      "assumption": "沙拉醬15g：份量及營養估算暫定；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 501.919,
+        "difference_kcal": 9.493999999999971,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豬肉沙拉",
+      "original_name": "豬肉沙拉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 365.0,
+        "protein_g": 21.0,
+        "fat_g": 18.0,
+        "carbohydrate_g": 10.0
+      },
+      "new": {
+        "calories_kcal": 485.825,
+        "protein_g": 27.064,
+        "fat_g": 23.929,
+        "carbohydrate_g": 43.4155
+      },
+      "provisional": true,
+      "assumption": "沙拉醬15g：份量及營養估算暫定；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 497.279,
+        "difference_kcal": 11.454000000000008,
+        "reason": ""
+      }
+    },
+    {
+      "name": "牛肉沙拉",
+      "original_name": "牛肉沙拉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 367.0,
+        "protein_g": 22.0,
+        "fat_g": 17.0,
+        "carbohydrate_g": 11.0
+      },
+      "new": {
+        "calories_kcal": 480.425,
+        "protein_g": 25.504,
+        "fat_g": 24.469,
+        "carbohydrate_g": 43.4155
+      },
+      "provisional": true,
+      "assumption": "沙拉醬15g：份量及營養估算暫定；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 495.899,
+        "difference_kcal": 15.47399999999999,
+        "reason": ""
+      }
+    },
+    {
+      "name": "番牛沙拉",
+      "original_name": "番牛沙拉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 407.0,
+        "protein_g": 24.0,
+        "fat_g": 17.0,
+        "carbohydrate_g": 20.0
+      },
+      "new": {
+        "calories_kcal": 496.225,
+        "protein_g": 25.504,
+        "fat_g": 23.969,
+        "carbohydrate_g": 49.4155
+      },
+      "provisional": true,
+      "assumption": "番茄燉牛肉120g：份量及組成暫定；沙拉醬15g：份量及營養估算暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 515.399,
+        "difference_kcal": 19.173999999999978,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鱸魚沙拉",
+      "original_name": "鱸魚沙拉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 315.0,
+        "protein_g": 22.0,
+        "fat_g": 12.0,
+        "carbohydrate_g": 10.0
+      },
+      "new": {
+        "calories_kcal": 453.425,
+        "protein_g": 27.604,
+        "fat_g": 20.119,
+        "carbohydrate_g": 43.4155
+      },
+      "provisional": true,
+      "assumption": "沙拉醬15g：份量及營養估算暫定；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 465.149,
+        "difference_kcal": 11.72399999999999,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鮭魚沙拉",
+      "original_name": "鮭魚沙拉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 340.0,
+        "protein_g": 21.0,
+        "fat_g": 15.0,
+        "carbohydrate_g": 10.0
+      },
+      "new": {
+        "calories_kcal": 494.325,
+        "protein_g": 24.269,
+        "fat_g": 26.229,
+        "carbohydrate_g": 43.4155
+      },
+      "provisional": true,
+      "assumption": "沙拉醬15g：份量及營養估算暫定；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 506.799,
+        "difference_kcal": 12.47399999999999,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豆腐番茄麵",
+      "original_name": "豆腐番茄麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 661.0,
+        "protein_g": 33.0,
+        "fat_g": 24.0,
+        "carbohydrate_g": 27.0
+      },
+      "new": {
+        "calories_kcal": 586.635,
+        "protein_g": 30.428,
+        "fat_g": 14.946,
+        "carbohydrate_g": 82.6525
+      },
+      "provisional": true,
+      "assumption": "番茄醬汁150g：配方用量維持、暫定；每100g營養值已依本次指定修正",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 586.836,
+        "difference_kcal": 0.20100000000002183,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鷹嘴豆番茄麵",
+      "original_name": "鷹嘴豆番茄麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 626.0,
+        "protein_g": 24.0,
+        "fat_g": 23.0,
+        "carbohydrate_g": 28.0
+      },
+      "new": {
+        "calories_kcal": 603.635,
+        "protein_g": 26.428,
+        "fat_g": 12.446,
+        "carbohydrate_g": 97.3025
+      },
+      "provisional": true,
+      "assumption": "鷹嘴豆100g：份量暫定；番茄醬汁150g：配方用量維持、暫定；每100g營養值已依本次指定修正",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 606.9359999999999,
+        "difference_kcal": 3.300999999999931,
+        "reason": ""
+      }
+    },
+    {
+      "name": "雞肉番茄麵",
+      "original_name": "雞肉番茄麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 609.0,
+        "protein_g": 36.0,
+        "fat_g": 19.0,
+        "carbohydrate_g": 18.0
+      },
+      "new": {
+        "calories_kcal": 615.835,
+        "protein_g": 42.328,
+        "fat_g": 17.726,
+        "carbohydrate_g": 69.9025
+      },
+      "provisional": true,
+      "assumption": "番茄醬汁150g：配方用量維持、暫定；每100g營養值已依本次指定修正；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 608.456,
+        "difference_kcal": 7.379000000000019,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豬肉番茄麵",
+      "original_name": "豬肉番茄麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 633.0,
+        "protein_g": 29.0,
+        "fat_g": 25.0,
+        "carbohydrate_g": 18.0
+      },
+      "new": {
+        "calories_kcal": 609.235,
+        "protein_g": 34.688,
+        "fat_g": 20.606,
+        "carbohydrate_g": 69.9025
+      },
+      "provisional": true,
+      "assumption": "番茄醬汁150g：配方用量維持、暫定；每100g營養值已依本次指定修正；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 603.816,
+        "difference_kcal": 5.418999999999983,
+        "reason": ""
+      }
+    },
+    {
+      "name": "牛肉番茄麵",
+      "original_name": "牛肉番茄麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 636.0,
+        "protein_g": 30.0,
+        "fat_g": 24.0,
+        "carbohydrate_g": 19.0
+      },
+      "new": {
+        "calories_kcal": 603.835,
+        "protein_g": 33.128,
+        "fat_g": 21.146,
+        "carbohydrate_g": 69.9025
+      },
+      "provisional": true,
+      "assumption": "番茄醬汁150g：配方用量維持、暫定；每100g營養值已依本次指定修正；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 602.436,
+        "difference_kcal": 1.399000000000001,
+        "reason": ""
+      }
+    },
+    {
+      "name": "番牛番茄麵",
+      "original_name": "番牛番茄麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 675.0,
+        "protein_g": 32.0,
+        "fat_g": 25.0,
+        "carbohydrate_g": 28.0
+      },
+      "new": {
+        "calories_kcal": 619.635,
+        "protein_g": 33.128,
+        "fat_g": 20.646,
+        "carbohydrate_g": 75.9025
+      },
+      "provisional": true,
+      "assumption": "番茄燉牛肉120g：份量及組成暫定；番茄醬汁150g：配方用量維持、暫定；每100g營養值已依本次指定修正",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 621.936,
+        "difference_kcal": 2.3010000000000446,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鱸魚番茄麵",
+      "original_name": "鱸魚番茄麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 584.0,
+        "protein_g": 29.0,
+        "fat_g": 19.0,
+        "carbohydrate_g": 18.0
+      },
+      "new": {
+        "calories_kcal": 576.835,
+        "protein_g": 35.228,
+        "fat_g": 16.796,
+        "carbohydrate_g": 69.9025
+      },
+      "provisional": true,
+      "assumption": "番茄醬汁150g：配方用量維持、暫定；每100g營養值已依本次指定修正；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 571.686,
+        "difference_kcal": 5.149000000000001,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鮭魚番茄麵",
+      "original_name": "鮭魚番茄麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 609.0,
+        "protein_g": 28.0,
+        "fat_g": 23.0,
+        "carbohydrate_g": 18.0
+      },
+      "new": {
+        "calories_kcal": 617.735,
+        "protein_g": 31.893,
+        "fat_g": 22.906,
+        "carbohydrate_g": 69.9025
+      },
+      "provisional": true,
+      "assumption": "番茄醬汁150g：配方用量維持、暫定；每100g營養值已依本次指定修正；煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 613.336,
+        "difference_kcal": 4.399000000000001,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豆腐青蔬麵",
+      "original_name": "豆腐青蔬麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 438.0,
+        "protein_g": 28.0,
+        "fat_g": 19.0,
+        "carbohydrate_g": 22.0
+      },
+      "new": {
+        "calories_kcal": 548.12,
+        "protein_g": 26.876,
+        "fat_g": 17.157,
+        "carbohydrate_g": 72.873
+      },
+      "provisional": true,
+      "assumption": "橄欖油10g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 553.4090000000001,
+        "difference_kcal": 5.289000000000101,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鷹嘴豆青蔬麵",
+      "original_name": "鷹嘴豆青蔬麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 404.0,
+        "protein_g": 19.0,
+        "fat_g": 19.0,
+        "carbohydrate_g": 24.0
+      },
+      "new": {
+        "calories_kcal": 565.12,
+        "protein_g": 22.876,
+        "fat_g": 14.657,
+        "carbohydrate_g": 87.523
+      },
+      "provisional": true,
+      "assumption": "鷹嘴豆100g：份量暫定；橄欖油10g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 573.509,
+        "difference_kcal": 8.38900000000001,
+        "reason": ""
+      }
+    },
+    {
+      "name": "雞肉青蔬麵",
+      "original_name": "雞肉青蔬麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 387.0,
+        "protein_g": 31.0,
+        "fat_g": 15.0,
+        "carbohydrate_g": 13.0
+      },
+      "new": {
+        "calories_kcal": 577.32,
+        "protein_g": 38.776,
+        "fat_g": 19.937,
+        "carbohydrate_g": 60.123
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定；橄欖油10g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 575.029,
+        "difference_kcal": 2.2910000000000537,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豬肉青蔬麵",
+      "original_name": "豬肉青蔬麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 411.0,
+        "protein_g": 24.0,
+        "fat_g": 21.0,
+        "carbohydrate_g": 13.0
+      },
+      "new": {
+        "calories_kcal": 570.72,
+        "protein_g": 31.136,
+        "fat_g": 22.817,
+        "carbohydrate_g": 60.123
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定；橄欖油10g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 570.389,
+        "difference_kcal": 0.3310000000000173,
+        "reason": ""
+      }
+    },
+    {
+      "name": "牛肉青蔬麵",
+      "original_name": "牛肉青蔬麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 413.0,
+        "protein_g": 25.0,
+        "fat_g": 20.0,
+        "carbohydrate_g": 15.0
+      },
+      "new": {
+        "calories_kcal": 565.32,
+        "protein_g": 29.576,
+        "fat_g": 23.357,
+        "carbohydrate_g": 60.123
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定；橄欖油10g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 569.009,
+        "difference_kcal": 3.6889999999999645,
+        "reason": ""
+      }
+    },
+    {
+      "name": "番牛青蔬麵",
+      "original_name": "番牛青蔬麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 453.0,
+        "protein_g": 27.0,
+        "fat_g": 20.0,
+        "carbohydrate_g": 23.0
+      },
+      "new": {
+        "calories_kcal": 581.12,
+        "protein_g": 29.576,
+        "fat_g": 22.857,
+        "carbohydrate_g": 66.123
+      },
+      "provisional": true,
+      "assumption": "番茄燉牛肉120g：份量及組成暫定；橄欖油10g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 588.509,
+        "difference_kcal": 7.38900000000001,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鱸魚青蔬麵",
+      "original_name": "鱸魚青蔬麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 361.0,
+        "protein_g": 25.0,
+        "fat_g": 15.0,
+        "carbohydrate_g": 13.0
+      },
+      "new": {
+        "calories_kcal": 538.32,
+        "protein_g": 31.676,
+        "fat_g": 19.007,
+        "carbohydrate_g": 60.123
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定；橄欖油10g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 538.259,
+        "difference_kcal": 0.06100000000003547,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鮭魚青蔬麵",
+      "original_name": "鮭魚青蔬麵",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 386.0,
+        "protein_g": 24.0,
+        "fat_g": 18.0,
+        "carbohydrate_g": 13.0
+      },
+      "new": {
+        "calories_kcal": 579.22,
+        "protein_g": 28.341,
+        "fat_g": 25.117,
+        "carbohydrate_g": 60.123
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定；橄欖油10g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 579.909,
+        "difference_kcal": 0.6889999999999645,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豆腐",
+      "original_name": "豆腐",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 137.0,
+        "protein_g": 15.0,
+        "fat_g": 6.0,
+        "carbohydrate_g": 9.0
+      },
+      "new": {
+        "calories_kcal": 58.8,
+        "protein_g": 5.16,
+        "fat_g": 2.04,
+        "carbohydrate_g": 5.1
+      },
+      "provisional": true,
+      "assumption": "本輪核准值仍以 provisional 部署資料追蹤，待店內實測確認",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 59.4,
+        "difference_kcal": 0.6000000000000014,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鷹嘴豆",
+      "original_name": "鷹嘴豆",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 102.0,
+        "protein_g": 6.0,
+        "fat_g": 5.0,
+        "carbohydrate_g": 10.0
+      },
+      "new": {
+        "calories_kcal": 164.0,
+        "protein_g": 8.9,
+        "fat_g": 2.6,
+        "carbohydrate_g": 27.4
+      },
+      "provisional": true,
+      "assumption": "鷹嘴豆100g：份量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 168.6,
+        "difference_kcal": 4.599999999999994,
+        "reason": ""
+      }
+    },
+    {
+      "name": "雞肉",
+      "original_name": "雞肉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 85.0,
+        "protein_g": 18.0,
+        "fat_g": 2.0,
+        "carbohydrate_g": 0.0
+      },
+      "new": {
+        "calories_kcal": 176.2,
+        "protein_g": 24.8,
+        "fat_g": 7.88,
+        "carbohydrate_g": 0.0
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 170.12,
+        "difference_kcal": 6.079999999999984,
+        "reason": ""
+      }
+    },
+    {
+      "name": "豬肉",
+      "original_name": "豬肉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 109.0,
+        "protein_g": 11.0,
+        "fat_g": 7.0,
+        "carbohydrate_g": 0.0
+      },
+      "new": {
+        "calories_kcal": 169.6,
+        "protein_g": 17.16,
+        "fat_g": 10.76,
+        "carbohydrate_g": 0.0
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 165.48000000000002,
+        "difference_kcal": 4.119999999999976,
+        "reason": ""
+      }
+    },
+    {
+      "name": "牛肉",
+      "original_name": "牛肉",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 111.0,
+        "protein_g": 12.0,
+        "fat_g": 7.0,
+        "carbohydrate_g": 1.0
+      },
+      "new": {
+        "calories_kcal": 164.2,
+        "protein_g": 15.6,
+        "fat_g": 11.3,
+        "carbohydrate_g": 0.0
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 164.1,
+        "difference_kcal": 0.09999999999999432,
+        "reason": ""
+      }
+    },
+    {
+      "name": "番牛",
+      "original_name": "番牛",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 151.0,
+        "protein_g": 14.0,
+        "fat_g": 7.0,
+        "carbohydrate_g": 10.0
+      },
+      "new": {
+        "calories_kcal": 180.0,
+        "protein_g": 15.6,
+        "fat_g": 10.8,
+        "carbohydrate_g": 6.0
+      },
+      "provisional": true,
+      "assumption": "番茄燉牛肉120g：份量及組成暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 183.6,
+        "difference_kcal": 3.5999999999999943,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鱸魚",
+      "original_name": "鱸魚",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 59.0,
+        "protein_g": 11.0,
+        "fat_g": 2.0,
+        "carbohydrate_g": 0.0
+      },
+      "new": {
+        "calories_kcal": 137.2,
+        "protein_g": 17.7,
+        "fat_g": 6.95,
+        "carbohydrate_g": 0.0
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 133.35,
+        "difference_kcal": 3.8499999999999943,
+        "reason": ""
+      }
+    },
+    {
+      "name": "鮭魚",
+      "original_name": "鮭魚",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 85.0,
+        "protein_g": 11.0,
+        "fat_g": 5.0,
+        "carbohydrate_g": 0.0
+      },
+      "new": {
+        "calories_kcal": 178.1,
+        "protein_g": 14.365,
+        "fat_g": 13.06,
+        "carbohydrate_g": 0.0
+      },
+      "provisional": true,
+      "assumption": "煎肉用油5g：用油量暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 175.0,
+        "difference_kcal": 3.0999999999999943,
+        "reason": ""
+      }
+    },
+    {
+      "name": "蔬菜盒",
+      "original_name": "蔬菜盒",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 46.0,
+        "protein_g": 2.0,
+        "fat_g": 2.1,
+        "carbohydrate_g": 3.9
+      },
+      "new": {
+        "calories_kcal": 45.02,
+        "protein_g": 3.827,
+        "fat_g": 0.478,
+        "carbohydrate_g": 7.883
+      },
+      "provisional": true,
+      "assumption": "本輪核准值仍以 provisional 部署資料追蹤，待店內實測確認",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 51.141999999999996,
+        "difference_kcal": 6.121999999999993,
+        "reason": ""
+      }
+    },
+    {
+      "name": "洋芋泥",
+      "original_name": "洋芋泥",
+      "mapping": "精確同名配對",
+      "old": {
+        "calories_kcal": 6.0,
+        "protein_g": 2.0,
+        "fat_g": 3.3,
+        "carbohydrate_g": 18.0
+      },
+      "new": {
+        "calories_kcal": 167.1,
+        "protein_g": 3.17,
+        "fat_g": 4.735,
+        "carbohydrate_g": 28.865
+      },
+      "provisional": true,
+      "assumption": "奶油5g：用量沿用原假設，暫定；鮮奶15g：用量沿用原假設，暫定",
+      "guard": {
+        "status": "consistent",
+        "requires_correction": false,
+        "macro_energy_kcal": 170.755,
+        "difference_kcal": 3.655000000000001,
+        "reason": ""
+      }
+    }
+  ],
+  "excluded": [
+    {
+      "name": "冷泡茶",
+      "reason": "使用者指定排除，不更新"
+    },
+    {
+      "name": "南瓜豆漿",
+      "reason": "使用者指定排除，不更新"
+    },
+    {
+      "name": "燕麥豆漿",
+      "reason": "使用者指定排除，不更新"
+    },
+    {
+      "name": "紅豆紫米豆漿",
+      "reason": "使用者指定排除，不更新"
+    }
+  ],
+  "missing_no_change": [
+    {
+      "name": "地瓜",
+      "reason": "comparison-v2 無新值，不更新"
+    },
+    {
+      "name": "糖心蛋",
+      "reason": "comparison-v2 無新值，不更新"
+    },
+    {
+      "name": "雞蛋豆腐",
+      "reason": "comparison-v2 無新值，不更新"
+    }
+  ],
+  "not_added": [
+    {
+      "name": "五穀飯（單點180g）",
+      "reason": "old=null；只建立記餐固定參考，不新增 menu.csv 菜單項目",
+      "reference": {
+        "basis": "每100g熟飯",
+        "nutrition": {
+          "calories_kcal": 162,
+          "protein_g": 4.2,
+          "fat_g": 0.9,
+          "carbohydrate_g": 35
+        },
+        "source": "使用者核准 FatSecret 通用值",
+        "provisional": true,
+        "disclaimer": "非TFDA官方值、非店內實測；不得套用生米、乾米或毫升"
+      }
+    }
+  ]
+}

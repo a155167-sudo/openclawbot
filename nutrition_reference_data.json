@@ -1762,6 +1762,25 @@
       "evidence_sha256": "c6b1974def2fa546d75e200e6726b42f453a6e1e4fff672526bfc89fe352c522"
     },
     {
+      "food_code": "USER-APPROVED-FATSECRET-MULTIGRAIN-RICE-20261009",
+      "name": "五穀飯（熟飯暫定參考）",
+      "aliases": ["五穀飯", "熟五穀飯", "五穀米飯"],
+      "state": "樣品狀態:熟; 熟飯每100g通用值；非生米、乾米或容量資料",
+      "basis_amount": 100,
+      "basis_unit": "g",
+      "nutrition": {"calories_kcal": 162, "protein_g": 4.2, "fat_g": 0.9, "carbohydrate_g": 35},
+      "publisher": "FatSecret 通用值（使用者核准）",
+      "source_type": "user_approved_generic_reference",
+      "source_original_basis": "熟飯每100g",
+      "reference_label": "一般參考值",
+      "source_label": "一般參考值",
+      "card_note": "一般參考值",
+      "source_note": "僅適用熟五穀飯的克重；不得套用生米、乾米、毫升或其他容量單位；不代表TFDA官方值或店內實測。",
+      "reference_scope": "熟五穀飯，g only",
+      "preparation_assumption": "熟飯",
+      "retrieved_at": "2026-10-09T01:00:00+08:00"
+    },
+    {
       "food_code": "MEXT-02007-2023",
       "name": "甘藷（去皮、蒸熟）",
       "aliases": ["地瓜", "甘藷", "蕃薯", "番薯", "蒸地瓜", "蒸甘藷", "清蒸地瓜", "去皮蒸地瓜", "蒸去皮地瓜", "熟地瓜"],

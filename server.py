@@ -13274,6 +13274,7 @@ def _text_meal_source_label(method, source=None):
     return {
         "user_provided_nutrition": "使用者提供",
         "owner_private_catalog": "私人食品庫",
+        "official_menu_catalog": "一日樂食餐點",
         "legacy_ai_log_nutrition": "一般估算",
     }.get(method, "一般估算")
 
@@ -16048,7 +16049,8 @@ def build_text_meal_estimate_flex(draft):
     method = str((estimate.get("provenance") or {}).get("method") or "")
     fixed = method in {
         "user_provided_nutrition", "legacy_ai_log_nutrition",
-        "official_reference", "owner_private_catalog", "customer_revision",
+        "official_reference", "owner_private_catalog", "official_menu_catalog",
+        "customer_revision",
     }
     edit_query = urlencode({"view": "meal-edit", "token": token})
     edit_uri = f"https://liff.line.me/{CUSTOMER_RESCHEDULE_LIFF_ID}?{edit_query}"
@@ -16299,12 +16301,14 @@ def apply_text_meal_estimate_action(*, user_id, token, expected_version, action,
         estimate_method = str((estimate.get("provenance") or {}).get("method") or "")
         fixed_values = estimate_method in {
             "user_provided_nutrition", "legacy_ai_log_nutrition",
-            "official_reference", "owner_private_catalog", "customer_revision",
+            "official_reference", "owner_private_catalog", "official_menu_catalog",
+            "customer_revision",
         }
         source_type = {
             "user_provided_nutrition": "user_provided_nutrition",
             "official_reference": "official_reference",
             "owner_private_catalog": "user_private_food",
+            "official_menu_catalog": "official_menu",
         }.get(estimate_method, "ai_text_estimate")
         source_label = _confirmed_text_meal_source_label(estimate)
         result = create_daily_food_log(
@@ -16490,6 +16494,7 @@ def _natural_food_candidates(conn, user_id, food_name):
                   created_at,updated_at
            FROM food_catalog
            WHERE (owner_user_id=? OR visibility='public')
+             AND COALESCE(visibility,'')!='ledger_internal'
              AND lower(replace(replace(replace(replace(
                    product_name, ' ', ''), char(9), ''), char(10), ''), char(13), ''))=lower(?)
            ORDER BY CASE WHEN owner_user_id=? THEN 0 ELSE 1 END, updated_at DESC""",
@@ -18266,6 +18271,60 @@ def build_food_servings_picker(food_id, product_name="", meal_slot=""):
     )
 
 
+def _create_catalog_food_draft(*, user_id, message_id, item, meal_slot,
+                               servings=None, amount=None, amount_unit=""):
+    """Turn an exact catalog item into a zero-provider confirmation draft."""
+    if servings is None:
+        servings = _natural_food_servings(item, amount, amount_unit)
+    servings = _validate_natural_food_amount(servings, "serving")
+    per_serving = item.get("per_serving") or {}
+    nutrition = {
+        field: (None if per_serving.get(field) is None else
+                _ledger_number(per_serving.get(field), allow_none=False) * servings)
+        for field in ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g")
+    }
+    is_private = item.get("owner_user_id") == user_id
+    method = "owner_private_catalog" if is_private else "official_menu_catalog"
+    if amount is None:
+        amount, amount_unit = servings, "serving"
+    return create_fixed_text_meal_draft(
+        user_id=user_id, message_id=message_id,
+        request={
+            "food_name": item["product_name"], "amount": amount,
+            "unit": amount_unit, "meal_slot": meal_slot,
+            "portion_assumption": f"{amount:g}{_natural_unit_label(amount_unit)}",
+            "source": {
+                "type": method, "food_id": item["food_id"],
+                **({"card_note": "一日樂食餐點"} if not is_private else {}),
+            },
+            **nutrition,
+        },
+        method=method,
+    )
+
+
+def _is_official_menu_item(item):
+    return (item.get("owner_user_id") == "system"
+            and (item.get("source_type") == "official_menu"
+                 or (item.get("source_type") == "label"
+                     and str(item.get("food_id") or "").startswith("menu_"))))
+
+
+def _catalog_food_item_by_id(user_id, food_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT product_name FROM food_catalog WHERE food_id=? AND (owner_user_id=? OR visibility='public')",
+            (food_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise PermissionError("找不到可使用的食品資料")
+        candidates, _ = _natural_food_candidates(conn, user_id, row[0])
+    item = next((candidate for candidate in candidates if candidate["food_id"] == food_id), None)
+    if item is None:
+        raise PermissionError("找不到可使用的食品資料")
+    return item
+
+
 def _quick_log_catalog_card_once(
     *, user_id, food_id, meal_slot, event_ref, servings=None,
     amount=None, amount_unit="", display_quantity="",
@@ -18415,27 +18474,10 @@ def build_natural_food_log_reply(*, user_id, message_id, event, request):
                 return build_food_servings_picker(
                     item["food_id"], item["product_name"], meal_slot=slot
                 )
-            if item.get("owner_user_id") == user_id:
-                servings = _natural_food_servings(
-                    item, request["amount"], request["unit"]
-                )
-                per_serving = item.get("per_serving") or {}
-                nutrition = {
-                    field: (None if per_serving.get(field) is None
-                            else _ledger_number(per_serving.get(field), allow_none=False) * servings)
-                    for field in ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g")
-                }
-                draft = create_fixed_text_meal_draft(
-                    user_id=user_id, message_id=message_id,
-                    request={
-                        "food_name": item["product_name"],
-                        "amount": request["amount"], "unit": request["unit"],
-                        "meal_slot": slot,
-                        "portion_assumption": f"{request['amount']:g}{_natural_unit_label(request['unit'])}；私人食品庫",
-                        "source": {"type": "owner_private_catalog", "food_id": item["food_id"]},
-                        **nutrition,
-                    },
-                    method="owner_private_catalog",
+            if item.get("owner_user_id") == user_id or _is_official_menu_item(item):
+                draft = _create_catalog_food_draft(
+                    user_id=user_id, message_id=message_id, item=item, meal_slot=slot,
+                    amount=request["amount"], amount_unit=request["unit"],
                 )
                 return build_text_meal_estimate_flex(draft)
             quantity = f"{request['amount']:g}{_natural_unit_label(request['unit'])}"
@@ -19193,16 +19235,23 @@ def handle_meal_photo_postback(event):
                 servings = _validate_natural_food_amount(
                     float(serving_choice), "serving"
                 )
-                event_ref = str(
-                    getattr(event, "webhook_event_id", "") or ""
-                ).strip()
-                if not event_ref:
-                    event_ref = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
-                reply = _quick_log_catalog_card_once(
-                    user_id=uid, food_id=food_id, servings=servings,
-                    meal_slot=slot, event_ref=event_ref,
-                    display_quantity=f"{servings:g}份",
-                )
+                item = _catalog_food_item_by_id(uid, food_id)
+                if _is_official_menu_item(item):
+                    message_id = str(getattr(event, "webhook_event_id", "") or "") or f"{uid}:{data}"
+                    draft = _create_catalog_food_draft(
+                        user_id=uid, message_id=message_id, item=item,
+                        meal_slot=slot, servings=servings,
+                    )
+                    reply = build_text_meal_estimate_flex(draft)
+                else:
+                    event_ref = str(getattr(event, "webhook_event_id", "") or "").strip()
+                    if not event_ref:
+                        event_ref = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
+                    reply = _quick_log_catalog_card_once(
+                        user_id=uid, food_id=food_id, servings=servings,
+                        meal_slot=slot, event_ref=event_ref,
+                        display_quantity=f"{servings:g}份",
+                    )
         except (ValueError, PermissionError) as exc:
             reply = TextSendMessage(text=f"⚠️ 尚未記錄：{exc}")
         line_bot_api.reply_message(event.reply_token, reply)
@@ -19219,14 +19268,23 @@ def handle_meal_photo_postback(event):
         unit = natural_choice.group(3)
         slot = natural_choice.group(4)
         try:
-            event_ref = str(getattr(event, "webhook_event_id", "") or "").strip()
-            if not event_ref:
-                event_ref = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
-            reply = _quick_log_catalog_card_once(
-                user_id=uid, food_id=food_id, amount=amount, amount_unit=unit,
-                meal_slot=slot, event_ref=event_ref,
-                display_quantity=f"{amount:g}{_natural_unit_label(unit)}",
-            )
+            item = _catalog_food_item_by_id(uid, food_id)
+            if _is_official_menu_item(item):
+                message_id = str(getattr(event, "webhook_event_id", "") or "") or f"{uid}:{data}"
+                draft = _create_catalog_food_draft(
+                    user_id=uid, message_id=message_id, item=item, meal_slot=slot,
+                    amount=amount, amount_unit=unit,
+                )
+                reply = build_text_meal_estimate_flex(draft)
+            else:
+                event_ref = str(getattr(event, "webhook_event_id", "") or "").strip()
+                if not event_ref:
+                    event_ref = f"{uid}|{getattr(event, 'timestamp', '')}|{data}"
+                reply = _quick_log_catalog_card_once(
+                    user_id=uid, food_id=food_id, amount=amount, amount_unit=unit,
+                    meal_slot=slot, event_ref=event_ref,
+                    display_quantity=f"{amount:g}{_natural_unit_label(unit)}",
+                )
         except (ValueError, PermissionError) as exc:
             reply = TextSendMessage(text=f"⚠️ 尚未記錄：{exc}")
         line_bot_api.reply_message(event.reply_token, reply)

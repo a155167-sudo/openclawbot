@@ -385,6 +385,8 @@ def is_fixed_core_request(request):
     name = _key(request.get("food_name", ""))
     if any(term in name for term in ("無糖豆漿", "無加糖豆漿", "豆漿(無糖)")):
         return True
+    if re.fullmatch(r"(?:熟|煮熟)?(?:五穀飯|五穀米飯)", name):
+        return True
     if re.fullmatch(r"(?:熟|水煮|煮熟)?(?:白飯|白米飯)", name):
         return True
     modifiers = r"(?:生|熟|清蒸|蒸熟|蒸|烤|水煮|帶皮|去皮|黃肉|紅肉|紫肉)*"
