@@ -5807,7 +5807,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                 sheet = gc.open_by_url(SHEET_URL)
                 
                 # (1) 寫入歷史總表
-                main_sheet = sheet.sheet1
+                main_sheet = _order_history_worksheet(sheet)
                 now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
                 main_sheet.append_row([now_str, name, goal, int(tdee), int(protein), restrictions, total_price, ",".join(active_days_list), schedule_text])
                 
@@ -11373,6 +11373,24 @@ class _SubscriptionDispatchSheetAdapter:
         return self.read_schedule()
 
 
+ORDER_HISTORY_WORKSHEET_TITLE = "raw_logs"
+
+
+def _order_history_worksheet(spreadsheet):
+    """Return the order-history tab by name.
+
+    Never fall back to the first tab: when the first tab is not raw_logs
+    (e.g. the staging workbook starts with Master_API_View), appending there
+    shifts the main schedule table. Fail before any write instead.
+    """
+    try:
+        return spreadsheet.worksheet(ORDER_HISTORY_WORKSHEET_TITLE)
+    except gspread.exceptions.WorksheetNotFound as exc:
+        raise RuntimeError(
+            f"找不到歷史紀錄分頁「{ORDER_HISTORY_WORKSHEET_TITLE}」，已停止寫入 Google Sheet"
+        ) from exc
+
+
 def _upsert_master_api_rows(api_sheet, user_id: str, rows):
     """Incrementally converge Master_API_View by (Date, User_ID)."""
     _require_controlled_workbook_writer("subscription_formalization")
@@ -11508,7 +11526,7 @@ def _formalize_subscription_snapshot_unfenced(order_id: int, snapshot: dict):
         try:
             print(f"📊 [PAYMENT_GATE] 正式寫入 Google Sheet，訂單 #{order_id}，共 {len(master_api_rows)} 筆資料")
             sheet = gc.open_by_url(SHEET_URL)
-            main_sheet = sheet.sheet1
+            main_sheet = _order_history_worksheet(sheet)
             now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
             active_fence = current_server_workbook_write_fence()
             if active_fence is not None:

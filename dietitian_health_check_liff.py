@@ -682,7 +682,7 @@ function renderQueue(){{
   queueCountNode.textContent=`目前顯示 ${{items.length}} 筆（此頁載入 ${{listedCases.length}} 筆，上限 25）`;
 }}
 function addProfile(label,value){{const wrap=node('div');wrap.append(node('dt',label),node('dd',provided(value)));document.getElementById('profile').append(wrap);}}
-function displayDate(value){{return typeof value==='string'&&/^\d{{4}}-\d{{2}}-\d{{2}}$/.test(value)?value.replaceAll('-','/'):null;}}
+function displayDate(value){{return typeof value==='string'&&/^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(value)?value.replaceAll('-','/'):null;}}
 function caseCode(item){{return item&&typeof item.case_code==='string'&&/^HC-[0-9A-F]{{6}}$/.test(item.case_code)?item.case_code:'案件代碼待同步';}}
 function recordRange(item){{
   const start=displayDate(item&&item.collected_date_start),end=displayDate(item&&item.collected_date_end);
