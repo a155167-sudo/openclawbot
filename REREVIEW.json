@@ -1,0 +1,123 @@
+{
+  "report_schema": "fixed-candidate-narrow-rereview-v1",
+  "reviewed_at_context_date": "2026-10-05",
+  "reviewer": "Hermes direct independent subagent; not Jev/AG",
+  "scope": {
+    "workspace": "/home/win-xi/nanjing-text-estimation-dependency-recovery",
+    "purpose": "固定修正版本小範圍複審原 IR-001 至 IR-004",
+    "original_review_retained": true,
+    "product_source_read_only": true,
+    "only_written": "REREVIEW.json",
+    "excluded": [
+      "no implementation or source/test edits",
+      "no broad regression",
+      "no live parent server import",
+      "no secret, provider, LINE, Sheet, printer, or external network access",
+      "no actual parent SDK/router end-to-end execution"
+    ]
+  },
+  "fixed_hashes": {
+    "text_meal_dependency_recovery.py": {
+      "expected": "69ed08c520d68c60f60b51f8e6d3857dfd64095688e4c44085e12a358af511e2",
+      "observed": "69ed08c520d68c60f60b51f8e6d3857dfd64095688e4c44085e12a358af511e2",
+      "match": true
+    },
+    "tests/test_text_meal_dependency_recovery.py": {
+      "expected": "658dc582d592e40c9f99f0891ef9aa6eacdb7cbcf29db0beb88f3d8a7d83e15f",
+      "observed": "658dc582d592e40c9f99f0891ef9aa6eacdb7cbcf29db0beb88f3d8a7d83e15f",
+      "match": true
+    },
+    "tests/test_independent_review_regressions.py": {
+      "expected": "61c5260b0b140ae6b595f0f466888a151166113265c07a087252cf5d483a70bc",
+      "observed": "61c5260b0b140ae6b595f0f466888a151166113265c07a087252cf5d483a70bc",
+      "match": true
+    },
+    "/mnt/c/Users/WIN-XI/nanjing-isolated/e2-openclaw-ntfs/shared_ai_quota.py": {
+      "expected": "75988112e014d5a7ce17435b8de7956e23990322a530e9928329b78c2ecf856e",
+      "observed": "75988112e014d5a7ce17435b8de7956e23990322a530e9928329b78c2ecf856e",
+      "match": true
+    }
+  },
+  "test_run": {
+    "command": "env -i PATH=$PATH HOME=/home/win-xi PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TEXT_MEAL_PARENT_ROOT=/mnt/c/Users/WIN-XI/nanjing-isolated/e2-openclaw-ntfs python3 -m pytest -q --tb=short -p no:cacheprovider tests/test_text_meal_dependency_recovery.py tests/test_independent_review_regressions.py",
+    "exit_code": 0,
+    "stdout": "...............                                                          [100%]\n15 passed in 0.08s",
+    "interpretation": "15 個固定候選版窄測試通過，證明 portable module 與 shared refund 的所列回歸；不等同 parent claim/reclaim、真實 schema、SDK/router 或 release 整合通過。"
+  },
+  "ir_rulings": [
+    {
+      "id": "IR-001",
+      "original_severity": "HIGH",
+      "scoped_ruling": "MODULE_FIX_VERIFIED_IN_NARROW_HARNESS",
+      "release_ruling": "REMAINS_INTEGRATION_BLOCKED",
+      "evidence": [
+        "text_meal_dependency_recovery.py:438-445 requires an actual charged ledger receipt matching parent attempt, user, and parent token.",
+        "text_meal_dependency_recovery.py:657-677 repeats parent validation in the provider-start transaction before the SDK call.",
+        "test_ir001_uncharged_parent_must_not_authorize_provider passes; an uncharged synthetic parent causes no provider call and no debit."
+      ],
+      "remaining": "Actual parent batch claim creation must produce and preserve this authoritative receipt and ownership contract through the real schema and entry path; that integration was not implemented or exercised."
+    },
+    {
+      "id": "IR-002",
+      "original_severity": "HIGH",
+      "scoped_ruling": "STANDALONE_MODULE_FIX_VERIFIED",
+      "release_ruling": "BATCH_PARENT_RECOVERY_NOT_VERIFIED",
+      "evidence": [
+        "text_meal_dependency_recovery.py:552-584 recognizes only standalone claimed/no-start attempts, performs owned refund inside the same BEGIN IMMEDIATE transaction, changes the draft owner, and records pre_provider_refunded.",
+        "The replacement claim is committed before leaving that transaction; an old process later cannot pass the live draft owner check at lines 669-676, and its provider-start update is rolled back, so it cannot reach the SDK call.",
+        "test_ir002_expired_prestart_claim_is_safely_recoverable passes while provider-started/unknown paths remain non-refundable."
+      ],
+      "remaining": "This safe recovery explicitly excludes batch children. Parent batch pre-start recovery, old-owner fencing, and concurrent parent-child reclaim still require real end-to-end integration proof."
+    },
+    {
+      "id": "IR-003",
+      "original_severity": "HIGH",
+      "scoped_ruling": "SHARED_REFUND_GUARD_VERIFIED_ONLY",
+      "release_ruling": "OPEN_BLOCKER",
+      "evidence": [
+        "shared_ai_quota.py:96-124 checks text_meal_provider_attempts by user_id and quota_attempt_id before any refund mutation and refuses provider_started, unknown, completed, or non-empty provider_started_at.",
+        "Child provider-start is committed before the SDK call, so a later refund transaction sharing this database can observe the marker.",
+        "test_ir003_actual_shared_refund_cannot_refund_parent_after_child_start passes against the actual shared refund primitive."
+      ],
+      "remaining": "The actual parent batch claim/fail/reclaim path still does not honor the new marker and was not integrated or tested. It could reclaim or allocate another debit after an unknown provider start. Marker visibility/atomicity is proven only for the co-located reduced schema transaction, not the actual parent lifecycle. IR-003 therefore remains BLOCKING."
+    },
+    {
+      "id": "IR-004",
+      "original_severity": "MEDIUM",
+      "scoped_ruling": "MODULE_FIX_VERIFIED_IN_NARROW_HARNESS",
+      "release_ruling": "REAL_ENTRY_INTEGRATION_UNPROVEN",
+      "evidence": [
+        "text_meal_dependency_recovery.py:516-547 identifies terminal replay before parent validation and removes only the live processing/lease requirement for that replay.",
+        "Replay still requires unchanged request, exact user and batch row, child scope/message identity, charged parent receipt, and exact child quota_owner receipt.",
+        "test_ir004_completed_child_replays_after_parent_completion passes without a second provider call or debit."
+      ],
+      "remaining": "Actual parent schema initializer, lifecycle values, migration compatibility, SDK/router entry wiring, and precise version preservation remain untested."
+    }
+  ],
+  "boundary_assessment": {
+    "verified": [
+      "real charged parent receipt is required by the portable child module",
+      "standalone pre-provider owned refund and same-transaction re-claim are fenced",
+      "shared refund refuses a parent owner after a durable child provider-start marker",
+      "terminal replay does not require a live parent lease and remains ownership-scoped"
+    ],
+    "not_verified": [
+      "actual parent batch claim/reclaim honoring the child provider-start marker",
+      "actual parent batch pre-start recovery and concurrent old-owner fencing",
+      "atomic marker visibility across any production connection/database/schema boundary",
+      "actual host schema and migration compatibility",
+      "actual provider SDK adapter, router, and parent lifecycle wiring",
+      "broad regression or release acceptance"
+    ]
+  },
+  "conclusion": {
+    "original_independent_review": "FAIL_RETAINED_UNCHANGED",
+    "fixed_candidate_narrow_tests": "PASS",
+    "module_shared_refund_repairs": "SCOPED_VERIFIED",
+    "parent_claim_reclaim_integration": "NOT_INTEGRATED",
+    "ir003": "OPEN_BLOCKER",
+    "integration_safety": "BLOCKED",
+    "release_ready": false,
+    "reason": "15/15 only closes the stated module/shared-refund regressions in the reduced harness. The real parent batch claim/reclaim lifecycle, batch pre-start recovery, schema and SDK/router wiring remain absent; the scoped PASS must not replace the original FAIL or be reported as full closure."
+  }
+}

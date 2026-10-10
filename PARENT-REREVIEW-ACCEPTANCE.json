@@ -1,0 +1,31 @@
+{
+  "delegation":"deleg_947fe5e0",
+  "executor":"Hermes direct independent reviewer; not Jev/AG",
+  "worker_status":"completed",
+  "duration_seconds":108.45,
+  "api_calls":8,
+  "report_parent_read_and_sha_verified":true,
+  "report_sha256":"4e5cd28caa516428922fb4a5a5a020a84c28fcec83e175a9dec096fecc918651",
+  "four_fixed_artifact_hashes_parent_verified_match":true,
+  "accepted_evidence":"15 passed in 0.08s; narrow module/shared-refund proof only",
+  "accepted_rulings":{
+    "IR001":"module charged-parent receipt guard verified; actual parent creation/entry not verified",
+    "IR002":"standalone pre-start owned refund/re-claim and old-owner fence verified; batch recovery excluded",
+    "IR003":"shared refund marker guard verified; actual parent claim/fail/reclaim OPEN BLOCKER",
+    "IR004":"terminal replay scope verified; actual schema/router not verified"
+  },
+  "parent_followup_read_only_actual_server_findings":{
+    "file":"/mnt/c/Users/WIN-XI/nanjing-isolated/e2-openclaw-ntfs/server.py",
+    "claim_unit":"_claim_photo_ingredient_batch_quota",
+    "claim_gap":"lines 15169-15177 call refund without checking its result, then install a new owner; lines 15188-15191 can debit again. No child provider-start check precedes this reclaim.",
+    "fail_unit":"_fail_photo_ingredient_batch_children",
+    "fail_gap":"lines 15266-15277 retire a processing parent to failed before attempting refund; shared refund can refuse, but parent lifecycle still needs an explicit unknown/held policy and reclaim guard.",
+    "static_binding_gaps":["TEXT_MEAL_ESTIMATE_LEASE_SECONDS","_photo_ingredient_child_scope"],
+    "binding_gap_evidence":"AST analysis of actual current server top-level definitions, imports and assignments, excluding function locals/builtins; these globals are statically unbound in claim. Not a runtime SDK failure reproduction."
+  },
+  "product_changes_this_followup":false,
+  "integration_status":"NOT_INTEGRATED",
+  "release_ready":false,
+  "original_FAIL_retained":true,
+  "next_acceptance_scope":"Cohesive batch dependency binding and actual claim/fail/reclaim marker policy, with real isolated owner schema/SDK and exact preservation guard; do not present portable helper evidence as that acceptance"
+}

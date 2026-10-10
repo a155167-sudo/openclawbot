@@ -1,0 +1,141 @@
+{
+  "report_schema": "independent-fixed-hash-review-v1",
+  "reviewed_at_context_date": "2026-10-05",
+  "reviewer": "Hermes direct independent subagent; not Jev/AG",
+  "scope": {
+    "workspace": "/home/win-xi/nanjing-text-estimation-dependency-recovery",
+    "parent_root_read_only": "/mnt/c/Users/WIN-XI/nanjing-isolated/e2-openclaw-ntfs",
+    "read": [
+      "PARENT-RECOVERY-VERIFICATION.json",
+      "text_meal_dependency_recovery.py (all 667 lines)",
+      "tests/test_text_meal_dependency_recovery.py (all 321 lines)",
+      "tests/conftest.py (all 64 lines)",
+      "targeted parent symbol search only"
+    ],
+    "not_done": [
+      "no product/source edits",
+      "no integration implementation",
+      "no broad regression",
+      "no live root server import",
+      "no provider, Sheet, LINE, printer, secret, or external network access",
+      "no full 1MB source read"
+    ]
+  },
+  "fixed_hashes": {
+    "text_meal_dependency_recovery.py": {
+      "expected": "01820062e07725385fa6c3fc5efb0ba01a126bad0513f7d4c383eec0010b85da",
+      "observed": "01820062e07725385fa6c3fc5efb0ba01a126bad0513f7d4c383eec0010b85da",
+      "match": true
+    },
+    "tests/test_text_meal_dependency_recovery.py": {
+      "expected": "e8bc2b5222ea4013e26ee104d05d36747d4342b011e48ad203bb526db8b4d1cc",
+      "observed": "e8bc2b5222ea4013e26ee104d05d36747d4342b011e48ad203bb526db8b4d1cc",
+      "match": true
+    },
+    "tests/conftest.py": {
+      "expected": "da1da3ebf0e8bfd27475ba932f469715e1de7e22bf55a9582a5956f34325afdc",
+      "observed": "da1da3ebf0e8bfd27475ba932f469715e1de7e22bf55a9582a5956f34325afdc",
+      "match": true
+    }
+  },
+  "raw_test": {
+    "command": "env -i PATH=$PATH HOME=/home/win-xi PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TEXT_MEAL_PARENT_ROOT=/mnt/c/Users/WIN-XI/nanjing-isolated/e2-openclaw-ntfs timeout 60s python3 -m pytest -q --tb=short -p no:cacheprovider tests/test_text_meal_dependency_recovery.py",
+    "exit_code": 0,
+    "stdout": "...........                                                              [100%]\n11 passed in 0.06s",
+    "interpretation": "The narrow standalone suite passes against the actual shared_ai_quota charge primitive. It is not evidence of actual parent SDK/router/schema/batch refund integration."
+  },
+  "positive_controls": [
+    {
+      "area": "single-request provider-start fencing",
+      "evidence": "text_meal_dependency_recovery.py:601-619 commits state='provider_started' before the SDK call at 621-622; exceptions after that become unknown at 623-630; redelivery of provider_unknown is blocked at 523-525."
+    },
+    {
+      "area": "atomic standalone charge and claim",
+      "evidence": "The non-batch charge at 575-579 and provider-attempt insert at 589-594 share the same BEGIN IMMEDIATE transaction opened at 501-503."
+    }
+  ],
+  "findings": [
+    {
+      "id": "IR-001",
+      "severity": "HIGH",
+      "classification": "core module defect: shared-cost/batch parent ownership",
+      "title": "Batch child trusts a parent-row label without proving an actual charged parent attempt",
+      "exact_file_lines": [
+        "text_meal_dependency_recovery.py:396-435",
+        "text_meal_dependency_recovery.py:571-594",
+        "tests/test_text_meal_dependency_recovery.py:255-293"
+      ],
+      "evidence": "Validation checks processing status, owner, lease, scope, and charge_attempt_id equality, but does not verify a charged shared-quota ledger entry or another authoritative parent charge receipt. The batch path then sets allowed=True and skips charge. The existing test deliberately seeds only photo_ingredient_batch_quota_ops; it asserts quota remains 3 and even that no text_meal_estimate_quota_ledger table exists, while the provider is called successfully.",
+      "minimal_repro_prediction": "Use the existing runtime with quota=3; insert exactly the synthetic processing batch row used by test_photo_child_uses_parent_charge_attempt_and_does_not_spend_again, without calling the parent shared-charge primitive; invoke create_text_meal_estimate_draft with its batch key/owner. Predicted: provider call succeeds, draft is pending, quota remains 3, and no authoritative charged ledger row exists.",
+      "required_contract": "Bind and verify an authoritative parent charge/claim receipt transactionally; equality of two caller-controlled row fields is not proof of ownership/payment."
+    },
+    {
+      "id": "IR-002",
+      "severity": "HIGH",
+      "classification": "core module defect: lease/unknown/shared-cost recovery",
+      "title": "Expired pre-provider claimed attempts are irreversibly treated as provider-started unknown",
+      "exact_file_lines": [
+        "text_meal_dependency_recovery.py:529-547",
+        "text_meal_dependency_recovery.py:596-599"
+      ],
+      "evidence": "On any expired estimating lease, recovery changes the draft to provider_unknown and changes both attempt states claimed and provider_started to unknown. It never reads the prior state or provider_started_at and HostDependencies has no refund primitive. Thus the durable provider-start marker is not honored for the safe pre-start crash case.",
+      "minimal_repro_prediction": "Seed an expired estimating draft, a real charged shared-quota attempt, and text_meal_provider_attempts.state='claimed' with empty provider_started_at; do not call the provider. Redeliver the same message. Predicted: TextMealProviderError result-unknown, attempt becomes unknown, no provider call, quota remains debited, and every later redelivery is permanently blocked.",
+      "required_contract": "Under the same owned transaction, inspect the attempt state: claimed with no provider-start marker may use the real owned refund primitive and become retryable; provider_started must remain unknown and must never refund or blind-retry."
+    },
+    {
+      "id": "IR-003",
+      "severity": "HIGH",
+      "classification": "integration blocker: batch parent fail/refund race",
+      "title": "Child provider-start is not durably propagated to the batch parent charge owner",
+      "exact_file_lines": [
+        "text_meal_dependency_recovery.py:571-594",
+        "text_meal_dependency_recovery.py:601-622"
+      ],
+      "evidence": "A child records provider_started only in text_meal_provider_attempts under its fresh child attempt_id; quota_attempt_id merely contains the parent owner string. No update or callback marks photo_ingredient_batch_quota_ops or the authoritative parent claim as provider-started. There is also a transaction gap after child claim commit and before child provider-start commit. Targeted parent search confirms a real owned refund primitive exists at shared_ai_quota.py:80-81 and 96-107, but this module does not bind it or a parent batch transition API.",
+      "minimal_repro_prediction": "Allow a child under a processing parent; after the child transaction at line 595 commits, expire/fail the parent before or just after the child's provider-start transaction, then execute parent refund/reclaim logic. Predicted risk: parent code cannot learn from its own row that a child provider may have started, so it can refund/retry the shared charge while the first provider result is in flight. Exact outcome is BLOCKED pending the unimplemented parent claim/fail/refund binding.",
+      "required_contract": "Parent claim/fail/refund must share a durable provider-start marker with every child and fail closed: once any child can have crossed provider start, parent failure must not refund or retry. Claim validation and start marking need an atomic/version-fenced parent ownership protocol."
+    },
+    {
+      "id": "IR-004",
+      "severity": "MEDIUM",
+      "classification": "core module defect: redelivery/batch lifecycle",
+      "title": "Completed batch child cannot be replayed after the parent leaves processing",
+      "exact_file_lines": [
+        "text_meal_dependency_recovery.py:504-519",
+        "text_meal_dependency_recovery.py:520-528"
+      ],
+      "evidence": "Batch scope/lease validation executes before lookup of an existing child draft. Therefore replay depends on the parent still being processing with an unexpired lease, even when this exact user/message already has a completed pending draft and needs no provider or charge.",
+      "minimal_repro_prediction": "Run the successful photo-child test once; update its parent batch status to completed (or expire its lease); call the same child message again. Predicted: ValueError batch scope invalid instead of returning the existing draft; provider and quota remain unchanged.",
+      "required_contract": "Define an authenticated idempotent replay path for an already-owned exact child before requiring a live parent processing lease, while still rejecting changed user/message/request/batch ownership."
+    }
+  ],
+  "coverage_gaps": [
+    "No test covers expired state='claimed' before provider start and the corresponding owned refund/retry behavior.",
+    "No test proves a real parent shared charge exists for a photo batch; the current positive test proves the opposite.",
+    "No test drives parent claim/fail/refund against a child provider-start marker.",
+    "No test replays a completed child after parent completion or lease expiry.",
+    "Reduced test schema is not the actual parent daily-food initializer.",
+    "Provider SDK shape is fake; actual SDK/router/LINE entry paths were not exercised."
+  ],
+  "integration_bindings_missing": [
+    "authoritative parent batch claim/ownership adapter",
+    "owned quota refund primitive for definitely pre-provider attempts",
+    "atomic parent-visible provider-start transition or query",
+    "parent batch fail/reclaim policy that refuses refund/retry after any possible provider start",
+    "actual host schema initializer and migration compatibility proof",
+    "actual isolated provider SDK adapter and router entry wiring"
+  ],
+  "conclusion": {
+    "core_module_quality": "FAIL",
+    "integration_status": "NOT_INTEGRATED",
+    "integration_safety": "BLOCKED",
+    "release_ready": false,
+    "reason": "The single-request post-start unknown fence is conservative, but pre-start lease recovery ignores that marker, batch children can consume provider work without proof of a real parent charge, parent refund/retry cannot observe child provider start, and batch redelivery breaks after parent lifecycle transition. Passing 11 narrow tests does not close these defects."
+  },
+  "limitations": [
+    "Review is fixed to the three recorded hashes and the stated line counts.",
+    "Only targeted parent symbol search was used; no complete server.py review and no claim that parent behavior was fully characterized.",
+    "IR-003 is an integration blocker/risk prediction, not a demonstrated parent E2E failure, because the required binding is absent and live root import was prohibited.",
+    "No broad regression or external side-effect test was run."
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "executor":"Parent/controller direct; not Jev/AG",
+  "review_delegation":"deleg_ec5f28f5 completed; 166.52 seconds; 7 calls; not timeout",
+  "original_independent_review":"FAIL, retained unchanged",
+  "original_review_sha256":"511526b91870b0a174698cb017304a2cd110462422399bec32e559fdce6b15cc",
+  "original_controller_reproduction":"4 failed in 0.08s; actual SQLite and shared accounting primitives, not business mocks",
+  "current_module_sha256":"69ed08c520d68c60f60b51f8e6d3857dfd64095688e4c44085e12a358af511e2",
+  "current_test_sha256":"658dc582d592e40c9f99f0891ef9aa6eacdb7cbcf29db0beb88f3d8a7d83e15f",
+  "adversarial_test_sha256":"61c5260b0b140ae6b595f0f466888a151166113265c07a087252cf5d483a70bc",
+  "current_parent_shared_sha256":"75988112e014d5a7ce17435b8de7956e23990322a530e9928329b78c2ecf856e",
+  "parent_server_unchanged_sha256":"248e96a9050b22bcef03e3c45ee1f8f934e03e8222205e9e5ed4b9d2017a2cc7",
+  "reference_source_unchanged_sha256":"e1235aa25370fcfc7e9d154451e83b35fb8afdf97a345b589ac4a444f1582a51",
+  "source_bytes_identical_units":["TextMealProviderError","_normalize_text_meal_estimate","_text_meal_draft_from_row","_text_meal_provider_payload","estimate_text_meal_nutrition","get_text_meal_estimate_draft"],
+  "necessary_adapted_source_units":["create_text_meal_estimate_draft","_validate_photo_ingredient_child_scope"],
+  "module_test_observed":"15 passed in 0.08s",
+  "shared_regression_observed":"4 passed in 0.68s",
+  "repair_scope":{
+    "IR-001":"Charged parent receipt bound to actual user/token/attempt; actual debit now required in positive photo test; validation again under provider-start transaction",
+    "IR-002":"Standalone expired pre-provider claimed attempt uses owned refund and same-transaction re-claim; started/unknown remains held; old process fenced by changed draft owner",
+    "IR-003":"Shared refund now consults durable child provider marker by real quota owner before any mutation; actual parent batch claim/reclaim still not integrated/tested",
+    "IR-004":"Terminal child replay checks unchanged request and exact UID/batch scope/receipt/child quota owner without requiring live parent processing lease"
+  },
+  "backups":["before-ir002-repair/text_meal_dependency_recovery.py","before-ir002-repair/test_text_meal_dependency_recovery.py","/mnt/c/Users/WIN-XI/nanjing-isolated/e2-openclaw-ntfs/before-shared-provider-marker-bd47.py"],
+  "test_limits":["reduced host schema, not parent owner initializer","actual shared charge/refund but not full parent batch claim/fail/reclaim SDK","external provider responses synthetic; no live network/LINE/Sheet/printer","no main recovery-module wiring or current broad regression"],
+  "remaining":["actual batch claim/reclaim must honor provider-start marker and never allocate another debit after unknown provider start","batch pre-start recovery and concurrent parent-child fencing E2E","wire actual host schema/provider/SDK and precise version preservation guard","fixed current candidate regression and independent acceptance"],
+  "quality_status":"PENDING_REREVIEW_NOT_PASS",
+  "integration_status":"NOT_INTEGRATED",
+  "release_ready":false
+}

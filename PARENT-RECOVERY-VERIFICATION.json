@@ -1,0 +1,34 @@
+{
+  "delegation_id":"deleg_b0ee6302",
+  "executor":"Hermes direct recovery subagent; not Jev/AG",
+  "worker_status":"hard_timeout",
+  "worker_seconds":600.02,
+  "worker_api_calls":29,
+  "worker_final_summary_received":false,
+  "parent_recovered_existing_artifacts":true,
+  "module_sha256":"01820062e07725385fa6c3fc5efb0ba01a126bad0513f7d4c383eec0010b85da",
+  "test_sha256":"e8bc2b5222ea4013e26ee104d05d36747d4342b011e48ad203bb526db8b4d1cc",
+  "conftest_sha256":"da1da3ebf0e8bfd27475ba932f469715e1de7e22bf55a9582a5956f34325afdc",
+  "reference_source_sha256":"e1235aa25370fcfc7e9d154451e83b35fb8afdf97a345b589ac4a444f1582a51",
+  "source_unit_comparison":{
+    "byte_and_ast_identical":["TextMealProviderError","_normalize_text_meal_estimate","_text_meal_draft_from_row","_text_meal_provider_payload","_validate_photo_ingredient_child_scope","estimate_text_meal_nutrition","get_text_meal_estimate_draft"],
+    "adapted_not_identical":["create_text_meal_estimate_draft"]
+  },
+  "parent_test_execution":{
+    "command":"env -i PATH=<inherited executable path> HOME=/home/win-xi PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TEXT_MEAL_PARENT_ROOT=/mnt/c/Users/WIN-XI/nanjing-isolated/e2-openclaw-ntfs python3 -m pytest -q --tb=short -p no:cacheprovider tests/test_text_meal_dependency_recovery.py",
+    "exit_code":0,
+    "observed_output":"11 passed in 0.06s",
+    "real_logic":"SQLite persistence and parent shared_ai_quota charge primitive",
+    "external_fake":"provider SDK response shape",
+    "limitations":["standalone module tests, not actual parent server/LINE SDK entry tests","test supplies reduced host schema initializer, not actual parent daily-food initializer","photo parent row is seeded without a real parent charge; no second child charge is checked, but actual parent accounting provenance is not proven"]
+  },
+  "main_product_hashes_unchanged_since_previous_parent_receipt":{
+    "server.py":"248e96a9050b22bcef03e3c45ee1f8f934e03e8222205e9e5ed4b9d2017a2cc7",
+    "ai_consultation_ledger.py":"1955195e954d97b2479ca513ba349425b3ba5353f81deed817eb53ade1b07e7c",
+    "shared_ai_quota.py":"bd47bcd2696cc73a1159428506022b4639cb7d4cc49494476b78e88566b55788"
+  },
+  "integration_status":"NOT_INTEGRATED",
+  "closure_status":"NOT_CLOSED",
+  "remaining":["review full provider unknown/expired recovery and source dependencies","parent photo batch claim/fail/refund must honor provider-start marker before any refund/retry","bind actual host schema/provider/clock without changing unrelated functions or enabling flags","real isolated SDK integration and precise preservation guard","fixed latest-candidate regression and independent release gate"],
+  "release_ready":false
+}
