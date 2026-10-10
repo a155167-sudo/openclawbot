@@ -125,6 +125,8 @@ from subscription_meal_plan import (
     get_subscription_form_value,
 )
 from customer_health_check_liff import attach_customer_health_check_routes
+from dietitian_health_check_approval import create_health_check_approval_saver
+from dietitian_health_check_draft import create_health_check_draft_saver
 from dietitian_health_check_api import (
     attach_dietitian_health_check_routes,
     load_dietitian_health_check_config,
@@ -151,6 +153,7 @@ from dietitian_health_check_command import (
 from vip_health_check import (
     configure_vip_health_check_connection,
     create_first_vip_health_check_case,
+    ensure_dietitian_health_check_draft_schema,
     ensure_vip_health_check_schema,
     get_customer_health_check_state,
     is_vip_health_check_enabled,
@@ -3771,6 +3774,24 @@ def get_dietitian_health_check_image(case_id: str, log_id: str):
         )
 
 
+def save_dietitian_health_check_draft(
+    case_id, fields, expected_source_token, expected_review_version, request_id, actor_id
+):
+    """Open the canonical DB only after the HTTP identity/role gate succeeds."""
+    return create_health_check_draft_saver(DB_PATH)(
+        case_id, fields, expected_source_token, expected_review_version, request_id, actor_id
+    )
+
+
+def approve_dietitian_health_check_review(
+    case_id, expected_source_token, expected_review_version, request_id, actor_id
+):
+    """Approve only after HTTP identity/role checks; create no external delivery."""
+    return create_health_check_approval_saver(DB_PATH)(
+        case_id, expected_source_token, expected_review_version, request_id, actor_id
+    )
+
+
 def _current_dietitian_health_check_allowed_uids():
     return load_dietitian_health_check_config(os.environ).allowed_uids
 
@@ -3794,6 +3815,8 @@ def register_dietitian_health_check_api(target_app=app):
         list_loader=list_dietitian_health_checks,
         detail_loader=get_dietitian_health_check,
         image_loader=get_dietitian_health_check_image,
+        draft_saver=save_dietitian_health_check_draft,
+        approval_saver=approve_dietitian_health_check_review,
         allowed_uid_loader=_current_dietitian_health_check_allowed_uids,
     )
     attach_dietitian_health_check_liff_routes(
@@ -4004,6 +4027,8 @@ def init_db():
         ensure_meal_photo_schema(conn)
         # 首次 VIP 三日健檢採獨立 additive schema；功能入口仍由 flag 控制。
         ensure_vip_health_check_schema(conn)
+        # 草稿 source fence / operation ledger 走既有 numeric migration ledger。
+        ensure_dietitian_health_check_draft_schema(conn)
 
         # --- 以上結束 ---
 

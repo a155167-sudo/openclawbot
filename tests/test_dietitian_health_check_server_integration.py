@@ -113,6 +113,91 @@ print(json.dumps({'list':list_status != 404,
     }
 
 
+def test_server_registers_enabled_draft_and_approval_writers_with_exact_post_routes(tmp_path):
+    result, _data_dir = _run_server(
+        tmp_path,
+        """import json, server
+from fastapi.testclient import TestClient
+client=TestClient(server.app)
+draft=client.post('/api/dietitian/health-checks/case-1/reviews',json={})
+approval=client.post('/api/dietitian/health-checks/case-1/reviews/approve',json={})
+print(json.dumps({'draft_writer':callable(server.save_dietitian_health_check_draft),
+ 'approval_writer':callable(server.approve_dietitian_health_check_review),
+ 'draft_status':draft.status_code,'approval_status':approval.status_code}))""",
+        DIETITIAN_HEALTH_CHECK_READ_ENABLED="true",
+        DIETITIAN_HEALTH_CHECK_LIFF_ID=CHANNEL + "-dietitianCheck",
+        DIETITIAN_HEALTH_CHECK_LINE_LOGIN_CHANNEL_ID=CHANNEL,
+        DIETITIAN_HEALTH_CHECK_ALLOWED_UIDS=UID,
+        DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID=CHANNEL + "-dietitianCheck",
+        DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS=UID,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _last_json(result.stdout) == {
+        "draft_writer": True, "approval_writer": True,
+        "draft_status": 401, "approval_status": 401,
+    }
+
+
+def test_registered_server_http_approval_then_get_shows_approved_pending_delivery(tmp_path):
+    result, _data_dir = _run_server(
+        tmp_path,
+        """import json, pathlib, requests, runpy, time
+class VerifyResponse:
+ status_code=200
+ def json(self):
+  now=int(time.time())
+  return {'iss':'https://access.line.me','aud':'2009251085',
+          'sub':'U1234567890abcdef1234567890abcdef','iat':now-1,'exp':now+300}
+requests.post=lambda *args,**kwargs: VerifyResponse()
+import server
+from fastapi.testclient import TestClient
+fixture=runpy.run_path(str(pathlib.Path('tests/test_dietitian_health_check_api.py')))
+fixture_dir=pathlib.Path(server.DB_DIR)/'approval-fixture'
+fixture_dir.mkdir(parents=True,exist_ok=True)
+server.DB_PATH=str(fixture['_populated_db'](fixture_dir))
+server.create_health_check_draft_saver(server.DB_PATH)
+client=TestClient(server.app)
+headers={'Authorization':'Bearer signed'}
+before=client.get('/api/dietitian/health-checks/case-1',headers=headers)
+assert before.status_code == 200, before.text
+token=before.json()['source_token']
+fields={'good':'早餐穩定','priority':'增加蔬菜','next_7_days':'午餐加一份蔬菜','comment':'先求持續'}
+draft=client.post('/api/dietitian/health-checks/case-1/reviews',headers=headers,json={
+ **fields,'expected_source_token':token,'expected_review_version':2,'request_id':'server-draft-1'})
+approval=client.post('/api/dietitian/health-checks/case-1/reviews/approve',headers=headers,json={
+ 'expected_source_token':token,'expected_review_version':draft.json()['review_version'],
+ 'request_id':'server-approval-1'})
+after=client.get('/api/dietitian/health-checks/case-1',headers=headers)
+print(json.dumps({'before':before.status_code,'draft':draft.status_code,
+ 'approval_status':approval.status_code,'approval':approval.json(),
+ 'get_status':after.status_code,'case_status':after.json().get('status'),
+ 'review_status':(after.json().get('latest_review') or {}).get('status'),
+ 'review':(after.json().get('latest_review') or {}).get('review'),
+ 'get_approval':after.json().get('approval')}))""",
+        DIETITIAN_HEALTH_CHECK_READ_ENABLED="true",
+        DIETITIAN_HEALTH_CHECK_LIFF_ID=CHANNEL + "-dietitianCheck",
+        DIETITIAN_HEALTH_CHECK_LINE_LOGIN_CHANNEL_ID=CHANNEL,
+        DIETITIAN_HEALTH_CHECK_ALLOWED_UIDS=UID,
+        DIETITIAN_HEALTH_CHECK_COMMAND_LIFF_ID=CHANNEL + "-dietitianCheck",
+        DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS=UID,
+    )
+    assert result.returncode == 0, result.stderr
+    evidence = _last_json(result.stdout)
+    assert evidence["before"] == evidence["draft"] == 200
+    assert evidence["approval_status"] == evidence["get_status"] == 200
+    assert evidence["approval"]["delivery_status"] == "pending"
+    assert evidence["case_status"] == "approved_pending_delivery"
+    assert evidence["review_status"] == "approved"
+    assert evidence["review"] == {
+        "good": "早餐穩定", "priority": "增加蔬菜",
+        "next_7_days": "午餐加一份蔬菜", "comment": "先求持續",
+    }
+    assert evidence["get_approval"] == {
+        "report_id": evidence["approval"]["report_id"],
+        "status": "approved", "delivery_status": "pending",
+    }
+
+
 def test_server_read_only_loaders_fail_closed_for_corrupt_database(tmp_path):
     result, _data_dir = _run_server(
         tmp_path,

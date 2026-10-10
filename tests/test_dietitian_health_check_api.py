@@ -54,6 +54,44 @@ def _manifest_for_source_hash(
     ).hexdigest()
 
 
+def _v2_source_hash(log_id: str, local_date: str, meal_slot: str) -> str:
+    payload = {
+        "schema_version": "vip_health_check_source_v2",
+        "food_log_id": log_id,
+        "food_log_version": 3,
+        "nutrition_snapshot_json": '{"calories_kcal":500}',
+        "local_date": local_date,
+        "normalized_meal_slot": meal_slot.strip() or "unspecified",
+        "trust_binding": "",
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _upgrade_fixture_to_v2(conn: sqlite3.Connection) -> None:
+    hashes = {
+        log_id: _v2_source_hash(log_id, local_date, meal_slot)
+        for log_id, local_date, meal_slot in SOURCE_ROWS
+    }
+    for log_id, source_hash in hashes.items():
+        conn.execute(
+            "UPDATE vip_health_check_source_refs SET source_hash=? WHERE food_log_id=?",
+            (source_hash, log_id),
+        )
+    manifest = hashlib.sha256(
+        "\n".join(
+            [f"{log_id}:3:{hashes[log_id]}" for log_id in sorted(hashes)]
+            + [
+                f"day:{day}:{count}:{rule}"
+                for day, rule, count, _status in VALID_DAY_ROWS
+            ]
+        ).encode()
+    ).hexdigest()
+    conn.execute("UPDATE vip_health_check_cases SET source_manifest_hash=?", (manifest,))
+    conn.execute("UPDATE vip_health_check_reviews SET source_manifest_hash=?", (manifest,))
+
+
 MANIFEST_HASH = _manifest_for_source_hash(SOURCE_HASH)
 ALL_CASE_STATUSES = (
     "collecting",
@@ -98,6 +136,28 @@ def _schema(conn: sqlite3.Connection) -> None:
             suggested_values_json TEXT NOT NULL, limitations TEXT NOT NULL,
             source_manifest_hash TEXT NOT NULL, approved_by TEXT NOT NULL,
             approved_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE vip_health_check_reports (
+            report_id TEXT PRIMARY KEY, case_id TEXT NOT NULL, review_id TEXT NOT NULL UNIQUE,
+            report_kind TEXT NOT NULL DEFAULT 'baseline_3day', report_version INTEGER NOT NULL,
+            report_json TEXT NOT NULL, source_manifest_hash TEXT NOT NULL,
+            published_by TEXT NOT NULL, published_at TEXT NOT NULL,
+            UNIQUE(case_id,report_kind,report_version),
+            FOREIGN KEY(case_id) REFERENCES vip_health_check_cases(case_id),
+            FOREIGN KEY(review_id) REFERENCES vip_health_check_reviews(review_id)
+        );
+        CREATE TABLE vip_health_check_deliveries (
+            delivery_id TEXT PRIMARY KEY, report_id TEXT NOT NULL, user_id TEXT NOT NULL,
+            delivery_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, delivered_at TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(report_id) REFERENCES vip_health_check_reports(report_id)
+        );
+        CREATE TABLE vip_health_check_audit_log (
+            audit_id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT NOT NULL,
+            actor_type TEXT NOT NULL, actor_id TEXT NOT NULL DEFAULT '',
+            from_status TEXT NOT NULL DEFAULT '', to_status TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
         );
         CREATE TABLE food_catalog (food_id TEXT PRIMARY KEY, product_name TEXT NOT NULL);
         CREATE TABLE food_logs (
@@ -177,7 +237,10 @@ def _populated_db(tmp_path):
     return path
 
 
-def _client(*, loader, verifier=None, allowed=(DIETITIAN_UID,)):
+def _client(
+    *, loader, verifier=None, allowed=(DIETITIAN_UID,), draft_saver=None,
+    approval_saver=None, detail_loader=None,
+):
     from dietitian_health_check_api import (
         DietitianHealthCheckConfig,
         attach_dietitian_health_check_routes,
@@ -199,10 +262,707 @@ def _client(*, loader, verifier=None, allowed=(DIETITIAN_UID,)):
             allowed_uids=frozenset(allowed),
         ),
         list_loader=lambda **kwargs: recording_loader("list", **kwargs),
-        detail_loader=lambda case_id: recording_loader("detail", case_id=case_id),
+        detail_loader=(
+            detail_loader
+            if detail_loader is not None
+            else lambda case_id: recording_loader("detail", case_id=case_id)
+        ),
+        draft_saver=draft_saver,
+        approval_saver=approval_saver,
         token_verifier=verifier or (lambda _token, *, channel_id: DIETITIAN_UID),
     ) is True
     return TestClient(app, raise_server_exceptions=False), seen
+
+
+def test_authorized_http_draft_save_reloads_exact_four_field_snapshot(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        source_token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []}, draft_saver=saver
+    )
+    fields = {
+        "good": "早餐有穩定記錄",
+        "priority": "先改善蔬菜份量",
+        "next_7_days": "每天午餐加一份蔬菜",
+        "comment": "先做一件可持續的事",
+    }
+    response = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer signed"},
+        json={
+            **fields,
+            "expected_source_token": source_token,
+            "expected_review_version": 2,
+            "request_id": "save-case-1-001",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "draft"
+    assert response.json()["review_version"] == 3
+    with sqlite3.connect(path) as conn:
+        detail = load_health_check_detail(conn, case_id="case-1")
+    assert detail["latest_review_fresh"] is True
+    assert detail["current_review_version"] == 3
+    assert detail["latest_review"]["review"] == fields
+
+
+def test_authorized_http_approval_locks_saved_review_and_get_shows_pending_delivery(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_approval import create_health_check_approval_saver
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    draft_saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        source_token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+    fields = {
+        "good": "早餐有穩定記錄",
+        "priority": "先改善蔬菜份量",
+        "next_7_days": "每天午餐加一份蔬菜",
+        "comment": "先做一件可持續的事",
+    }
+    draft = draft_saver("case-1", fields, source_token, 2, "draft-before-approve", DIETITIAN_UID)
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []},
+        detail_loader=lambda case_id: load_health_check_detail(
+            sqlite3.connect(path), case_id=case_id
+        ),
+        approval_saver=create_health_check_approval_saver(path),
+    )
+    response = client.post(
+        "/api/dietitian/health-checks/case-1/reviews/approve",
+        headers={"Authorization": "Bearer signed"},
+        json={
+            "expected_source_token": source_token,
+            "expected_review_version": draft["review_version"],
+            "request_id": "approve-case-1-001",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["delivery_status"] == "pending"
+    detail = client.get(
+        "/api/dietitian/health-checks/case-1",
+        headers={"Authorization": "Bearer signed"},
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["status"] == "approved_pending_delivery"
+    assert detail.json()["latest_review"]["status"] == "approved"
+    assert detail.json()["latest_review"]["review"] == fields
+    assert detail.json()["approval"]["delivery_status"] == "pending"
+    with sqlite3.connect(path) as conn:
+        stored = conn.execute(
+            "SELECT report_json FROM vip_health_check_reports WHERE review_id=?",
+            (draft["review_id"],),
+        ).fetchone()[0]
+        assert json.loads(stored) == {
+            "good": fields["good"], "priority": fields["priority"],
+            "next_7_days": fields["next_7_days"], "limitations": fields["comment"],
+        }
+        assert conn.execute(
+            "SELECT status,attempts FROM vip_health_check_deliveries"
+        ).fetchone() == ("pending", 0)
+
+
+def _produce_approved_health_check(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_approval import create_health_check_approval_saver
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    draft_saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        detail = load_health_check_detail(conn, case_id="case-1")
+        assert detail is not None
+        source_token = str(detail["source_token"])
+    draft = draft_saver(
+        "case-1",
+        {"good": "好", "priority": "優先", "next_7_days": "行動", "comment": "限制"},
+        source_token,
+        2,
+        "projection-draft",
+        DIETITIAN_UID,
+    )
+    approval = create_health_check_approval_saver(path)(
+        "case-1",
+        source_token,
+        draft["review_version"],
+        "projection-approval",
+        DIETITIAN_UID,
+    )
+    return path, draft, approval
+
+
+@pytest.mark.parametrize(
+    ("succeeded", "expected_case_status", "expected_delivery_status"),
+    (
+        (None, "approved_pending_delivery", "pending"),
+        (False, "delivery_failed", "failed"),
+        (True, "delivered", "delivered"),
+    ),
+)
+def test_approval_get_projection_accepts_canonical_lifecycle_pairs(
+    tmp_path, succeeded, expected_case_status, expected_delivery_status
+):
+    from dietitian_health_check_api import load_health_check_detail
+    from vip_health_check import record_health_check_delivery_attempt
+
+    path, _draft, approval = _produce_approved_health_check(tmp_path)
+    if succeeded is not None:
+        with sqlite3.connect(path) as conn:
+            record_health_check_delivery_attempt(
+                conn,
+                delivery_key=approval["delivery_key"],
+                succeeded=succeeded,
+                error="temporary failure" if not succeeded else "",
+                attempted_at=datetime(2026, 9, 5, tzinfo=timezone.utc),
+            )
+            conn.commit()
+    with sqlite3.connect(path) as conn:
+        detail = load_health_check_detail(conn, case_id="case-1")
+    assert detail is not None
+    assert detail["status"] == expected_case_status
+    assert detail["approval"] == {
+        "report_id": approval["report_id"],
+        "status": "approved",
+        "delivery_status": expected_delivery_status,
+    }
+
+
+@pytest.mark.parametrize(
+    ("tamper_sql", "parameters"),
+    (
+        ("UPDATE vip_health_check_deliveries SET user_id=?", (OTHER_UID,)),
+        ("UPDATE vip_health_check_deliveries SET status=?", ("unknown",)),
+        ("UPDATE vip_health_check_cases SET status=? WHERE case_id='case-1'", ("delivered",)),
+        ("DELETE FROM vip_health_check_deliveries", ()),
+        ("UPDATE vip_health_check_deliveries SET report_id=?", ("missing-report",)),
+        ("UPDATE vip_health_check_reports SET case_id=?", ("other-case",)),
+        ("UPDATE vip_health_check_reports SET review_id=?", ("missing-review",)),
+        ("UPDATE vip_health_check_reports SET report_kind=?", ("other-kind",)),
+    ),
+    ids=(
+        "wrong-recipient",
+        "unknown-delivery-status",
+        "incoherent-case-status",
+        "missing-delivery",
+        "delivery-report-mapping",
+        "report-case-mapping",
+        "report-review-mapping",
+        "wrong-report-kind",
+    ),
+)
+def test_approval_get_projection_fails_closed_for_tampered_binding_or_state(
+    tmp_path, tamper_sql, parameters
+):
+    from dietitian_health_check_api import load_health_check_detail
+
+    path, _draft, _approval = _produce_approved_health_check(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(tamper_sql, parameters)
+        conn.commit()
+        with pytest.raises(ValueError, match="invalid approved review projection"):
+            load_health_check_detail(conn, case_id="case-1")
+
+
+def test_approval_get_projection_wrong_recipient_cannot_present_delivered(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from vip_health_check import record_health_check_delivery_attempt
+
+    path, _draft, approval = _produce_approved_health_check(tmp_path)
+    with sqlite3.connect(path) as conn:
+        record_health_check_delivery_attempt(
+            conn,
+            delivery_key=str(approval["delivery_key"]),
+            succeeded=True,
+            error="",
+            attempted_at=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        )
+        conn.execute("UPDATE vip_health_check_deliveries SET user_id=?", (OTHER_UID,))
+        conn.commit()
+        with pytest.raises(ValueError, match="invalid approved review projection"):
+            load_health_check_detail(conn, case_id="case-1")
+
+
+def test_approval_get_projection_never_presents_approved_report_as_draft(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+
+    path, draft, _approval = _produce_approved_health_check(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE vip_health_check_reviews SET status='draft' WHERE review_id=?",
+            (draft["review_id"],),
+        )
+        conn.commit()
+        detail = load_health_check_detail(conn, case_id="case-1")
+    assert detail is not None
+    assert detail["latest_review"]["status"] == "draft"
+    assert detail["approval"] is None
+
+
+def test_http_approval_stale_source_or_review_is_409_with_zero_writes(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_approval import create_health_check_approval_saver
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    draft_saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        source_token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+    draft = draft_saver(
+        "case-1",
+        {"good": "好", "priority": "優先", "next_7_days": "行動", "comment": "點評"},
+        source_token, 2, "draft-for-stale-approve", DIETITIAN_UID,
+    )
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []},
+        approval_saver=create_health_check_approval_saver(path),
+    )
+    with sqlite3.connect(path) as conn:
+        before = "\n".join(conn.iterdump())
+    for suffix, token, version in (
+        ("source", "f" * 64, draft["review_version"]),
+        ("review", source_token, draft["review_version"] - 1),
+    ):
+        response = client.post(
+            "/api/dietitian/health-checks/case-1/reviews/approve",
+            headers={"Authorization": "Bearer signed"},
+            json={
+                "expected_source_token": token,
+                "expected_review_version": version,
+                "request_id": f"stale-{suffix}",
+            },
+        )
+        assert response.status_code == 409
+        with sqlite3.connect(path) as conn:
+            assert "\n".join(conn.iterdump()) == before
+
+
+def test_http_approval_exact_retry_replays_and_cross_actor_request_id_reuse_conflicts(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_approval import create_health_check_approval_saver
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    draft_saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+    draft = draft_saver(
+        "case-1",
+        {"good": "好", "priority": "優先", "next_7_days": "行動", "comment": "點評"},
+        token, 2, "draft-for-retry", DIETITIAN_UID,
+    )
+
+    def verify(raw_token, *, channel_id):
+        assert channel_id == CHANNEL_ID
+        return DIETITIAN_UID if raw_token == "actor-a" else OTHER_UID
+
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []}, verifier=verify,
+        allowed=(DIETITIAN_UID, OTHER_UID),
+        approval_saver=create_health_check_approval_saver(path),
+    )
+    payload = {
+        "expected_source_token": token,
+        "expected_review_version": draft["review_version"],
+        "request_id": "approval-retry-001",
+    }
+    first = client.post(
+        "/api/dietitian/health-checks/case-1/reviews/approve",
+        headers={"Authorization": "Bearer actor-a"}, json=payload,
+    )
+    replay = client.post(
+        "/api/dietitian/health-checks/case-1/reviews/approve",
+        headers={"Authorization": "Bearer actor-a"}, json=payload,
+    )
+    sibling = client.post(
+        "/api/dietitian/health-checks/case-1/reviews/approve",
+        headers={"Authorization": "Bearer actor-b"}, json=payload,
+    )
+    assert first.status_code == replay.status_code == 200
+    assert replay.json() == {**first.json(), "created": False}
+    assert sibling.status_code == 409
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM vip_health_check_reports").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM vip_health_check_deliveries").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT actor_id,status FROM vip_health_check_approval_operations"
+        ).fetchone() == (DIETITIAN_UID, "completed")
+
+
+def test_approval_authorization_and_body_validation_deny_before_writer():
+    calls = []
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []},
+        approval_saver=lambda *args: calls.append(args),
+    )
+    valid = {
+        "expected_source_token": "a" * 64,
+        "expected_review_version": 3,
+        "request_id": "approve-valid",
+    }
+    denied = client.post(
+        "/api/dietitian/health-checks/case-1/reviews/approve", json=valid
+    )
+    invalid = client.post(
+        "/api/dietitian/health-checks/case-1/reviews/approve",
+        headers={"Authorization": "Bearer signed"},
+        json={**valid, "review": {"good": "client claim"}},
+    )
+    assert denied.status_code == 401
+    assert invalid.status_code == 422
+    assert calls == []
+
+
+def test_approved_case_rejects_further_draft_changes(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_approval import create_health_check_approval_saver
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    draft_saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+    fields = {"good": "好", "priority": "優先", "next_7_days": "行動", "comment": "點評"}
+    draft = draft_saver("case-1", fields, token, 2, "draft-before-lock", DIETITIAN_UID)
+    create_health_check_approval_saver(path)(
+        "case-1", token, draft["review_version"], "approval-lock", DIETITIAN_UID
+    )
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []}, draft_saver=draft_saver
+    )
+    changed = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer signed"},
+        json={
+            "good": "試圖改寫", "priority": "試圖改寫",
+            "next_7_days": "試圖改寫", "comment": "試圖改寫",
+            "expected_source_token": token,
+            "expected_review_version": draft["review_version"],
+            "request_id": "draft-after-approval",
+        },
+    )
+    assert changed.status_code == 409
+    with sqlite3.connect(path) as conn:
+        rows = conn.execute(
+            "SELECT status,review_json FROM vip_health_check_reviews WHERE case_id='case-1' "
+            "ORDER BY review_version"
+        ).fetchall()
+    assert len(rows) == 3
+    assert rows[-1] == ("approved", json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def test_exact_http_draft_retry_returns_same_version_without_extra_row(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        source_token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []},
+        draft_saver=saver,
+    )
+    payload = {
+        "good": "做得好", "priority": "優先事項",
+        "next_7_days": "七天行動", "comment": "個人點評",
+        "expected_source_token": source_token,
+        "expected_review_version": 2, "request_id": "retry-001",
+    }
+    first = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer signed"}, json=payload,
+    )
+    replay = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer signed"}, json=payload,
+    )
+    assert first.status_code == replay.status_code == 200
+    assert replay.json()["review_id"] == first.json()["review_id"]
+    assert replay.json()["review_version"] == first.json()["review_version"]
+    assert replay.json()["created"] is False
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_reviews WHERE case_id='case-1'"
+        ).fetchone()[0] == 3
+
+
+def test_detail_projects_opaque_source_token_and_post_requires_that_observation(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        detail = load_health_check_detail(conn, case_id="case-1")
+    assert isinstance(detail["source_token"], str)
+    assert len(detail["source_token"]) == 64
+    assert detail["source_token"] != detail["updated_at"]
+    assert detail["source_token"] != MANIFEST_HASH
+
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []}, draft_saver=saver
+    )
+    response = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer signed"},
+        json={
+            **{key: f"token-{key}" for key in ("good", "priority", "next_7_days", "comment")},
+            "expected_source_token": detail["source_token"],
+            "expected_review_version": 2,
+            "request_id": "source-token-001",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_request_id_is_durably_bound_to_verified_actor_and_payload(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+
+    def verify(raw_token, *, channel_id):
+        assert channel_id == CHANNEL_ID
+        return DIETITIAN_UID if raw_token == "actor-a" else OTHER_UID
+
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []}, verifier=verify,
+        allowed=(DIETITIAN_UID, OTHER_UID), draft_saver=saver,
+    )
+    payload = {
+        **{key: f"actor-a-{key}" for key in ("good", "priority", "next_7_days", "comment")},
+        "expected_source_token": token,
+        "expected_review_version": 2,
+        "request_id": "shared-request-id",
+    }
+    first = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer actor-a"}, json=payload,
+    )
+    assert first.status_code == 200, first.text
+    before = sqlite3.connect(path).execute(
+        "SELECT COUNT(*) FROM vip_health_check_reviews WHERE case_id='case-1'"
+    ).fetchone()[0]
+
+    sibling = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer actor-b"},
+        json={**payload, "comment": "actor B changed payload", "expected_review_version": 3},
+    )
+    assert sibling.status_code == 409
+    exact = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer actor-a"}, json=payload,
+    )
+    assert exact.status_code == 200
+    assert exact.json() == {**first.json(), "created": False}
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vip_health_check_reviews WHERE case_id='case-1'"
+        ).fetchone()[0] == before
+        operation = conn.execute(
+            "SELECT actor_id,status FROM dietitian_health_check_draft_operations "
+            "WHERE case_id='case-1' AND request_id='shared-request-id'"
+        ).fetchone()
+    assert operation == (DIETITIAN_UID, "completed")
+
+
+def test_unrefreshed_canonical_source_change_conflicts_without_writing(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+        before = conn.execute("SELECT COUNT(*) FROM vip_health_check_reviews").fetchone()[0]
+        conn.execute(
+            """UPDATE food_logs SET version=version+1,
+                      nutrition_snapshot_json='{"calories_kcal":777}'
+               WHERE log_id='log-owned'"""
+        )
+    payload = {
+        **{key: f"live-{key}" for key in ("good", "priority", "next_7_days", "comment")},
+        "expected_source_token": token,
+        "expected_review_version": 2,
+        "request_id": "unrefreshed-source",
+    }
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []}, draft_saver=saver
+    )
+    response = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer signed"}, json=payload,
+    )
+    assert response.status_code == 409
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM vip_health_check_reviews").fetchone()[0] == before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM dietitian_health_check_draft_operations"
+        ).fetchone()[0] == 0
+
+
+def test_same_second_refresh_invalidates_old_source_token(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+    from dietitian_health_check_draft import create_health_check_draft_saver
+    from vip_health_check import refresh_case_source_manifest
+
+    path = _populated_db(tmp_path)
+    saver = create_health_check_draft_saver(path)
+    with sqlite3.connect(path) as conn:
+        token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+        updated_at = conn.execute(
+            "SELECT updated_at FROM vip_health_check_cases WHERE case_id='case-1'"
+        ).fetchone()[0]
+        conn.execute(
+            """UPDATE food_logs SET version=version+1,
+                      nutrition_snapshot_json='{"calories_kcal":888}'
+               WHERE log_id='log-owned'"""
+        )
+        refresh_case_source_manifest(
+            conn, case_id="case-1", evaluated_at=datetime.fromisoformat(updated_at)
+        )
+        assert conn.execute(
+            "SELECT updated_at FROM vip_health_check_cases WHERE case_id='case-1'"
+        ).fetchone()[0] == updated_at
+        new_token = load_health_check_detail(conn, case_id="case-1")["source_token"]
+        assert new_token != token
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []}, draft_saver=saver
+    )
+    response = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer signed"},
+        json={
+            **{key: f"aba-{key}" for key in ("good", "priority", "next_7_days", "comment")},
+            "expected_source_token": token,
+            "expected_review_version": 2,
+            "request_id": "same-second-aba",
+        },
+    )
+    assert response.status_code == 409
+
+
+def _draft_payload(**changes):
+    payload = {
+        "good": "做得好", "priority": "優先事項",
+        "next_7_days": "七天行動", "comment": "個人點評",
+        "expected_source_token": "a" * 64,
+        "expected_review_version": 2, "request_id": "request-001",
+    }
+    payload.update(changes)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("headers", "verifier", "allowed", "expected"),
+    [
+        ({}, None, (DIETITIAN_UID,), 401),
+        ({"Authorization": "Bearer bad"}, "invalid", (DIETITIAN_UID,), 401),
+        ({"Authorization": "Bearer signed"}, None, (OTHER_UID,), 403),
+        ({"Authorization": "Bearer signed"}, "unavailable", (DIETITIAN_UID,), 503),
+    ],
+)
+def test_draft_authorization_denies_before_writer(headers, verifier, allowed, expected):
+    from dietitian_health_check_api import LineAuthenticationError, LineAuthenticationUnavailable
+
+    calls = []
+    def verify(_token, *, channel_id):
+        if verifier == "invalid":
+            raise LineAuthenticationError("private")
+        if verifier == "unavailable":
+            raise LineAuthenticationUnavailable("private")
+        return DIETITIAN_UID
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []}, verifier=verify,
+        allowed=allowed, draft_saver=lambda *args: calls.append(args),
+    )
+    response = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers=headers, json=_draft_payload(),
+    )
+    assert response.status_code == expected
+    assert calls == []
+    assert response.headers["cache-control"] == "no-store"
+    assert "private" not in response.text
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"actor": DIETITIAN_UID}, {"user_id": CUSTOMER_UID}, {"state": "draft"},
+        {"good": ""}, {"comment": "x" * 4001},
+        {"expected_review_version": True}, {"expected_review_version": -1},
+        {"expected_case_updated_at": "not-a-version"}, {"request_id": "bad request"},
+    ],
+)
+def test_draft_body_allowlist_and_bounds_reject_before_writer(mutation):
+    calls = []
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []},
+        draft_saver=lambda *args: calls.append(args),
+    )
+    response = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer signed"}, json=_draft_payload(**mutation),
+    )
+    assert response.status_code == 422
+    assert calls == []
+
+
+def test_draft_unknown_stale_review_stale_source_and_frozen_fail_without_write(tmp_path):
+    from dietitian_health_check_draft import create_health_check_draft_saver
+
+    path = _populated_db(tmp_path)
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []},
+        draft_saver=create_health_check_draft_saver(path),
+    )
+    headers = {"Authorization": "Bearer signed"}
+    probes = [
+        ("missing-case", _draft_payload(), 404),
+        ("case-1", _draft_payload(expected_review_version=1), 409),
+        ("case-1", _draft_payload(expected_source_token="b" * 64), 409),
+    ]
+    with sqlite3.connect(path) as conn:
+        before = conn.execute("SELECT COUNT(*) FROM vip_health_check_reviews").fetchone()[0]
+    for case_id, payload, expected in probes:
+        response = client.post(
+            f"/api/dietitian/health-checks/{case_id}/reviews",
+            headers=headers, json=payload,
+        )
+        assert response.status_code == expected
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE vip_health_check_cases SET status='approved_pending_delivery'")
+    response = client.post(
+        "/api/dietitian/health-checks/case-1/reviews", headers=headers,
+        json=_draft_payload(),
+    )
+    assert response.status_code == 409
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM vip_health_check_reviews").fetchone()[0] == before
+
+
+def test_draft_writer_failure_maps_to_generic_503_without_leak():
+    client, _seen = _client(
+        loader=lambda *_args, **_kwargs: {"items": []},
+        draft_saver=lambda *_args: (_ for _ in ()).throw(RuntimeError("private-db-path")),
+    )
+    response = client.post(
+        "/api/dietitian/health-checks/case-1/reviews",
+        headers={"Authorization": "Bearer signed"}, json=_draft_payload(),
+    )
+    assert response.status_code == 503
+    assert "private-db-path" not in response.text
 
 
 def test_feature_flag_and_enabled_identity_configuration_are_fail_closed():
@@ -686,6 +1446,46 @@ def test_ready_projection_does_not_expose_hash_unbound_legal_meal_slot_swap(tmp_
     assert "meal_slot" not in source
 
 
+def test_v2_projection_exposes_bound_timeline_fields_and_rejects_legal_slot_swap(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+
+    path = _populated_db(tmp_path)
+    with sqlite3.connect(path) as conn:
+        _upgrade_fixture_to_v2(conn)
+        detail = load_health_check_detail(conn, case_id="case-1")
+        assert detail is not None
+        source = next(item for item in detail["source_logs"] if item["log_id"] == "log-owned")
+        assert source["local_date"] == "2026-09-02"
+        assert source["normalized_meal_slot"] == "lunch"
+
+        conn.execute(
+            "UPDATE food_logs SET meal_slot=CASE log_id "
+            "WHEN 'log-owned' THEN 'breakfast' WHEN 'log-02-breakfast' THEN 'lunch' "
+            "ELSE meal_slot END WHERE log_id IN ('log-owned','log-02-breakfast')"
+        )
+        with pytest.raises(ValueError, match="invalid source reference semantics"):
+            load_health_check_detail(conn, case_id="case-1")
+
+
+def test_frozen_v2_case_retains_history_but_omits_tampered_reference_date(tmp_path):
+    from dietitian_health_check_api import load_health_check_detail
+
+    path = _populated_db(tmp_path)
+    with sqlite3.connect(path) as conn:
+        _upgrade_fixture_to_v2(conn)
+        conn.execute("UPDATE vip_health_check_cases SET status='delivered'")
+        conn.execute(
+            "UPDATE vip_health_check_source_refs SET local_date='2026-09-03' "
+            "WHERE food_log_id='log-owned'"
+        )
+        detail = load_health_check_detail(conn, case_id="case-1")
+
+    assert detail is not None
+    assert detail["status"] == "delivered"
+    assert "log-owned" not in {item["log_id"] for item in detail["source_logs"]}
+    assert detail["source_integrity"]["all_snapshots_available"] is False
+
+
 def test_refreshable_projection_rejects_stale_source_date_or_version(tmp_path):
     from dietitian_health_check_api import load_health_check_detail
 
@@ -758,6 +1558,7 @@ def test_projection_suppresses_review_from_stale_source_manifest(tmp_path):
         detail = load_health_check_detail(conn, case_id="case-1")
     assert detail["latest_review"] is None
     assert detail["latest_review_fresh"] is False
+    assert detail["current_review_version"] == 2
     assert "STALE-REVIEW" not in json.dumps(detail)
 
 

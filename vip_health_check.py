@@ -25,6 +25,31 @@ FEATURE_FLAG = "VIP_HEALTH_CHECK_ENABLED"
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
+def ensure_dietitian_health_check_draft_schema(conn: sqlite3.Connection) -> None:
+    """Run the formal numeric draft migration without committing caller state."""
+    from dietitian_health_check_migration import migrate_dietitian_health_check_draft_schema
+
+    migrate_dietitian_health_check_draft_schema(conn)
+
+
+def health_check_source_token(
+    conn: sqlite3.Connection, *, case_id: str, manifest_hash: str
+) -> str:
+    """Return an opaque observation token bound to persisted monotonic revision."""
+    row = conn.execute(
+        """SELECT revision,manifest_hash FROM dietitian_health_check_source_revisions
+           WHERE case_id=?""",
+        (case_id,),
+    ).fetchone()
+    if row is None or str(row[1]) != str(manifest_hash):
+        raise sqlite3.IntegrityError("missing or stale health-check source revision")
+    canonical = json.dumps(
+        {"case_id": case_id, "revision": int(row[0]), "manifest_hash": str(row[1])},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def require_vip_health_check_connection(
     conn: sqlite3.Connection,
 ) -> sqlite3.Connection:
@@ -2103,6 +2128,10 @@ def create_first_vip_health_check_case(
         }
 
     case_id = "vhc_" + uuid.uuid4().hex
+    draft_revision_schema_installed = conn.execute(
+        """SELECT 1 FROM sqlite_master
+           WHERE type='table' AND name='dietitian_health_check_source_revisions'"""
+    ).fetchone() is not None
     conn.execute("SAVEPOINT create_first_vip_health_check_case")
     try:
         conn.execute(
@@ -2123,6 +2152,12 @@ def create_first_vip_health_check_case(
                 started_at,
             ),
         )
+        if draft_revision_schema_installed:
+            conn.execute(
+                """INSERT INTO dietitian_health_check_source_revisions
+                   (case_id,revision,manifest_hash,updated_at) VALUES (?,1,'',?)""",
+                (case_id, started_at),
+            )
         conn.execute(
             """INSERT INTO vip_health_check_audit_log
                (case_id,actor_type,actor_id,from_status,to_status,reason,created_at)
@@ -2216,6 +2251,36 @@ def _canonical_json_text(value: str) -> str:
         return str(value or "")
 
 
+def normalized_health_check_meal_slot(value: object) -> str:
+    """Return the canonical meal grouping label bound into new source hashes."""
+    return str(value or "").strip() or "unspecified"
+
+
+def health_check_source_hash_v2(
+    *,
+    food_log_id: object,
+    food_log_version: object,
+    nutrition_snapshot_json: object,
+    local_date: object,
+    normalized_meal_slot: object,
+    effective_revision_hash: object = "",
+) -> str:
+    """Bind timeline metadata without changing the historical v1 digest contract."""
+    payload = {
+        "schema_version": "vip_health_check_source_v2",
+        "food_log_id": str(food_log_id or ""),
+        "food_log_version": int(food_log_version),
+        "nutrition_snapshot_json": _canonical_json_text(str(nutrition_snapshot_json or "")),
+        "local_date": str(local_date or ""),
+        "normalized_meal_slot": normalized_health_check_meal_slot(normalized_meal_slot),
+        "trust_binding": str(effective_revision_hash or ""),
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def refresh_case_source_manifest(
     conn: sqlite3.Connection,
     *,
@@ -2248,14 +2313,15 @@ def refresh_case_source_manifest(
 
     conn.execute("SAVEPOINT refresh_case_source_manifest")
     try:
+        ensure_dietitian_health_check_draft_schema(conn)
         case = conn.execute(
-            """SELECT user_id,window_started_at,window_ends_at,status
+            """SELECT user_id,window_started_at,window_ends_at,status,source_manifest_hash
                FROM vip_health_check_cases WHERE case_id=?""",
             (str(case_id or "").strip(),),
         ).fetchone()
         if not case:
             raise ValueError("找不到健檢案件")
-        user_id, window_start_text, window_end_text, current_status = case
+        user_id, window_start_text, window_end_text, current_status, prior_manifest_hash = case
         if current_status not in _REFRESHABLE_CASE_STATUSES:
             raise ValueError("案件已進入不可重建來源的狀態")
 
@@ -2274,6 +2340,14 @@ def refresh_case_source_manifest(
                  AND COALESCE(deleted_at,'')=''""",
             (user_id,),
         ).fetchall()
+        persisted_sources = {
+            str(source[0]): (int(source[1]), str(source[2]))
+            for source in conn.execute(
+                """SELECT food_log_id,food_log_version,source_hash
+                   FROM vip_health_check_source_refs WHERE case_id=?""",
+                (case_id,),
+            ).fetchall()
+        }
 
         included: list[dict[str, object]] = []
         by_date: dict[str, list[dict[str, object]]] = defaultdict(list)
@@ -2291,21 +2365,39 @@ def refresh_case_source_manifest(
                 continue
             local_date = local_time.date().isoformat()
             version = int(version or 1)
-            source_material = (
-                f"{log_id}:{version}:"
-                f"{_canonical_json_text(nutrition_snapshot_json)}"
+            normalized_meal_slot = normalized_health_check_meal_slot(meal_slot)
+            effective_revision_hash = (
+                trust["effective_revision_hash"]
+                if trust["integrity_status"] == "verified"
+                else ""
             )
-            if trust["integrity_status"] == "verified":
-                source_material += (
-                    ":user_confirmed_ai_estimate:"
-                    f"{trust['effective_revision_hash']}"
+            legacy_material = (
+                f"{log_id}:{version}:{_canonical_json_text(nutrition_snapshot_json)}"
+            )
+            if effective_revision_hash:
+                legacy_material += (
+                    f":user_confirmed_ai_estimate:{effective_revision_hash}"
                 )
+            legacy_hash = hashlib.sha256(legacy_material.encode("utf-8")).hexdigest()
+            persisted = persisted_sources.get(str(log_id))
+            source_hash = (
+                legacy_hash
+                if persisted == (version, legacy_hash)
+                else health_check_source_hash_v2(
+                    food_log_id=log_id,
+                    food_log_version=version,
+                    nutrition_snapshot_json=nutrition_snapshot_json,
+                    local_date=local_date,
+                    normalized_meal_slot=normalized_meal_slot,
+                    effective_revision_hash=effective_revision_hash,
+                )
+            )
             item = {
                 "food_log_id": log_id,
                 "version": version,
                 "local_date": local_date,
-                "meal_slot": str(meal_slot or ""),
-                "source_hash": hashlib.sha256(source_material.encode("utf-8")).hexdigest(),
+                "meal_slot": normalized_meal_slot,
+                "source_hash": source_hash,
             }
             included.append(item)
             by_date[local_date].append(item)
@@ -2358,6 +2450,15 @@ def refresh_case_source_manifest(
         manifest_hash = hashlib.sha256("\n".join(manifest_lines).encode("utf-8")).hexdigest()
 
         next_status = "ready_for_review" if valid_day_count >= 3 else "collecting"
+        if str(prior_manifest_hash or "") != manifest_hash:
+            changed = conn.execute(
+                """UPDATE dietitian_health_check_source_revisions
+                   SET revision=revision+1,manifest_hash=?,updated_at=?
+                   WHERE case_id=? AND manifest_hash=?""",
+                (manifest_hash, evaluated_text, case_id, str(prior_manifest_hash or "")),
+            )
+            if changed.rowcount != 1:
+                raise sqlite3.IntegrityError("health-check source revision changed")
         conn.execute(
             """UPDATE vip_health_check_cases
                SET status=?,valid_day_count=?,source_manifest_hash=?,updated_at=? WHERE case_id=?""",
@@ -2390,6 +2491,24 @@ def refresh_case_source_manifest(
         "source_manifest_hash": manifest_hash,
         "rule_version": rule_version,
     }
+
+
+def probe_current_health_check_source_manifest(
+    conn: sqlite3.Connection, *, case_id: str, evaluated_at: datetime,
+) -> dict[str, object]:
+    """Compute through the production refresh path and leave no persisted side effect."""
+    conn.execute("SAVEPOINT probe_current_health_check_source_manifest")
+    try:
+        result = refresh_case_source_manifest(
+            conn, case_id=case_id, evaluated_at=evaluated_at
+        )
+        conn.execute("ROLLBACK TO SAVEPOINT probe_current_health_check_source_manifest")
+        conn.execute("RELEASE SAVEPOINT probe_current_health_check_source_manifest")
+        return result
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT probe_current_health_check_source_manifest")
+        conn.execute("RELEASE SAVEPOINT probe_current_health_check_source_manifest")
+        raise
 
 
 def _json_object(value: Mapping[str, object], field: str) -> str:

@@ -46,6 +46,30 @@ from meal_photo_system import (
 from test_meal_photo_system import _answer_all, ai_estimated_payload, sample_payload
 
 
+def _expected_health_source_v2_hash(
+    *, log_id, version, nutrition, consumed_at, meal_slot, trust_binding="",
+):
+    nutrition_value = json.loads(nutrition) if isinstance(nutrition, str) else nutrition
+    canonical_nutrition = json.dumps(
+        nutrition_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    payload = {
+        "schema_version": "vip_health_check_source_v2",
+        "food_log_id": str(log_id),
+        "food_log_version": int(version),
+        "nutrition_snapshot_json": canonical_nutrition,
+        "local_date": datetime.fromisoformat(consumed_at).astimezone(
+            timezone(timedelta(hours=8))
+        ).date().isoformat(),
+        "normalized_meal_slot": str(meal_slot or "").strip() or "unspecified",
+        "trust_binding": str(trust_binding or ""),
+    }
+    canonical_payload = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+
 class FakeWorksheet:
     def __init__(self, records):
         self._records = records
@@ -981,9 +1005,18 @@ def test_recorded_updated_replay_repairs_failed_health_check_projection(
         current = user_confirmed_meal_photo_trust_projection(
             conn, log_id, "user_confirmed_ai_estimate",
         )
-        expected_source_hash = hashlib.sha256(
-            f"{log_id}:3:{json.dumps(current['nutrition'], ensure_ascii=False, sort_keys=True, separators=(',', ':'))}:user_confirmed_ai_estimate:{current['effective_revision_hash']}".encode()
-        ).hexdigest()
+        canonical_row = conn.execute(
+            "SELECT version,consumed_at,meal_slot FROM food_logs WHERE log_id=?",
+            (log_id,),
+        ).fetchone()
+        expected_source_hash = _expected_health_source_v2_hash(
+            log_id=log_id,
+            version=canonical_row[0],
+            nutrition=current["nutrition"],
+            consumed_at=canonical_row[1],
+            meal_slot=canonical_row[2],
+            trust_binding=current["effective_revision_hash"],
+        )
         refreshed_ref = conn.execute(
             "SELECT food_log_version,source_hash FROM vip_health_check_source_refs "
             "WHERE case_id=? AND food_log_id=?", (case["case_id"], log_id),
@@ -7092,16 +7125,18 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
             ).fetchall()
             assert len(refs) == 1
             log = conn.execute(
-                "SELECT log_id,version,nutrition_snapshot_json FROM food_logs"
+                "SELECT log_id,version,nutrition_snapshot_json,consumed_at,meal_slot "
+                "FROM food_logs"
             ).fetchall()
             assert len(log) == 1
             assert refs[0][:2] == log[0][:2]
-            canonical = json.dumps(json.loads(log[0][2]), ensure_ascii=False,
-                                   sort_keys=True, separators=(",", ":"))
-            import hashlib
-            assert refs[0][2] == hashlib.sha256(
-                f"{log[0][0]}:{log[0][1]}:{canonical}".encode()
-            ).hexdigest()
+            assert refs[0][2] == _expected_health_source_v2_hash(
+                log_id=log[0][0],
+                version=log[0][1],
+                nutrition=log[0][2],
+                consumed_at=log[0][3],
+                meal_slot=log[0][4],
+            )
             assert conn.execute("SELECT COUNT(*) FROM food_exchange_approvals").fetchone()[0] == 1
     with sqlite3.connect(db) as conn:
         assert daily_consumed_totals(

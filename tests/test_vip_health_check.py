@@ -2360,6 +2360,22 @@ def test_manifest_uses_canonical_logs_keeps_same_day_meals_and_ignores_planned_p
         "SELECT log_id,nutrition_snapshot_json FROM food_logs ORDER BY log_id"
     ).fetchall() == original_snapshots
 
+    from dietitian_health_check_api import load_health_check_detail
+
+    conn.execute(
+        """CREATE TABLE health_profile (
+               user_id TEXT PRIMARY KEY,name TEXT,tdee INTEGER,protein REAL,
+               goal TEXT,restrictions TEXT,active_days TEXT
+           )"""
+    )
+    detail = load_health_check_detail(conn, case_id=str(case["case_id"]))
+    assert detail is not None
+    projected = {item["log_id"]: item for item in detail["source_logs"]}
+    assert projected["log-breakfast"]["local_date"] == "2026-09-03"
+    assert projected["log-breakfast"]["normalized_meal_slot"] == "早餐"
+    assert projected["log-lunch"]["local_date"] == "2026-09-03"
+    assert projected["log-lunch"]["normalized_meal_slot"] == "午餐"
+
 
 def test_third_qualified_day_moves_case_to_ready_without_copying_planned_meal(conn):
     from vip_health_check import (

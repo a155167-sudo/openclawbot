@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
 import requests
 
@@ -26,6 +26,13 @@ from nutrition_system import (
     verified_exchange_approval_projection,
 )
 from protected_health_check_image import ImagePreview, ImageUnavailable, read_bounded_preview
+from dietitian_health_check_approval import ApprovalConflict, ApprovalNotFound
+from dietitian_health_check_draft import DraftConflict, DraftNotFound
+from vip_health_check import (
+    health_check_source_hash_v2,
+    health_check_source_token,
+    normalized_health_check_meal_slot,
+)
 
 
 LINE_ID_TOKEN_VERIFY_URL = "https://api.line.me/oauth2/v2.1/verify"
@@ -95,7 +102,10 @@ AI_OBSERVATION_FIELDS = frozenset(
     {"pattern", "patterns", "observation", "observations", "strengths", "gaps", "risks"}
 )
 REVIEW_FIELDS = frozenset(
-    {"good", "priority", "strengths", "improvements", "recommendations", "summary"}
+    {
+        "good", "priority", "next_7_days", "comment", "strengths",
+        "improvements", "recommendations", "summary",
+    }
 )
 SUGGESTED_VALUE_FIELDS = frozenset(
     {
@@ -105,7 +115,7 @@ SUGGESTED_VALUE_FIELDS = frozenset(
 )
 AI_TEXT_FIELDS = frozenset({"pattern", "observation"})
 AI_TEXT_OR_LIST_FIELDS = AI_OBSERVATION_FIELDS - AI_TEXT_FIELDS
-REVIEW_TEXT_FIELDS = frozenset({"good", "priority", "summary"})
+REVIEW_TEXT_FIELDS = frozenset({"good", "priority", "next_7_days", "comment", "summary"})
 REVIEW_TEXT_OR_LIST_FIELDS = REVIEW_FIELDS - REVIEW_TEXT_FIELDS
 _DROP = object()
 _INVALID = object()
@@ -392,7 +402,7 @@ def _local_date_text(value: object, field: str) -> str:
     return text
 
 
-def _source_hash_matches(conn: sqlite3.Connection, log: sqlite3.Row) -> bool:
+def _source_hash_version(conn: sqlite3.Connection, log: sqlite3.Row) -> str | None:
     expected = log["source_hash"]
     version = log["food_log_version"]
     log_id = log["log_id"]
@@ -404,10 +414,10 @@ def _source_hash_matches(conn: sqlite3.Connection, log: sqlite3.Row) -> bool:
         or version < 1
         or not isinstance(log_id, str)
     ):
-        return False
+        return None
     raw_nutrition = log["nutrition_snapshot_json"]
     if not isinstance(raw_nutrition, str):
-        return False
+        return None
     try:
         canonical = json.dumps(
             json.loads(raw_nutrition),
@@ -421,8 +431,13 @@ def _source_hash_matches(conn: sqlite3.Connection, log: sqlite3.Row) -> bool:
         conn, log_id, str(log["trust_type"] or "") if "trust_type" in log.keys() else ""
     )
     if trust["integrity_status"] == "integrity_verification_failed":
-        return False
-    actual = hashlib.sha256(
+        return None
+    trust_binding = (
+        str(trust["effective_revision_hash"])
+        if trust["integrity_status"] == "verified"
+        else ""
+    )
+    legacy = hashlib.sha256(
         (
             f"{log_id}:{version}:{canonical}"
             + (
@@ -432,7 +447,37 @@ def _source_hash_matches(conn: sqlite3.Connection, log: sqlite3.Row) -> bool:
             )
         ).encode("utf-8")
     ).hexdigest()
-    return hmac.compare_digest(actual, expected)
+    if hmac.compare_digest(legacy, expected):
+        return "v1"
+    keys = set(log.keys())
+    if {"local_date", "consumed_at", "meal_slot"}.issubset(keys):
+        try:
+            consumed_text = _iso_datetime_text(
+                log["consumed_at"], "source_log.consumed_at"
+            )
+            assert consumed_text is not None
+            canonical_date = _taipei_datetime(consumed_text).date().isoformat()
+            ref_date = _local_date_text(log["local_date"], "source_ref.local_date")
+            normalized_slot = normalized_health_check_meal_slot(log["meal_slot"])
+        except (AssertionError, TypeError, ValueError):
+            return None
+        if canonical_date != ref_date:
+            return None
+        current = health_check_source_hash_v2(
+            food_log_id=log_id,
+            food_log_version=version,
+            nutrition_snapshot_json=raw_nutrition,
+            local_date=ref_date,
+            normalized_meal_slot=normalized_slot,
+            effective_revision_hash=trust_binding,
+        )
+        if hmac.compare_digest(current, expected):
+            return "v2"
+    return None
+
+
+def _source_hash_matches(conn: sqlite3.Connection, log: sqlite3.Row) -> bool:
+    return _source_hash_version(conn, log) is not None
 
 
 def _profile_from_row(row: sqlite3.Row | None) -> dict[str, object | None]:
@@ -829,8 +874,8 @@ def load_health_check_detail(
         else ",'' AS trust_type,'' AS trust_hash,'{}' AS exchange_snapshot_json"
     )
     logs = conn.execute(
-        f"""SELECT fl.log_id,sr.food_log_version,sr.source_hash,
-                  fl.nutrition_snapshot_json{trust_columns}
+        f"""SELECT fl.log_id,sr.food_log_version,sr.source_hash,sr.local_date,
+                  fl.consumed_at,fl.meal_slot,fl.nutrition_snapshot_json{trust_columns}
            FROM vip_health_check_source_refs sr
            JOIN vip_health_check_cases c ON c.case_id=sr.case_id
            JOIN food_logs fl ON fl.log_id=sr.food_log_id AND fl.user_id=c.user_id
@@ -842,7 +887,8 @@ def load_health_check_detail(
     ).fetchall()
     source_logs = []
     for log in logs:
-        if not _source_hash_matches(conn, log):
+        source_hash_version = _source_hash_version(conn, log)
+        if source_hash_version is None:
             continue
         version = log["food_log_version"]
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
@@ -857,6 +903,13 @@ def load_health_check_detail(
             "food_log_version": version,
             "nutrition_snapshot": nutrition_snapshot,
         }
+        if source_hash_version == "v2":
+            source["local_date"] = _local_date_text(
+                log["local_date"], "source_ref.local_date"
+            )
+            source["normalized_meal_slot"] = normalized_health_check_meal_slot(
+                log["meal_slot"]
+            )
         trust = user_confirmed_meal_photo_trust_projection(
             conn, log["log_id"], str(log["trust_type"] or "")
         )
@@ -900,6 +953,23 @@ def load_health_check_detail(
     ).fetchone()
     case_manifest = row["source_manifest_hash"]
     review_manifest = None if review is None else review["source_manifest_hash"]
+    current_review_version = 0 if review is None else review["review_version"]
+    if (
+        isinstance(current_review_version, bool)
+        or not isinstance(current_review_version, int)
+        or current_review_version < 0
+        or (review is not None and current_review_version < 1)
+    ):
+        raise ValueError("invalid review version")
+    result["current_review_version"] = current_review_version
+    revision_table_exists = conn.execute(
+        """SELECT 1 FROM sqlite_master
+           WHERE type='table' AND name='dietitian_health_check_source_revisions'"""
+    ).fetchone() is not None
+    if revision_table_exists:
+        result["source_token"] = health_check_source_token(
+            conn, case_id=case_id, manifest_hash=str(case_manifest)
+        )
     review_is_fresh = (
         review is not None
         and referenced_count == len(source_logs)
@@ -961,6 +1031,37 @@ def load_health_check_detail(
                 review["updated_at"], "review.updated_at"
             ),
         }
+    result["approval"] = None
+    if review_is_fresh and review is not None and review["status"] == "approved":
+        approval = conn.execute(
+            """SELECT r.report_id,r.report_kind,ar.status,d.status,d.user_id,
+                      c.user_id,c.status
+               FROM vip_health_check_reports r
+               JOIN vip_health_check_reviews ar
+                 ON ar.review_id=r.review_id AND ar.case_id=r.case_id
+               JOIN vip_health_check_cases c ON c.case_id=r.case_id
+               JOIN vip_health_check_deliveries d ON d.report_id=r.report_id
+               WHERE r.case_id=? AND r.review_id=?""",
+            (case_id, review["review_id"]),
+        ).fetchall()
+        if (
+            len(approval) != 1
+            or approval[0][1] != "baseline_3day"
+            or approval[0][2] != "approved"
+            or approval[0][3] not in {"pending", "failed", "delivered"}
+            or approval[0][4] != approval[0][5]
+            or (approval[0][6], approval[0][3]) not in {
+                ("approved_pending_delivery", "pending"),
+                ("delivery_failed", "failed"),
+                ("delivered", "delivered"),
+            }
+        ):
+            raise ValueError("invalid approved review projection")
+        result["approval"] = {
+            "report_id": _required_text(approval[0][0], "approval.report_id", maximum=128),
+            "status": "approved",
+            "delivery_status": approval[0][3],
+        }
     return result
 
 
@@ -970,8 +1071,20 @@ def load_health_check_image(
     """Resolve one private image through its canonical case/log/draft chain."""
     try:
         conn.row_factory = sqlite3.Row
+        source_ref_columns = {
+            str(item[1]) for item in conn.execute("PRAGMA table_info(vip_health_check_source_refs)")
+        }
+        food_log_columns = {
+            str(item[1]) for item in conn.execute("PRAGMA table_info(food_logs)")
+        }
+        timeline_columns = (
+            ",sr.local_date,fl.consumed_at,fl.meal_slot"
+            if "local_date" in source_ref_columns
+            and {"consumed_at", "meal_slot"}.issubset(food_log_columns)
+            else ",'' AS local_date,'' AS consumed_at,'' AS meal_slot"
+        )
         rows = conn.execute(
-            """SELECT c.user_id AS case_user_id,c.status AS case_status,
+            f"""SELECT c.user_id AS case_user_id,c.status AS case_status,
                       sr.food_log_id,sr.food_log_version,sr.source_hash,
                       fl.log_id,fl.user_id AS log_user_id,fl.version,
                       fl.nutrition_snapshot_json,fl.source_image_ref,
@@ -984,6 +1097,7 @@ def load_health_check_image(
                       d.source_image_ref AS draft_image_ref,d.status AS draft_status,
                       d.version AS draft_version,d.workflow_version,
                       d.confirmed_log_id,d.approved_log_id,d.confirmed_by
+                      {timeline_columns}
                FROM vip_health_check_cases c
                JOIN vip_health_check_source_refs sr ON sr.case_id=c.case_id
                JOIN food_logs fl ON fl.log_id=sr.food_log_id
@@ -1050,6 +1164,8 @@ def create_dietitian_health_check_router(
     list_loader: Callable[..., Mapping[str, object]],
     detail_loader: Callable[[str], Mapping[str, object] | None],
     image_loader: Callable[[str, str], ImagePreview | None] | None = None,
+    draft_saver: Callable[..., Mapping[str, object]] | None = None,
+    approval_saver: Callable[..., Mapping[str, object]] | None = None,
     allowed_uid_loader: Callable[[], frozenset[str]] | None = None,
     token_verifier: Callable[..., str] = verify_line_id_token,
 ) -> APIRouter:
@@ -1059,25 +1175,27 @@ def create_dietitian_health_check_router(
         raise ValueError("invalid dietitian allowlist")
     router = APIRouter()
 
-    def authorize(authorization: str | None) -> JSONResponse | None:
+    def authorize(
+        authorization: str | None,
+    ) -> tuple[JSONResponse | None, str | None]:
         scheme, separator, token = str(authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not separator or not token.strip():
-            return _response("authentication required", 401)
+            return _response("authentication required", 401), None
         try:
             subject = token_verifier(token.strip(), channel_id=channel_id)
         except LineAuthenticationError:
-            return _response("authentication failed", 401)
+            return _response("authentication failed", 401), None
         except LineAuthenticationUnavailable:
-            return _response("authentication unavailable", 503)
+            return _response("authentication unavailable", 503), None
         except Exception:
-            return _response("authentication unavailable", 503)
+            return _response("authentication unavailable", 503), None
         try:
             current_allowed = allowed_uids if allowed_uid_loader is None else allowed_uid_loader()
         except Exception:
-            return _response("authorization unavailable", 503)
+            return _response("authorization unavailable", 503), None
         if subject not in current_allowed:
-            return _response("forbidden", 403)
-        return None
+            return _response("forbidden", 403), None
+        return None, subject
 
     @router.get("/api/dietitian/health-checks", response_class=JSONResponse)
     def list_cases(
@@ -1086,7 +1204,7 @@ def create_dietitian_health_check_router(
         limit: str = Query(default="25"),
         offset: str = Query(default="0"),
     ) -> JSONResponse:
-        denied = authorize(authorization)
+        denied, _actor_id = authorize(authorization)
         if denied is not None:
             return denied
         statuses = tuple(status or sorted(CASE_STATUSES))
@@ -1114,7 +1232,7 @@ def create_dietitian_health_check_router(
         case_id: str,
         authorization: str | None = Header(default=None),
     ) -> JSONResponse:
-        denied = authorize(authorization)
+        denied, _actor_id = authorize(authorization)
         if denied is not None:
             return denied
         if not CASE_ID_PATTERN.fullmatch(case_id):
@@ -1127,6 +1245,137 @@ def create_dietitian_health_check_router(
         except Exception:
             return _response("health-check data unavailable", 503)
 
+    if draft_saver is not None:
+        @router.post(
+            "/api/dietitian/health-checks/{case_id}/reviews",
+            response_class=JSONResponse,
+        )
+        async def save_draft(
+            case_id: str,
+            request: Request,
+            authorization: str | None = Header(default=None),
+        ) -> JSONResponse:
+            denied, actor_id = authorize(authorization)
+            if denied is not None:
+                return denied
+            assert actor_id is not None
+            if not CASE_ID_PATTERN.fullmatch(case_id):
+                return _response("invalid case id", 422)
+            content_length = request.headers.get("content-length", "")
+            if content_length and (not content_length.isdigit() or int(content_length) > 20_000):
+                return _response("invalid draft", 422)
+            body = await request.body()
+            if len(body) > 20_000:
+                return _response("invalid draft", 422)
+            try:
+                payload = json.loads(body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return _response("invalid draft", 422)
+            allowed = {
+                "good", "priority", "next_7_days", "comment",
+                "expected_source_token", "expected_review_version", "request_id",
+            }
+            if not isinstance(payload, dict) or set(payload) != allowed:
+                return _response("invalid draft", 422)
+            fields = {
+                key: payload[key]
+                for key in ("good", "priority", "next_7_days", "comment")
+            }
+            if any(
+                not isinstance(value, str) or not value.strip() or len(value) > 4000
+                for value in fields.values()
+            ):
+                return _response("invalid draft", 422)
+            expected_source_token = payload["expected_source_token"]
+            expected_review = payload["expected_review_version"]
+            request_id = payload["request_id"]
+            if (
+                not isinstance(expected_source_token, str)
+                or CANONICAL_SHA256_PATTERN.fullmatch(expected_source_token) is None
+                or isinstance(expected_review, bool)
+                or not isinstance(expected_review, int)
+                or expected_review < 0
+                or not isinstance(request_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", request_id)
+            ):
+                return _response("invalid draft", 422)
+            try:
+                result = draft_saver(
+                    case_id, fields, expected_source_token, expected_review, request_id,
+                    actor_id,
+                )
+            except DraftNotFound:
+                return _response("health-check case not found", 404)
+            except DraftConflict:
+                return _response("draft is stale or frozen", 409)
+            except Exception:
+                return _response("health-check data unavailable", 503)
+            public_result = {
+                key: result[key]
+                for key in ("review_id", "review_version", "status", "created")
+                if key in result
+            }
+            return JSONResponse(public_result, headers=NO_STORE_HEADERS)
+
+    if approval_saver is not None:
+        @router.post(
+            "/api/dietitian/health-checks/{case_id}/reviews/approve",
+            response_class=JSONResponse,
+        )
+        async def approve_review(
+            case_id: str,
+            request: Request,
+            authorization: str | None = Header(default=None),
+        ) -> JSONResponse:
+            denied, actor_id = authorize(authorization)
+            if denied is not None:
+                return denied
+            assert actor_id is not None
+            if not CASE_ID_PATTERN.fullmatch(case_id):
+                return _response("invalid case id", 422)
+            content_length = request.headers.get("content-length", "")
+            if content_length and (not content_length.isdigit() or int(content_length) > 2000):
+                return _response("invalid approval", 422)
+            body = await request.body()
+            if len(body) > 2000:
+                return _response("invalid approval", 422)
+            try:
+                payload = json.loads(body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return _response("invalid approval", 422)
+            allowed = {"expected_source_token", "expected_review_version", "request_id"}
+            if not isinstance(payload, dict) or set(payload) != allowed:
+                return _response("invalid approval", 422)
+            source_token = payload["expected_source_token"]
+            review_version = payload["expected_review_version"]
+            request_id = payload["request_id"]
+            if (
+                not isinstance(source_token, str)
+                or CANONICAL_SHA256_PATTERN.fullmatch(source_token) is None
+                or isinstance(review_version, bool)
+                or not isinstance(review_version, int)
+                or review_version < 1
+                or not isinstance(request_id, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", request_id) is None
+            ):
+                return _response("invalid approval", 422)
+            try:
+                result = approval_saver(
+                    case_id, source_token, review_version, request_id, actor_id
+                )
+            except ApprovalNotFound:
+                return _response("health-check case not found", 404)
+            except ApprovalConflict:
+                return _response("approval is stale or frozen", 409)
+            except Exception:
+                return _response("health-check data unavailable", 503)
+            public_result = {
+                key: result[key]
+                for key in ("report_id", "delivery_status", "created")
+                if key in result
+            }
+            return JSONResponse(public_result, headers=NO_STORE_HEADERS)
+
     if image_loader is not None:
         @router.get(
             "/api/dietitian/health-checks/{case_id}/sources/{log_id}/image",
@@ -1137,7 +1386,7 @@ def create_dietitian_health_check_router(
             log_id: str,
             authorization: Any = Header(default=None),
         ) -> Response:
-            denied = authorize(authorization)
+            denied, _actor_id = authorize(authorization)
             if denied is not None:
                 return denied
             if not CASE_ID_PATTERN.fullmatch(case_id) or not CASE_ID_PATTERN.fullmatch(log_id):
@@ -1176,6 +1425,32 @@ def create_dietitian_health_check_router(
         methods=unsupported_methods,
         include_in_schema=False,
     )
+    if draft_saver is not None:
+        def draft_method_not_allowed() -> JSONResponse:
+            return JSONResponse(
+                {"detail": "method not allowed"}, status_code=405,
+                headers={**NO_STORE_HEADERS, "Allow": "POST"},
+            )
+
+        router.add_api_route(
+            "/api/dietitian/health-checks/{case_id}/reviews",
+            draft_method_not_allowed,
+            methods=["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"],
+            include_in_schema=False,
+        )
+    if approval_saver is not None:
+        def approval_method_not_allowed() -> JSONResponse:
+            return JSONResponse(
+                {"detail": "method not allowed"}, status_code=405,
+                headers={**NO_STORE_HEADERS, "Allow": "POST"},
+            )
+
+        router.add_api_route(
+            "/api/dietitian/health-checks/{case_id}/reviews/approve",
+            approval_method_not_allowed,
+            methods=["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"],
+            include_in_schema=False,
+        )
 
     return router
 
@@ -1187,6 +1462,8 @@ def attach_dietitian_health_check_routes(
     list_loader: Callable[..., Mapping[str, object]],
     detail_loader: Callable[[str], Mapping[str, object] | None],
     image_loader: Callable[[str, str], ImagePreview | None] | None = None,
+    draft_saver: Callable[..., Mapping[str, object]] | None = None,
+    approval_saver: Callable[..., Mapping[str, object]] | None = None,
     allowed_uid_loader: Callable[[], frozenset[str]] | None = None,
     token_verifier: Callable[..., str] = verify_line_id_token,
 ) -> bool:
@@ -1197,7 +1474,23 @@ def attach_dietitian_health_check_routes(
     async def enforce_dietitian_health_check_read_only(request: Any, call_next: Any):
         path = str(request.url.path)
         protected_prefix = "/api/dietitian/health-checks"
-        if request.method != "GET" and (
+        is_draft_post = (
+            draft_saver is not None
+            and request.method == "POST"
+            and re.fullmatch(
+                r"/api/dietitian/health-checks/[A-Za-z0-9][A-Za-z0-9_-]{0,127}/reviews",
+                path,
+            ) is not None
+        )
+        is_approval_post = (
+            approval_saver is not None
+            and request.method == "POST"
+            and re.fullmatch(
+                r"/api/dietitian/health-checks/[A-Za-z0-9][A-Za-z0-9_-]{0,127}/reviews/approve",
+                path,
+            ) is not None
+        )
+        if request.method != "GET" and not is_draft_post and not is_approval_post and (
             path == protected_prefix or path.startswith(protected_prefix + "/")
         ):
             return JSONResponse(
@@ -1214,6 +1507,8 @@ def attach_dietitian_health_check_routes(
             list_loader=list_loader,
             detail_loader=detail_loader,
             image_loader=image_loader,
+            draft_saver=draft_saver,
+            approval_saver=approval_saver,
             allowed_uid_loader=allowed_uid_loader,
             token_verifier=token_verifier,
         )

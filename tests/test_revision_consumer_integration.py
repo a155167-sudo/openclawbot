@@ -1,6 +1,8 @@
 import hashlib
 import json
 import sqlite3
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -50,6 +52,10 @@ def test_revision_wrapper_replay_refreshes_real_consumers_without_duplicate_writ
             activation_event_key="revision-activation-event",
             activated_at=now - server.timedelta(minutes=5),
         )
+        assert conn.execute(
+            "SELECT revision,manifest_hash FROM dietitian_health_check_source_revisions "
+            "WHERE case_id=?", (case["case_id"],),
+        ).fetchone() == (1, "")
         conn.execute(
             "INSERT OR IGNORE INTO health_profile "
             "(user_id,today_extra_cal,today_extra_pro,today_food_items,today_date,tdee,protein) "
@@ -137,12 +143,29 @@ def test_revision_wrapper_replay_refreshes_real_consumers_without_duplicate_writ
         projection = user_confirmed_meal_photo_trust_projection(
             conn, log_id, "user_confirmed_ai_estimate",
         )
+        canonical_row = conn.execute(
+            "SELECT consumed_at,meal_slot,version FROM food_logs WHERE log_id=?",
+            (log_id,),
+        ).fetchone()
         ref = conn.execute(
             "SELECT food_log_version,source_hash FROM vip_health_check_source_refs "
             "WHERE case_id=? AND food_log_id=?", (case["case_id"], log_id),
         ).fetchone()
+        expected_source_payload = {
+            "schema_version": "vip_health_check_source_v2",
+            "food_log_id": str(log_id),
+            "food_log_version": int(canonical_row["version"]),
+            "nutrition_snapshot_json": _canonical(projection["nutrition"]),
+            "local_date": datetime.fromisoformat(
+                canonical_row["consumed_at"]
+            ).astimezone(ZoneInfo("Asia/Taipei")).date().isoformat(),
+            "normalized_meal_slot": (
+                str(canonical_row["meal_slot"] or "").strip() or "unspecified"
+            ),
+            "trust_binding": str(projection["effective_revision_hash"] or ""),
+        }
         expected_source_hash = hashlib.sha256(
-            f"{log_id}:2:{_canonical(projection['nutrition'])}:user_confirmed_ai_estimate:{projection['effective_revision_hash']}".encode()
+            _canonical(expected_source_payload).encode("utf-8")
         ).hexdigest()
         assert tuple(ref) == (2, expected_source_hash)
         summary = daily_food_summary(

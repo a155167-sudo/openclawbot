@@ -296,9 +296,9 @@ def _load_proven_candidate(
     rows = conn.execute(
         """SELECT c.user_id AS case_user_id,c.status AS case_status,
                   c.source_manifest_hash AS case_manifest,
-                  sr.food_log_id,sr.food_log_version,sr.source_hash,
+                  sr.food_log_id,sr.food_log_version,sr.source_hash,sr.local_date,
                   fl.log_id,fl.user_id AS log_user_id,fl.food_id,fl.version,
-                  fl.nutrition_snapshot_json,fl.source_image_ref,
+                  fl.consumed_at,fl.meal_slot,fl.nutrition_snapshot_json,fl.source_image_ref,
                   fl.confirmation_status,fl.deleted_at,fl.trust_type,fl.trust_hash,
                   fl.exchange_snapshot_json,
                   fc.owner_user_id AS catalog_owner_user_id,
@@ -355,7 +355,9 @@ def _load_proven_candidate(
         or not _source_hash_matches(conn, row)
     ):
         return None
-    if row["workflow_version"] == "user_confirmed_ai_estimate_v1":
+    if row["workflow_version"] in {
+        "user_confirmed_ai_estimate_v1", "user_confirmed_ai_nutrition_v2"
+    }:
         if (
             row["draft_status"] != "user_confirmed"
             or row["confirmed_log_id"] != log_id
