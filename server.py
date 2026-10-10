@@ -46,8 +46,11 @@ from app_config import load_settings
 from dispatch_authority_bridge import import_initial_published_version
 from workbook_write_lease import (
     FULL_REQUIRED_WRITER_INVENTORY,
+    WorkbookLeaseConflict as _WorkbookLeaseConflict,
     configure_workbook_writer_capability,
+    describe_workbook_lease,
     ensure_workbook_lease_schema,
+    operator_release_unknown_lease,
 )
 from gspread_pair_reschedule_adapter import GspreadPairRescheduleAdapter
 from pair_reschedule_coordinator import verify_admin_context
@@ -2683,13 +2686,13 @@ ADMIN_ONLY_EXACT_COMMANDS = {
     "#測試週報", "#測試晚報", "#生24", "#生48", "#延餐清單", "#待核訂單",
     "#清空熱量", "#刪除檔案", "#重置", "重置本週", "檢查數據", "#待審營養份量",
     "#待審餐點", "#待核換餐", "#查核換餐", "#取得換餐確認指令",
-    "#確認換餐已套用", "#確認換餐未套用"
+    "#確認換餐已套用", "#確認換餐未套用", "#排餐鎖狀態"
 }
 ADMIN_ONLY_PREFIXES = (
     "@靜音 ", "@解除靜音 ", "#喚醒AI ", "#上傳點數\n", "#核准延餐 ", "#拒絕延餐 ",
     "#核准訂單 ", "#拒絕訂單 ", "#開通訂單 ", "#核准營養份量 ",
     "#查核換餐 ", "#取得換餐確認指令 ", "#確認換餐已套用 ",
-    "#確認換餐未套用 "
+    "#確認換餐未套用 ", "#解除排餐鎖 "
 )
 
 BOUND_ADMIN_EXACT_COMMANDS = {
@@ -2712,7 +2715,7 @@ PRIVILEGED_COMMAND_STEMS = (
     "#喚醒AI", "#上傳點數", "#核准延餐", "#拒絕延餐", "#核准訂單",
     "#拒絕訂單", "#開通訂單", "#核准營養份量", "#待核換餐",
     "#查核換餐", "#取得換餐確認指令", "#確認換餐已套用", "#確認換餐未套用",
-    "健康回報", "今日健康日報", "重新整理今日報告",
+    "健康回報", "今日健康日報", "重新整理今日報告", "#排餐鎖狀態", "#解除排餐鎖",
 )
 PRIVILEGED_SHORT_COMMANDS = {"#教", "#管"}
 
@@ -11386,6 +11389,51 @@ def _schedule_balance_text(kcal_left, protein_need):
     protein = round(float(protein_need), 1)
     protein_text = str(int(protein)) if protein.is_integer() else f"{protein:.1f}"
     return f"剩 {kcal}kcal / 補 {protein_text}g"
+
+
+def _workbook_lock_status_text() -> str:
+    """Admin view of the shared-workbook write lease (read-only)."""
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        ensure_workbook_lease_schema(conn)
+        conn.commit()
+        info = describe_workbook_lease(conn, workbook_id=SPREADSHEET_ID, now=tw_now())
+    if not info or info["status"] != "active":
+        return "✅ 排餐試算表目前沒有被鎖住，可以正常寫入。"
+    lines = [
+        "🔒 排餐試算表目前被鎖住",
+        f"寫入類型：{info['writer_id']}",
+        f"操作：{info['operation_id']}",
+        f"開始：{info['acquired_at']}",
+        f"到期：{info['expires_at']}（{'已逾時，結果不明' if info['expired'] else '仍在處理中'}）",
+    ]
+    if info["operator_releasable"] and info["expired"]:
+        lines += [
+            "",
+            "請先打開排餐試算表，確認這筆操作的資料沒有寫壞（個人分頁、Master_API_View、raw_logs）。",
+            "確認無誤後再傳：",
+            f"#解除排餐鎖 {info['operation_id']}",
+        ]
+    elif info["operator_releasable"]:
+        lines += ["", "寫入仍在進行中，請等到期後再查詢。"]
+    else:
+        lines += ["", "這類鎖由改期流程自行收尾，不能手動解除，請聯絡工程人員。"]
+    return "\n".join(lines)
+
+
+def _release_workbook_lock_text(operation_id: str, operator_uid: str) -> str:
+    if not operation_id:
+        return "⚠️ 請附上操作代碼，例如：#解除排餐鎖 subscription-formalization:5（先用 #排餐鎖狀態 查詢）"
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+            operator_release_unknown_lease(
+                conn, workbook_id=SPREADSHEET_ID, operation_id=operation_id,
+                operator_id=str(operator_uid), now=tw_now(),
+                evidence="admin verified Sheet via LINE #解除排餐鎖",
+            )
+    except _WorkbookLeaseConflict as exc:
+        return f"⚠️ 未解除：{exc}"
+    print(f"🔓 排餐鎖已由管理員解除：{operation_id}")
+    return f"🔓 已解除排餐鎖（{operation_id}）。之後的開通、改期可以正常寫入。"
 
 
 ORDER_HISTORY_WORKSHEET_TITLE = "raw_logs"
@@ -22961,6 +23009,18 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             return
         ok, result = update_subscription_order_status(int(order_id), "activated", uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+        return
+
+    elif msg == "#排餐鎖狀態":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=_workbook_lock_status_text()))
+        return
+
+    elif msg.startswith("#解除排餐鎖 "):
+        operation_id = msg.replace("#解除排餐鎖 ", "", 1).strip()
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=_release_workbook_lock_text(operation_id, uid)),
+        )
         return
 
     elif msg == "#今日出餐完成":
