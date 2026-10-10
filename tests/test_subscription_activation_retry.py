@@ -237,7 +237,7 @@ def _install_activation_db(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "formalize_subscription_snapshot", fake_formalize)
     monkeypatch.setattr(
         server.line_bot_api, "push_message",
-        lambda uid, message, **kwargs: pushes.append((uid, message.text, kwargs.get("retry_key"))),
+        lambda uid, message, **kwargs: pushes.append((uid, "\n".join(m.text for m in (message if isinstance(message, list) else [message])), kwargs.get("retry_key"))),
     )
     monkeypatch.setattr(socket, "create_connection", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("network forbidden")))
     return db_path, pushes, formalize_calls
@@ -290,7 +290,7 @@ def test_activation_success_notification_unknown_outcome_stops_automatic_retry(t
     calls = []
 
     def unknown_push(uid, message, **kwargs):
-        calls.append((uid, message.text, kwargs.get("retry_key")))
+        calls.append((uid, "\n".join(m.text for m in (message if isinstance(message, list) else [message])), kwargs.get("retry_key")))
         raise TimeoutError("unknown provider outcome")
 
     monkeypatch.setattr(server.line_bot_api, "push_message", unknown_push)

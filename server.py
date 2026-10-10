@@ -11709,6 +11709,30 @@ def _activation_success_message(order_id: int, vip_code: str) -> str:
     )
 
 
+_ACTIVATION_CODE_LINE = re.compile(r"#VIPORDER-[A-Z0-9]{6}")
+
+
+def _activation_push_texts(customer_msg: str) -> list[str]:
+    """Send the activation code as its own bubble so customers can copy it in one tap.
+
+    The canonical message (and its idempotency hash) is unchanged; only the
+    presentation is split into [explanation, code] within one push request.
+    """
+    lines = customer_msg.split("\n")
+    code_lines = [i for i, line in enumerate(lines) if _ACTIVATION_CODE_LINE.fullmatch(line.strip())]
+    if len(code_lines) != 1:
+        return [customer_msg]
+    index = code_lines[0]
+    code = lines[index].strip()
+    body_lines = lines[:index] + lines[index + 1:]
+    body = "\n".join(body_lines).replace(
+        "請複製並傳送以下專屬開通碼，完成會員權限啟用：",
+        "請複製下一則訊息的專屬開通碼，直接傳送給我們即可完成會員權限啟用：",
+    )
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    return [body, code]
+
+
 def _activation_notification_identity(order_id: int, user_id: str, customer_msg: str):
     scope = _ACTIVATION_NOTIFICATION_SCOPE
     retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{scope}:order:{order_id}"))
@@ -11799,7 +11823,9 @@ def _deliver_activation_success_notification(order_id: int, user_id: str, custom
     accepted_request_id = ""
     try:
         retry_client.push_message(
-            user_id, TextSendMessage(text=customer_msg), retry_key=retry_key, timeout=12,
+            user_id,
+            [TextSendMessage(text=part) for part in _activation_push_texts(customer_msg)],
+            retry_key=retry_key, timeout=12,
         )
     except Exception as exc:
         if getattr(exc, "status_code", None) == 409:
