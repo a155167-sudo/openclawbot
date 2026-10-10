@@ -226,6 +226,13 @@ class PairSheetPlan:
     expected_readback: dict[str, dict[str, list[Any]]]
 
 
+_PRICE_SUFFIX = re.compile(r"\s*[(（]\s*\$?\s*\d+(?:\.\d+)?\s*[)）]\s*$")
+
+
+def _meal_without_price(value: object) -> str:
+    return _PRICE_SUFFIX.sub("", str(value or "").strip())
+
+
 def _iso_date(value: object) -> str:
     raw = str(value or "").strip().replace("/", "-")
     try:
@@ -395,6 +402,14 @@ class GspreadPairRescheduleAdapter:
         source_master = list(master_before[master_positions[source]][:21])
         if any(str(value).strip() in {"", "無", "尚未安排"} for value in source_master[3:5]):
             raise PairSheetConflict("Master_API_View source meals are missing")
+        # Master_API_View has one row per customer per day and no order column.
+        # When two orders of the same customer overlap, that row may belong to
+        # the other order; moving it would corrupt the other plan.  Refuse.
+        source_schedule = schedule_before[schedule_positions[source]]
+        if [_meal_without_price(source_master[3]), _meal_without_price(source_master[4])] != [
+            _meal_without_price(source_schedule[2]), _meal_without_price(source_schedule[5]),
+        ]:
+            raise PairSheetConflict("Master_API_View source row belongs to a different plan")
         if target in master_positions:
             target_master = list(master_before[master_positions[target]][:21])
             _validate_target_master_numeric(target_master)
