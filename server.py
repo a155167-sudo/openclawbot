@@ -5656,8 +5656,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
 
             lunch_str = f"{lunch['name']} (${lunch['price']})"
             dinner_str = f"{dinner['name']} (${dinner['price']})"
-            planned_cal_total = lunch['cal'] + dinner['cal']
-            planned_pro_total = lunch['pro'] + dinner['pro']
+            planned_cal_total = _schedule_number(lunch['cal'] + dinner['cal'])
+            planned_pro_total = _schedule_number(lunch['pro'] + dinner['pro'])
             schedule_sheet_rows.append([
                 actual_date_str,
                 f"{w_label}-{day_name}",
@@ -5669,7 +5669,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                 dinner['pro'],
                 planned_cal_total,
                 planned_pro_total,
-                f"剩 {day_tdee_left}kcal / 補 {day_p_need}g",
+                _schedule_balance_text(day_tdee_left, day_p_need),
                 f"${daily_price}",
                 "",  
                 "待列印"      
@@ -7337,9 +7337,9 @@ def sync_user_sheet_from_master(user_id: str):
                 f"{dinner['name']} (${dinner['price']})",
                 dinner['cal'],
                 dinner['pro'],
-                lunch['cal'] + dinner['cal'],
-                lunch['pro'] + dinner['pro'],
-                f"剩 {day_tdee_left}kcal / 補 {day_p_need}g",
+                _schedule_number(lunch['cal'] + dinner['cal']),
+                _schedule_number(lunch['pro'] + dinner['pro']),
+                _schedule_balance_text(day_tdee_left, day_p_need),
                 f"${daily_price}",
                 workout or "",
                 "待列印"
@@ -11371,6 +11371,21 @@ class _SubscriptionDispatchSheetAdapter:
         if len(generation_ids) != len(set(generation_ids)) or set(generation_ids) != set(self._dispatch_ids):
             raise RuntimeError("可信出單既有 generation 含重複、缺漏或未知 ID")
         return self.read_schedule()
+
+
+def _schedule_number(value):
+    """Round schedule nutrition sums so float noise (63.519000000000005) never
+    reaches the Sheet; menu values carry at most 3 decimals."""
+    rounded = round(float(value), 3)
+    return int(rounded) if rounded.is_integer() else rounded
+
+
+def _schedule_balance_text(kcal_left, protein_need):
+    """熱量整數、蛋白質一位小數 (matches the customer-facing display rule)."""
+    kcal = int(round(float(kcal_left)))
+    protein = round(float(protein_need), 1)
+    protein_text = str(int(protein)) if protein.is_integer() else f"{protein:.1f}"
+    return f"剩 {kcal}kcal / 補 {protein_text}g"
 
 
 ORDER_HISTORY_WORKSHEET_TITLE = "raw_logs"
