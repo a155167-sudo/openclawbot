@@ -95,8 +95,19 @@
       }
     }
   }
+  const DETAIL_TEXT = {
+    "Sheet two-view planner rejected before-image": "排餐表上這兩天的資料和訂單對不上（可能是另一期方案的餐），本次沒有改期，Sheet 未變動。請聯絡客服協助。",
+    "single formalized source profile row is required": "找不到這餐的原始排餐資料，本次沒有改期。請聯絡客服協助。",
+    "dynamic target profile cannot be inferred": "這個方案含訓練課表，系統無法自動改期，請聯絡客服協助。",
+    "reschedule dates outside original expiry + 30 window": "目標日期超出可改期的範圍（原到期日後 30 天內）。",
+    "same-day pair reschedule cutoff has passed": "當天早上 8:00 後不能改當天的餐。",
+    "printer dispatch scope intersects reschedule": "這天的餐已進入出單流程，不能再改期。",
+    "trusted source/empty target authority is invalid": "目標日期已經有餐，請選擇空白的日期。",
+    "Sheet source differs from trusted publication": "排餐表上這天的資料和系統紀錄對不上，本次沒有改期，Sheet 未變動。請聯絡客服協助。",
+  };
   function friendlyError(data, fallback){
-    const message = (data && data.detail) ? data.detail : fallback;
+    const raw = (data && data.detail) ? data.detail : "";
+    const message = raw ? (DETAIL_TEXT[raw] || (/[\u4e00-\u9fff]/.test(raw) ? raw : `無法改期，請聯絡客服（代碼：${raw}）`)) : fallback;
     const code = data && data.auth_code;
     return /^(?:A0[0-6]|L0[1-6])$/.test(code || "") ? `${message}（診斷 ${code}）` : message;
   }

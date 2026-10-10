@@ -300,12 +300,23 @@ def _persisted_target_master_profile(
         # the current source profile. A moved source comes from a confirmed
         # immutable two-view snapshot; the initial source comes from the
         # formalized order payload. Dynamic plans require target-day facts.
-        moved = conn.execute('''SELECT v.row_json,v.row_hash FROM pair_reschedule_view_rows v
-            JOIN pair_reschedule_snapshot_receipts r ON r.operation_id=v.operation_id
-            JOIN reschedule_dispatch_operations o ON o.operation_id=r.operation_id
-            WHERE r.new_version_id=? AND o.status='confirmed'
-              AND v.view_name='master' AND v.service_date=?''',
-            (current_version_id, source_date)).fetchall()
+        # Walk the confirmed version chain newest-first: the source may have
+        # been moved here by an earlier reschedule, not the latest one.
+        moved, version_id, seen = [], current_version_id, set()
+        while version_id and version_id not in seen and len(seen) < 64:
+            seen.add(version_id)
+            moved = conn.execute('''SELECT v.row_json,v.row_hash FROM pair_reschedule_view_rows v
+                JOIN pair_reschedule_snapshot_receipts r ON r.operation_id=v.operation_id
+                JOIN reschedule_dispatch_operations o ON o.operation_id=r.operation_id
+                WHERE r.new_version_id=? AND o.status='confirmed'
+                  AND v.view_name='master' AND v.service_date=?''',
+                (version_id, source_date)).fetchall()
+            if moved:
+                break
+            parent = conn.execute(
+                "SELECT parent_version_id FROM reschedule_dispatch_versions WHERE version_id=? AND order_id=?",
+                (version_id, order_id)).fetchone()
+            version_id = str(parent[0]) if parent and parent[0] else None
         if len(moved) == 1:
             if _digest(str(moved[0][0])) != str(moved[0][1]):
                 raise PairRescheduleConflict('confirmed source Master snapshot hash differs')
