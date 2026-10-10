@@ -189,3 +189,85 @@ def release_workbook_lease(conn: sqlite3.Connection, *, lease_token: str,
         if not caller_owned:
             conn.rollback()
         raise
+
+
+OPERATOR_RELEASABLE_WRITERS = frozenset({"subscription_formalization"})
+
+
+def describe_workbook_lease(conn: sqlite3.Connection, *, workbook_id: str, now: datetime) -> dict | None:
+    """Read-only view of the current lease for operators."""
+    instant = _instant(now)
+    row = conn.execute(
+        """SELECT writer_id,operation_id,acquired_at,expires_at,status,final_outcome,released_at
+             FROM workbook_write_leases WHERE workbook_id=?""",
+        (workbook_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    expires = datetime.fromisoformat(str(row[3]))
+    return {
+        "writer_id": row[0], "operation_id": row[1], "acquired_at": row[2],
+        "expires_at": row[3], "status": row[4], "final_outcome": row[5],
+        "released_at": row[6],
+        "expired": expires.astimezone(timezone.utc) <= instant,
+        "operator_releasable": row[4] == "active" and row[0] in OPERATOR_RELEASABLE_WRITERS,
+    }
+
+
+def operator_release_unknown_lease(
+    conn: sqlite3.Connection, *, workbook_id: str, operation_id: str,
+    operator_id: str, evidence: str, now: datetime,
+) -> None:
+    """Release an expired lease whose outcome is unknown, after a human verified the Sheet.
+
+    Only writers in OPERATOR_RELEASABLE_WRITERS qualify (pair-reschedule leases are
+    reconciled by their own coordinator and must never be released here). The lease
+    must be expired, the operation id must match exactly, and an audit row is kept.
+    """
+    instant = _instant(now)
+    if not all(str(v or "").strip() for v in (workbook_id, operation_id, operator_id, evidence)):
+        raise WorkbookLeaseConflict("operator release requires identity and evidence")
+    if conn.in_transaction:
+        raise WorkbookLeaseConflict("operator release requires clean transaction ownership")
+    conn.execute("""CREATE TABLE IF NOT EXISTS workbook_lease_operator_releases (
+        lease_token TEXT PRIMARY KEY NOT NULL,
+        workbook_id TEXT NOT NULL,
+        writer_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        operator_id TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        released_at TEXT NOT NULL
+    )""")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            """SELECT writer_id,operation_id,lease_token,status,expires_at
+                 FROM workbook_write_leases WHERE workbook_id=?""",
+            (workbook_id,),
+        ).fetchone()
+        if row is None or row[3] != "active":
+            raise WorkbookLeaseConflict("no active lease to release")
+        if row[1] != operation_id:
+            raise WorkbookLeaseConflict("operation id does not match the active lease")
+        if row[0] not in OPERATOR_RELEASABLE_WRITERS:
+            raise WorkbookLeaseConflict("this writer's lease cannot be released by an operator")
+        if datetime.fromisoformat(str(row[4])).astimezone(timezone.utc) > instant:
+            raise WorkbookLeaseConflict("lease has not expired; the write may still be running")
+        changed = conn.execute(
+            """UPDATE workbook_write_leases
+                  SET status='released',final_outcome='operator_verified',released_at=?
+                WHERE workbook_id=? AND lease_token=? AND status='active'""",
+            (instant.isoformat(), workbook_id, row[2]),
+        ).rowcount
+        if changed != 1:
+            raise WorkbookLeaseConflict("active lease changed during release")
+        conn.execute(
+            """INSERT INTO workbook_lease_operator_releases
+               (lease_token,workbook_id,writer_id,operation_id,operator_id,evidence,released_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (row[2], workbook_id, row[0], row[1], operator_id, evidence.strip(), instant.isoformat()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
