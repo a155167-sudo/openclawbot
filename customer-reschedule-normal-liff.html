@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>餐點改期</title>
+  <style>
+    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172026;background:#f7f8f5}
+    body{margin:0}
+    main{max-width:720px;margin:0 auto;padding:18px}
+    .banner{background:#fff2b8;border:1px solid #d3a900;border-radius:8px;padding:12px 14px;font-weight:700}
+    .panel{margin-top:14px;background:white;border:1px solid #d9ded6;border-radius:8px;padding:14px}
+    label{display:block;margin-top:12px;font-size:14px;color:#405047}
+    select,button{width:100%;box-sizing:border-box;margin-top:6px;padding:10px;border-radius:8px;border:1px solid #b8c2ba;background:white}
+    button{background:#1f6f50;color:white;border:0;font-weight:700}
+    button:disabled{background:#8da89a}
+    pre{white-space:pre-wrap;background:#f0f3ef;padding:10px;border-radius:8px;overflow:auto}
+    .muted{color:#66746c;font-size:13px}
+    .result-box{margin-top:14px;padding:14px;border:2px solid #1f6f50;border-radius:8px;background:#eaf6ee;color:#143f2e;font-size:16px;font-weight:700;line-height:1.5;overflow-wrap:anywhere;white-space:pre-wrap}
+    .result-box:empty{display:none}
+    .approval-feedback{margin:6px 0;color:#143f2e;font-size:14px;font-weight:700;overflow-wrap:anywhere}
+    .approval-feedback:empty{display:none}
+    #preview,#contextStatus,#pending{overflow-wrap:anywhere}
+    .hidden{display:none}
+  </style>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <script>window.__RESCHEDULE_RUNTIME__ = null; /* __CUSTOMER_RESCHEDULE_RUNTIME__ */</script>
+</head>
+<body>
+<main>
+  <div class="banner">南京店・餐點改期申請</div>
+  <section class="panel">
+    <h1>餐點改期</h1>
+    <p class="muted">請選擇來源日期與目標日期；送出後等待核准，核准後才完成改期。</p>
+    <label>來源日期
+      <select id="source"></select>
+    </label>
+    <label>目標日期
+      <select id="target"></select>
+    </label>
+    <button id="submit">送出改期申請</button>
+    <div id="contextStatus" class="muted"></div>
+    <button id="reauth" type="button" hidden>重新登入 LINE</button>
+    <div id="result" class="result-box" role="status" aria-live="polite" aria-atomic="true"></div>
+    <div id="preview" class="muted"></div>
+  </section>
+  <section id="adminPanel" class="panel hidden">
+    <h2>管理改期申請</h2>
+    <button id="refresh">刷新待處理申請</button>
+    <div id="pending" class="muted"></div>
+  </section>
+</main>
+<script>
+(function(){
+  const runtime = window.__RESCHEDULE_RUNTIME__ || {};
+  let idToken = "";
+  let authFailed = false;
+  const requestedAdminRequestId = new URLSearchParams(window.location.search).get("request_id") || "";
+  const reauth = document.getElementById("reauth");
+  let context = null;
+  const source = document.getElementById("source");
+  const target = document.getElementById("target");
+  const preview = document.getElementById("preview");
+  const result = document.getElementById("result");
+  const pending = document.getElementById("pending");
+  const adminPanel = document.getElementById("adminPanel");
+  const submit = document.getElementById("submit");
+  const refresh = document.getElementById("refresh");
+  const contextStatus = document.getElementById("contextStatus");
+  let loadingContext = false;
+  let submitting = false;
+  let currentIntentKey = "";
+  let currentRequestId = "";
+  let lastOperationText = "";
+  let approvedJustNow = false;
+  const approvingRequestIds = new Set();
+  const blockedApprovalIds = new Set();
+  const approvalFeedback = new Map();
+  const headers = () => ({Authorization:`Bearer ${idToken}`,"Content-Type":"application/json"});
+  function setText(node, value){node.textContent = value || "";}
+  function rememberResult(value){
+    lastOperationText = value || "";
+    setText(result, lastOperationText);
+  }
+  function syncApprovalCard(requestId){
+    for (const card of pending.children) {
+      if (card.dataset.requestId !== requestId) continue;
+      const button = card.querySelector(".approval-button");
+      const feedback = card.querySelector(".approval-feedback");
+      if (feedback) setText(feedback, approvalFeedback.get(requestId) || "");
+      if (button) {
+        const busy = approvingRequestIds.has(requestId);
+        button.textContent = busy ? "核准處理中" : "核准此申請";
+        button.disabled = busy || blockedApprovalIds.has(requestId) || authFailed;
+      }
+    }
+  }
+  function friendlyError(data, fallback){
+    const message = (data && data.detail) ? data.detail : fallback;
+    const code = data && data.auth_code;
+    return /^(?:A0[0-6]|L0[1-6])$/.test(code || "") ? `${message}（診斷 ${code}）` : message;
+  }
+  async function fetchJson(url, options){
+    if (authFailed) throw new Error("登入狀態失效，請重新登入 LINE。");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 40000);
+    try {
+      const response = await fetch(url,{cache:"no-store",credentials:"omit",...(options || {}),signal:controller.signal});
+      const data = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        authFailed = true;
+        reauth.hidden = false;
+        updateControls();
+      }
+      return {response,data};
+    } catch (error) {
+      if (error && error.name === "AbortError") throw new Error("連線逾時，請稍後刷新狀態。");
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  function requestId(){
+    const key = context && source.value && target.value ? `${context.order_id}|${source.value}|${target.value}` : "";
+    if (!key) return "";
+    if (key !== currentIntentKey) {
+      currentIntentKey = key;
+      const uuid = window.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      currentRequestId = `RS_${uuid}`;
+    }
+    return currentRequestId;
+  }
+  function controlsEnabled(){
+    return Boolean(context && source.value && target.value && !loadingContext && !submitting && !authFailed);
+  }
+  function updateControls(){
+    const enabled = controlsEnabled();
+    source.disabled = loadingContext || submitting || !context || authFailed;
+    target.disabled = loadingContext || submitting || !context || authFailed;
+    submit.disabled = !enabled;
+    refresh.disabled = submitting || authFailed;
+  }
+  function formatMeals(meals){
+    return (meals || []).map(item => {
+      const name = String(item.name || "未提供");
+      return name.replace(/\s*[（(]\s*(?:NT\s*[$＄]|[$＄]|TWD)\s*\d+(?:,\d{3})*(?:\.\d+)?\s*[）)]\s*$/i, "").trim() || "未提供";
+    }).join("、");
+  }
+  async function boot(){
+    try {
+      if (!runtime.liffId) { setText(result,"LIFF 設定缺失"); return; }
+      await liff.init({liffId: runtime.liffId});
+      if (!liff.isLoggedIn()) { liff.login(); return; }
+      idToken = liff.getIDToken();
+      if (typeof idToken !== "string" || !idToken.trim() || ["null", "undefined"].includes(idToken.trim())) {
+        idToken = "";
+        authFailed = true;
+        reauth.hidden = false;
+        setText(contextStatus, "尚未取得 LINE 登入憑證（診斷 A01），請關閉後從 LINE 重新開啟。");
+        updateControls();
+        return;
+      }
+      updateControls();
+      if (requestedAdminRequestId) {
+        setText(contextStatus, "請在下方查看申請；核准前會再次檢查餐點狀態。");
+        await refreshPending();
+        return;
+      }
+      await loadContext();
+      if (!authFailed) await refreshPending();
+    } catch (error) {
+      setText(result, `載入失敗：${error.message || String(error)}`);
+      if (idToken && !authFailed) await refreshPending();
+    }
+  }
+  reauth.addEventListener("click", () => {
+    if (liff.isInClient()) {
+      setText(contextStatus, "請關閉此視窗，再從 LINE 聊天室重新開啟改期入口，以取得新的登入憑證。");
+      return;
+    }
+    reauth.disabled = true;
+    try {
+      idToken = "";
+      liff.logout();
+      liff.login({redirectUri: window.location.origin + "/customer-reschedule"});
+    } catch (_) {
+      reauth.disabled = false;
+      setText(contextStatus, "無法啟動重新登入，請關閉後從 LINE 重新開啟改期入口。");
+    }
+  });
+  async function loadContext(){
+    loadingContext = true;
+    updateControls();
+    setText(contextStatus, "正在載入改期資料...");
+    setText(preview, approvedJustNow ? "下一次改期預覽，尚未送出：正在刷新資料…" : "");
+    source.innerHTML = "";
+    target.innerHTML = "";
+    context = null;
+    try {
+      const {response,data} = await fetchJson("/customer-reschedule/context",{headers:headers()});
+      if (!response.ok) {
+        setText(contextStatus, response.status === 403 ? "此帳號僅能使用下方管理功能。" : friendlyError(data, "改期資料載入失敗"));
+        if (lastOperationText) setText(result, lastOperationText);
+        return false;
+      }
+      context = data.orders && data.orders[0];
+      if (!context || !(context.source_dates || []).length) {
+        setText(contextStatus, data.detail || "目前沒有可改期的來源日期。");
+        if (!lastOperationText) setText(result, "");
+        return;
+      }
+      setText(contextStatus, "");
+      for (const item of context.source_dates || []) {
+        const meals = formatMeals(item.meals || []);
+        const option = new Option(`${item.date} ${meals}`, item.date);
+        option.dataset.meals = JSON.stringify(item.meals || []);
+        source.add(option);
+      }
+      for (const day of context.target_dates || []) target.add(new Option(day, day));
+      if (!target.options.length) {
+        setText(contextStatus, "目前沒有有效權益內可送出且可核准的目標日期。");
+        if (lastOperationText) setText(result, lastOperationText);
+        return;
+      }
+      await updatePreview();
+      return true;
+    } finally {
+      loadingContext = false;
+      updateControls();
+    }
+  }
+  async function updatePreview(){
+    updateControls();
+    if (!context || !source.value || !target.value) return;
+    const nextLabel = approvedJustNow ? "下一次改期預覽，尚未送出：" : "";
+    try {
+      const url = `/customer-reschedule/preview?order_id=${encodeURIComponent(context.order_id)}&source_date=${encodeURIComponent(source.value)}&target_date=${encodeURIComponent(target.value)}`;
+      const {response,data} = await fetchJson(url,{headers:headers()});
+      if (!response.ok) { setText(preview, `${nextLabel}${friendlyError(data, "預覽失敗")}`); return; }
+      setText(preview, `${nextLabel || "預覽："}${data.source_date} 的 ${formatMeals(data.source_meals)}，改到 ${data.target_date}。送出後狀態會是待管理員核准。`);
+    } catch (error) {
+      setText(preview, `${nextLabel}預覽逾時或失敗：${error.message || String(error)}`);
+    }
+  }
+  async function refreshPending(){
+    adminPanel.classList.add("hidden");
+    pending.innerHTML = "";
+    setText(pending, "");
+    try {
+      const {response,data} = await fetchJson("/api/admin/customer-pair-reschedule-requests",{headers:headers()});
+      if (!response.ok) {
+        if (response.status !== 403) setText(pending, friendlyError(data, "管理資料刷新失敗"));
+        return false;
+      }
+      if (!data || !Array.isArray(data.requests) || authFailed) return false;
+      adminPanel.classList.remove("hidden");
+      pending.innerHTML = "";
+      const requests = data.requests.filter(item => !requestedAdminRequestId || item.request_id === requestedAdminRequestId);
+      if (!requests.length) {
+        setText(pending, "目前沒有待處理或待讀回確認的申請。");
+        return true;
+      }
+      for (const item of requests) {
+        const wrap = document.createElement("div");
+        wrap.dataset.requestId = item.request_id;
+        const summary = document.createElement("p");
+        const reason = item.disabled_reason ? ` ${item.disabled_reason}` : "";
+        summary.textContent = `申請 ${item.request_id}：${item.source_date} 改到 ${item.target_date}，狀態 ${statusText(item.status)}。${reason}`;
+        wrap.append(summary);
+        if (item.can_approve) {
+          const button = document.createElement("button");
+          button.className = "approval-button";
+          button.textContent = "核准此申請";
+          button.onclick = () => approve(item, button);
+          wrap.append(button);
+        }
+        const feedback = document.createElement("p");
+        feedback.className = "approval-feedback";
+        feedback.setAttribute("role", "status");
+        feedback.setAttribute("aria-live", "polite");
+        wrap.append(feedback);
+        if (item.can_reconcile) {
+          const button = document.createElement("button");
+          button.textContent = "讀回確認狀態";
+          button.onclick = () => reconcile(item.request_id, button);
+          wrap.append(button);
+        }
+        pending.append(wrap);
+        syncApprovalCard(item.request_id);
+      }
+      return true;
+    } catch (error) {
+      setText(pending, `管理資料刷新失敗：${error.message || String(error)}`);
+      return false;
+    }
+  }
+  function statusText(status){
+    if (status === "pending_admin") return "待管理員核准";
+    if (status === "submitted") return "已送出待核准";
+    if (status === "completed") return "已完成";
+    if (status === "sheet_unknown") return "Google 寫入結果待讀回確認";
+    if (status === "confirmed") return "已確認完成";
+    return status || "未知";
+  }
+  async function approve(item, button){
+    const requestId = item.request_id;
+    if (button.disabled || authFailed || approvingRequestIds.has(requestId) || blockedApprovalIds.has(requestId)) return;
+    approvingRequestIds.add(requestId);
+    approvalFeedback.set(requestId, "核准處理中，請勿重複點擊");
+    syncApprovalCard(requestId);
+    rememberResult(`正在核准申請 ${requestId}：${item.source_date} → ${item.target_date}，請稍候…`);
+    try {
+      const {response,data} = await fetchJson(`/api/admin/customer-pair-reschedule-requests/${encodeURIComponent(requestId)}/approve`,{method:"POST",headers:headers(),body:"{}"});
+      if (!response.ok) {
+        const message = data && data.detail === "claim-aware consumer capability is not active"
+          ? "出單安全準備尚未完成，本次未執行改期，請勿重複核准"
+          : friendlyError(data, "核准失敗");
+        if (data && data.detail === "claim-aware consumer capability is not active") blockedApprovalIds.add(requestId);
+        approvalFeedback.set(requestId, message);
+        rememberResult(message);
+        return;
+      }
+      const confirmed = data.status === "confirmed";
+      const successText = confirmed
+        ? `申請 ${requestId} 已確認：${item.source_date} → ${item.target_date}，午、晚餐一起改期。`
+        : `申請 ${requestId}：${item.source_date} → ${item.target_date}，核准結果：${statusText(data.status)}。`;
+      blockedApprovalIds.add(requestId);
+      approvalFeedback.set(requestId, successText);
+      approvedJustNow = confirmed;
+      rememberResult(successText);
+      let contextOk = false;
+      try { contextOk = await loadContext() !== false; } catch (error) { setText(contextStatus, `改期資料刷新失敗：${error.message || String(error)}`); }
+      if (!contextOk || !context || !source.value || !target.value) setText(preview, "下一次改期預覽，尚未送出：目前無可用預覽，請刷新查核。");
+      const pendingOk = await refreshPending();
+      if (!contextOk || !pendingOk) rememberResult(`${successText} 後續資料刷新失敗，請手動刷新查核。`);
+    } catch (error) {
+      blockedApprovalIds.add(requestId);
+      const message = `申請 ${requestId} 結果待確認，請刷新查核，不要重送。${error.message || String(error)}`;
+      approvalFeedback.set(requestId, message);
+      rememberResult(message);
+    } finally {
+      approvingRequestIds.delete(requestId);
+      syncApprovalCard(requestId);
+    }
+  }
+  async function reconcile(requestId, button){
+    button.disabled = true;
+    try {
+      const {response,data} = await fetchJson(`/api/admin/customer-pair-reschedule-requests/${encodeURIComponent(requestId)}/reconcile`,{method:"POST",headers:headers(),body:"{}"});
+      if (!response.ok) { rememberResult(friendlyError(data, "讀回確認失敗")); return; }
+      rememberResult(`讀回結果：${statusText(data.status)}。`);
+      await loadContext();
+      await refreshPending();
+    } catch (error) {
+      setText(result, `讀回逾時或失敗：${error.message || String(error)}`);
+    } finally {
+      button.disabled = false;
+    }
+  }
+  submit.onclick = async function(){
+    if (!controlsEnabled()) return;
+    submitting = true;
+    updateControls();
+    try {
+      const rid = requestId();
+      const body = JSON.stringify({order_id:context.order_id,source_date:source.value,target_date:target.value,request_id:rid});
+      const {response,data} = await fetchJson("/customer-reschedule/pending-request",{method:"POST",headers:headers(),body});
+      if (!response.ok) { rememberResult(friendlyError(data, "送出失敗")); return; }
+      rememberResult(`已送出申請 ${data.request_id}，目前狀態：${statusText(data.status)}。`);
+      approvedJustNow = false;
+      setText(preview, "本次申請已送出，請查看上方操作結果。");
+      await refreshPending();
+    } catch (error) {
+      rememberResult(`送出逾時或失敗：${error.message || String(error)} 請刷新狀態，不會自動重送。`);
+    } finally {
+      submitting = false;
+      updateControls();
+    }
+  };
+  refresh.onclick = async function(){
+    this.disabled = true;
+    try {
+      await refreshPending();
+    } finally {
+      updateControls();
+    }
+  };
+  source.onchange = function(){requestId(); updatePreview();};
+  target.onchange = function(){requestId(); updatePreview();};
+  updateControls();
+  boot().catch(error => setText(result, String(error)));
+})();
+</script>
+</body>
+</html>

@@ -1,7 +1,11 @@
 # Railway production variables — never commit real secret values.
 APP_ENV=production
-ENABLE_SCHEDULER=true
+ENABLE_SCHEDULER=false
 VIP_HEALTH_CHECK_ENABLED=false
+DIETITIAN_HEALTH_CHECK_DELIVERY_RECOVERY_ENABLED=false
+# Keep disabled until the dedicated Production customer LIFF has passed isolated staging E2E.
+VIP_HEALTH_CHECK_LIFF_ID=<dedicated production customer health-check LIFF ID>
+VIP_HEALTH_CHECK_LINE_LOGIN_CHANNEL_ID=<owning production LINE Login Channel ID>
 DATA_DIR=/app/data
 PUBLIC_BASE_URL=https://YOUR-PRODUCTION-DOMAIN
 
@@ -14,7 +18,8 @@ MEAL_PHOTO_IMAGE_SECRET=<at least 32 random bytes>
 ADMIN_SECRET=<secret admin command value>
 FORM_WEBHOOK_SECRET=<at least 32 random bytes, production only>
 SURVEY_WEBHOOK_SECRET=<at least 32 random bytes, production only>
-SURVEY_REWARD_LINK_COUNT=2
+SURVEY_REWARD_LINK_COUNT=1
+SURVEY_REWARD_POINTS_PER_LINK=2
 
 SPREADSHEET_ID=<production Google Sheet ID>
 ADMIN_UID=<production provider Jason UID>

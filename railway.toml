@@ -2,7 +2,8 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "uvicorn server:app --host 0.0.0.0 --port $PORT"
+# Python supervisor is PID 1. It starts uvicorn + worker in this SAME service/container/volume.
+startCommand = "python3 ops/supervise_web_worker.py"
 healthcheckPath = "/health"
 healthcheckTimeout = 120
 restartPolicyType = "on_failure"
