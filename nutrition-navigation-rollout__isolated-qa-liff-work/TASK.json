@@ -1,0 +1,23 @@
+{
+  "task_id": "customer-reschedule-liff-staging-v1",
+  "context_id": "computer-nutrition-staging",
+  "environment": "synthetic-staging-copy",
+  "production_write": false,
+  "goal": "Build a customer-facing LIFF staging surface for submitting a two-meal reschedule request for nutritionist/admin approval.",
+  "policy": {
+    "workflow": "customer_submit_pending_admin",
+    "pair_required": true,
+    "target_window": "from package expiry date through expiry date plus 30 calendar days inclusive",
+    "no_direct_customer_write": true,
+    "occupied_target_rejected": true
+  },
+  "required_acceptance": [
+    "server verifies owner/order authority server-side; never trusts client UID",
+    "preview is read-only and cancel creates no request",
+    "submit is idempotent and creates pending_admin request",
+    "target window and occupied target rejection are tested",
+    "mobile and desktop UI show source/target dates and lunch+dinner together",
+    "no production, LINE, Railway, Sheets, or external API access during tests"
+  ],
+  "allowed_files": ["customer_reschedule_liff.py", "customer_reschedule_liff.html", "tests/test_customer_reschedule_liff.py", "tests/test_customer_reschedule_ui.mjs"]
+}

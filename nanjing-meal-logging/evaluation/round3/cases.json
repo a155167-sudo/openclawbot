@@ -1,0 +1,5895 @@
+{
+  "schema_version": "round3-eval-cases-v3",
+  "frozen_policy": "v3 is a pre-first-live contract correction. Expected values and prompts are frozen before any live-provider run. Do not edit after results; create a new version instead.",
+  "revision": {
+    "supersedes": "v2 (preserved under external evidence round3/eval-v2)",
+    "timing": "before the first live-provider evaluation; zero live-provider calls were made while preparing v3",
+    "reason": "Represent natural portions as numeric counts, require clarification when no g/ml conversion exists, and freeze three exact user-reported unsweetened-soymilk regressions."
+  },
+  "fallback_contract": {
+    "routes": [
+      "unit_mismatch",
+      "fallback_eligible"
+    ],
+    "actual_source": "ai",
+    "basis_amount": 100,
+    "basis_unit": "same_as_requested",
+    "required_nutrients": [
+      "calories_kcal",
+      "protein_g",
+      "fat_g",
+      "carbohydrate_g"
+    ],
+    "final_formula": "basis_nutrition * requested_amount / 100",
+    "unit_mismatch_requires_warning": true
+  },
+  "provenance": {
+    "official_zip": "/home/win-xi/nanjing-meal-logging-evidence/round2/tfda-food-nutrition-20-json.zip",
+    "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+    "source_decision": "/home/win-xi/nanjing-meal-logging-evidence/round2/SOURCE-DECISION.md",
+    "source_decision_rule": "TFDA每100克不可冒充每100毫升；未知密度時 ml 營養 NOT_SCORED。"
+  },
+  "counts": {
+    "items": 30,
+    "cases": 93,
+    "minimum_phrasings_per_item": 3
+  },
+  "cases": [
+    {
+      "case_id": "R3-01-1",
+      "item_key": "white_rice",
+      "user_text": "早餐吃了150克白飯",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "白飯",
+          "acceptable_food_names": [
+            "白飯",
+            "白米飯"
+          ],
+          "food_state": "熟白飯（白米加水電鍋烹煮），不含配菜油醬",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 183,
+                "max": 183
+              },
+              "protein_g": {
+                "min": 3.1,
+                "max": 3.1
+              },
+              "fat_g": {
+                "min": 0.3,
+                "max": 0.3
+              },
+              "carbohydrate_g": {
+                "min": 41.0,
+                "max": 41.0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "A0550601",
+              "sample_name": "白飯",
+              "food_state": "熟；白米加1.1倍水電鍋烹煮",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-01-2",
+      "item_key": "white_rice",
+      "user_text": "白飯200g，算午餐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "白飯",
+          "acceptable_food_names": [
+            "白飯",
+            "白米飯"
+          ],
+          "food_state": "熟白飯（白米加水電鍋烹煮），不含配菜油醬",
+          "amount": 200,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 183,
+                "max": 183
+              },
+              "protein_g": {
+                "min": 3.1,
+                "max": 3.1
+              },
+              "fat_g": {
+                "min": 0.3,
+                "max": 0.3
+              },
+              "carbohydrate_g": {
+                "min": 41.0,
+                "max": 41.0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "A0550601",
+              "sample_name": "白飯",
+              "food_state": "熟；白米加1.1倍水電鍋烹煮",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-01-3",
+      "item_key": "white_rice",
+      "user_text": "晚餐來一碗白飯",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "白飯",
+          "acceptable_food_names": [
+            "白飯",
+            "白米飯"
+          ],
+          "food_state": "熟白飯（白米加水電鍋烹煮），不含配菜油醬",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 183,
+                "max": 183
+              },
+              "protein_g": {
+                "min": 3.1,
+                "max": 3.1
+              },
+              "fat_g": {
+                "min": 0.3,
+                "max": 0.3
+              },
+              "carbohydrate_g": {
+                "min": 41.0,
+                "max": 41.0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "A0550601",
+              "sample_name": "白飯",
+              "food_state": "熟；白米加1.1倍水電鍋烹煮",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-02-1",
+      "item_key": "unsweet_soymilk",
+      "user_text": "早餐喝無糖豆漿300克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "無糖豆漿",
+          "acceptable_food_names": [
+            "無糖豆漿",
+            "豆漿(無糖)"
+          ],
+          "food_state": "包裝無糖黃豆豆漿；官方僅克重，無密度",
+          "amount": 300,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 35,
+                "max": 35
+              },
+              "protein_g": {
+                "min": 3.6,
+                "max": 3.6
+              },
+              "fat_g": {
+                "min": 1.9,
+                "max": 1.9
+              },
+              "carbohydrate_g": {
+                "min": 0.7,
+                "max": 0.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "H1150201",
+              "sample_name": "豆漿(無糖)",
+              "food_state": "包裝產品（黃豆、水等）",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-02-2",
+      "item_key": "unsweet_soymilk",
+      "user_text": "無糖豆漿500ml當早餐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "無糖豆漿",
+          "acceptable_food_names": [
+            "無糖豆漿",
+            "豆漿(無糖)"
+          ],
+          "food_state": "包裝無糖黃豆豆漿；官方僅克重，無密度",
+          "amount": 500,
+          "unit": "ml",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "unit_mismatch",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": true
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "官方資料只有每100克且無密度，不能把 g 當 ml；改走明示警告的每100ml AI備援，但缺獨立相容金標，營養品質不計分。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 35,
+                "max": 35
+              },
+              "protein_g": {
+                "min": 3.6,
+                "max": 3.6
+              },
+              "fat_g": {
+                "min": 1.9,
+                "max": 1.9
+              },
+              "carbohydrate_g": {
+                "min": 0.7,
+                "max": 0.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "H1150201",
+              "sample_name": "豆漿(無糖)",
+              "food_state": "包裝產品（黃豆、水等）",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-02-3",
+      "item_key": "unsweet_soymilk",
+      "user_text": "點心喝了350cc無糖豆漿",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "無糖豆漿",
+          "acceptable_food_names": [
+            "無糖豆漿",
+            "豆漿(無糖)"
+          ],
+          "food_state": "包裝無糖黃豆豆漿；官方僅克重，無密度",
+          "amount": 350,
+          "unit": "ml",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "unit_mismatch",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": true
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "官方資料只有每100克且無密度，不能把 g 當 ml；改走明示警告的每100ml AI備援，但缺獨立相容金標，營養品質不計分。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 35,
+                "max": 35
+              },
+              "protein_g": {
+                "min": 3.6,
+                "max": 3.6
+              },
+              "fat_g": {
+                "min": 1.9,
+                "max": 1.9
+              },
+              "carbohydrate_g": {
+                "min": 0.7,
+                "max": 0.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "H1150201",
+              "sample_name": "豆漿(無糖)",
+              "food_state": "包裝產品（黃豆、水等）",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-02-4",
+      "item_key": "unsweet_soymilk",
+      "user_text": "無糖豆漿500ml",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "無糖豆漿",
+          "acceptable_food_names": [
+            "無糖豆漿",
+            "豆漿(無糖)"
+          ],
+          "food_state": "包裝無糖黃豆豆漿；官方僅克重，無密度",
+          "amount": 500,
+          "unit": "ml",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "unit_mismatch",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": true
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "官方資料只有每100克且無密度，不能把 g 當 ml；改走明示警告的每100ml AI備援，但缺獨立相容金標，營養品質不計分。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 35,
+                "max": 35
+              },
+              "protein_g": {
+                "min": 3.6,
+                "max": 3.6
+              },
+              "fat_g": {
+                "min": 1.9,
+                "max": 1.9
+              },
+              "carbohydrate_g": {
+                "min": 0.7,
+                "max": 0.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "H1150201",
+              "sample_name": "豆漿(無糖)",
+              "food_state": "包裝產品（黃豆、水等）",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-02-5",
+      "item_key": "unsweet_soymilk",
+      "user_text": "午餐我喝了無糖豆漿500cc",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "無糖豆漿",
+          "acceptable_food_names": [
+            "無糖豆漿",
+            "豆漿(無糖)"
+          ],
+          "food_state": "包裝無糖黃豆豆漿；官方僅克重，無密度",
+          "amount": 500,
+          "unit": "ml",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "unit_mismatch",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": true
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "官方資料只有每100克且無密度，不能把 g 當 ml；改走明示警告的每100ml AI備援，但缺獨立相容金標，營養品質不計分。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 35,
+                "max": 35
+              },
+              "protein_g": {
+                "min": 3.6,
+                "max": 3.6
+              },
+              "fat_g": {
+                "min": 1.9,
+                "max": 1.9
+              },
+              "carbohydrate_g": {
+                "min": 0.7,
+                "max": 0.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "H1150201",
+              "sample_name": "豆漿(無糖)",
+              "food_state": "包裝產品（黃豆、水等）",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-02-6",
+      "item_key": "unsweet_soymilk",
+      "user_text": "一杯大杯無糖豆漿",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "無糖豆漿",
+          "acceptable_food_names": [
+            "無糖豆漿",
+            "豆漿(無糖)"
+          ],
+          "food_state": "包裝無糖黃豆豆漿；官方僅克重，無密度",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "一杯／大杯只有自然份數，實際容量未知；須先澄清 ml，不得把一杯當100克或100毫升。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 35,
+                "max": 35
+              },
+              "protein_g": {
+                "min": 3.6,
+                "max": 3.6
+              },
+              "fat_g": {
+                "min": 1.9,
+                "max": 1.9
+              },
+              "carbohydrate_g": {
+                "min": 0.7,
+                "max": 0.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "H1150201",
+              "sample_name": "豆漿(無糖)",
+              "food_state": "包裝產品（黃豆、水等）",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-03-1",
+      "item_key": "whole_milk",
+      "user_text": "早餐全脂鮮奶240克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "全脂鮮乳",
+          "acceptable_food_names": [
+            "全脂鮮奶",
+            "全脂鮮乳",
+            "鮮奶"
+          ],
+          "food_state": "全脂3.0–3.8%鮮乳；官方僅克重，無密度",
+          "amount": 240,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 63,
+                "max": 63
+              },
+              "protein_g": {
+                "min": 3.1,
+                "max": 3.1
+              },
+              "fat_g": {
+                "min": 3.6,
+                "max": 3.6
+              },
+              "carbohydrate_g": {
+                "min": 4.8,
+                "max": 4.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "L01021",
+              "sample_name": "全脂鮮乳平均值",
+              "food_state": "全脂3.0–3.8%鮮乳",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-03-2",
+      "item_key": "whole_milk",
+      "user_text": "喝了250ml鮮奶當點心",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "全脂鮮乳",
+          "acceptable_food_names": [
+            "全脂鮮奶",
+            "全脂鮮乳",
+            "鮮奶"
+          ],
+          "food_state": "全脂3.0–3.8%鮮乳；官方僅克重，無密度",
+          "amount": 250,
+          "unit": "ml",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "unit_mismatch",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": true
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "官方資料只有每100克且無密度，不能把 g 當 ml；改走明示警告的每100ml AI備援，但缺獨立相容金標，營養品質不計分。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 63,
+                "max": 63
+              },
+              "protein_g": {
+                "min": 3.1,
+                "max": 3.1
+              },
+              "fat_g": {
+                "min": 3.6,
+                "max": 3.6
+              },
+              "carbohydrate_g": {
+                "min": 4.8,
+                "max": 4.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "L01021",
+              "sample_name": "全脂鮮乳平均值",
+              "food_state": "全脂3.0–3.8%鮮乳",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-03-3",
+      "item_key": "whole_milk",
+      "user_text": "晚餐後一杯全脂鮮乳",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "全脂鮮乳",
+          "acceptable_food_names": [
+            "全脂鮮奶",
+            "全脂鮮乳",
+            "鮮奶"
+          ],
+          "food_state": "全脂3.0–3.8%鮮乳；官方僅克重，無密度",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 63,
+                "max": 63
+              },
+              "protein_g": {
+                "min": 3.1,
+                "max": 3.1
+              },
+              "fat_g": {
+                "min": 3.6,
+                "max": 3.6
+              },
+              "carbohydrate_g": {
+                "min": 4.8,
+                "max": 4.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "L01021",
+              "sample_name": "全脂鮮乳平均值",
+              "food_state": "全脂3.0–3.8%鮮乳",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-04-1",
+      "item_key": "raw_chicken_breast",
+      "user_text": "午餐生雞胸肉180克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生去皮雞胸肉",
+          "acceptable_food_names": [
+            "生雞胸肉",
+            "去皮生雞胸肉"
+          ],
+          "food_state": "生雞胸、去皮，不套用熟重",
+          "amount": 180,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 119,
+                "max": 119
+              },
+              "protein_g": {
+                "min": 23.3,
+                "max": 23.3
+              },
+              "fat_g": {
+                "min": 2.1,
+                "max": 2.1
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "I04024",
+              "sample_name": "去皮清肉平均值",
+              "food_state": "生，雞胸部位",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-04-2",
+      "item_key": "raw_chicken_breast",
+      "user_text": "200g去皮生雞胸算晚餐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生去皮雞胸肉",
+          "acceptable_food_names": [
+            "生雞胸肉",
+            "去皮生雞胸肉"
+          ],
+          "food_state": "生雞胸、去皮，不套用熟重",
+          "amount": 200,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 119,
+                "max": 119
+              },
+              "protein_g": {
+                "min": 23.3,
+                "max": 23.3
+              },
+              "fat_g": {
+                "min": 2.1,
+                "max": 2.1
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "I04024",
+              "sample_name": "去皮清肉平均值",
+              "food_state": "生，雞胸部位",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-04-3",
+      "item_key": "raw_chicken_breast",
+      "user_text": "早餐記生雞胸100公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生去皮雞胸肉",
+          "acceptable_food_names": [
+            "生雞胸肉",
+            "去皮生雞胸肉"
+          ],
+          "food_state": "生雞胸、去皮，不套用熟重",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 119,
+                "max": 119
+              },
+              "protein_g": {
+                "min": 23.3,
+                "max": 23.3
+              },
+              "fat_g": {
+                "min": 2.1,
+                "max": 2.1
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "I04024",
+              "sample_name": "去皮清肉平均值",
+              "food_state": "生，雞胸部位",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-05-1",
+      "item_key": "tea_egg",
+      "user_text": "早餐茶葉蛋50克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "茶葉蛋",
+          "acceptable_food_names": [
+            "茶葉蛋"
+          ],
+          "food_state": "熟雞蛋製品、去殼",
+          "amount": 50,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 145,
+                "max": 145
+              },
+              "protein_g": {
+                "min": 13.7,
+                "max": 13.7
+              },
+              "fat_g": {
+                "min": 9.1,
+                "max": 9.1
+              },
+              "carbohydrate_g": {
+                "min": 2.2,
+                "max": 2.2
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "K01121",
+              "sample_name": "茶葉蛋平均值",
+              "food_state": "熟雞蛋製品；去殼",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-05-2",
+      "item_key": "tea_egg",
+      "user_text": "午餐加一顆茶葉蛋",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "茶葉蛋",
+          "acceptable_food_names": [
+            "茶葉蛋"
+          ],
+          "food_state": "熟雞蛋製品、去殼",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "nonempty_or_clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 145,
+                "max": 145
+              },
+              "protein_g": {
+                "min": 13.7,
+                "max": 13.7
+              },
+              "fat_g": {
+                "min": 9.1,
+                "max": 9.1
+              },
+              "carbohydrate_g": {
+                "min": 2.2,
+                "max": 2.2
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "K01121",
+              "sample_name": "茶葉蛋平均值",
+              "food_state": "熟雞蛋製品；去殼",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-05-3",
+      "item_key": "tea_egg",
+      "user_text": "吃了兩顆茶葉蛋當點心",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "茶葉蛋",
+          "acceptable_food_names": [
+            "茶葉蛋"
+          ],
+          "food_state": "熟雞蛋製品、去殼",
+          "amount": 2,
+          "unit": "natural",
+          "portion_assumption": "nonempty_or_clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 145,
+                "max": 145
+              },
+              "protein_g": {
+                "min": 13.7,
+                "max": 13.7
+              },
+              "fat_g": {
+                "min": 9.1,
+                "max": 9.1
+              },
+              "carbohydrate_g": {
+                "min": 2.2,
+                "max": 2.2
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "K01121",
+              "sample_name": "茶葉蛋平均值",
+              "food_state": "熟雞蛋製品；去殼",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-06-1",
+      "item_key": "banana",
+      "user_text": "早餐北蕉100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "北蕉",
+          "acceptable_food_names": [
+            "香蕉",
+            "北蕉"
+          ],
+          "food_state": "去皮北蕉平均值",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 85,
+                "max": 85
+              },
+              "protein_g": {
+                "min": 1.5,
+                "max": 1.5
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 22.1,
+                "max": 22.1
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "D08001",
+              "sample_name": "北蕉平均值",
+              "food_state": "去皮",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-06-2",
+      "item_key": "banana",
+      "user_text": "點心吃香蕉120g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "北蕉",
+          "acceptable_food_names": [
+            "香蕉",
+            "北蕉"
+          ],
+          "food_state": "去皮北蕉平均值",
+          "amount": 120,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 85,
+                "max": 85
+              },
+              "protein_g": {
+                "min": 1.5,
+                "max": 1.5
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 22.1,
+                "max": 22.1
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "D08001",
+              "sample_name": "北蕉平均值",
+              "food_state": "去皮",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-06-3",
+      "item_key": "banana",
+      "user_text": "下午吃一根香蕉",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "北蕉",
+          "acceptable_food_names": [
+            "香蕉",
+            "北蕉"
+          ],
+          "food_state": "去皮北蕉平均值",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "nonempty_or_clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 85,
+                "max": 85
+              },
+              "protein_g": {
+                "min": 1.5,
+                "max": 1.5
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 22.1,
+                "max": 22.1
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "D08001",
+              "sample_name": "北蕉平均值",
+              "food_state": "去皮",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-07-1",
+      "item_key": "boxed_meal",
+      "user_text": "午餐吃了一個便當",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "便當",
+          "acceptable_food_names": [
+            "便當",
+            "排骨便當",
+            "雞腿便當"
+          ],
+          "food_state": "混合餐；主菜、配菜、飯量與油醬未知",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": null
+        }
+      }
+    },
+    {
+      "case_id": "R3-07-2",
+      "item_key": "boxed_meal",
+      "user_text": "晚餐半個排骨便當",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "便當",
+          "acceptable_food_names": [
+            "便當",
+            "排骨便當",
+            "雞腿便當"
+          ],
+          "food_state": "混合餐；主菜、配菜、飯量與油醬未知",
+          "amount": 0.5,
+          "unit": "natural",
+          "portion_assumption": "clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "自然份便當沒有 g/ml 換算或固定配方依據；須先澄清實際重量、飯菜內容與油醬，不得將自然份量當作每100克 AI 備援。",
+          "gold_per_100": null
+        }
+      }
+    },
+    {
+      "case_id": "R3-07-3",
+      "item_key": "boxed_meal",
+      "user_text": "午餐雞腿便當一份，飯正常",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "便當",
+          "acceptable_food_names": [
+            "便當",
+            "排骨便當",
+            "雞腿便當"
+          ],
+          "food_state": "混合餐；主菜、配菜、飯量與油醬未知",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "自然份便當沒有 g/ml 換算或固定配方依據；須先澄清實際重量、飯菜內容與油醬，不得將自然份量當作每100克 AI 備援。",
+          "gold_per_100": null
+        }
+      }
+    },
+    {
+      "case_id": "R3-08-1",
+      "item_key": "bubble_tea",
+      "user_text": "點心喝大杯珍珠奶茶",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "珍珠奶茶／手搖飲",
+          "acceptable_food_names": [
+            "珍珠奶茶",
+            "珍奶",
+            "無糖紅茶"
+          ],
+          "food_state": "現調混合飲料；糖冰、配方與杯容量須保留",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": null
+        }
+      }
+    },
+    {
+      "case_id": "R3-08-2",
+      "item_key": "bubble_tea",
+      "user_text": "下午喝700ml半糖珍奶",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "珍珠奶茶／手搖飲",
+          "acceptable_food_names": [
+            "珍珠奶茶",
+            "珍奶",
+            "無糖紅茶"
+          ],
+          "food_state": "現調混合飲料；糖冰、配方與杯容量須保留",
+          "amount": 700,
+          "unit": "ml",
+          "portion_assumption": "nonempty"
+        },
+        "routing": {
+          "status": "fallback_eligible",
+          "available_units": [],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "可測來源路由與解析，但混合配方沒有本題庫的獨立營養金標。",
+          "gold_per_100": null
+        }
+      }
+    },
+    {
+      "case_id": "R3-08-3",
+      "item_key": "bubble_tea",
+      "user_text": "無糖紅茶500cc，記點心",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "珍珠奶茶／手搖飲",
+          "acceptable_food_names": [
+            "珍珠奶茶",
+            "珍奶",
+            "無糖紅茶"
+          ],
+          "food_state": "現調混合飲料；糖冰、配方與杯容量須保留",
+          "amount": 500,
+          "unit": "ml",
+          "portion_assumption": "nonempty"
+        },
+        "routing": {
+          "status": "fallback_eligible",
+          "available_units": [],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "可測來源路由與解析，但混合配方沒有本題庫的獨立營養金標。",
+          "gold_per_100": null
+        }
+      }
+    },
+    {
+      "case_id": "R3-09-1",
+      "item_key": "boiled_egg",
+      "user_text": "早餐水煮蛋55克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "雞水煮蛋",
+          "acceptable_food_names": [
+            "水煮蛋",
+            "雞水煮蛋"
+          ],
+          "food_state": "熟水煮全蛋，不含油醬",
+          "amount": 55,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 144,
+                "max": 144
+              },
+              "protein_g": {
+                "min": 14,
+                "max": 14
+              },
+              "fat_g": {
+                "min": 9.2,
+                "max": 9.2
+              },
+              "carbohydrate_g": {
+                "min": 1.7,
+                "max": 1.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "K0111101",
+              "sample_name": "雞水煮蛋",
+              "food_state": "水煮熟全蛋",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-09-2",
+      "item_key": "boiled_egg",
+      "user_text": "午餐雞水煮蛋110g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "雞水煮蛋",
+          "acceptable_food_names": [
+            "水煮蛋",
+            "雞水煮蛋"
+          ],
+          "food_state": "熟水煮全蛋，不含油醬",
+          "amount": 110,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 144,
+                "max": 144
+              },
+              "protein_g": {
+                "min": 14,
+                "max": 14
+              },
+              "fat_g": {
+                "min": 9.2,
+                "max": 9.2
+              },
+              "carbohydrate_g": {
+                "min": 1.7,
+                "max": 1.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "K0111101",
+              "sample_name": "雞水煮蛋",
+              "food_state": "水煮熟全蛋",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-09-3",
+      "item_key": "boiled_egg",
+      "user_text": "點心一顆水煮蛋",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "雞水煮蛋",
+          "acceptable_food_names": [
+            "水煮蛋",
+            "雞水煮蛋"
+          ],
+          "food_state": "熟水煮全蛋，不含油醬",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "nonempty_or_clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 144,
+                "max": 144
+              },
+              "protein_g": {
+                "min": 14,
+                "max": 14
+              },
+              "fat_g": {
+                "min": 9.2,
+                "max": 9.2
+              },
+              "carbohydrate_g": {
+                "min": 1.7,
+                "max": 1.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "K0111101",
+              "sample_name": "雞水煮蛋",
+              "food_state": "水煮熟全蛋",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-10-1",
+      "item_key": "yellow_sweet_potato",
+      "user_text": "早餐生地瓜150克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "黃肉甘藷",
+          "acceptable_food_names": [
+            "生地瓜",
+            "黃肉甘藷"
+          ],
+          "food_state": "生、去皮黃肉甘藷",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 121,
+                "max": 121
+              },
+              "protein_g": {
+                "min": 1.3,
+                "max": 1.3
+              },
+              "fat_g": {
+                "min": 0.2,
+                "max": 0.2
+              },
+              "carbohydrate_g": {
+                "min": 27.8,
+                "max": 27.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "B0400601",
+              "sample_name": "黃肉甘藷",
+              "food_state": "生、黃皮黃肉；去皮",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-10-2",
+      "item_key": "yellow_sweet_potato",
+      "user_text": "黃肉甘藷200g算午餐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "黃肉甘藷",
+          "acceptable_food_names": [
+            "生地瓜",
+            "黃肉甘藷"
+          ],
+          "food_state": "生、去皮黃肉甘藷",
+          "amount": 200,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 121,
+                "max": 121
+              },
+              "protein_g": {
+                "min": 1.3,
+                "max": 1.3
+              },
+              "fat_g": {
+                "min": 0.2,
+                "max": 0.2
+              },
+              "carbohydrate_g": {
+                "min": 27.8,
+                "max": 27.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "B0400601",
+              "sample_name": "黃肉甘藷",
+              "food_state": "生、黃皮黃肉；去皮",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-10-3",
+      "item_key": "yellow_sweet_potato",
+      "user_text": "吃半條生黃肉地瓜當點心",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "黃肉甘藷",
+          "acceptable_food_names": [
+            "生地瓜",
+            "黃肉甘藷"
+          ],
+          "food_state": "生、去皮黃肉甘藷",
+          "amount": 0.5,
+          "unit": "natural",
+          "portion_assumption": "nonempty_or_clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 121,
+                "max": 121
+              },
+              "protein_g": {
+                "min": 1.3,
+                "max": 1.3
+              },
+              "fat_g": {
+                "min": 0.2,
+                "max": 0.2
+              },
+              "carbohydrate_g": {
+                "min": 27.8,
+                "max": 27.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "B0400601",
+              "sample_name": "黃肉甘藷",
+              "food_state": "生、黃皮黃肉；去皮",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-11-1",
+      "item_key": "raw_salmon",
+      "user_text": "午餐生鮭魚120克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生去皮大西洋鮭魚",
+          "acceptable_food_names": [
+            "生鮭魚",
+            "去皮大西洋鮭魚"
+          ],
+          "food_state": "生、去皮去骨大西洋鮭魚",
+          "amount": 120,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 221,
+                "max": 221
+              },
+              "protein_g": {
+                "min": 20.2,
+                "max": 20.2
+              },
+              "fat_g": {
+                "min": 14.9,
+                "max": 14.9
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "J04024",
+              "sample_name": "大西洋鮭魚平均值(去皮)",
+              "food_state": "生；去皮去骨",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-11-2",
+      "item_key": "raw_salmon",
+      "user_text": "晚餐去皮大西洋鮭魚180g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生去皮大西洋鮭魚",
+          "acceptable_food_names": [
+            "生鮭魚",
+            "去皮大西洋鮭魚"
+          ],
+          "food_state": "生、去皮去骨大西洋鮭魚",
+          "amount": 180,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 221,
+                "max": 221
+              },
+              "protein_g": {
+                "min": 20.2,
+                "max": 20.2
+              },
+              "fat_g": {
+                "min": 14.9,
+                "max": 14.9
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "J04024",
+              "sample_name": "大西洋鮭魚平均值(去皮)",
+              "food_state": "生；去皮去骨",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-11-3",
+      "item_key": "raw_salmon",
+      "user_text": "生鮭魚100公克，算午餐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生去皮大西洋鮭魚",
+          "acceptable_food_names": [
+            "生鮭魚",
+            "去皮大西洋鮭魚"
+          ],
+          "food_state": "生、去皮去骨大西洋鮭魚",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 221,
+                "max": 221
+              },
+              "protein_g": {
+                "min": 20.2,
+                "max": 20.2
+              },
+              "fat_g": {
+                "min": 14.9,
+                "max": 14.9
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "J04024",
+              "sample_name": "大西洋鮭魚平均值(去皮)",
+              "food_state": "生；去皮去骨",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-12-1",
+      "item_key": "steamed_mackerel",
+      "user_text": "晚餐蒸鯖魚100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "蒸鯖魚",
+          "acceptable_food_names": [
+            "蒸鯖魚"
+          ],
+          "food_state": "含皮去骨內臟、100°C蒸10分鐘",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 392,
+                "max": 392
+              },
+              "protein_g": {
+                "min": 14.6,
+                "max": 14.6
+              },
+              "fat_g": {
+                "min": 36.5,
+                "max": 36.5
+              },
+              "carbohydrate_g": {
+                "min": 0.7,
+                "max": 0.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "J0414810",
+              "sample_name": "鯖魚(蒸)",
+              "food_state": "100°C蒸10分鐘",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-12-2",
+      "item_key": "steamed_mackerel",
+      "user_text": "午餐吃150g蒸鯖魚",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "蒸鯖魚",
+          "acceptable_food_names": [
+            "蒸鯖魚"
+          ],
+          "food_state": "含皮去骨內臟、100°C蒸10分鐘",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 392,
+                "max": 392
+              },
+              "protein_g": {
+                "min": 14.6,
+                "max": 14.6
+              },
+              "fat_g": {
+                "min": 36.5,
+                "max": 36.5
+              },
+              "carbohydrate_g": {
+                "min": 0.7,
+                "max": 0.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "J0414810",
+              "sample_name": "鯖魚(蒸)",
+              "food_state": "100°C蒸10分鐘",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-12-3",
+      "item_key": "steamed_mackerel",
+      "user_text": "蒸鯖魚80公克記晚餐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "蒸鯖魚",
+          "acceptable_food_names": [
+            "蒸鯖魚"
+          ],
+          "food_state": "含皮去骨內臟、100°C蒸10分鐘",
+          "amount": 80,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 392,
+                "max": 392
+              },
+              "protein_g": {
+                "min": 14.6,
+                "max": 14.6
+              },
+              "fat_g": {
+                "min": 36.5,
+                "max": 36.5
+              },
+              "carbohydrate_g": {
+                "min": 0.7,
+                "max": 0.7
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "J0414810",
+              "sample_name": "鯖魚(蒸)",
+              "food_state": "100°C蒸10分鐘",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-13-1",
+      "item_key": "traditional_tofu",
+      "user_text": "午餐傳統豆腐100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "傳統豆腐",
+          "acceptable_food_names": [
+            "傳統豆腐",
+            "板豆腐"
+          ],
+          "food_state": "傳統豆腐，未指定油煎",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 96,
+                "max": 96
+              },
+              "protein_g": {
+                "min": 9.6,
+                "max": 9.6
+              },
+              "fat_g": {
+                "min": 5.5,
+                "max": 5.5
+              },
+              "carbohydrate_g": {
+                "min": 1.9,
+                "max": 1.9
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R4700902",
+              "sample_name": "傳統豆腐(2022年取樣)",
+              "food_state": "傳統豆腐",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-13-2",
+      "item_key": "traditional_tofu",
+      "user_text": "晚餐吃了180g板豆腐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "傳統豆腐",
+          "acceptable_food_names": [
+            "傳統豆腐",
+            "板豆腐"
+          ],
+          "food_state": "傳統豆腐，未指定油煎",
+          "amount": 180,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 96,
+                "max": 96
+              },
+              "protein_g": {
+                "min": 9.6,
+                "max": 9.6
+              },
+              "fat_g": {
+                "min": 5.5,
+                "max": 5.5
+              },
+              "carbohydrate_g": {
+                "min": 1.9,
+                "max": 1.9
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R4700902",
+              "sample_name": "傳統豆腐(2022年取樣)",
+              "food_state": "傳統豆腐",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-13-3",
+      "item_key": "traditional_tofu",
+      "user_text": "早餐記傳統豆腐80公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "傳統豆腐",
+          "acceptable_food_names": [
+            "傳統豆腐",
+            "板豆腐"
+          ],
+          "food_state": "傳統豆腐，未指定油煎",
+          "amount": 80,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 96,
+                "max": 96
+              },
+              "protein_g": {
+                "min": 9.6,
+                "max": 9.6
+              },
+              "fat_g": {
+                "min": 5.5,
+                "max": 5.5
+              },
+              "carbohydrate_g": {
+                "min": 1.9,
+                "max": 1.9
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R4700902",
+              "sample_name": "傳統豆腐(2022年取樣)",
+              "food_state": "傳統豆腐",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-14-1",
+      "item_key": "raw_edamame",
+      "user_text": "午餐生毛豆仁100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生毛豆仁",
+          "acceptable_food_names": [
+            "生毛豆仁",
+            "毛豆仁"
+          ],
+          "food_state": "生毛豆仁、去莢",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 129,
+                "max": 129
+              },
+              "protein_g": {
+                "min": 14.6,
+                "max": 14.6
+              },
+              "fat_g": {
+                "min": 3.3,
+                "max": 3.3
+              },
+              "carbohydrate_g": {
+                "min": 12.5,
+                "max": 12.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "H1100101",
+              "sample_name": "毛豆仁",
+              "food_state": "生",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-14-2",
+      "item_key": "raw_edamame",
+      "user_text": "點心毛豆仁80g，生的",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生毛豆仁",
+          "acceptable_food_names": [
+            "生毛豆仁",
+            "毛豆仁"
+          ],
+          "food_state": "生毛豆仁、去莢",
+          "amount": 80,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 129,
+                "max": 129
+              },
+              "protein_g": {
+                "min": 14.6,
+                "max": 14.6
+              },
+              "fat_g": {
+                "min": 3.3,
+                "max": 3.3
+              },
+              "carbohydrate_g": {
+                "min": 12.5,
+                "max": 12.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "H1100101",
+              "sample_name": "毛豆仁",
+              "food_state": "生",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-14-3",
+      "item_key": "raw_edamame",
+      "user_text": "晚餐加生毛豆仁60公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生毛豆仁",
+          "acceptable_food_names": [
+            "生毛豆仁",
+            "毛豆仁"
+          ],
+          "food_state": "生毛豆仁、去莢",
+          "amount": 60,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 129,
+                "max": 129
+              },
+              "protein_g": {
+                "min": 14.6,
+                "max": 14.6
+              },
+              "fat_g": {
+                "min": 3.3,
+                "max": 3.3
+              },
+              "carbohydrate_g": {
+                "min": 12.5,
+                "max": 12.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "H1100101",
+              "sample_name": "毛豆仁",
+              "food_state": "生",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-15-1",
+      "item_key": "raw_spinach",
+      "user_text": "午餐生菠菜100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生菠菜",
+          "acceptable_food_names": [
+            "生菠菜",
+            "菠菜"
+          ],
+          "food_state": "生菠菜、去根",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 18,
+                "max": 18
+              },
+              "protein_g": {
+                "min": 2.2,
+                "max": 2.2
+              },
+              "fat_g": {
+                "min": 0.3,
+                "max": 0.3
+              },
+              "carbohydrate_g": {
+                "min": 2.4,
+                "max": 2.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E5000101",
+              "sample_name": "菠菜",
+              "food_state": "生；去根部",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-15-2",
+      "item_key": "raw_spinach",
+      "user_text": "晚餐菠菜150g，還沒煮",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生菠菜",
+          "acceptable_food_names": [
+            "生菠菜",
+            "菠菜"
+          ],
+          "food_state": "生菠菜、去根",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 18,
+                "max": 18
+              },
+              "protein_g": {
+                "min": 2.2,
+                "max": 2.2
+              },
+              "fat_g": {
+                "min": 0.3,
+                "max": 0.3
+              },
+              "carbohydrate_g": {
+                "min": 2.4,
+                "max": 2.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E5000101",
+              "sample_name": "菠菜",
+              "food_state": "生；去根部",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-15-3",
+      "item_key": "raw_spinach",
+      "user_text": "早餐記生菠菜80公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生菠菜",
+          "acceptable_food_names": [
+            "生菠菜",
+            "菠菜"
+          ],
+          "food_state": "生菠菜、去根",
+          "amount": 80,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 18,
+                "max": 18
+              },
+              "protein_g": {
+                "min": 2.2,
+                "max": 2.2
+              },
+              "fat_g": {
+                "min": 0.3,
+                "max": 0.3
+              },
+              "carbohydrate_g": {
+                "min": 2.4,
+                "max": 2.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E5000101",
+              "sample_name": "菠菜",
+              "food_state": "生；去根部",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-16-1",
+      "item_key": "raw_cauliflower",
+      "user_text": "午餐生花椰菜120克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生花椰菜",
+          "acceptable_food_names": [
+            "生花椰菜",
+            "花椰菜"
+          ],
+          "food_state": "生花椰菜",
+          "amount": 120,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 23,
+                "max": 23
+              },
+              "protein_g": {
+                "min": 1.8,
+                "max": 1.8
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 4.5,
+                "max": 4.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E5800101",
+              "sample_name": "花椰菜",
+              "food_state": "生",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-16-2",
+      "item_key": "raw_cauliflower",
+      "user_text": "晚餐花椰菜200g，生重",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生花椰菜",
+          "acceptable_food_names": [
+            "生花椰菜",
+            "花椰菜"
+          ],
+          "food_state": "生花椰菜",
+          "amount": 200,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 23,
+                "max": 23
+              },
+              "protein_g": {
+                "min": 1.8,
+                "max": 1.8
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 4.5,
+                "max": 4.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E5800101",
+              "sample_name": "花椰菜",
+              "food_state": "生",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-16-3",
+      "item_key": "raw_cauliflower",
+      "user_text": "生花椰菜100公克算午餐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生花椰菜",
+          "acceptable_food_names": [
+            "生花椰菜",
+            "花椰菜"
+          ],
+          "food_state": "生花椰菜",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 23,
+                "max": 23
+              },
+              "protein_g": {
+                "min": 1.8,
+                "max": 1.8
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 4.5,
+                "max": 4.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E5800101",
+              "sample_name": "花椰菜",
+              "food_state": "生",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-17-1",
+      "item_key": "raw_red_tomato",
+      "user_text": "早餐紅番茄150克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生紅番茄",
+          "acceptable_food_names": [
+            "紅番茄",
+            "生大番茄",
+            "牛番茄"
+          ],
+          "food_state": "生紅色系大番茄、去蒂",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 19,
+                "max": 19
+              },
+              "protein_g": {
+                "min": 0.8,
+                "max": 0.8
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 4.1,
+                "max": 4.1
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E74001",
+              "sample_name": "大番茄平均值(紅色系)",
+              "food_state": "生；去蒂",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-17-2",
+      "item_key": "raw_red_tomato",
+      "user_text": "午餐生大番茄200g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生紅番茄",
+          "acceptable_food_names": [
+            "紅番茄",
+            "生大番茄",
+            "牛番茄"
+          ],
+          "food_state": "生紅色系大番茄、去蒂",
+          "amount": 200,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 19,
+                "max": 19
+              },
+              "protein_g": {
+                "min": 0.8,
+                "max": 0.8
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 4.1,
+                "max": 4.1
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E74001",
+              "sample_name": "大番茄平均值(紅色系)",
+              "food_state": "生；去蒂",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-17-3",
+      "item_key": "raw_red_tomato",
+      "user_text": "點心吃一顆牛番茄",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生紅番茄",
+          "acceptable_food_names": [
+            "紅番茄",
+            "生大番茄",
+            "牛番茄"
+          ],
+          "food_state": "生紅色系大番茄、去蒂",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "nonempty_or_clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 19,
+                "max": 19
+              },
+              "protein_g": {
+                "min": 0.8,
+                "max": 0.8
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 4.1,
+                "max": 4.1
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E74001",
+              "sample_name": "大番茄平均值(紅色系)",
+              "food_state": "生；去蒂",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-18-1",
+      "item_key": "apple",
+      "user_text": "點心蘋果150克，去皮去核",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "蘋果",
+          "acceptable_food_names": [
+            "蘋果",
+            "蘋果果肉"
+          ],
+          "food_state": "混色蘋果、去皮去核",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 51,
+                "max": 51
+              },
+              "protein_g": {
+                "min": 0.2,
+                "max": 0.2
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 13.9,
+                "max": 13.9
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "D32004",
+              "sample_name": "蘋果平均值(混色)",
+              "food_state": "去皮及核",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-18-2",
+      "item_key": "apple",
+      "user_text": "早餐吃200g蘋果果肉",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "蘋果",
+          "acceptable_food_names": [
+            "蘋果",
+            "蘋果果肉"
+          ],
+          "food_state": "混色蘋果、去皮去核",
+          "amount": 200,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 51,
+                "max": 51
+              },
+              "protein_g": {
+                "min": 0.2,
+                "max": 0.2
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 13.9,
+                "max": 13.9
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "D32004",
+              "sample_name": "蘋果平均值(混色)",
+              "food_state": "去皮及核",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-18-3",
+      "item_key": "apple",
+      "user_text": "下午一顆蘋果",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "蘋果",
+          "acceptable_food_names": [
+            "蘋果",
+            "蘋果果肉"
+          ],
+          "food_state": "混色蘋果、去皮去核",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "nonempty_or_clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 51,
+                "max": 51
+              },
+              "protein_g": {
+                "min": 0.2,
+                "max": 0.2
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 13.9,
+                "max": 13.9
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "D32004",
+              "sample_name": "蘋果平均值(混色)",
+              "food_state": "去皮及核",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-19-1",
+      "item_key": "raw_oats",
+      "user_text": "早餐生燕麥50克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生燕麥",
+          "acceptable_food_names": [
+            "生燕麥",
+            "燕麥乾重"
+          ],
+          "food_state": "生燕麥粒，不是沖泡後重量",
+          "amount": 50,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 406,
+                "max": 406
+              },
+              "protein_g": {
+                "min": 10.9,
+                "max": 10.9
+              },
+              "fat_g": {
+                "min": 10.2,
+                "max": 10.2
+              },
+              "carbohydrate_g": {
+                "min": 67.4,
+                "max": 67.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "A0800101",
+              "sample_name": "燕麥",
+              "food_state": "生",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-19-2",
+      "item_key": "raw_oats",
+      "user_text": "燕麥乾重80g算早餐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生燕麥",
+          "acceptable_food_names": [
+            "生燕麥",
+            "燕麥乾重"
+          ],
+          "food_state": "生燕麥粒，不是沖泡後重量",
+          "amount": 80,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 406,
+                "max": 406
+              },
+              "protein_g": {
+                "min": 10.9,
+                "max": 10.9
+              },
+              "fat_g": {
+                "min": 10.2,
+                "max": 10.2
+              },
+              "carbohydrate_g": {
+                "min": 67.4,
+                "max": 67.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "A0800101",
+              "sample_name": "燕麥",
+              "food_state": "生",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-19-3",
+      "item_key": "raw_oats",
+      "user_text": "點心記生燕麥30公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生燕麥",
+          "acceptable_food_names": [
+            "生燕麥",
+            "燕麥乾重"
+          ],
+          "food_state": "生燕麥粒，不是沖泡後重量",
+          "amount": 30,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 406,
+                "max": 406
+              },
+              "protein_g": {
+                "min": 10.9,
+                "max": 10.9
+              },
+              "fat_g": {
+                "min": 10.2,
+                "max": 10.2
+              },
+              "carbohydrate_g": {
+                "min": 67.4,
+                "max": 67.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "A0800101",
+              "sample_name": "燕麥",
+              "food_state": "生",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-20-1",
+      "item_key": "white_mantou",
+      "user_text": "早餐白饅頭100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "白饅頭",
+          "acceptable_food_names": [
+            "白饅頭"
+          ],
+          "food_state": "白饅頭成品",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 248,
+                "max": 248
+              },
+              "protein_g": {
+                "min": 8.1,
+                "max": 8.1
+              },
+              "fat_g": {
+                "min": 1.2,
+                "max": 1.2
+              },
+              "carbohydrate_g": {
+                "min": 51.3,
+                "max": 51.3
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R2400201",
+              "sample_name": "白饅頭",
+              "food_state": "混合均勻打碎",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-20-2",
+      "item_key": "white_mantou",
+      "user_text": "點心吃50g白饅頭",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "白饅頭",
+          "acceptable_food_names": [
+            "白饅頭"
+          ],
+          "food_state": "白饅頭成品",
+          "amount": 50,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 248,
+                "max": 248
+              },
+              "protein_g": {
+                "min": 8.1,
+                "max": 8.1
+              },
+              "fat_g": {
+                "min": 1.2,
+                "max": 1.2
+              },
+              "carbohydrate_g": {
+                "min": 51.3,
+                "max": 51.3
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R2400201",
+              "sample_name": "白饅頭",
+              "food_state": "混合均勻打碎",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-20-3",
+      "item_key": "white_mantou",
+      "user_text": "早餐一顆白饅頭",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "白饅頭",
+          "acceptable_food_names": [
+            "白饅頭"
+          ],
+          "food_state": "白饅頭成品",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "nonempty_or_clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 248,
+                "max": 248
+              },
+              "protein_g": {
+                "min": 8.1,
+                "max": 8.1
+              },
+              "fat_g": {
+                "min": 1.2,
+                "max": 1.2
+              },
+              "carbohydrate_g": {
+                "min": 51.3,
+                "max": 51.3
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R2400201",
+              "sample_name": "白饅頭",
+              "food_state": "混合均勻打碎",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-21-1",
+      "item_key": "dry_noodles",
+      "user_text": "午餐乾麵條80克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "乾麵條",
+          "acceptable_food_names": [
+            "乾麵條",
+            "麵條乾重",
+            "乾麵"
+          ],
+          "food_state": "未煮乾麵條",
+          "amount": 80,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 350,
+                "max": 350
+              },
+              "protein_g": {
+                "min": 11.6,
+                "max": 11.6
+              },
+              "fat_g": {
+                "min": 1.5,
+                "max": 1.5
+              },
+              "carbohydrate_g": {
+                "min": 72.5,
+                "max": 72.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R2000101",
+              "sample_name": "乾麵條",
+              "food_state": "乾麵條",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-21-2",
+      "item_key": "dry_noodles",
+      "user_text": "晚餐麵條乾重100g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "乾麵條",
+          "acceptable_food_names": [
+            "乾麵條",
+            "麵條乾重",
+            "乾麵"
+          ],
+          "food_state": "未煮乾麵條",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 350,
+                "max": 350
+              },
+              "protein_g": {
+                "min": 11.6,
+                "max": 11.6
+              },
+              "fat_g": {
+                "min": 1.5,
+                "max": 1.5
+              },
+              "carbohydrate_g": {
+                "min": 72.5,
+                "max": 72.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R2000101",
+              "sample_name": "乾麵條",
+              "food_state": "乾麵條",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-21-3",
+      "item_key": "dry_noodles",
+      "user_text": "早餐記乾麵60公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "乾麵條",
+          "acceptable_food_names": [
+            "乾麵條",
+            "麵條乾重",
+            "乾麵"
+          ],
+          "food_state": "未煮乾麵條",
+          "amount": 60,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 350,
+                "max": 350
+              },
+              "protein_g": {
+                "min": 11.6,
+                "max": 11.6
+              },
+              "fat_g": {
+                "min": 1.5,
+                "max": 1.5
+              },
+              "carbohydrate_g": {
+                "min": 72.5,
+                "max": 72.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R2000101",
+              "sample_name": "乾麵條",
+              "food_state": "乾麵條",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-22-1",
+      "item_key": "dry_vermicelli",
+      "user_text": "午餐冬粉乾重50克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "冬粉",
+          "acceptable_food_names": [
+            "冬粉",
+            "乾冬粉"
+          ],
+          "food_state": "未煮冬粉（綠豆、澱粉、水等）",
+          "amount": 50,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 351,
+                "max": 351
+              },
+              "protein_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 87.5,
+                "max": 87.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R4600201",
+              "sample_name": "冬粉",
+              "food_state": "綠豆、澱粉、水等",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-22-2",
+      "item_key": "dry_vermicelli",
+      "user_text": "晚餐80g未煮冬粉",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "冬粉",
+          "acceptable_food_names": [
+            "冬粉",
+            "乾冬粉"
+          ],
+          "food_state": "未煮冬粉（綠豆、澱粉、水等）",
+          "amount": 80,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 351,
+                "max": 351
+              },
+              "protein_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 87.5,
+                "max": 87.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R4600201",
+              "sample_name": "冬粉",
+              "food_state": "綠豆、澱粉、水等",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-22-3",
+      "item_key": "dry_vermicelli",
+      "user_text": "早餐乾冬粉30公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "冬粉",
+          "acceptable_food_names": [
+            "冬粉",
+            "乾冬粉"
+          ],
+          "food_state": "未煮冬粉（綠豆、澱粉、水等）",
+          "amount": 30,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 351,
+                "max": 351
+              },
+              "protein_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 87.5,
+                "max": 87.5
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "R4600201",
+              "sample_name": "冬粉",
+              "food_state": "綠豆、澱粉、水等",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-23-1",
+      "item_key": "raw_sweet_corn",
+      "user_text": "午餐生甜玉米粒100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "甜玉米",
+          "acceptable_food_names": [
+            "生甜玉米粒",
+            "甜玉米"
+          ],
+          "food_state": "生甜玉米粒",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 107,
+                "max": 107
+              },
+              "protein_g": {
+                "min": 3.3,
+                "max": 3.3
+              },
+              "fat_g": {
+                "min": 2.5,
+                "max": 2.5
+              },
+              "carbohydrate_g": {
+                "min": 17.8,
+                "max": 17.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "A0400301",
+              "sample_name": "甜玉米",
+              "food_state": "生；取玉米粒",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-23-2",
+      "item_key": "raw_sweet_corn",
+      "user_text": "點心玉米粒150g，生重",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "甜玉米",
+          "acceptable_food_names": [
+            "生甜玉米粒",
+            "甜玉米"
+          ],
+          "food_state": "生甜玉米粒",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 107,
+                "max": 107
+              },
+              "protein_g": {
+                "min": 3.3,
+                "max": 3.3
+              },
+              "fat_g": {
+                "min": 2.5,
+                "max": 2.5
+              },
+              "carbohydrate_g": {
+                "min": 17.8,
+                "max": 17.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "A0400301",
+              "sample_name": "甜玉米",
+              "food_state": "生；取玉米粒",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-23-3",
+      "item_key": "raw_sweet_corn",
+      "user_text": "早餐吃一根甜玉米",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "甜玉米",
+          "acceptable_food_names": [
+            "生甜玉米粒",
+            "甜玉米"
+          ],
+          "food_state": "生甜玉米粒",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "nonempty_or_clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 107,
+                "max": 107
+              },
+              "protein_g": {
+                "min": 3.3,
+                "max": 3.3
+              },
+              "fat_g": {
+                "min": 2.5,
+                "max": 2.5
+              },
+              "carbohydrate_g": {
+                "min": 17.8,
+                "max": 17.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "A0400301",
+              "sample_name": "甜玉米",
+              "food_state": "生；取玉米粒",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-24-1",
+      "item_key": "raw_peanuts",
+      "user_text": "點心生花生仁30克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生帶膜花生仁",
+          "acceptable_food_names": [
+            "生花生仁",
+            "帶膜花生"
+          ],
+          "food_state": "生、帶膜花生仁",
+          "amount": 30,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 516,
+                "max": 516
+              },
+              "protein_g": {
+                "min": 23.6,
+                "max": 23.6
+              },
+              "fat_g": {
+                "min": 38.1,
+                "max": 38.1
+              },
+              "carbohydrate_g": {
+                "min": 28.4,
+                "max": 28.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "C1705301",
+              "sample_name": "帶膜花生仁(生)(2004年取樣)",
+              "food_state": "生、帶膜",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-24-2",
+      "item_key": "raw_peanuts",
+      "user_text": "早餐帶膜花生20g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生帶膜花生仁",
+          "acceptable_food_names": [
+            "生花生仁",
+            "帶膜花生"
+          ],
+          "food_state": "生、帶膜花生仁",
+          "amount": 20,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 516,
+                "max": 516
+              },
+              "protein_g": {
+                "min": 23.6,
+                "max": 23.6
+              },
+              "fat_g": {
+                "min": 38.1,
+                "max": 38.1
+              },
+              "carbohydrate_g": {
+                "min": 28.4,
+                "max": 28.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "C1705301",
+              "sample_name": "帶膜花生仁(生)(2004年取樣)",
+              "food_state": "生、帶膜",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-24-3",
+      "item_key": "raw_peanuts",
+      "user_text": "午餐加生花生仁15公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生帶膜花生仁",
+          "acceptable_food_names": [
+            "生花生仁",
+            "帶膜花生"
+          ],
+          "food_state": "生、帶膜花生仁",
+          "amount": 15,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 516,
+                "max": 516
+              },
+              "protein_g": {
+                "min": 23.6,
+                "max": 23.6
+              },
+              "fat_g": {
+                "min": 38.1,
+                "max": 38.1
+              },
+              "carbohydrate_g": {
+                "min": 28.4,
+                "max": 28.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "C1705301",
+              "sample_name": "帶膜花生仁(生)(2004年取樣)",
+              "food_state": "生、帶膜",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-25-1",
+      "item_key": "plain_cashews",
+      "user_text": "點心原味腰果30克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "原味腰果",
+          "acceptable_food_names": [
+            "原味腰果",
+            "熟腰果"
+          ],
+          "food_state": "熟原味腰果",
+          "amount": 30,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 566,
+                "max": 566
+              },
+              "protein_g": {
+                "min": 16.4,
+                "max": 16.4
+              },
+              "fat_g": {
+                "min": 43.7,
+                "max": 43.7
+              },
+              "carbohydrate_g": {
+                "min": 35.2,
+                "max": 35.2
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "C0810101",
+              "sample_name": "原味腰果",
+              "food_state": "熟",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-25-2",
+      "item_key": "plain_cashews",
+      "user_text": "早餐吃20g熟腰果",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "原味腰果",
+          "acceptable_food_names": [
+            "原味腰果",
+            "熟腰果"
+          ],
+          "food_state": "熟原味腰果",
+          "amount": 20,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 566,
+                "max": 566
+              },
+              "protein_g": {
+                "min": 16.4,
+                "max": 16.4
+              },
+              "fat_g": {
+                "min": 43.7,
+                "max": 43.7
+              },
+              "carbohydrate_g": {
+                "min": 35.2,
+                "max": 35.2
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "C0810101",
+              "sample_name": "原味腰果",
+              "food_state": "熟",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-25-3",
+      "item_key": "plain_cashews",
+      "user_text": "午餐加原味腰果15公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "原味腰果",
+          "acceptable_food_names": [
+            "原味腰果",
+            "熟腰果"
+          ],
+          "food_state": "熟原味腰果",
+          "amount": 15,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 566,
+                "max": 566
+              },
+              "protein_g": {
+                "min": 16.4,
+                "max": 16.4
+              },
+              "fat_g": {
+                "min": 43.7,
+                "max": 43.7
+              },
+              "carbohydrate_g": {
+                "min": 35.2,
+                "max": 35.2
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "C0810101",
+              "sample_name": "原味腰果",
+              "food_state": "熟",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-26-1",
+      "item_key": "raw_pork_tenderloin",
+      "user_text": "午餐生豬小里肌150克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生豬小里肌",
+          "acceptable_food_names": [
+            "生豬小里肌",
+            "豬里肌"
+          ],
+          "food_state": "生豬小里肌",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 139,
+                "max": 139
+              },
+              "protein_g": {
+                "min": 21.1,
+                "max": 21.1
+              },
+              "fat_g": {
+                "min": 5.4,
+                "max": 5.4
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "I0306101",
+              "sample_name": "豬小里肌",
+              "food_state": "生；豬小里肌部位",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-26-2",
+      "item_key": "raw_pork_tenderloin",
+      "user_text": "晚餐豬里肌生重200g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生豬小里肌",
+          "acceptable_food_names": [
+            "生豬小里肌",
+            "豬里肌"
+          ],
+          "food_state": "生豬小里肌",
+          "amount": 200,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 139,
+                "max": 139
+              },
+              "protein_g": {
+                "min": 21.1,
+                "max": 21.1
+              },
+              "fat_g": {
+                "min": 5.4,
+                "max": 5.4
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "I0306101",
+              "sample_name": "豬小里肌",
+              "food_state": "生；豬小里肌部位",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-26-3",
+      "item_key": "raw_pork_tenderloin",
+      "user_text": "早餐記生小里肌100公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生豬小里肌",
+          "acceptable_food_names": [
+            "生豬小里肌",
+            "豬里肌"
+          ],
+          "food_state": "生豬小里肌",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 139,
+                "max": 139
+              },
+              "protein_g": {
+                "min": 21.1,
+                "max": 21.1
+              },
+              "fat_g": {
+                "min": 5.4,
+                "max": 5.4
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "I0306101",
+              "sample_name": "豬小里肌",
+              "food_state": "生；豬小里肌部位",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-27-1",
+      "item_key": "raw_beef_hotpot",
+      "user_text": "午餐生牛肉火鍋片100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生牛肉火鍋片",
+          "acceptable_food_names": [
+            "生牛肉火鍋片",
+            "牛肉片",
+            "生火鍋牛肉"
+          ],
+          "food_state": "生冷凍牛肉火鍋片平均值",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 250,
+                "max": 250
+              },
+              "protein_g": {
+                "min": 19.1,
+                "max": 19.1
+              },
+              "fat_g": {
+                "min": 18.7,
+                "max": 18.7
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "I01101",
+              "sample_name": "牛肉火鍋片平均值",
+              "food_state": "生、冷凍產品",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-27-2",
+      "item_key": "raw_beef_hotpot",
+      "user_text": "晚餐牛肉片生重150g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生牛肉火鍋片",
+          "acceptable_food_names": [
+            "生牛肉火鍋片",
+            "牛肉片",
+            "生火鍋牛肉"
+          ],
+          "food_state": "生冷凍牛肉火鍋片平均值",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 250,
+                "max": 250
+              },
+              "protein_g": {
+                "min": 19.1,
+                "max": 19.1
+              },
+              "fat_g": {
+                "min": 18.7,
+                "max": 18.7
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "I01101",
+              "sample_name": "牛肉火鍋片平均值",
+              "food_state": "生、冷凍產品",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-27-3",
+      "item_key": "raw_beef_hotpot",
+      "user_text": "生火鍋牛肉80公克算午餐",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生牛肉火鍋片",
+          "acceptable_food_names": [
+            "生牛肉火鍋片",
+            "牛肉片",
+            "生火鍋牛肉"
+          ],
+          "food_state": "生冷凍牛肉火鍋片平均值",
+          "amount": 80,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 250,
+                "max": 250
+              },
+              "protein_g": {
+                "min": 19.1,
+                "max": 19.1
+              },
+              "fat_g": {
+                "min": 18.7,
+                "max": 18.7
+              },
+              "carbohydrate_g": {
+                "min": 0,
+                "max": 0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "I01101",
+              "sample_name": "牛肉火鍋片平均值",
+              "food_state": "生、冷凍產品",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-28-1",
+      "item_key": "raw_cabbage",
+      "user_text": "午餐生高麗菜150克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生高麗菜",
+          "acceptable_food_names": [
+            "生高麗菜",
+            "甘藍"
+          ],
+          "food_state": "生甘藍、去粗莖",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 23,
+                "max": 23
+              },
+              "protein_g": {
+                "min": 1.3,
+                "max": 1.3
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 4.8,
+                "max": 4.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E30001",
+              "sample_name": "甘藍平均值",
+              "food_state": "生；去粗莖",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-28-2",
+      "item_key": "raw_cabbage",
+      "user_text": "晚餐甘藍200g，生重",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生高麗菜",
+          "acceptable_food_names": [
+            "生高麗菜",
+            "甘藍"
+          ],
+          "food_state": "生甘藍、去粗莖",
+          "amount": 200,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 23,
+                "max": 23
+              },
+              "protein_g": {
+                "min": 1.3,
+                "max": 1.3
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 4.8,
+                "max": 4.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E30001",
+              "sample_name": "甘藍平均值",
+              "food_state": "生；去粗莖",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-28-3",
+      "item_key": "raw_cabbage",
+      "user_text": "早餐記生高麗菜100公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "生高麗菜",
+          "acceptable_food_names": [
+            "生高麗菜",
+            "甘藍"
+          ],
+          "food_state": "生甘藍、去粗莖",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 23,
+                "max": 23
+              },
+              "protein_g": {
+                "min": 1.3,
+                "max": 1.3
+              },
+              "fat_g": {
+                "min": 0.1,
+                "max": 0.1
+              },
+              "carbohydrate_g": {
+                "min": 4.8,
+                "max": 4.8
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E30001",
+              "sample_name": "甘藍平均值",
+              "food_state": "生；去粗莖",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-29-1",
+      "item_key": "fruit_cucumber",
+      "user_text": "午餐水果小黃瓜100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "午餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "水果小黃瓜",
+          "acceptable_food_names": [
+            "水果小黃瓜",
+            "生小黃瓜",
+            "水果胡瓜"
+          ],
+          "food_state": "生水果小胡瓜、去蒂",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 13,
+                "max": 13
+              },
+              "protein_g": {
+                "min": 0.6,
+                "max": 0.6
+              },
+              "fat_g": {
+                "min": 0,
+                "max": 0
+              },
+              "carbohydrate_g": {
+                "min": 3.0,
+                "max": 3.0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E6400301",
+              "sample_name": "水果小胡瓜",
+              "food_state": "生；去蒂",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-29-2",
+      "item_key": "fruit_cucumber",
+      "user_text": "點心生小黃瓜150g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "水果小黃瓜",
+          "acceptable_food_names": [
+            "水果小黃瓜",
+            "生小黃瓜",
+            "水果胡瓜"
+          ],
+          "food_state": "生水果小胡瓜、去蒂",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 13,
+                "max": 13
+              },
+              "protein_g": {
+                "min": 0.6,
+                "max": 0.6
+              },
+              "fat_g": {
+                "min": 0,
+                "max": 0
+              },
+              "carbohydrate_g": {
+                "min": 3.0,
+                "max": 3.0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E6400301",
+              "sample_name": "水果小胡瓜",
+              "food_state": "生；去蒂",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-29-3",
+      "item_key": "fruit_cucumber",
+      "user_text": "晚餐記水果胡瓜80公克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "晚餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "水果小黃瓜",
+          "acceptable_food_names": [
+            "水果小黃瓜",
+            "生小黃瓜",
+            "水果胡瓜"
+          ],
+          "food_state": "生水果小胡瓜、去蒂",
+          "amount": 80,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 13,
+                "max": 13
+              },
+              "protein_g": {
+                "min": 0.6,
+                "max": 0.6
+              },
+              "fat_g": {
+                "min": 0,
+                "max": 0
+              },
+              "carbohydrate_g": {
+                "min": 3.0,
+                "max": 3.0
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "E6400301",
+              "sample_name": "水果小胡瓜",
+              "food_state": "生；去蒂",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-30-1",
+      "item_key": "unsweet_fiber_yogurt",
+      "user_text": "早餐無糖纖維優格100克",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "早餐",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "無糖纖維濃稠發酵乳",
+          "acceptable_food_names": [
+            "無糖纖維優格",
+            "中脂無糖優格",
+            "原味優格"
+          ],
+          "food_state": "中脂、無糖且纖維強化濃稠發酵乳",
+          "amount": 100,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 74,
+                "max": 74
+              },
+              "protein_g": {
+                "min": 3.2,
+                "max": 3.2
+              },
+              "fat_g": {
+                "min": 2.2,
+                "max": 2.2
+              },
+              "carbohydrate_g": {
+                "min": 10.4,
+                "max": 10.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "L0314201",
+              "sample_name": "中脂濃稠發酵乳(無糖&纖維強化)",
+              "food_state": "中脂、無糖、纖維強化",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-30-2",
+      "item_key": "unsweet_fiber_yogurt",
+      "user_text": "點心中脂無糖優格150g",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "無糖纖維濃稠發酵乳",
+          "acceptable_food_names": [
+            "無糖纖維優格",
+            "中脂無糖優格",
+            "原味優格"
+          ],
+          "food_state": "中脂、無糖且纖維強化濃稠發酵乳",
+          "amount": 150,
+          "unit": "g",
+          "portion_assumption": "empty"
+        },
+        "routing": {
+          "status": "official_match",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "SCORED",
+          "not_scored_reason": null,
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 74,
+                "max": 74
+              },
+              "protein_g": {
+                "min": 3.2,
+                "max": 3.2
+              },
+              "fat_g": {
+                "min": 2.2,
+                "max": 2.2
+              },
+              "carbohydrate_g": {
+                "min": 10.4,
+                "max": 10.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "L0314201",
+              "sample_name": "中脂濃稠發酵乳(無糖&纖維強化)",
+              "food_state": "中脂、無糖、纖維強化",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "R3-30-3",
+      "item_key": "unsweet_fiber_yogurt",
+      "user_text": "下午一杯原味優格",
+      "expected": {
+        "intent": "meal_log",
+        "meal_slot": "點心",
+        "item_count": 1,
+        "item": {
+          "canonical_food": "無糖纖維濃稠發酵乳",
+          "acceptable_food_names": [
+            "無糖纖維優格",
+            "中脂無糖優格",
+            "原味優格"
+          ],
+          "food_state": "中脂、無糖且纖維強化濃稠發酵乳",
+          "amount": 1,
+          "unit": "natural",
+          "portion_assumption": "clarification"
+        },
+        "routing": {
+          "status": "clarification",
+          "available_units": [
+            "g"
+          ],
+          "must_not_use_g_as_ml": false
+        },
+        "nutrition_evaluation": {
+          "status": "NOT_SCORED",
+          "not_scored_reason": "份量、容量、狀態或配方尚不確定，沒有相容的獨立營養金標。",
+          "gold_per_100": {
+            "basis_amount": 100,
+            "basis_unit": "g",
+            "ranges": {
+              "calories_kcal": {
+                "min": 74,
+                "max": 74
+              },
+              "protein_g": {
+                "min": 3.2,
+                "max": 3.2
+              },
+              "fat_g": {
+                "min": 2.2,
+                "max": 2.2
+              },
+              "carbohydrate_g": {
+                "min": 10.4,
+                "max": 10.4
+              }
+            },
+            "source": {
+              "publisher": "TFDA",
+              "dataset": "食品營養成分資料集",
+              "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+              "official_zip_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+              "food_code": "L0314201",
+              "sample_name": "中脂濃稠發酵乳(無糖&纖維強化)",
+              "food_state": "中脂、無糖、纖維強化",
+              "value_column": "每100克含量"
+            },
+            "range_reason": "上下限相同，因金標是官方資料列的每100克公布值；評分容差另由 rubric 定義，不擴張來源範圍。"
+          }
+        }
+      }
+    }
+  ]
+}

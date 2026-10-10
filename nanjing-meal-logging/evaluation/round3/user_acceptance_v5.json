@@ -1,0 +1,122 @@
+{
+  "schema_version": "round4-mobile-user-acceptance-v5",
+  "policy_timing": "本次有限 staging live 前修正版；沿用不看 AI 輸出、不動態放寬的預先固定數值規則，不宣稱較早 v5 草稿已正式凍結",
+  "scope": "sidecar acceptance policy; does not replace or rescore frozen v3/v4 gold",
+  "legacy_freeze": {
+    "files": {
+      "cases.json": "8d8a3acb940fcd7937977aff3eadc49074198e3341716523ba0f7d08f67203dc",
+      "rubric.md": "86fb4bd9cd436dc5e9d61853f041f7ce231731ab74a3f405086f5352b9ecf943",
+      "runner.py": "d6e4aede15005b628bad919fa78c24c1f0b8fab9bea11d423e85e0ae3b070183",
+      "live_adapter.py": "9cadef0a729ef53913772fff15620e1d3cf5660da070a72556743343c927dd0a"
+    }
+  },
+  "authorized_categories": {
+    "1": "輸入與 parsed state 資訊完整，DB 已有相容列，僅解析名稱夾量/精確等價名稱/詞序缺口；可提 alias，但本檔不改 data",
+    "2": "實際 parsed state/品種資訊不足（可能是原文不足，也可能原文足夠但模型漏）；真正 pipeline 澄清可 PASS，或卡片明示必要 scope 後以 AI估算且通過獨立範圍可 PASS",
+    "3": "輸入與解析資訊足夠，但目前沒有獨立同單位可比來源；AI數字只能 UNVERIFIED"
+  },
+  "hard_fail_zero_tolerance": [
+    "state_or_edible_part_mismatch",
+    "g_ml_basis_mismatch",
+    "false_official",
+    "unknown_nutrient_coerced_to_zero",
+    "uncertain_quantity_forced_to_final"
+  ],
+  "range_method": {
+    "id": "tfda-single-compatible-row-plausibility-v1",
+    "rule": "僅對食品、狀態、可食部、單位相容的 TFDA 100g 列預先展開 hard envelope：熱量 70%-130%；P/F/C 60%-140%；官方明列 0 為 0-1g。這是第四輪前固定的合理性 hard bound，不是官方 confidence interval，也不是看 AI 輸出後移動容差。",
+    "multiple_rows": "若未來有多個相容列，先取逐營養素來源 min/max，再套相同外擴規則；本 v5 不混入不相容狀態/品種/可食部。",
+    "unknown": "沒有獨立同單位可比來源時標 UNVERIFIED；AI 自己提供的 min/max 不可令其 PASS。"
+  },
+  "sources": {
+    "tfda54": {
+      "publisher": "TFDA",
+      "dataset": "食品營養成分資料集",
+      "dataset_url": "https://data.fda.gov.tw/data/opendata/export/20/json",
+      "artifact": "/home/win-xi/nanjing-meal-logging-evidence/round2/tfda-food-nutrition-20-json.zip",
+      "artifact_sha256": "755d2f0e4a7c1fe80ac0636863117e376773c9342cfd68e7b05e67d81e3c6064",
+      "catalog_rows": 54,
+      "basis_unit": "g"
+    },
+    "ime_unsweet_soymilk_label": {
+      "publisher": "義美食品／包裝營養標示照片",
+      "product": "義美無加糖豆奶 (Soybean Milk, No Sugar Added)",
+      "barcode": "4710126194403",
+      "label_image_url": "https://images.openfoodfacts.org/images/products/471/012/619/4403/nutrition_en.5.400.jpg",
+      "catalog_record_url": "https://world.openfoodfacts.org/product/4710126194403",
+      "retrieved_via": "Open Food Facts product API and label image; values independently read from package image",
+      "scope_limit": "只作該義美包裝產品，或卡片明示以此品牌標示作 benchmark 的 AI 估算；不是所有台灣豆漿官方真值"
+    }
+  },
+  "benchmarks": {
+    "whole_milk_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"全脂3.0-3.8%鮮乳","food_code":"L01021","ranges":{"calories_kcal":{"min":44.1,"max":81.9},"protein_g":{"min":1.86,"max":4.34},"fat_g":{"min":2.16,"max":5.04},"carbohydrate_g":{"min":2.88,"max":6.72}},"sources":["tfda54:L01021"],"derived_without_live_ai_output":true},
+    "raw_peeled_chicken_breast_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生雞胸、去皮","food_code":"I04024","ranges":{"calories_kcal":{"min":83.3,"max":154.7},"protein_g":{"min":13.98,"max":32.62},"fat_g":{"min":1.26,"max":2.94},"carbohydrate_g":{"min":0,"max":1}},"sources":["tfda54:I04024"],"derived_without_live_ai_output":true},
+    "peeled_apple_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"混色蘋果、去皮去核","food_code":"D32004","ranges":{"calories_kcal":{"min":35.7,"max":66.3},"protein_g":{"min":0.12,"max":0.28},"fat_g":{"min":0.06,"max":0.14},"carbohydrate_g":{"min":8.34,"max":19.46}},"sources":["tfda54:D32004"],"derived_without_live_ai_output":true},
+    "dry_noodles_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"未煮乾麵條","food_code":"R2000101","ranges":{"calories_kcal":{"min":245,"max":455},"protein_g":{"min":6.96,"max":16.24},"fat_g":{"min":0.9,"max":2.1},"carbohydrate_g":{"min":43.5,"max":101.5}},"sources":["tfda54:R2000101"],"derived_without_live_ai_output":true},
+    "raw_pork_tenderloin_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生豬小里肌","food_code":"I0306101","ranges":{"calories_kcal":{"min":97.3,"max":180.7},"protein_g":{"min":12.66,"max":29.54},"fat_g":{"min":3.24,"max":7.56},"carbohydrate_g":{"min":0,"max":1}},"sources":["tfda54:I0306101"],"derived_without_live_ai_output":true},
+    "raw_beef_hotpot_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生冷凍牛肉火鍋片平均值","food_code":"I01101","ranges":{"calories_kcal":{"min":175,"max":325},"protein_g":{"min":11.46,"max":26.74},"fat_g":{"min":11.22,"max":26.18},"carbohydrate_g":{"min":0,"max":1}},"sources":["tfda54:I01101"],"derived_without_live_ai_output":true},
+    "steamed_mackerel_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"含皮去骨內臟、100C蒸10分鐘","food_code":"J0414810","ranges":{"calories_kcal":{"min":274.4,"max":509.6},"protein_g":{"min":8.76,"max":20.44},"fat_g":{"min":21.9,"max":51.1},"carbohydrate_g":{"min":0.42,"max":0.98}},"sources":["tfda54:J0414810"],"derived_without_live_ai_output":true},
+    "raw_edamame_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生毛豆仁、去莢","food_code":"H1100101","ranges":{"calories_kcal":{"min":90.3,"max":167.7},"protein_g":{"min":8.76,"max":20.44},"fat_g":{"min":1.98,"max":4.62},"carbohydrate_g":{"min":7.5,"max":17.5}},"sources":["tfda54:H1100101"],"derived_without_live_ai_output":true},
+    "raw_cauliflower_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生花椰菜","food_code":"E5800101","ranges":{"calories_kcal":{"min":16.1,"max":29.9},"protein_g":{"min":1.08,"max":2.52},"fat_g":{"min":0.06,"max":0.14},"carbohydrate_g":{"min":2.7,"max":6.3}},"sources":["tfda54:E5800101"],"derived_without_live_ai_output":true},
+    "raw_oats_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生燕麥粒乾重","food_code":"A0800101","ranges":{"calories_kcal":{"min":284.2,"max":527.8},"protein_g":{"min":6.54,"max":15.26},"fat_g":{"min":6.12,"max":14.28},"carbohydrate_g":{"min":40.44,"max":94.36}},"sources":["tfda54:A0800101"],"derived_without_live_ai_output":true},
+    "raw_cabbage_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生甘藍、去粗莖","food_code":"E30001","ranges":{"calories_kcal":{"min":16.1,"max":29.9},"protein_g":{"min":0.78,"max":1.82},"fat_g":{"min":0.06,"max":0.14},"carbohydrate_g":{"min":2.88,"max":6.72}},"sources":["tfda54:E30001"],"derived_without_live_ai_output":true},
+    "raw_spinach_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生菠菜、去根","food_code":"E5000101","ranges":{"calories_kcal":{"min":12.6,"max":23.4},"protein_g":{"min":1.32,"max":3.08},"fat_g":{"min":0.18,"max":0.42},"carbohydrate_g":{"min":1.44,"max":3.36}},"sources":["tfda54:E5000101"],"derived_without_live_ai_output":true},
+    "raw_fruit_cucumber_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生水果小胡瓜、去蒂","food_code":"E6400301","ranges":{"calories_kcal":{"min":9.1,"max":16.9},"protein_g":{"min":0.36,"max":0.84},"fat_g":{"min":0,"max":1},"carbohydrate_g":{"min":1.8,"max":4.2}},"sources":["tfda54:E6400301"],"derived_without_live_ai_output":true},
+    "raw_peeled_yellow_sweet_potato_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生、去皮、黃肉甘藷","food_code":"B0400601","ranges":{"calories_kcal":{"min":84.7,"max":157.3},"protein_g":{"min":0.78,"max":1.82},"fat_g":{"min":0.12,"max":0.28},"carbohydrate_g":{"min":16.68,"max":38.92}},"sources":["tfda54:B0400601"],"derived_without_live_ai_output":true},
+    "raw_peeled_atlantic_salmon_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生、去皮去骨大西洋鮭魚","food_code":"J04024","ranges":{"calories_kcal":{"min":154.7,"max":287.3},"protein_g":{"min":12.12,"max":28.28},"fat_g":{"min":8.94,"max":20.86},"carbohydrate_g":{"min":0,"max":1}},"sources":["tfda54:J04024"],"derived_without_live_ai_output":true},
+    "raw_red_large_tomato_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生紅色系大番茄、去蒂","food_code":"E74001","ranges":{"calories_kcal":{"min":13.3,"max":24.7},"protein_g":{"min":0.48,"max":1.12},"fat_g":{"min":0.06,"max":0.14},"carbohydrate_g":{"min":2.46,"max":5.74}},"sources":["tfda54:E74001"],"derived_without_live_ai_output":true},
+    "raw_sweet_corn_kernels_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生甜玉米粒","food_code":"A0400301","ranges":{"calories_kcal":{"min":74.9,"max":139.1},"protein_g":{"min":1.98,"max":4.62},"fat_g":{"min":1.5,"max":3.5},"carbohydrate_g":{"min":10.68,"max":24.92}},"sources":["tfda54:A0400301"],"derived_without_live_ai_output":true},
+    "raw_skin_on_peanut_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"生、帶膜花生仁","food_code":"C1705301","ranges":{"calories_kcal":{"min":361.2,"max":670.8},"protein_g":{"min":14.16,"max":33.04},"fat_g":{"min":22.86,"max":53.34},"carbohydrate_g":{"min":17.04,"max":39.76}},"sources":["tfda54:C1705301"],"derived_without_live_ai_output":true},
+    "unsweet_fiber_yogurt_g": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"g","scope":"中脂、無糖且纖維強化濃稠發酵乳","food_code":"L0314201","ranges":{"calories_kcal":{"min":51.8,"max":96.2},"protein_g":{"min":1.92,"max":4.48},"fat_g":{"min":1.32,"max":3.08},"carbohydrate_g":{"min":6.24,"max":14.56}},"sources":["tfda54:L0314201"],"derived_without_live_ai_output":true},
+    "whole_milk_ml_unknown": {"verification_status":"UNVERIFIED","basis_amount":100,"basis_unit":"ml","scope":"未指定品牌鮮奶；TFDA只有g且無密度","ranges":null,"sources":["tfda54:L01021:g-only-not-comparable"],"derived_without_live_ai_output":true},
+    "half_sugar_bubble_milk_tea_ml_unknown": {"verification_status":"UNVERIFIED","basis_amount":100,"basis_unit":"ml","scope":"半糖珍奶配方與珍珠量未知","ranges":null,"sources":[],"derived_without_live_ai_output":true},
+    "unsweet_black_tea_ml_unknown": {"verification_status":"UNVERIFIED","basis_amount":100,"basis_unit":"ml","scope":"無糖紅茶品牌/配方未限定；本地來源未固定","ranges":null,"sources":[],"derived_without_live_ai_output":true},
+    "packaged_unsweet_soymilk_ime_100ml": {"verification_status":"VERIFIED","basis_amount":100,"basis_unit":"ml","scope":"義美無加糖豆奶包裝產品","label_serving":{"amount":250,"unit":"ml"},"label_nutrition":{"calories_kcal":84.9,"protein_g":8.5,"fat_g":4.3,"carbohydrate_g":3.0},"per_100":{"calories_kcal":34.0,"protein_g":3.4,"fat_g":1.7,"carbohydrate_g":1.2},"ranges":{"calories_kcal":{"min":34.0,"max":34.0},"protein_g":{"min":3.4,"max":3.4},"fat_g":{"min":1.7,"max":1.7},"carbohydrate_g":{"min":1.2,"max":1.2}},"sources":["ime_unsweet_soymilk_label:4710126194403"],"derived_without_live_ai_output":true,"prohibits_g_to_ml_conversion":true,"required_visible_assumption":"以義美無加糖豆奶每250ml包裝標示換算；僅作品牌 benchmark"}
+  },
+  "missing_33": [
+    {"case_id":"R3-03-1","category":1,"benchmark":"whole_milk_g","classification_basis":"原句明示全脂鮮奶與g；全脂鮮奶↔全脂鮮乳為同 scope 台灣常見同義。","safe_alias_proposal":{"alias":"全脂鮮奶","target":"L01021","scope":"僅全脂3.0-3.8%鮮乳、g；不得涵蓋泛稱鮮奶或ml"}},
+    {"case_id":"R3-04-2","category":1,"benchmark":"raw_peeled_chicken_breast_g","classification_basis":"原文明示去皮、生、雞胸、g；僅詞序與肉字差異。","safe_alias_proposal":{"alias":"去皮生雞胸","target":"I04024","scope":"僅生雞胸去皮、g"}},
+    {"case_id":"R3-18-1","category":1,"benchmark":"peeled_apple_g","classification_basis":"原文明示蘋果、去皮去核、g；名稱夾帶量與處理詞。","safe_alias_proposal":{"alias":"蘋果，去皮去核","target":"D32004","scope":"僅去皮去核可食部、g"}},
+    {"case_id":"R3-21-3","category":1,"benchmark":"dry_noodles_g","classification_basis":"乾麵為乾麵條常見同義且原句明示g。","safe_alias_proposal":{"alias":"乾麵","target":"R2000101","scope":"僅未煮乾麵條、g"}},
+    {"case_id":"R3-26-3","category":1,"benchmark":"raw_pork_tenderloin_g","classification_basis":"原文明示生小里肌與g；省略豬字但 scope 精確。","safe_alias_proposal":{"alias":"生小里肌","target":"I0306101","scope":"僅生豬小里肌、g"}},
+    {"case_id":"R3-27-3","category":1,"benchmark":"raw_beef_hotpot_g","classification_basis":"原文明示生、火鍋牛肉與g；與生牛肉火鍋片詞序等價。","safe_alias_proposal":{"alias":"生火鍋牛肉","target":"I01101","scope":"僅生冷凍牛肉火鍋片、g"}},
+
+    {"case_id":"R3-03-2","category":2,"benchmark":"whole_milk_ml_unknown","classification_basis":"只說鮮奶，未明示全脂/品牌；且ml沒有相容獨立來源。","required_clarification":"品牌與脂肪等級；若估算須另有每100ml包裝標示來源"},
+    {"case_id":"R3-04-1","category":2,"benchmark":"raw_peeled_chicken_breast_g","classification_basis":"生雞胸未說去皮；不得把去皮 TFDA 列假定為 exact。","required_assumption":"AI卡片明示以生去皮雞胸作估算；否則詢問皮別"},
+    {"case_id":"R3-04-3","category":2,"benchmark":"raw_peeled_chicken_breast_g","classification_basis":"生雞胸未說去皮；不得把去皮 TFDA 列假定為 exact。","required_assumption":"AI卡片明示以生去皮雞胸作估算；否則詢問皮別"},
+    {"case_id":"R3-08-2","category":2,"benchmark":"half_sugar_bubble_milk_tea_ml_unknown","classification_basis":"雖有700ml與半糖，奶/茶/珍珠/冰量配方仍不足。","required_clarification":"品牌、配方或營養標示；目前無獨立範圍，數字只能UNVERIFIED"},
+    {"case_id":"R3-10-1","category":2,"benchmark":"raw_peeled_yellow_sweet_potato_g","classification_basis":"生地瓜未明示黃肉與去皮；不得假裝單一 food code 精確。","required_assumption":"AI卡片明示生、去皮、黃肉假設；否則澄清"},
+    {"case_id":"R3-11-1","category":2,"benchmark":"raw_peeled_atlantic_salmon_g","classification_basis":"生鮭魚未明示大西洋、去皮去骨。","required_assumption":"AI卡片明示大西洋、去皮去骨假設；否則澄清"},
+    {"case_id":"R3-11-2","category":2,"benchmark":"raw_peeled_atlantic_salmon_g","classification_basis":"已知大西洋與去皮，但原句未明示生熟/去骨。","required_assumption":"AI卡片明示生、去骨假設；否則澄清"},
+    {"case_id":"R3-11-3","category":2,"benchmark":"raw_peeled_atlantic_salmon_g","classification_basis":"只知生鮭魚，品種與皮骨狀態不足。","required_assumption":"AI卡片明示大西洋、去皮去骨假設；否則澄清"},
+    {"case_id":"R3-17-1","category":2,"benchmark":"raw_red_large_tomato_g","classification_basis":"紅番茄未明示大果與去蒂。","required_assumption":"AI卡片明示紅色系大番茄可食部假設；否則澄清"},
+    {"case_id":"R3-18-2","category":2,"benchmark":"peeled_apple_g","classification_basis":"蘋果果肉未明示品種與是否去皮去核後稱重。","required_assumption":"AI卡片明示混色、去皮去核可食部假設；否則澄清"},
+    {"case_id":"R3-23-2","category":2,"benchmark":"raw_sweet_corn_kernels_g","classification_basis":"玉米粒生重未明示甜玉米品種。","required_assumption":"AI卡片明示甜玉米粒假設；否則澄清"},
+    {"case_id":"R3-24-1","category":2,"benchmark":"raw_skin_on_peanut_g","classification_basis":"生花生仁未明示帶膜/去膜。","required_assumption":"AI卡片明示帶膜假設；否則澄清"},
+    {"case_id":"R3-24-3","category":2,"benchmark":"raw_skin_on_peanut_g","classification_basis":"生花生仁未明示帶膜/去膜。","required_assumption":"AI卡片明示帶膜假設；否則澄清"},
+    {"case_id":"R3-26-2","category":2,"benchmark":"raw_pork_tenderloin_g","classification_basis":"豬里肌不是必然等於豬小里肌。","required_assumption":"AI卡片明示以豬小里肌估算；否則詢問部位"},
+    {"case_id":"R3-27-2","category":2,"benchmark":"raw_beef_hotpot_g","classification_basis":"牛肉片不必然是冷凍火鍋片，部位與脂肪差異大。","required_assumption":"AI卡片明示以冷凍牛肉火鍋片平均值估算；否則澄清"},
+    {"case_id":"R3-29-2","category":2,"benchmark":"raw_fruit_cucumber_g","classification_basis":"生小黃瓜未明示水果小黃瓜品種。","required_assumption":"AI卡片明示以水果小胡瓜估算；否則澄清"},
+    {"case_id":"R3-30-2","category":2,"benchmark":"unsweet_fiber_yogurt_g","classification_basis":"中脂無糖優格未明示纖維強化。","required_assumption":"AI卡片明示纖維強化濃稠發酵乳假設；否則澄清"},
+
+    {"case_id":"R3-12-1","category":1,"benchmark":"steamed_mackerel_g","classification_basis":"DB 已有蒸鯖魚相容列；原文與 parsed state 都明示蒸，實際 parsed food_name 夾帶100克造成純名稱命中缺口，不是 DB 缺資料。"},
+    {"case_id":"R3-14-2","category":1,"benchmark":"raw_edamame_g","classification_basis":"DB 已有生毛豆仁相容列；原文與 parsed state 都明示生，實際 parsed food_name 夾帶80g造成純名稱命中缺口。"},
+    {"case_id":"R3-16-2","category":1,"benchmark":"raw_cauliflower_g","classification_basis":"DB 已有生花椰菜相容列；原文與 parsed state 都明示生重，實際 parsed food_name 夾帶200g造成純名稱命中缺口。"},
+    {"case_id":"R3-19-2","category":1,"benchmark":"raw_oats_g","classification_basis":"DB 已有生燕麥乾重相容列；原文與 parsed state 都明示乾重，實際 parsed food_name 夾帶乾重80g造成純名稱命中缺口。"},
+    {"case_id":"R3-28-2","category":1,"benchmark":"raw_cabbage_g","classification_basis":"DB 已有生甘藍相容列；原文與 parsed state 都明示生重，實際 parsed food_name 夾帶200g造成純名稱命中缺口。"},
+    {"case_id":"R3-15-2","category":2,"benchmark":"raw_spinach_g","classification_basis":"DB 已有生菠菜相容列且原文「還沒煮」其實足夠；模型漏 food_state，屬 parsed 資訊不足，不得說 DB 沒有。","required_assumption":"卡片明示依原文以未煮／生菠菜估算；或安全澄清"},
+    {"case_id":"R3-21-2","category":2,"benchmark":"dry_noodles_g","classification_basis":"DB 已有乾麵條相容列且原文明示乾重；模型漏 food_state，屬 parsed 資訊不足。","required_assumption":"卡片明示依原文以未煮乾麵條估算；或安全澄清"},
+    {"case_id":"R3-28-3","category":2,"benchmark":"raw_cabbage_g","classification_basis":"DB 已有生甘藍相容列且原文明示生；模型漏 food_state，屬 parsed 資訊不足。","required_assumption":"卡片明示依原文以生高麗菜估算；或安全澄清"},
+    {"case_id":"R3-29-1","category":2,"benchmark":"raw_fruit_cucumber_g","classification_basis":"DB 已有水果小胡瓜相容列且原文明示水果；模型 parsed food_name 漏品種詞，屬 parsed 資訊不足。","required_assumption":"卡片明示依原文以水果小黃瓜估算；或安全澄清"},
+    {"case_id":"R3-08-3","category":3,"benchmark":"unsweet_black_tea_ml_unknown","classification_basis":"無糖紅茶與500cc資訊足夠，但目前 DB 無相容每100ml來源；AI數字因缺獨立範圍只能UNVERIFIED，或透明報告。"}
+  ],
+  "phone_core_special_cases": {
+    "generic_unsweet_soymilk_500ml": {
+      "case_ids": ["R3-02-2", "R3-02-4", "R3-02-5"],
+      "reference_only": "packaged_unsweet_soymilk_ime_100ml",
+      "verification_status": "UNVERIFIED",
+      "acceptance": "未知品牌可作透明合理估算；必須 source.type=ai、basis=100ml、卡片可見AI估算，不得冒稱 generic official、不得讀 TFDA 100g 當100ml；未補第二個獨立每100ml真標示前只能 UNVERIFIED。",
+      "source_limit_note": "單一義美真包裝僅為同類豆奶合理性參考，不代表使用者喝該牌，也不足以形成 generic 獨立範圍。"
+    }
+  }
+}

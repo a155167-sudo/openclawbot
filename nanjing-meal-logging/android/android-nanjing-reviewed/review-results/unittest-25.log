@@ -1,0 +1,36 @@
+test_absence_cp950_and_result_wording (test_backend_contract_binding.BackendBindingTests.test_absence_cp950_and_result_wording) ... ok
+test_auth_http_and_malformed_json_errors_are_sanitized (test_backend_contract_binding.BackendBindingTests.test_auth_http_and_malformed_json_errors_are_sanitized) ... ok
+test_busy_ledger_fails_closed_before_socket (test_backend_contract_binding.BackendBindingTests.test_busy_ledger_fails_closed_before_socket) ... ok
+test_cli_missing_private_config_never_opens_sheet_or_socket (test_backend_contract_binding.BackendBindingTests.test_cli_missing_private_config_never_opens_sheet_or_socket) ... 安全停止：無法讀取 Android 本機 private config
+ok
+test_cli_offline_full_positive_default_dry_run (test_backend_contract_binding.BackendBindingTests.test_cli_offline_full_positive_default_dry_run) ... ok
+test_config_requires_https_exact_origin_and_real_missing_credential_fails (test_backend_contract_binding.BackendBindingTests.test_config_requires_https_exact_origin_and_real_missing_credential_fails) ... ok
+test_connect_failure_retryable_and_send_failure_ambiguous (test_backend_contract_binding.BackendBindingTests.test_connect_failure_retryable_and_send_failure_ambiguous) ... ok
+test_contract_positive_binds_exact_backend_identity_and_14_columns (test_backend_contract_binding.BackendBindingTests.test_contract_positive_binds_exact_backend_identity_and_14_columns) ... ok
+test_contract_rejects_duplicates_nonactivated_unknown_receipt_and_bad_payload (test_backend_contract_binding.BackendBindingTests.test_contract_rejects_duplicates_nonactivated_unknown_receipt_and_bad_payload) ... ok
+test_contract_shape_is_exact_and_empty_export_cannot_hide_unknown_sheet_receipt (test_backend_contract_binding.BackendBindingTests.test_contract_shape_is_exact_and_empty_export_cannot_hide_unknown_sheet_receipt) ... ok
+test_cross_day_and_incremental_summary_members_are_counted_once (test_backend_contract_binding.BackendBindingTests.test_cross_day_and_incremental_summary_members_are_counted_once) ... ok
+test_cross_origin_redirect_is_blocked_without_forwarding_authorization (test_backend_contract_binding.BackendBindingTests.test_cross_origin_redirect_is_blocked_without_forwarding_authorization) ... ok
+test_default_date_uses_asia_taipei_across_midnight (test_backend_contract_binding.BackendBindingTests.test_default_date_uses_asia_taipei_across_midnight) ... ok
+test_default_dry_run_has_no_sheet_write_socket_or_ledger_row (test_backend_contract_binding.BackendBindingTests.test_default_dry_run_has_no_sheet_write_socket_or_ledger_row) ... ok
+test_fetch_uses_exact_readonly_query_bearer_and_timeout (test_backend_contract_binding.BackendBindingTests.test_fetch_uses_exact_readonly_query_bearer_and_timeout) ... ok
+test_header_must_be_exact_and_unique (test_backend_contract_binding.BackendBindingTests.test_header_must_be_exact_and_unique) ... ok
+test_invalid_calendar_date_in_sheet_fails_closed (test_backend_contract_binding.BackendBindingTests.test_invalid_calendar_date_in_sheet_fails_closed) ... ok
+test_missing_row_duplicate_unknown_row_tamper_and_sheet_identity_all_block (test_backend_contract_binding.BackendBindingTests.test_missing_row_duplicate_unknown_row_tamper_and_sheet_identity_all_block) ... ok
+test_old_ledger_migration_preserves_ambiguous_and_manual_states (test_backend_contract_binding.BackendBindingTests.test_old_ledger_migration_preserves_ambiguous_and_manual_states) ... ok
+test_positive_render_fake_socket_ledger_writeback_failure_then_no_reprint (test_backend_contract_binding.BackendBindingTests.test_positive_render_fake_socket_ledger_writeback_failure_then_no_reprint) ... ok
+test_reconcile_exact_positive_and_current_print_status_is_external (test_backend_contract_binding.BackendBindingTests.test_reconcile_exact_positive_and_current_print_status_is_external) ... ok
+test_stale_claim_token_cannot_complete_new_retry_generation (test_backend_contract_binding.BackendBindingTests.test_stale_claim_token_cannot_complete_new_retry_generation) ... ok
+test_two_real_sqlite_connections_claim_one_retry_only (test_backend_contract_binding.BackendBindingTests.test_two_real_sqlite_connections_claim_one_retry_only)
+Two Android processes sharing a ledger must not both enter socket send. ... ok
+test_writer_lock_is_released_before_socket_and_parallel_job_refuses (test_backend_contract_binding.BackendBindingTests.test_writer_lock_is_released_before_socket_and_parallel_job_refuses) ... ok
+test_wrong_workbook_or_service_date_fails_closed (test_backend_contract_binding.BackendBindingTests.test_wrong_workbook_or_service_date_fails_closed) ... ok
+
+----------------------------------------------------------------------
+Ran 25 tests in 0.136s
+
+OK
+模式=DRY-RUN 日期=2026/09/16 store=nanjing 候選=1 已送印略過=0
+{"ambiguous": 0, "blocked_manual": 0, "customer_already_complete": 0, "customer_dispatched": 0, "dry_run_candidates": 1, "summary_ambiguous": 0, "summary_dispatched": 0, "summary_key": "", "warnings": [], "writeback_failed": 0, "writeback_recovered": 0}
+模式=DRY-RUN 日期=2026/09/17 store=nanjing 候選=1 已送印略過=0
+{"ambiguous": 0, "blocked_manual": 0, "customer_already_complete": 0, "customer_dispatched": 0, "dry_run_candidates": 1, "summary_ambiguous": 0, "summary_dispatched": 0, "summary_key": "", "warnings": [], "writeback_failed": 0, "writeback_recovered": 0}

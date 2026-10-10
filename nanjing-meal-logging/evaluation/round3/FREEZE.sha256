@@ -1,0 +1,8 @@
+# Round 3 evaluator projection v4 frozen after v3 live reports; no live-provider run under v4 yet.
+# v4 changes only adapter/report projection of native pipeline clarification traceability.
+# Complete v3 freeze is preserved under external evidence round3/eval-v3-before-projection/.
+# cases.json, rubric values, product behavior, and historical reports are unchanged.
+8d8a3acb940fcd7937977aff3eadc49074198e3341716523ba0f7d08f67203dc  cases.json
+86fb4bd9cd436dc5e9d61853f041f7ce231731ab74a3f405086f5352b9ecf943  rubric.md
+d6e4aede15005b628bad919fa78c24c1f0b8fab9bea11d423e85e0ae3b070183  runner.py
+9cadef0a729ef53913772fff15620e1d3cf5660da070a72556743343c927dd0a  live_adapter.py

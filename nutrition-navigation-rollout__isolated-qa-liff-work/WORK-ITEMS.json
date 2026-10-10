@@ -1,0 +1,5 @@
+[
+  {"id":"backend-contract","capability":"logic","allowed_files":["customer_reschedule_liff.py","tests/test_customer_reschedule_liff.py"],"timeout_seconds":240},
+  {"id":"customer-ui","capability":"ui","allowed_files":["customer_reschedule_liff.html","tests/test_customer_reschedule_ui.mjs"],"timeout_seconds":240},
+  {"id":"visual-review","capability":"visual_review","allowed_files":[],"timeout_seconds":180}
+]

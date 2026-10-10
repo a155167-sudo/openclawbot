@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#176b4a">
+  <title>餐點改期互動示範</title>
+  <style>:root{color-scheme:light;--g9:#123f32;--g7:#176b4a;--g1:#e4f3eb;--g0:#f2f8f5;--ink:#19332b;--muted:#63736d;--line:#d9e6df;--paper:#fff;--canvas:#f4f7f5;--error:#a23b32;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-synthesis:none}
+*{box-sizing:border-box}body{margin:0;min-width:320px;overflow-x:hidden;color:var(--ink);background:radial-gradient(circle at 90% 4%,rgba(79,157,119,.13),transparent 28rem),var(--canvas);line-height:1.55}button,select{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}:focus-visible{outline:3px solid #e0a72d;outline-offset:3px}
+.demo-banner{padding:9px 16px;color:#fff;background:var(--g9);font-size:.82rem;font-weight:700;letter-spacing:.02em;text-align:center}.app-shell{width:min(100% - 32px,1060px);margin:0 auto;padding:34px 0 56px}.hero{position:relative;padding:4px 0 26px}.eyebrow,.step{margin:0 0 6px;color:var(--g7);font-size:.72rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase}h1,h2,p{margin-top:0}h1{margin-bottom:14px;font-size:clamp(2rem,8vw,3.8rem);line-height:1.13;letter-spacing:-.045em}h2{margin-bottom:0;font-size:1.3rem;line-height:1.25}.hero-copy{max-width:36rem;margin-bottom:22px;color:var(--muted)}
+.meal-total{display:inline-flex;align-items:center;gap:14px;min-height:54px;padding:8px 10px 8px 17px;border:1px solid var(--line);border-radius:999px;background:#ffffffc7}.meal-total__label{color:var(--muted);font-size:.88rem}.meal-total strong{padding:6px 13px;border-radius:999px;color:#fff;background:var(--g7)}
+.control-card,.schedule-section{border:1px solid #123f321a;border-radius:22px;background:var(--paper);box-shadow:0 14px 45px #19332b12}.control-card{padding:22px}.schedule-section{margin-top:18px;padding:22px}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px}.source-chip{flex:none;padding:5px 10px;border-radius:99px;color:var(--g7);background:var(--g1);font-size:.78rem;font-weight:800}label{display:block;margin-bottom:7px;font-size:.92rem;font-weight:750}select{width:100%;min-height:50px;padding:0 42px 0 14px;border:1px solid #aebfb6;border-radius:12px;color:var(--ink);background:#fff}
+.selection-preview{display:flex;align-items:center;gap:12px;min-height:66px;margin:14px 0;padding:12px;border-radius:12px;background:var(--g0)}.selection-preview__icon{display:grid;place-items:center;flex:0 0 38px;height:38px;border-radius:50%;color:var(--g7);background:var(--g1);font-weight:900}.selection-preview__label{display:block;color:var(--muted);font-size:.76rem}.selection-preview strong{display:block;font-size:.9rem}.primary-button,.secondary-button,.text-button{min-height:46px;border-radius:12px;font-weight:800}.primary-button{width:100%;padding:10px 18px;border:1px solid var(--g7);color:#fff;background:var(--g7);box-shadow:0 6px 14px #176b4a2b}.primary-button:hover:not(:disabled){background:var(--g9)}.secondary-button{padding:10px 18px;border:1px solid #aebfb6;color:var(--ink);background:#fff}.text-button{min-height:44px;padding:6px 11px;border:0;color:var(--g7);background:transparent}.text-button:hover{background:var(--g0)}
+.feedback{display:none;margin:13px 0 0;padding:11px 13px;border-radius:10px;font-size:.9rem;font-weight:650}.feedback.error{display:block;color:var(--error);background:#fff0ed}.feedback.success{display:block;color:var(--g7);background:#e7f5ed}.schedule{display:grid;gap:12px}.day-card{padding:16px;border:1px solid var(--line);border-radius:15px;background:#fbfdfc}.day-card__header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}.day-card h3{margin:0;font-size:1rem}.day-card__date{color:var(--muted);font-size:.78rem;white-space:nowrap}.meal-list{display:grid;gap:8px;margin:0;padding:0;list-style:none}.meal-card{display:flex;align-items:center;gap:11px;min-height:50px;padding:9px 11px;border-radius:11px;background:#fff;box-shadow:inset 0 0 0 1px #123f3214}.meal-slot{flex:none;padding:3px 7px;border-radius:6px;color:var(--g7);background:var(--g1);font-size:.72rem;font-weight:800}.meal-name{font-weight:750}.empty-day{margin:0;padding:13px;border:1px dashed #bdccc4;border-radius:10px;color:var(--muted);font-size:.88rem;text-align:center}
+dialog{width:min(calc(100% - 28px),470px);max-height:calc(100dvh - 28px);padding:0;overflow:auto;border:0;border-radius:22px;color:var(--ink);box-shadow:0 24px 80px #0a20194d}dialog::backdrop{background:#0a20199e;backdrop-filter:blur(3px)}.dialog-content{padding:25px}.dialog-mark{display:grid;place-items:center;width:44px;height:44px;margin-bottom:17px;border-radius:50%;color:#fff;background:var(--g7);font-size:1.2rem;font-weight:900}.date-route{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:9px;margin:22px 0 14px;padding:14px;border-radius:13px;background:var(--g0)}.date-route span{display:block;color:var(--muted);font-size:.73rem}.date-route strong{display:block;font-size:.95rem}.route-arrow{color:var(--g7)!important;font-size:1.2rem!important;font-weight:900}.dialog-meals{padding:14px;border:1px solid var(--line);border-radius:13px}.dialog-meals>span{color:var(--muted);font-size:.8rem}.dialog-meals ul{margin:8px 0 0;padding-left:1.25rem;font-weight:750}.dialog-note{margin:13px 0 18px;color:var(--muted);font-size:.82rem;text-align:center}.dialog-actions{display:grid;grid-template-columns:1fr 1.35fr;gap:10px}
+@media(min-width:760px){.app-shell{padding-top:58px}.hero{padding-right:220px}.meal-total{position:absolute;top:26px;right:0}.control-card,.schedule-section{padding:28px}.schedule{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(prefers-reduced-motion:no-preference){dialog[open]{animation:dialog-in .18s ease-out}.primary-button,.text-button{transition:background-color .15s ease,transform .15s ease}.primary-button:active:not(:disabled){transform:translateY(1px)}@keyframes dialog-in{from{opacity:0;transform:translateY(8px) scale(.985)}}}
+</style>
+</head>
+<body>
+  <div class="demo-banner" role="note">電腦營養測試・送出後等待營養師核准，不會直接修改餐表</div>
+  <main class="app-shell">
+    <header class="hero">
+      <p class="eyebrow">COMPUTER NUTRITION・STAGING</p>
+      <h1>把今天的餐點，<br>安心移到另一天</h1>
+      <p class="hero-copy">先確認午餐與晚餐，再送出改期申請。申請會交由營養師核准，客戶不會直接改動餐表。</p>
+      <div class="meal-total" aria-label="餐表餐點總數"><span class="meal-total__label">目前餐點</span><strong><span id="meal-count">0</span> 份</strong></div>
+    </header>
+    <section class="control-card" aria-labelledby="reschedule-title">
+      <div class="section-heading"><div><p class="step">步驟 1</p><h2 id="reschedule-title">先選擇要改的排餐日期</h2></div><span class="source-chip">來源 <span id="source-chip">讀取中</span></span></div>
+      <label for="source-date">哪一天的餐要改期？</label>
+      <select id="source-date"><option value="">正在載入目前排餐…</option></select>
+      <label for="target-date">要移到哪一天？</label>
+      <select id="target-date">
+        <option value="">請選擇日期</option>
+        <option value="2099-10-31">2099/10/31（包月最後一天）</option>
+        <option value="2099-11-05">2099/11/05（已有排餐）</option>
+        <option value="2099-11-30">2099/11/30（最後可改日期）</option>
+        <option value="2099-12-01">2099/12/01（超過 30 天）</option>
+      </select>
+      <div class="selection-preview" aria-live="polite"><span class="selection-preview__icon" aria-hidden="true">→</span><div><span class="selection-preview__label">改期預覽</span><strong id="preview-summary">選擇日期後，可檢查改期內容</strong></div></div>
+      <button class="primary-button" id="preview-button" type="button">預覽改期</button>
+      <p id="feedback" class="feedback" aria-live="polite"></p>
+    </section>
+    <section class="schedule-section" aria-labelledby="schedule-title">
+      <div class="section-heading schedule-heading"><div><p class="step">目前安排</p><h2 id="schedule-title">餐點日程</h2></div><button class="text-button" id="reset-button" type="button">重設示範</button></div>
+      <div id="schedule" class="schedule"></div>
+    </section>
+  </main>
+  <dialog id="confirm-dialog" aria-labelledby="dialog-title" aria-describedby="dialog-note">
+    <div class="dialog-content">
+      <div class="dialog-mark" aria-hidden="true">→</div><p class="step">步驟 2</p><h2 id="dialog-title">確認送出改期申請</h2>
+      <div class="date-route" aria-label="改期日期"><div><span>從</span><strong id="dialog-source"></strong></div><span class="route-arrow" aria-hidden="true">→</span><div><span>移到</span><strong id="dialog-target"></strong></div></div>
+      <div class="dialog-meals"><span>將移動 2 份餐點</span><ul id="dialog-meal-list"></ul></div>
+      <p id="dialog-note" class="dialog-note">送出後會等待營養師核准；取消不會變更餐點。</p>
+      <div class="dialog-actions"><button id="cancel-button" class="secondary-button" type="button">取消</button><button id="confirm-button" class="primary-button" type="button">送出申請</button></div>
+    </div>
+  </dialog>
+  <script>/*
+ * model.js — shared demo store (pure state logic, no UI).
+ * Synthetic Meal Reschedule Demo per CONTRACT.md.
+ * In-memory only: no storage, network, DOM, or external dependencies.
+ * Source date is fixed at 2099-10-23 (not tied to the real calendar).
+ */
+'use strict';
+
+var SOURCE_DATE = '2099-10-23';
+var PACKAGE_EXPIRY = '2099-10-31';
+var PACKAGE_LAST_RESCHEDULE_DATE = '2099-11-30';
+
+/**
+ * Strict real ISO calendar date check: exactly YYYY-MM-DD and a date
+ * that actually exists (handles month lengths and leap years).
+ */
+function isRealISODate(value) {
+  if (typeof value !== 'string') return false;
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return false;
+  var y = Number(m[1]);
+  var mo = Number(m[2]);
+  var d = Number(m[3]);
+  if (mo < 1 || mo > 12) return false;
+  var leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  var daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return d >= 1 && d <= daysInMonth[mo - 1];
+}
+
+/** Deep copy of a meal array into detached, JSON-safe plain objects. */
+function cloneMeals(meals) {
+  var out = [];
+  for (var i = 0; i < meals.length; i++) {
+    out.push({ id: meals[i].id, slot: meals[i].slot, name: meals[i].name });
+  }
+  return out;
+}
+
+function createDemoStore() {
+  // Internal state. Meal arrays are only ever exposed through clones.
+  var mealsByDate = new Map();
+  mealsByDate.set(SOURCE_DATE, [
+    { id: 'L1', slot: '午餐', name: '香草雞腿飯' },
+    { id: 'D1', slot: '晚餐', name: '菇菇豆腐飯' }
+  ]);
+  mealsByDate.set('2099-11-05', [
+    { id: 'O1', slot: '晚餐', name: '鮭魚飯' }
+  ]);
+
+  var revision = 0;
+  // eventId -> { target, meals } for successful moves (replay/conflict support).
+  var eventBindings = new Map();
+
+  function sourceMeals() {
+    var meals = mealsByDate.get(SOURCE_DATE);
+    return meals || [];
+  }
+
+  function buildResult(ok, code, message, target, meals) {
+    return {
+      ok: ok,
+      code: code,
+      message: message,
+      source: SOURCE_DATE,
+      target: target,
+      meals: cloneMeals(meals && meals.length ? meals : [])
+    };
+  }
+
+  /** Validate target only (no source check), no mutation. Returns error info or null. */
+  function validateTarget(target) {
+    if (target === undefined || target === null || target === '') {
+      return { code: 'missing_target', message: '請選擇要改期到的日期。' };
+    }
+    if (!isRealISODate(target)) {
+      return { code: 'invalid_date', message: '目標日期格式不正確，或不是實際存在的日期。' };
+    }
+    // Both sides are strict zero-padded ISO strings, so string order is date order.
+    if (target < PACKAGE_EXPIRY) {
+      return { code: 'before_package_expiry', message: '目標日期必須從包月最後一天 2099-10-31 起算。' };
+    }
+    if (target > PACKAGE_LAST_RESCHEDULE_DATE) {
+      return { code: 'beyond_package_window', message: '目標日期不可超過包月最後一天後 30 天（2099-11-30）。' };
+    }
+    var occupied = mealsByDate.get(target);
+    if (occupied && occupied.length > 0) {
+      return { code: 'occupied', message: '目標日期已有餐點，請選擇其他日期。' };
+    }
+    return null;
+  }
+
+  function snapshot() {
+    var days = {};
+    mealsByDate.forEach(function (meals, date) {
+      days[date] = cloneMeals(meals);
+    });
+    return { days: days, revision: revision };
+  }
+
+  function preview(target) {
+    var err = validateTarget(target);
+    if (err) {
+      return buildResult(false, err.code, err.message, target, []);
+    }
+    var source = sourceMeals();
+    if (source.length === 0) {
+      return buildResult(false, 'empty_source', '來源日期 2099-10-23 已沒有可改期的餐點。', target, []);
+    }
+    return buildResult(true, 'ok', '改期預覽完成，將移動 ' + source.length + ' 道餐點。', target, source);
+  }
+
+  function confirm(target, eventId) {
+    var validEvent = typeof eventId === 'string' && eventId.length > 0;
+
+    // Successful binding takes precedence over revalidation so replay/conflict
+    // work even after the source was emptied (and the target is now occupied).
+    if (validEvent && eventBindings.has(eventId)) {
+      var binding = eventBindings.get(eventId);
+      if (binding.target === target) {
+        return buildResult(true, 'replayed', '此事件先前已執行過，餐點不會再次移動。', target, binding.meals);
+      }
+      return buildResult(false, 'event_conflict', '此事件先前已綁定 ' + binding.target + '，無法改期至其他日期。', target, []);
+    }
+
+    if (!validEvent) {
+      return buildResult(false, 'invalid_event', '缺少有效的事件代碼，未執行改期。', target, []);
+    }
+
+    // Revalidate exactly like preview(); on failure state stays untouched.
+    var check = preview(target);
+    if (!check.ok) {
+      return buildResult(false, check.code, check.message, target, []);
+    }
+
+    // Atomic move: both source meals to target, source cleared, revision +1.
+    var moved = sourceMeals();
+    mealsByDate.set(SOURCE_DATE, []);
+    mealsByDate.set(target, moved);
+    revision += 1;
+    eventBindings.set(eventId, { target: target, meals: cloneMeals(moved) });
+
+    return buildResult(true, 'moved', '已將 ' + moved.length + ' 道餐點改期至 ' + target + '。', target, moved);
+  }
+
+  return {
+    snapshot: snapshot,
+    preview: preview,
+    confirm: confirm
+  };
+}
+
+// Browser global (regular <script>) and CommonJS export when available.
+if (typeof globalThis !== 'undefined') {
+  globalThis.createDemoStore = createDemoStore;
+}
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { createDemoStore: createDemoStore };
+}
+</script>
+  <script>window.__RESCHEDULE_RUNTIME__ = null; /* __CUSTOMER_RESCHEDULE_RUNTIME__ */</script>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <script>(() => {
+  "use strict";
+  const RUNTIME = globalThis.__RESCHEDULE_RUNTIME__ || null;
+  const QUERY = new URLSearchParams(location.search);
+  const LIVE = Boolean(RUNTIME);
+  let SOURCE = QUERY.get("source_date") || "";
+  let SOURCE_MEALS = [];
+  let DATES = LIVE ? [] : ["2099-10-23", "2099-10-31", "2099-11-05", "2099-11-30"];
+  let LABELS = {"2099-10-23":"目前排餐","2099-10-31":"包月最後一天","2099-11-05":"既有安排","2099-11-30":"最後可改日期"};
+  const el = {
+    count:document.querySelector("#meal-count"), schedule:document.querySelector("#schedule"),
+    sourceSelect:document.querySelector("#source-date"), sourceChip:document.querySelector("#source-chip"),
+    target:document.querySelector("#target-date"), preview:document.querySelector("#preview-button"),
+    summary:document.querySelector("#preview-summary"), feedback:document.querySelector("#feedback"),
+    reset:document.querySelector("#reset-button"), dialog:document.querySelector("#confirm-dialog"),
+    source:document.querySelector("#dialog-source"), dialogTarget:document.querySelector("#dialog-target"),
+    meals:document.querySelector("#dialog-meal-list"), cancel:document.querySelector("#cancel-button"),
+    confirm:document.querySelector("#confirm-button")
+  };
+  let store = globalThis.createDemoStore();
+  let idToken = null;
+  let pending = null;
+  let sequence = 0;
+  let restoreFocus = false;
+
+  const formatDate = (date) => date.split("-").join("/");
+  const totalMeals = (days) => Object.values(days).reduce((sum, meals) => sum + meals.length, 0);
+
+  function feedback(message = "", type = "") {
+    el.feedback.textContent = message;
+    el.feedback.className = `feedback${type ? ` ${type}` : ""}`;
+    if (type === "success") el.feedback.setAttribute("role", "status");
+    else el.feedback.removeAttribute("role");
+  }
+
+  function selectionSummary() {
+    el.summary.textContent = el.target.value
+      ? `從 ${formatDate(SOURCE)} 移到 ${el.target.selectedOptions[0].textContent.split("（")[0].trim()}`
+      : "選擇日期後，可檢查改期內容";
+  }
+
+  function mealsMarkup(meals) {
+    if (!meals.length) return '<p class="empty-day">這天目前沒有餐點</p>';
+    return `<ul class="meal-list">${meals.map((meal) => `<li class="meal-card"><span class="meal-slot">${meal.slot}</span><span class="meal-name">${meal.name}</span></li>`).join("")}</ul>`;
+  }
+
+  function render() {
+    const state = store.snapshot();
+    el.count.textContent = String(totalMeals(state.days));
+    if(el.sourceChip) el.sourceChip.textContent = formatDate(SOURCE);
+    el.schedule.innerHTML = DATES.map((date) => {
+      const meals = state.days[date] || [];
+      return `<article class="day-card" data-date="${date}"><div class="day-card__header"><h3>${LABELS[date] || "目前排餐"}</h3><span class="day-card__date">${formatDate(date)}</span></div>${mealsMarkup(meals)}</article>`;
+    }).join("");
+    el.target.disabled = LIVE && !SOURCE;
+    el.preview.disabled = (state.days[SOURCE] || []).length === 0;
+    if (el.preview.disabled) el.summary.textContent = "來源日已無餐點，可重設後再次體驗";
+    else selectionSummary();
+  }
+
+  async function openPreview() {
+    feedback();
+    if (LIVE) {
+      try {
+        const target = el.target.value;
+        if (!target) { feedback("請選擇要改期到的日期。", "error"); return; }
+        const response = await fetch(`/customer-reschedule/preview?order_id=${encodeURIComponent(QUERY.get("order_id"))}&source_date=${encodeURIComponent(SOURCE)}&target_date=${encodeURIComponent(target)}`, {headers:{"Authorization":`Bearer ${idToken}`},cache:"no-store",credentials:"omit"});
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.detail || "無法載入改期預覽");
+        pending = {target, eventId:`meal-reschedule-${crypto.randomUUID()}`};
+        el.source.textContent = formatDate(SOURCE);
+        el.dialogTarget.textContent = formatDate(target);
+        if (!Array.isArray(body.source_meals) || body.source_meals.length === 0 || body.source_meals.some((meal) => !(meal.slot && meal.name) && !String(meal.label || "").trim())) throw new Error("預覽資料缺少實際餐點內容");
+        el.meals.replaceChildren(...body.source_meals.map((meal) => {const item=document.createElement("li");item.textContent = meal.slot && meal.name ? `${meal.slot}・${meal.name}` : `餐點・${meal.label}`;return item}));
+        el.confirm.disabled = false;restoreFocus = true;el.dialog.showModal();el.cancel.focus();
+      } catch (error) { feedback(error.message || "無法載入改期預覽", "error"); }
+      return;
+    }
+    const result = store.preview(el.target.value);
+    if (!result.ok) {
+      pending = null;
+      feedback(result.message, "error");
+      return;
+    }
+    pending = {target:result.target, eventId:`meal-reschedule-${++sequence}`};
+    el.source.textContent = formatDate(result.source);
+    el.dialogTarget.textContent = formatDate(result.target);
+    el.meals.innerHTML = result.meals.map((meal) => `<li>${meal.slot}・${meal.name}</li>`).join("");
+    el.confirm.disabled = false;
+    restoreFocus = true;
+    el.dialog.showModal();
+    el.cancel.focus();
+  }
+
+  function cancelPreview() {
+    pending = null;
+    el.dialog.close("cancel");
+  }
+
+  function submitRequest() {
+    if (!pending || el.confirm.disabled) return;
+    el.confirm.disabled = true;
+    if (!LIVE) {
+      const result = {ok:true, message:`已送出 ${formatDate(pending.target)} 改期申請，等待營養師核准。`};
+      pending = null;
+      el.dialog.close("submitted");
+      feedback(result.message, "success");
+      return;
+    }
+    fetch("/customer-reschedule/pending-request", {
+      method:"POST",
+      headers:{"Authorization":`Bearer ${idToken}`, "Content-Type":"application/json"},
+      body:JSON.stringify({order_id:Number(QUERY.get("order_id")), source_date:SOURCE, target_date:pending.target, request_id:pending.eventId})
+    }).then(async (response) => {
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || "改期申請暫時無法處理");
+      pending = null;
+      el.dialog.close("submitted");
+      feedback("已送出改期申請，等待營養師核准。", "success");
+    }).catch((error) => {
+      el.confirm.disabled = false;
+      feedback(error.message, "error");
+    });
+  }
+
+  function resetDemo() {
+    if (el.dialog.open) {
+      restoreFocus = false;
+      el.dialog.close("reset");
+    }
+    store = globalThis.createDemoStore();
+    pending = null;
+    sequence = 0;
+    el.target.value = "";
+    el.confirm.disabled = false;
+    feedback();
+    render();
+  }
+
+  el.sourceSelect.addEventListener("change", () => {
+    if(!LIVE) return;
+    SOURCE = el.sourceSelect.value;
+    const selected = el.sourceSelect.selectedOptions[0];
+    SOURCE_MEALS = selected && selected.dataset.meals ? JSON.parse(selected.dataset.meals) : [];
+    DATES = SOURCE ? [SOURCE] : [];
+    if (SOURCE) LABELS[SOURCE] = selected.dataset.label || "目前排餐";
+    el.target.value = "";
+    pending = null;
+    store = {snapshot:() => ({days: SOURCE ? {[SOURCE]: SOURCE_MEALS} : {}})};
+    selectionSummary();
+    render();
+  });
+  el.target.addEventListener("change", selectionSummary);
+  el.preview.addEventListener("click", openPreview);
+  el.cancel.addEventListener("click", cancelPreview);
+  el.confirm.addEventListener("click", submitRequest);
+  el.reset.addEventListener("click", resetDemo);
+  el.dialog.addEventListener("cancel", () => { pending = null; });
+  el.dialog.addEventListener("close", () => {
+    if (restoreFocus) el.preview.focus();
+    restoreFocus = false;
+  });
+  async function initLive() {
+    if (!LIVE) { render(); return; }
+    try {
+      await liff.init({liffId:RUNTIME.liffId});
+      if (!liff.isLoggedIn()) { liff.login(); return; }
+      idToken = liff.getIDToken();
+      if (!idToken) throw new Error("LINE 身份驗證尚未完成");
+      if (!QUERY.get("order_id")) throw new Error("請從 LINE 的改期入口進入，缺少訂單資料");
+      const response = await fetch("/customer-reschedule/context", {headers:{"Authorization":`Bearer ${idToken}`},cache:"no-store",credentials:"omit"});
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || "無法載入改期選項");
+      const order = (body.orders || []).find((item) => String(item.order_id) === QUERY.get("order_id"));
+      const sourceChoices = order && (order.source_dates || []);
+      const initialSource = sourceChoices.find((item) => item.date === SOURCE) || sourceChoices[0];
+      if (!order || !initialSource) throw new Error("找不到可改期的訂單或來源日期");
+      SOURCE = "";
+      SOURCE_MEALS = [];
+      DATES = [];
+      el.sourceSelect.replaceChildren(new Option("請先選擇要改的排餐日期", ""));
+      for (const item of sourceChoices) {
+        const option = new Option(item.date + (item.label ? "・" + item.label : ""), item.date);
+        option.dataset.label = item.label || "目前排餐";
+        option.dataset.meals = JSON.stringify((item.meals || []).map((meal) => ({slot: meal.slot || "餐點", name: meal.name || "餐點內容未提供"})));
+        el.sourceSelect.appendChild(option);
+      }
+      el.sourceSelect.value = "";
+      el.target.replaceChildren(new Option("請先選擇來源日期", ""));
+      for (const date of (order.target_dates || [])) el.target.appendChild(new Option(formatDate(date), date));
+      el.reset.hidden = true;
+      store = {snapshot:() => ({days:{}})};
+      render();
+      feedback("請先選擇要改的排餐日期，再選擇目標日期。", "success");
+    } catch (error) {
+      el.sourceSelect.replaceChildren(new Option("目前無法載入排餐", ""));
+      el.sourceSelect.disabled = true;
+      el.target.replaceChildren(new Option("請先完成排餐資料載入", ""));
+      el.target.disabled = true;
+      el.preview.disabled = true;
+      feedback(error.message || "LINE 身份驗證失敗", "error");
+    }
+  }
+  initLive();
+})();
+</script>
+</body>
+</html>

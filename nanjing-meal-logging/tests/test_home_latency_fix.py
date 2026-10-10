@@ -1,0 +1,403 @@
+from collections import Counter
+import json
+import sqlite3
+from types import SimpleNamespace
+
+import server
+from customer_navigation import build_customer_home_contents
+
+
+DISPATCH_HEADER = [
+    "實際日期", "週期與星期", "午餐安排", "午餐熱量", "午餐蛋白",
+    "晚餐安排", "晚餐熱量", "晚餐蛋白", "今日排餐總熱量",
+    "今日排餐總蛋白", "熱量剩餘 / 蛋白質需補", "單日金額",
+    "明日預定課表", "列印狀態", "Dispatch_Row_ID", "Order_ID",
+    "Menu_Version",
+]
+
+
+class _ReadOnlyWorksheet:
+    def __init__(self, title, counts, values, records=None, sheet_id=17):
+        self.title = title
+        self.id = sheet_id
+        self._counts = counts
+        self._values = values
+        self._records = records or []
+
+    def get_all_values(self):
+        self._counts[f"{self.title}.get_all_values"] += 1
+        return self._values
+
+    def get_all_records(self):
+        self._counts[f"{self.title}.get_all_records"] += 1
+        return self._records
+
+    def __getattr__(self, name):
+        if name in {"update", "batch_update", "append_row", "append_rows", "clear", "delete_rows"}:
+            raise AssertionError(f"home must not write Sheet via {name}")
+        raise AttributeError(name)
+
+
+class _Book:
+    def __init__(self, counts, sheets):
+        self.id = "latency-fixture-book"
+        self._counts = counts
+        self._sheets = {sheet.title: sheet for sheet in sheets}
+
+    def worksheets(self):
+        self._counts["book.worksheets"] += 1
+        return list(self._sheets.values())
+
+    def worksheet(self, title):
+        self._counts[f"book.worksheet:{title}"] += 1
+        if title not in self._sheets:
+            raise KeyError(title)
+        return self._sheets[title]
+
+    def add_worksheet(self, **_kwargs):
+        raise AssertionError("home must not create a worksheet")
+
+
+class _GC:
+    def __init__(self, counts, book):
+        self._counts = counts
+        self._book = book
+
+    def open_by_key(self, _key):
+        self._counts["gc.open_by_key"] += 1
+        return self._book
+
+    def open_by_url(self, _url):
+        raise AssertionError("home must not enter the Sheet rebuild writer")
+
+
+class _Line:
+    def __init__(self, counts):
+        self.counts = counts
+        self.messages = []
+
+    def reply_message(self, _token, message):
+        self.counts["line.reply_message"] += 1
+        self.messages.append(message)
+
+
+def _event(uid, event_id):
+    return SimpleNamespace(
+        message=SimpleNamespace(id=event_id, text="首頁"),
+        source=SimpleNamespace(user_id=uid),
+        reply_token=f"reply-{event_id}",
+    )
+
+
+def _install_fixture(tmp_path, monkeypatch, *, users=("U-HOME-A",)):
+    counts = Counter()
+    db = tmp_path / "home.db"
+    monkeypatch.setattr(server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "DB_PATH", str(db))
+    server.init_db()
+    today_iso = server.tw_today().isoformat()
+    today_slash = server.tw_today().strftime("%Y/%m/%d")
+    with sqlite3.connect(db) as conn:
+        for index, uid in enumerate(users):
+            conn.execute(
+                "INSERT INTO health_profile(user_id,name,tdee,protein,today_date,sheet_name,status,training_group) VALUES (?,?,?,?,?,?,?,?)",
+                (uid, f"會員{index + 1}", 1800 + index * 100, 100 + index * 10, today_iso, f"sheet-{index + 1}", "A", "1"),
+            )
+            conn.execute(
+                "INSERT INTO usage(user_id,remaining_meals,status,expiry_date) VALUES (?,?,?,?)",
+                (uid, 10, "vip", "2099-12-31"),
+            )
+        conn.commit()
+
+    sheets = []
+    for index, uid in enumerate(users):
+        sheets.append(_ReadOnlyWorksheet(
+            f"sheet-{index + 1}", counts,
+            [["【VIP 客戶檔案】", f"姓名: 會員{index + 1}", f"User_ID: {uid}"],
+             DISPATCH_HEADER,
+             [today_slash, "本週", f"{uid}-午餐", "500", "40",
+              f"{uid}-晚餐", "600", "45", "1100", "85", "", "",
+              "跑步", "已送印", f"dispatch-{index + 1}", "1", "v1"]],
+            sheet_id=17 + index,
+        ))
+    sheets.extend([
+        _ReadOnlyWorksheet("Master_API_View", counts, [], [
+            {"Date": today_slash, "User_ID": uid, "Lunch_Item": f"{uid}-午餐", "Dinner_Item": f"{uid}-晚餐", "Plan_Week": "跑步"}
+            for uid in users
+        ]),
+        _ReadOnlyWorksheet("training_assignments", counts, [], []),
+    ])
+    book = _Book(counts, sheets)
+    monkeypatch.setattr(server, "SPREADSHEET_ID", book.id)
+    monkeypatch.setattr(server, "gc", _GC(counts, book))
+    line = _Line(counts)
+    monkeypatch.setattr(server, "line_bot_api", line)
+    server.processed_messages.clear()
+    return db, counts, line
+
+
+def _payload(message):
+    return message.as_json_dict()
+
+
+def test_registered_home_handler_uses_one_readonly_personal_snapshot_only(tmp_path, monkeypatch):
+    db, counts, line = _install_fixture(tmp_path, monkeypatch)
+    before = db.read_bytes()
+
+    server.handle_message(_event("U-HOME-A", "HOME-CALLS-1"))
+
+    assert counts["line.reply_message"] == 1
+    assert counts["gc.open_by_key"] == 1
+    assert counts["sheet-1.get_all_values"] == 1
+    assert counts["Master_API_View.get_all_records"] == 0
+    assert counts["training_assignments.get_all_records"] == 0
+    assert counts["book.worksheets"] == 0
+    assert before == db.read_bytes()
+    text = json.dumps(_payload(line.messages[0]), ensure_ascii=False)
+    assert "U-HOME-A-午餐" in text and "U-HOME-A-晚餐" in text
+    assert "預留 500" in text
+    assert "預留 600" in text
+
+
+def test_home_next_request_reads_fresh_canonical_food_logs_without_ttl(tmp_path, monkeypatch):
+    db, counts, line = _install_fixture(tmp_path, monkeypatch)
+
+    server.handle_message(_event("U-HOME-A", "HOME-FRESH-1"))
+    first = json.dumps(_payload(line.messages[-1]), ensure_ascii=False)
+    assert "今天還沒有紀錄" not in first  # two reserved subscription rows are visible
+    assert "已吃 0" in first
+
+    today = server.tw_today().isoformat()
+    with sqlite3.connect(db) as conn:
+        server.create_daily_food_log(
+            conn, user_id="U-HOME-A", product_name="剛記錄的豆漿", meal_slot="早餐",
+            consumed_at=f"{today}T08:00:00+08:00", servings=1,
+            nutrition={"calories_kcal": 123, "protein_g": 9, "fat_g": 4},
+            source_type="manual", operation_key="fresh-home-log", publish_catalog=False,
+        )
+        conn.commit()
+
+    server.handle_message(_event("U-HOME-A", "HOME-FRESH-2"))
+    second = json.dumps(_payload(line.messages[-1]), ensure_ascii=False)
+    assert "剛記錄的豆漿" in second
+    assert "已吃 123" in second
+    assert "蛋白質餘額" in second and "6 g" in second
+    assert "剛記錄的豆漿" in second
+    assert counts["gc.open_by_key"] == 2
+    assert counts["sheet-1.get_all_values"] == 2
+
+
+def test_home_requests_are_owner_bound_and_do_not_share_snapshots(tmp_path, monkeypatch):
+    _db, counts, line = _install_fixture(tmp_path, monkeypatch, users=("U-HOME-A", "U-HOME-B"))
+
+    server.handle_message(_event("U-HOME-A", "HOME-OWNER-A"))
+    server.handle_message(_event("U-HOME-B", "HOME-OWNER-B"))
+    payload_a = json.dumps(_payload(line.messages[0]), ensure_ascii=False)
+    payload_b = json.dumps(_payload(line.messages[1]), ensure_ascii=False)
+
+    assert "U-HOME-A-午餐" in payload_a and "U-HOME-B-午餐" not in payload_a
+    assert "U-HOME-B-午餐" in payload_b and "U-HOME-A-午餐" not in payload_b
+    assert counts["sheet-1.get_all_values"] == 1
+    assert counts["sheet-2.get_all_values"] == 1
+
+
+def test_non_vip_is_denied_before_any_sheet_access(tmp_path, monkeypatch):
+    db, counts, line = _install_fixture(tmp_path, monkeypatch)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE usage SET status='expired' WHERE user_id='U-HOME-A'")
+        conn.commit()
+
+    server.handle_message(_event("U-HOME-A", "HOME-NO-VIP"))
+
+    assert counts["gc.open_by_key"] == 0
+    assert counts["line.reply_message"] == 0
+
+
+def test_unknown_user_does_not_touch_sheet_or_create_profile(tmp_path, monkeypatch):
+    db, counts, line = _install_fixture(tmp_path, monkeypatch)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO usage(user_id,remaining_meals,status,expiry_date) VALUES (?,?,?,?)",
+            ("U-UNKNOWN", 1, "vip", "2099-12-31"),
+        )
+        conn.commit()
+
+    server.handle_message(_event("U-UNKNOWN", "HOME-UNKNOWN"))
+
+    assert counts["gc.open_by_key"] == 0
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM health_profile WHERE user_id='U-UNKNOWN'").fetchone()[0] == 0
+
+
+def test_home_scope_visible_output_matches_full_dashboard_fixture(tmp_path, monkeypatch):
+    _db, counts, _line = _install_fixture(tmp_path, monkeypatch)
+
+    full = server.get_dashboard_data("U-HOME-A")
+    home = server.get_dashboard_data("U-HOME-A", scope="home")
+
+    assert build_customer_home_contents(home) == build_customer_home_contents(full)
+    assert full["future_days"] is not None
+    assert counts["training_assignments.get_all_records"] == 5
+
+
+def test_home_misbound_current_sheet_is_rejected_and_recovers_only_same_full_uid_from_master(tmp_path, monkeypatch):
+    """A foreign personal sheet fails closed; even exact-UID Master rows are forbidden."""
+    db, counts, _line = _install_fixture(tmp_path, monkeypatch, users=("U-ALICE-1234", "U-BOB-9999"))
+    today = server.tw_today().strftime("%Y/%m/%d")
+    book = server.gc._book
+    book._sheets["sheet-1"] = _ReadOnlyWorksheet(
+        "sheet-1", counts,
+        [["【VIP 客戶檔案】", "姓名: Bob", "User_ID: U-BOB-9999"],
+         DISPATCH_HEADER,
+         [today, "本週", "BOB-LUNCH", "500", "40", "BOB-DINNER", "600", "45",
+          "1100", "85", "", "", "無", "已送印", "foreign-dispatch", "2", "v1"]],
+    )
+    master = book._sheets["Master_API_View"]
+    master._records = [
+        {"Date": today, "User_ID": "U-ALICE-1234", "Lunch_Item": "OWNER-LUNCH", "Dinner_Item": "OWNER-DINNER"},
+        {"Date": today, "User_ID": "U-BOB-9999", "Lunch_Item": "BOB-LUNCH", "Dinner_Item": "BOB-DINNER"},
+    ]
+
+    before = db.read_bytes()
+    data = server.get_dashboard_data("U-ALICE-1234", scope="home")
+
+    assert data["today_lunch"] == "尚未安排"
+    assert data["today_dinner"] == "尚未安排"
+    assert data["balance_sub_meals"] == []
+    assert data["subscription_source_status"] == "ambiguous"
+    assert counts["sheet-1.get_all_values"] == 1
+    assert counts["Master_API_View.get_all_records"] == 0
+    assert before == db.read_bytes()
+
+
+def test_home_stale_mapping_does_not_authorize_same_suffix_or_same_name_candidate(tmp_path, monkeypatch):
+    """A missing exact mapping cannot scan candidates or fall back to Master."""
+    db, counts, _line = _install_fixture(tmp_path, monkeypatch, users=("U-ALICE-1234",))
+    today = server.tw_today().strftime("%Y/%m/%d")
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE health_profile SET name='Alice', sheet_name='deleted-old-sheet' WHERE user_id='U-ALICE-1234'")
+        conn.commit()
+    book = server.gc._book
+    del book._sheets["sheet-1"]
+    book._sheets["Alice_1234_20260901"] = _ReadOnlyWorksheet(
+        "Alice_1234_20260901", counts,
+        [["【VIP 客戶檔案】", "姓名: Alice", "User_ID: U-OTHER-1234"],
+         DISPATCH_HEADER,
+         [today, "本週", "FOREIGN-LUNCH", "500", "40", "FOREIGN-DINNER", "600", "45",
+          "1100", "85", "", "", "無", "已送印", "foreign", "2", "v1"]],
+    )
+    book._sheets["Bob_1234_20260930"] = _ReadOnlyWorksheet(
+        "Bob_1234_20260930", counts,
+        [["【VIP 客戶檔案】", "姓名: Bob", "User_ID: U-BOB-1234"],
+         DISPATCH_HEADER,
+         [today, "本週", "BOB-LUNCH", "500", "40", "BOB-DINNER", "600", "45",
+          "1100", "85", "", "", "無", "已送印", "bob", "3", "v1"]],
+    )
+    book._sheets["Master_API_View"]._records = [
+        {"Date": today, "User_ID": "U-ALICE-1234", "Lunch_Item": "OWNER-LUNCH", "Dinner_Item": "OWNER-DINNER"},
+    ]
+
+    before = db.read_bytes()
+    data = server.get_dashboard_data("U-ALICE-1234", scope="home")
+
+    assert data["today_lunch"] == "尚未安排"
+    assert data["today_dinner"] == "尚未安排"
+    assert data["balance_sub_meals"] == []
+    assert data["subscription_source_status"] == "unavailable"
+    assert "FOREIGN" not in json.dumps(data, ensure_ascii=False)
+    assert counts["book.worksheets"] == 0
+    assert counts["Master_API_View.get_all_records"] == 0
+    assert before == db.read_bytes()
+
+
+def test_home_missing_personal_sheet_recovers_today_from_readonly_full_uid_master_snapshot(tmp_path, monkeypatch):
+    """A missing authoritative sheet rejects a matching Master snapshot."""
+    db, counts, _line = _install_fixture(tmp_path, monkeypatch, users=("U-HOME-A",))
+    today = server.tw_today().strftime("%Y/%m/%d")
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE health_profile SET sheet_name='missing-personal-sheet' WHERE user_id='U-HOME-A'")
+        conn.commit()
+    book = server.gc._book
+    del book._sheets["sheet-1"]
+    book._sheets["Master_API_View"]._records = [
+        {"Date": "2099/01/01", "User_ID": "U-HOME-A", "Lunch_Item": "FUTURE", "Dinner_Item": "FUTURE"},
+        {"Date": today, "User_ID": "U-HOME-B", "Lunch_Item": "FOREIGN", "Dinner_Item": "FOREIGN"},
+        {"Date": today, "User_ID": "U-HOME-A", "Lunch_Item": "OWNER-LUNCH", "Dinner_Item": "OWNER-DINNER", "Plan_Week": "REST"},
+    ]
+
+    before = db.read_bytes()
+    data = server.get_dashboard_data("U-HOME-A", scope="home")
+
+    assert data["today_lunch"] == "尚未安排"
+    assert data["today_dinner"] == "尚未安排"
+    assert data["today_workout"] == "無"
+    assert data["balance_sub_meals"] == []
+    assert data["subscription_source_status"] == "unavailable"
+    assert counts["gc.open_by_key"] == 1
+    assert counts["book.worksheet:missing-personal-sheet"] == 1
+    assert counts["Master_API_View.get_all_records"] == 0
+    assert counts["training_assignments.get_all_records"] == 0
+    assert before == db.read_bytes()
+
+
+def test_home_master_fallback_preserves_explicit_zero_and_unknown_nutrition(tmp_path, monkeypatch):
+    """Zero/unknown nutrition is preserved from an owner-bound personal sheet, not Master."""
+    db, counts, _line = _install_fixture(tmp_path, monkeypatch, users=("U-HOME-A",))
+    today = server.tw_today().strftime("%Y/%m/%d")
+    book = server.gc._book
+    book._sheets["sheet-1"]._values = [
+        ["【VIP 客戶檔案】", "姓名: 會員1", "User_ID: U-HOME-A"],
+        DISPATCH_HEADER,
+        [today, "本週", "未知自訂餐", "0", "unknown", "另一未知餐", "oops", 0,
+         "", "", "", "", "無", "已送印", "dispatch-zero", "1", "v1"],
+    ]
+    book._sheets["Master_API_View"]._records = [{
+        "Date": today, "User_ID": "U-HOME-A", "Lunch_Item": "MASTER-MUST-NOT-APPEAR",
+        "Dinner_Item": "MASTER-MUST-NOT-APPEAR", "Lunch_Calories": "999",
+    }]
+
+    before = db.read_bytes()
+    data = server.get_dashboard_data("U-HOME-A", scope="home")
+
+    assert data["subscription_source_status"] == "ok"
+    assert data["lunch_cal"] == 0
+    assert data["lunch_pro"] is None
+    assert data["dinner_cal"] is None
+    assert data["dinner_pro"] == 0
+    assert data["planned_cal"] is None
+    assert data["planned_pro"] is None
+    assert "MASTER-MUST-NOT-APPEAR" not in json.dumps(data, ensure_ascii=False)
+    assert counts["sheet-1.get_all_values"] == 1
+    assert counts["Master_API_View.get_all_records"] == 0
+    assert before == db.read_bytes()
+
+
+def test_home_master_read_failure_fails_closed_without_sheet_or_database_write(tmp_path, monkeypatch):
+    """A personal-sheet read failure fails closed and never attempts Master."""
+    db, counts, _line = _install_fixture(tmp_path, monkeypatch, users=("U-HOME-A",))
+    book = server.gc._book
+    master = book._sheets["Master_API_View"]
+
+    def fail_read():
+        counts["Master_API_View.get_all_records"] += 1
+        raise AssertionError("Master must not be read")
+
+    master.get_all_records = fail_read
+
+    def fail_personal_read():
+        counts["sheet-1.get_all_values"] += 1
+        raise PermissionError("offline fixture: personal sheet denied")
+
+    book._sheets["sheet-1"].get_all_values = fail_personal_read
+    before = db.read_bytes()
+
+    data = server.get_dashboard_data("U-HOME-A", scope="home")
+
+    assert data["today_lunch"] == "尚未安排"
+    assert data["today_dinner"] == "尚未安排"
+    assert data["lunch_cal"] is None and data["dinner_cal"] is None
+    assert data["balance_sub_meals"] == []
+    assert data["subscription_source_status"] == "unavailable"
+    assert counts["sheet-1.get_all_values"] == 1
+    assert counts["Master_API_View.get_all_records"] == 0
+    assert before == db.read_bytes()
