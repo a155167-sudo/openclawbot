@@ -8,6 +8,53 @@ from datetime import date
 from reschedule_dispatch_versions import exportable_versions
 
 
+def current_order_schedule_rows(
+    conn: sqlite3.Connection, *, order_id: int, owner_user_id: str,
+) -> list[tuple[str, list]] | None:
+    """Return (service_date, 14 source columns) for the order's current schedule.
+
+    The current schedule is the single confirmed reschedule version when one
+    exists, otherwise the receipt-backed published dispatch rows.  ``None``
+    means the schedule cannot be trusted right now (an open operation, a
+    broken chain, missing receipts); callers must not guess.
+    """
+    has_versions = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='reschedule_dispatch_versions'").fetchone()
+    versions = exportable_versions(conn, order_id=order_id) if has_versions else []
+    if len(versions) == 1:
+        from dispatch_authority_bridge import current_authority_snapshot
+        binding = conn.execute('''SELECT store_id FROM dispatch_authority_version_bindings
+            WHERE order_id=? LIMIT 1''', (order_id,)).fetchone()
+        if not binding:
+            return None
+        snapshot = current_authority_snapshot(
+            conn, version_id=str(versions[0]["version_id"]), order_id=order_id,
+            owner_user_id=owner_user_id, store_id=str(binding[0]))
+        return [(str(row["service_date"]), list(row["source_columns"]))
+                for row in snapshot.rows]
+    if versions:
+        return None
+    if has_versions and conn.execute(
+            """SELECT 1 FROM reschedule_dispatch_operations WHERE order_id=?
+                 AND status IN ('pending','sheet_unknown','manual_hold','confirmed')
+               LIMIT 1""",
+            (order_id,)).fetchone():
+        # An open/uncertain operation, or a confirmed one whose version cannot
+        # be exported: the published baseline may be stale, so report
+        # "unknown" rather than old meals.  Rejected-only history keeps the
+        # baseline because the Sheet was never changed.
+        return None
+    from subscription_dispatch_contract import _trusted_publication_rows
+    trusted = _trusted_publication_rows(
+        conn, 'r.order_id=? AND r.customer_uid=?', (order_id, owner_user_id))
+    published = conn.execute('''SELECT count(*) FROM subscription_dispatch_rows
+        WHERE order_id=? AND customer_uid=? AND publish_state='published' ''',
+        (order_id, owner_user_id)).fetchone()[0]
+    if not trusted or len(trusted) != published:
+        return None
+    return [(str(row["service_date"]), list(row["source_columns"])) for row in trusted]
+
+
 def normal_order_menu_context(
     conn: sqlite3.Connection, *, order_id: int, owner_user_id: str, today: date,
 ) -> dict:
@@ -15,32 +62,10 @@ def normal_order_menu_context(
     empty = {"order_id": order_id, "authoritative": True,
              "source_dates": [], "occupied_dates": []}
     try:
-        has_versions = conn.execute("SELECT 1 FROM sqlite_master WHERE name='reschedule_dispatch_versions'").fetchone()
-        versions = exportable_versions(conn, order_id=order_id) if has_versions else []
-        if len(versions) == 1:
-            from dispatch_authority_bridge import current_authority_snapshot
-            binding = conn.execute('''SELECT store_id FROM dispatch_authority_version_bindings
-                WHERE order_id=? LIMIT 1''', (order_id,)).fetchone()
-            if not binding:
-                return empty
-            snapshot = current_authority_snapshot(
-                conn, version_id=str(versions[0]["version_id"]), order_id=order_id,
-                owner_user_id=owner_user_id, store_id=str(binding[0]))
-            rows = [(str(row["service_date"]), list(row["source_columns"]))
-                    for row in snapshot.rows]
-        else:
-            if versions:
-                return empty
-            from subscription_dispatch_contract import _trusted_publication_rows
-            trusted = _trusted_publication_rows(
-                conn, 'r.order_id=? AND r.customer_uid=?', (order_id, owner_user_id))
-            published = conn.execute('''SELECT count(*) FROM subscription_dispatch_rows
-                WHERE order_id=? AND customer_uid=? AND publish_state='published' ''',
-                (order_id, owner_user_id)).fetchone()[0]
-            if not trusted or len(trusted) != published:
-                return empty
-            rows = [(str(row["service_date"]), list(row["source_columns"]))
-                    for row in trusted]
+        rows = current_order_schedule_rows(
+            conn, order_id=order_id, owner_user_id=owner_user_id)
+        if rows is None:
+            return empty
         dates, occupied, seen = [], [], set()
         for day, columns in rows:
             if day in seen or len(columns) != 14 or str(columns[0]).replace('/', '-') != day:
