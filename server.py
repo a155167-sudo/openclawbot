@@ -5,7 +5,7 @@ import json
 import math
 import sqlite3
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import secrets
 import string
 import base64
@@ -11391,6 +11391,17 @@ def _schedule_balance_text(kcal_left, protein_need):
     return f"剩 {kcal}kcal / 補 {protein_text}g"
 
 
+def _lock_time_text(value) -> str:
+    """ISO timestamp → 台灣時間 YYYY-MM-DD HH:MM; unparseable input is shown as-is."""
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+
+
 def _workbook_lock_status_text() -> str:
     """Admin view of the shared-workbook write lease (read-only)."""
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
@@ -11403,8 +11414,8 @@ def _workbook_lock_status_text() -> str:
         "🔒 排餐試算表目前被鎖住",
         f"寫入類型：{info['writer_id']}",
         f"操作：{info['operation_id']}",
-        f"開始：{info['acquired_at']}",
-        f"到期：{info['expires_at']}（{'已逾時，結果不明' if info['expired'] else '仍在處理中'}）",
+        f"開始：{_lock_time_text(info['acquired_at'])}（台灣時間）",
+        f"到期：{_lock_time_text(info['expires_at'])}（{'已逾時，結果不明' if info['expired'] else '仍在處理中'}）",
     ]
     if info["operator_releasable"] and info["expired"]:
         lines += [
