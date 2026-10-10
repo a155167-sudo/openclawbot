@@ -73,3 +73,20 @@ def test_reschedule_leases_are_never_operator_releasable(tmp_path):
             conn, workbook_id=WB, operation_id="pair-op",
             operator_id="Uadmin", evidence="x", now=T0 + timedelta(hours=1),
         )
+
+
+def _load_lock_time_text():
+    import ast
+    from pathlib import Path
+    src = (Path(__file__).parents[1] / "server.py").read_text(encoding="utf-8")
+    node = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "_lock_time_text")
+    ns = {"datetime": datetime, "timezone": timezone, "timedelta": timedelta}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "lock_time", "exec"), ns)
+    return ns["_lock_time_text"]
+
+
+def test_lock_times_shown_in_taiwan_time_to_minutes():
+    fmt = _load_lock_time_text()
+    assert fmt("2026-10-10T08:43:22.945781+00:00") == "2026-10-10 16:43"
+    assert fmt("2026-10-10T23:50:00+00:00") == "2026-10-11 07:50"
+    assert fmt("not-a-time") == "not-a-time"
