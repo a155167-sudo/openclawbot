@@ -11,6 +11,17 @@ from reschedule_dispatch_versions import exportable_versions
 def current_order_schedule_rows(
     conn: sqlite3.Connection, *, order_id: int, owner_user_id: str,
 ) -> list[tuple[str, list]] | None:
+    """(service_date, 14 source columns) view of :func:`current_order_schedule_records`."""
+    records = current_order_schedule_records(
+        conn, order_id=order_id, owner_user_id=owner_user_id)
+    if records is None:
+        return None
+    return [(row["service_date"], row["source_columns"]) for row in records]
+
+
+def current_order_schedule_records(
+    conn: sqlite3.Connection, *, order_id: int, owner_user_id: str,
+) -> list[dict] | None:
     """Return (service_date, 14 source columns) for the order's current schedule.
 
     The current schedule is the single confirmed reschedule version when one
@@ -30,8 +41,7 @@ def current_order_schedule_rows(
         snapshot = current_authority_snapshot(
             conn, version_id=str(versions[0]["version_id"]), order_id=order_id,
             owner_user_id=owner_user_id, store_id=str(binding[0]))
-        return [(str(row["service_date"]), list(row["source_columns"]))
-                for row in snapshot.rows]
+        return [_schedule_record(row) for row in snapshot.rows]
     if versions:
         return None
     if has_versions and conn.execute(
@@ -52,7 +62,13 @@ def current_order_schedule_rows(
         (order_id, owner_user_id)).fetchone()[0]
     if not trusted or len(trusted) != published:
         return None
-    return [(str(row["service_date"]), list(row["source_columns"])) for row in trusted]
+    return [_schedule_record(row) for row in trusted]
+
+
+def _schedule_record(row) -> dict:
+    return {"service_date": str(row["service_date"]),
+            "source_columns": list(row["source_columns"]),
+            "dispatch_row_id": str(row["dispatch_row_id"])}
 
 
 def normal_order_menu_context(
