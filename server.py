@@ -3513,7 +3513,7 @@ async def lifespan(app: FastAPI):
     repair_staging_duplicate_dates_once()
     bootstrap_staging_reschedule_fixture_once()
     dedicated_health_check_trigger = _health_check_delivery_recovery_is_active()
-    if not ENABLE_SCHEDULER and not dedicated_health_check_trigger:
+    if not ENABLE_SCHEDULER and not dedicated_health_check_trigger and not PLANNED_MEAL_AUTO_EATEN_ENABLED:
         print(f"⏸️ 自動定時器未啟動（APP_ENV={APP_ENV}）")
         yield
         return
@@ -3533,6 +3533,11 @@ async def lifespan(app: FastAPI):
         register_nutrition_cleanup_job(scheduler)
     if dedicated_health_check_trigger:
         register_health_check_delivery_job(scheduler)
+    if PLANNED_MEAL_AUTO_EATEN_ENABLED:
+        # 包月餐三狀態：只此一項，不受 ENABLE_SCHEDULER 影響（其餘排程仍關閉）。
+        scheduler.add_job(auto_mark_due_planned_meals, 'interval', minutes=5,
+                          max_instances=1, coalesce=True)
+        print("✅ 包月餐自動已吃：每 5 分鐘")
 
     if ENABLE_SCHEDULER:
         try:
@@ -4852,6 +4857,16 @@ def register_dietitian_health_check_api(target_app=app):
 register_dietitian_health_check_api()
 
 
+_PLANNED_MEAL_SKIPS_DDL = """CREATE TABLE IF NOT EXISTS planned_meal_skips (
+    user_id TEXT NOT NULL,
+    meal_date TEXT NOT NULL,
+    meal_slot TEXT NOT NULL,
+    meal_name TEXT NOT NULL DEFAULT '',
+    skipped_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, meal_date, meal_slot)
+)"""
+
+
 def init_db():
     # 單一資料路徑來源：必須遵守 DATA_DIR／DB_PATH，才能安全掛載 Railway Volume。
     os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
@@ -4921,6 +4936,7 @@ def init_db():
             checked_at TEXT,
             PRIMARY KEY (user_id, meal_date, meal_slot)
         )''')
+        c.execute(_PLANNED_MEAL_SKIPS_DDL)
         c.execute('''CREATE TABLE IF NOT EXISTS subscription_orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
@@ -7711,6 +7727,87 @@ def replace_recent_meal_with_name(user_id: str, meal_name: str):
     return flex, f"已把最近一筆改成：{result['product_name']}"
 
 
+
+
+def _planned_meal_operation_key(conn, user_id, today, meal_slot, subscription_meal_id):
+    """Stable idempotency key; after a 「沒吃」 a new key lets 已吃 count again."""
+    base = (f"planned-meal:{subscription_meal_id}" if subscription_meal_id
+            else f"planned-meal-legacy:{user_id}:{today}:{meal_slot}")
+    skipped = conn.execute(
+        "SELECT skipped_at FROM planned_meal_skips WHERE user_id=? AND meal_date=? AND meal_slot=?",
+        (user_id, today, meal_slot),
+    ).fetchone()
+    if skipped:
+        return f"{base}:after-skip:{skipped[0]}"
+    previous = conn.execute(
+        "SELECT COALESCE(deleted_at,'') FROM food_logs WHERE operation_key=? AND user_id=?",
+        (base, user_id),
+    ).fetchone()
+    if previous and previous[0]:
+        # The original planned row was removed (skip then re-eat across skips):
+        # never replay a deleted row as if it were eaten.
+        return f"{base}:again:{tw_now().isoformat(timespec='seconds')}"
+    return base
+
+
+def _record_planned_meal_eaten(user_id, meal_slot, meal_name, cal, pro,
+                               subscription_meal_id, *, source_text,
+                               skip_if_skipped=False):
+    """Write today's planned meal into the food ledger once. Returns (ok, message)."""
+    today = tw_today().isoformat()
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        c = conn.cursor()
+        c.execute(_PLANNED_MEAL_SKIPS_DDL)
+        ensure_daily_food_ledger_schema(conn)
+        conn.commit()
+        # One writer at a time: the customer's 已吃 and the auto job cannot both log.
+        conn.execute("BEGIN IMMEDIATE")
+        c.execute("SELECT 1 FROM planned_meal_checks WHERE user_id=? AND meal_date=? AND meal_slot=?", (user_id, today, meal_slot))
+        if c.fetchone():
+            conn.rollback()
+            return False, f"今天的{meal_slot}已經確認過了。"
+        if skip_if_skipped and c.execute(
+                "SELECT 1 FROM planned_meal_skips WHERE user_id=? AND meal_date=? AND meal_slot=?",
+                (user_id, today, meal_slot)).fetchone():
+            conn.rollback()
+            return False, f"今天的{meal_slot}已記錄沒吃。"
+
+        c.execute("SELECT 1 FROM health_profile WHERE user_id=?", (user_id,))
+        if not c.fetchone():
+            conn.rollback()
+            return False, "找不到你的健康資料。"
+
+        daily_log = create_daily_food_log(
+            conn, user_id=user_id, product_name=meal_name, meal_slot=meal_slot,
+            consumed_at=tw_now().isoformat(timespec="seconds"), servings=1,
+            nutrition={"calories_kcal": cal, "protein_g": pro},
+            source_type="planned_meal",
+            operation_key=_planned_meal_operation_key(
+                conn, user_id, today, meal_slot, subscription_meal_id),
+        )
+        _sync_health_profile_from_ledger_conn(conn, user_id, today)
+        c.execute("DELETE FROM planned_meal_skips WHERE user_id=? AND meal_date=? AND meal_slot=?",
+                  (user_id, today, meal_slot))
+        c.execute("INSERT OR REPLACE INTO planned_meal_checks (user_id, meal_date, meal_slot, meal_name, cal, pro, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (user_id, today, meal_slot, meal_name, cal, pro, tw_now().isoformat()))
+        c.execute("""
+            INSERT INTO recent_meal_logs (user_id, meal_name, base_cal, base_pro, current_cal, current_pro, meal_date, source_text, updated_at, food_log_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                meal_name=excluded.meal_name,
+                base_cal=excluded.base_cal,
+                base_pro=excluded.base_pro,
+                current_cal=excluded.current_cal,
+                current_pro=excluded.current_pro,
+                meal_date=excluded.meal_date,
+                source_text=excluded.source_text,
+                updated_at=excluded.updated_at,
+                food_log_id=excluded.food_log_id
+        """, (user_id, meal_name, cal, pro, cal, pro, today, source_text, tw_now().isoformat(), daily_log["log_id"]))
+        conn.commit()
+    return True, f"已幫你確認{meal_slot}：{meal_name}。"
+
+
 def mark_planned_meal_as_eaten(user_id: str, meal_slot: str):
     meal_slot = meal_slot.strip()
     if meal_slot not in ["午餐", "晚餐"]:
@@ -7734,61 +7831,164 @@ def mark_planned_meal_as_eaten(user_id: str, meal_slot: str):
     if not cal and not pro:
         return None, f"{meal_slot}還沒有營養資料，暫時無法直接確認已吃。"
 
-    today = tw_today().isoformat()
+    subscription_meal_id = d.get("lunch_subscription_meal_id" if meal_slot == "午餐" else "dinner_subscription_meal_id")
     try:
-        # ✅ 安全連線
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("SELECT 1 FROM planned_meal_checks WHERE user_id=? AND meal_date=? AND meal_slot=?", (user_id, today, meal_slot))
-            if c.fetchone():
-                return None, f"今天的{meal_slot}已經確認過了。"
-
-            c.execute("SELECT today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein FROM health_profile WHERE user_id=?", (user_id,))
-            hp = c.fetchone()
-            if not hp:
-                return None, "找不到你的健康資料。"
-
-            today_extra_cal, today_extra_pro, today_food_items, today_date, tdee, protein_goal = hp
-            daily_log = create_daily_food_log(
-                conn, user_id=user_id, product_name=meal_name, meal_slot=meal_slot,
-                consumed_at=tw_now().isoformat(timespec="seconds"), servings=1,
-                nutrition={"calories_kcal": cal, "protein_g": pro},
-                source_type="planned_meal",
-                operation_key=(
-                    f"planned-meal:{d.get('lunch_subscription_meal_id' if meal_slot == '午餐' else 'dinner_subscription_meal_id')}"
-                    if d.get("lunch_subscription_meal_id" if meal_slot == "午餐" else "dinner_subscription_meal_id")
-                    else f"planned-meal-legacy:{user_id}:{today}:{meal_slot}"
-                ),
-            )
-            _sync_health_profile_from_ledger_conn(conn, user_id, today)
-            c.execute(
-                "SELECT today_extra_cal,today_extra_pro,today_food_items FROM health_profile WHERE user_id=?",
-                (user_id,),
-            )
-            projected = c.fetchone() or (0, 0, "")
-            new_extra_cal, new_extra_pro, new_food_items = projected[0] or 0, projected[1] or 0, projected[2] or ""
-            c.execute("INSERT OR REPLACE INTO planned_meal_checks (user_id, meal_date, meal_slot, meal_name, cal, pro, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (user_id, today, meal_slot, meal_name, cal, pro, tw_now().isoformat()))
-            c.execute("""
-                INSERT INTO recent_meal_logs (user_id, meal_name, base_cal, base_pro, current_cal, current_pro, meal_date, source_text, updated_at, food_log_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    meal_name=excluded.meal_name,
-                    base_cal=excluded.base_cal,
-                    base_pro=excluded.base_pro,
-                    current_cal=excluded.current_cal,
-                    current_pro=excluded.current_pro,
-                    meal_date=excluded.meal_date,
-                    source_text=excluded.source_text,
-                    updated_at=excluded.updated_at,
-                    food_log_id=excluded.food_log_id
-            """, (user_id, meal_name, cal, pro, cal, pro, today, f"{meal_slot}已吃", tw_now().isoformat(), daily_log["log_id"]))
-            conn.commit()
+        ok, message = _record_planned_meal_eaten(
+            user_id, meal_slot, meal_name, cal, pro, subscription_meal_id,
+            source_text=f"{meal_slot}已吃",
+        )
     except Exception as e:
         return None, f"發生錯誤：{str(e)}"
+    if not ok:
+        return None, message
 
     flex = build_post_commit_food_dashboard(user_id)
-    return flex, f"已幫你確認{meal_slot}：{meal_name}。"
+    return flex, message
+
+
+PLANNED_MEAL_AUTO_EATEN_ENABLED = (
+    os.environ.get("PLANNED_MEAL_AUTO_EATEN_ENABLED", "").strip().lower() == "true"
+)
+_PLANNED_MEAL_COLUMNS = {"午餐": (2, 3, 4), "晚餐": (5, 6, 7)}
+
+
+def _planned_meal_number(value):
+    try:
+        text = str(value).strip()
+        return float(text) if text else None
+    except (TypeError, ValueError):
+        return None
+
+
+def auto_mark_due_planned_meals(*, now=None) -> int:
+    """背景工作：餐期已過、顧客沒按「沒吃」的包月餐自動寫入已吃。
+
+    Reads today's meals from the trusted local schedule only (no Sheet calls),
+    never writes unknown nutrition, and never touches a meal marked 沒吃.
+    Returns the number of meals written.
+    """
+    from customer_navigation import _meal_name_without_explicit_price
+    from normal_reschedule_context import current_order_schedule_records
+    from planned_meal_status import PHASE_AFTER, meal_phase
+
+    now = now or tw_now()
+    today = now.date().isoformat() if hasattr(now, "date") else tw_today().isoformat()
+    due_slots = [slot for slot in _PLANNED_MEAL_COLUMNS if meal_phase(slot, now) == PHASE_AFTER]
+    if not due_slots:
+        return 0
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            ensure_subscription_menu_entitlement_schema(conn)
+            orders = conn.execute(
+                """SELECT o.id, o.user_id FROM subscription_menu_entitlements e
+                     JOIN subscription_orders o ON o.id=e.order_id AND o.user_id=e.user_id
+                    WHERE e.status='active' AND e.expires_on>=? AND o.status='activated'
+                      AND COALESCE(o.formalized_at,'')<>''""",
+                (today,),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            print(f"⚠️ 包月餐自動已吃：讀取訂單失敗 {type(exc).__name__}")
+            return 0
+        todays = []
+        for order in orders:
+            try:
+                records = current_order_schedule_records(
+                    conn, order_id=int(order["id"]), owner_user_id=str(order["user_id"]))
+            except Exception as exc:
+                print(f"⚠️ 包月餐自動已吃：排餐讀取失敗 order {order['id']} {type(exc).__name__}")
+                continue
+            for record in records or []:
+                if record["service_date"] == today:
+                    todays.append((str(order["user_id"]), record))
+    written = 0
+    for user_id, record in todays:
+        columns = record["source_columns"]
+        for slot in due_slots:
+            name_i, kcal_i, pro_i = _PLANNED_MEAL_COLUMNS[slot]
+            name = _meal_name_without_explicit_price(str(columns[name_i] or "").strip())
+            kcal, protein = _planned_meal_number(columns[kcal_i]), _planned_meal_number(columns[pro_i])
+            if name in ("", "無") or kcal is None or protein is None:
+                continue
+            try:
+                ok, _ = _record_planned_meal_eaten(
+                    user_id, slot, name, kcal, protein,
+                    f"{record['dispatch_row_id']}:{slot}" if record.get("dispatch_row_id") else "",
+                    source_text=f"{slot}自動已吃", skip_if_skipped=True,
+                )
+                written += int(ok)
+            except Exception as exc:
+                print(f"⚠️ 包月餐自動已吃失敗（{slot}）：{type(exc).__name__}")
+    if written:
+        print(f"🍱 包月餐自動已吃：{written} 餐")
+    return written
+
+
+def _reply_planned_meal_skip(event, user_id, slot, meal_date):
+    try:
+        ok, text = mark_planned_meal_skipped(user_id, slot, meal_date)
+    except Exception as exc:
+        print(f"⚠️ 包月餐改沒吃失敗：{type(exc).__name__}")
+        ok, text = False, "暫時無法修改，請稍後再試，或輸入「找客服」。"
+    messages = [TextSendMessage(text=("✅ " if ok else "⚠️ ") + text)]
+    if ok:
+        dashboard = build_dashboard_flex(user_id)
+        if dashboard is not None:
+            messages.append(dashboard)
+    line_bot_api.reply_message(event.reply_token, messages)
+
+
+def mark_planned_meal_skipped(user_id: str, meal_slot: str, meal_date: str, *, now=None):
+    """顧客回報「沒吃」：移除今天這餐的包月紀錄，之後不再自動算已吃。"""
+    from planned_meal_status import can_skip
+
+    now = now or tw_now()
+    if meal_slot not in ("午餐", "晚餐"):
+        return False, "不支援的餐別。"
+    if not can_skip(meal_date, now):
+        return False, "只能修改今天的包月餐；之前的紀錄請到「今日明細」調整。"
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        conn.execute(_PLANNED_MEAL_SKIPS_DDL)
+        ensure_daily_food_ledger_schema(conn)
+        conn.commit()
+        # Record 沒吃 first (atomically with clearing 已吃) so the auto job can
+        # never re-add this meal while the ledger row is being removed.
+        conn.execute("BEGIN IMMEDIATE")
+        already = conn.execute(
+            "SELECT 1 FROM planned_meal_skips WHERE user_id=? AND meal_date=? AND meal_slot=?",
+            (user_id, meal_date, meal_slot),
+        ).fetchone()
+        planned = conn.execute(
+            "SELECT meal_name FROM planned_meal_checks WHERE user_id=? AND meal_date=? AND meal_slot=?",
+            (user_id, meal_date, meal_slot),
+        ).fetchone()
+        if not already:
+            conn.execute("DELETE FROM planned_meal_checks WHERE user_id=? AND meal_date=? AND meal_slot=?",
+                         (user_id, meal_date, meal_slot))
+            conn.execute(
+                "INSERT INTO planned_meal_skips (user_id, meal_date, meal_slot, meal_name, skipped_at) VALUES (?,?,?,?,?)",
+                (user_id, meal_date, meal_slot, planned[0] if planned else "",
+                 tw_now().isoformat(timespec="seconds")),
+            )
+        conn.commit()
+        rows = conn.execute(
+            """SELECT fl.log_id, fl.version
+                 FROM food_logs fl
+                WHERE fl.user_id=? AND fl.meal_slot=? AND fl.confirmation_status='confirmed'
+                  AND COALESCE(fl.deleted_at,'')='' AND substr(fl.consumed_at,1,10)=?
+                  AND (fl.operation_key LIKE 'planned-meal:%' OR fl.operation_key LIKE 'planned-meal-legacy:%')""",
+            (user_id, meal_slot, meal_date),
+        ).fetchall()
+    for log_id, version in rows:
+        apply_daily_food_log_edit(
+            user_id=user_id, log_id=log_id, expected_version=int(version or 1),
+            event_id=f"planned-meal-skip:{user_id}:{meal_date}:{meal_slot}:{log_id}",
+            action="delete",
+        )
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        _sync_health_profile_from_ledger_conn(conn, user_id, meal_date)
+        conn.commit()
+    return True, f"已改成今天的{meal_slot}沒吃，不算進今天的熱量。"
 
 
 def mark_today_workout_done(user_id: str):
@@ -8234,6 +8434,7 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
     hp = None
     ledger_names = []
     checked_slots = set()
+    skipped_slots = set()
     workout_done = False
     frequent_foods = []
     ai_estimated_cal = 0.0
@@ -8310,6 +8511,9 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
             try:
                 c.execute("SELECT meal_slot FROM planned_meal_checks WHERE user_id=? AND meal_date=?", (user_id, today_str))
                 checked_slots = {r[0] for r in c.fetchall()}
+                c.execute(_PLANNED_MEAL_SKIPS_DDL)
+                c.execute("SELECT meal_slot FROM planned_meal_skips WHERE user_id=? AND meal_date=?", (user_id, today_str))
+                skipped_slots = {r[0] for r in c.fetchall()}
                 if not home_only:
                     c.execute("SELECT 1 FROM workout_checks WHERE user_id=? AND workout_date=?", (user_id, today_str))
                     workout_done = bool(c.fetchone())
@@ -8512,6 +8716,9 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
             continue
         balance_sub_meals.append({
             "slot": slot, "name": meal, "kcal": calories, "protein": meal_protein,
+            "meal_date": today_str,
+            "eaten": slot in checked_slots,
+            "skipped": slot in skipped_slots and slot not in checked_slots,
             "subscription_meal_id": (
                 f"{subscription_dispatch_id}:{slot}" if subscription_dispatch_id else ""
             ),
@@ -19273,6 +19480,10 @@ def handle_postback_event(event):
         return handle_meal_photo_postback(event)
     if admin_authorization is not True and not has_active_vip_access(uid):
         return
+    from planned_meal_status import parse_skip_postback
+    skip = parse_skip_postback(data)
+    if skip:
+        return _reply_planned_meal_skip(event, uid, skip[0], skip[1])
     return handle_meal_photo_postback(event)
 
 
@@ -22749,6 +22960,11 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
     if msg == "今日運動完成":
         reply_text = mark_today_workout_done(uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    if msg in ["午餐沒吃", "晚餐沒吃"]:
+        slot = "午餐" if msg.startswith("午餐") else "晚餐"
+        _reply_planned_meal_skip(event, uid, slot, tw_today().isoformat())
         return
 
     if msg in ["午餐已吃", "晚餐已吃"]:

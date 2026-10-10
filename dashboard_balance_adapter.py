@@ -65,8 +65,9 @@ def adapt_dashboard_data(data: dict) -> dict:
     for raw in raw_sub_meals:
         meal_id = _identifier(raw.get("subscription_meal_id"))
         slot = str(raw.get("slot") or "其他")
-        match = -1 if raw.get("eaten") else None
-        if match is None and meal_id:
+        skipped = bool(raw.get("skipped"))
+        match = None
+        if meal_id:
             match = next((index for index, record in enumerate(records)
                           if index not in used_records
                           and record["subscription_meal_id"] == meal_id), None)
@@ -76,14 +77,21 @@ def adapt_dashboard_data(data: dict) -> dict:
                           and not record["subscription_meal_id"]
                           and record["source_type"] == "planned_meal"
                           and record["slot"] == slot), None)
-        if match is not None and match >= 0:
+        if match is not None:
             used_records.add(match)
+            if raw.get("meal_date"):
+                # 已吃的包月餐：當天可改成「沒吃」.
+                records[match]["skip_slot"] = slot
+                records[match]["meal_date"] = str(raw.get("meal_date"))
+        eaten = (bool(raw.get("eaten")) or match is not None) and not skipped
         sub_meals.append({
             "slot": slot,
             "name": _meal_name_without_explicit_price(raw.get("name") or "未命名包月餐"),
             "kcal": _number(raw.get("kcal")),
             "protein": _number(raw.get("protein")),
-            "eaten": match is not None,
+            "eaten": eaten,
+            "skipped": skipped,
+            "meal_date": str(raw.get("meal_date") or ""),
             "subscription_meal_id": meal_id,
         })
 

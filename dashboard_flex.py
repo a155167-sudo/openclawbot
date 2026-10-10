@@ -58,7 +58,8 @@ def compute(data, *, now=None):
     tk = data.get("target_kcal") or 0
     tp = data.get("target_protein") or 0
     eaten = data.get("records", [])
-    uneaten = [m for m in data.get("sub_meals", []) if not m.get("eaten")]
+    uneaten = [m for m in data.get("sub_meals", [])
+               if not m.get("eaten") and not m.get("skipped")]
     reserved = [m for m in uneaten
                 if m.get("kcal") is not None and m.get("protein") is not None]
     unknown_reserved = [m for m in uneaten if m not in reserved]
@@ -224,23 +225,41 @@ def build_dashboard_flex(data, *, now=None):
                      "cornerRadius": "12px", "backgroundColor": "#EEF6E2", "contents": [
                          {"type": "text", "text": c["hint"], "size": "sm", "wrap": True, "color": "#2F4A22"}]})
 
-    # 今日紀錄
+    # 今日紀錄（包月餐三狀態：待吃 → 吃了嗎 → 已吃；當天可改「沒吃」）
+    from planned_meal_status import PHASE_ASKING, meal_phase, skip_postback_data
+    render_now = now or datetime.now(ZoneInfo("Asia/Taipei"))
     rows = []
     for r in data.get("records", []):
-        rows.append((r.get("is_sub", False), f"{r['slot']}｜{r['name']}", f"{_kcal(r['kcal']) if r.get('kcal') is not None else '未知'} kcal", "#3E504D"))
+        link = None
+        if r.get("skip_slot") and r.get("meal_date"):
+            link = ("沒吃", {"type": "postback", "label": "沒吃",
+                            "data": skip_postback_data(r["skip_slot"], r["meal_date"]),
+                            "displayText": f"{r['skip_slot']}沒吃"})
+        rows.append((r.get("is_sub", False), f"{r['slot']}｜{r['name']}", f"{_kcal(r['kcal']) if r.get('kcal') is not None else '未知'} kcal", "#3E504D", link))
     for m in data.get("sub_meals", []):
-        if not m.get("eaten"):
-            nutrition = (f"預留 {_kcal(m['kcal'])}"
-                         if m.get("kcal") is not None and m.get("protein") is not None
-                         else "營養待補")
-            rows.append((True, f"{m['slot']}｜{m['name']}", nutrition, C_RES_TXT))
+        if m.get("eaten"):
+            continue
+        if m.get("skipped"):
+            rows.append((True, f"{m['slot']}｜{m['name']}", "沒吃", C_SUB,
+                         ("改回已吃", {"type": "message", "label": "改回已吃",
+                                      "text": f"{m['slot']}已吃"})))
+            continue
+        known = m.get("kcal") is not None and m.get("protein") is not None
+        if meal_phase(m["slot"], render_now) == PHASE_ASKING:
+            label = "吃了嗎？"
+            link = ("已吃", {"type": "message", "label": "已吃", "text": f"{m['slot']}已吃"}) if known else None
+        else:
+            # 待吃：沿用既有「預留」呈現（黃色＝還沒吃、已預留熱量）。
+            label = f"預留 {_kcal(m['kcal'])}" if known else "營養待補"
+            link = None
+        rows.append((True, f"{m['slot']}｜{m['name']}", label, C_RES_TXT, link))
     extra = len(rows) - MAX_ROWS
     rows = rows[:MAX_ROWS]
 
     record_box = [{"type": "text", "text": "今日紀錄", "size": "sm", "weight": "bold", "color": C_TEAL}]
     if not rows:
         record_box.append({"type": "text", "text": "今天還沒有紀錄", "size": "sm", "color": C_SUB, "margin": "sm"})
-    for is_sub, name, kcal, color in rows:
+    for is_sub, name, kcal, color, link in rows:
         left = []
         if is_sub:
             left.append({"type": "box", "layout": "vertical", "flex": 0, "paddingStart": "6px",
@@ -255,6 +274,11 @@ def build_dashboard_flex(data, *, now=None):
                                 "contents": left},
                                {"type": "text", "text": kcal, "size": "sm", "color": color, "align": "end",
                                 "flex": 0}]})
+        if link:
+            link_text, action = link
+            record_box.append({"type": "text", "text": f"{link_text} ›", "size": "xs",
+                               "color": C_GREEN if link_text != "沒吃" else C_SUB,
+                               "align": "end", "decoration": "underline", "action": action})
     if extra > 0:
         record_box.append({"type": "text", "text": f"還有 {extra} 筆，請看今日明細", "size": "xs",
                            "color": C_SUB, "margin": "sm"})
