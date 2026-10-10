@@ -188,3 +188,17 @@ def test_generic_409_is_unknown_and_not_retried(tmp_path, monkeypatch):
         assert conn.execute(
             "SELECT state FROM subscription_activation_notifications WHERE order_id=1"
         ).fetchone() == ("unknown",)
+
+
+def test_activation_code_is_pushed_as_its_own_message():
+    message = server._activation_success_message(6, "#VIPORDER-J2YG6T")
+    body, code = server._activation_push_texts(message)
+    assert code == "#VIPORDER-J2YG6T"
+    assert "#VIPORDER-" not in body
+    assert body.startswith("🎉 訂單 #6 付款已確認")
+    assert "下一則訊息" in body
+    assert "\n\n\n" not in body
+
+
+def test_activation_split_falls_back_to_single_message_without_code():
+    assert server._activation_push_texts("沒有開通碼") == ["沒有開通碼"]
