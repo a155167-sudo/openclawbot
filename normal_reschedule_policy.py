@@ -91,7 +91,29 @@ def normal_pair_policy(conn: sqlite3.Connection, order_id: int, owner: str,
         raise PairRescheduleConflict('reschedule dates outside original expiry + 30 window')
     if now.time() >= time(8) and (src == now.date() or tgt == now.date()):
         raise PairRescheduleConflict('same-day pair reschedule cutoff has passed')
-    return source + ' 午餐／晚餐', target + ' 午餐／晚餐'
+    return (_schedule_week_label(conn, order_id, src) or source + ' 午餐／晚餐',
+            _schedule_week_label(conn, order_id, tgt) or target + ' 午餐／晚餐')
+
+
+_WEEKDAY_LABELS = ('週一', '週二', '週三', '週四', '週五', '週六', '週日')
+
+
+def _schedule_week_label(conn: sqlite3.Connection, order_id: int, day: date) -> str:
+    """「第N週-週X」 counted from the Monday of the order's first service week,
+    matching the labels written at activation.  Empty when unknown."""
+    try:
+        first = conn.execute(
+            "SELECT min(service_date) FROM subscription_dispatch_rows WHERE order_id=?",
+            (order_id,),
+        ).fetchone()
+        start = date.fromisoformat(str(first[0])) if first and first[0] else None
+    except (sqlite3.Error, ValueError):
+        return ''
+    if start is None or day < start:
+        return ''
+    week_monday = start - timedelta(days=start.weekday())
+    week = (day - week_monday).days // 7 + 1
+    return f'第{week}週-{_WEEKDAY_LABELS[day.weekday()]}'
 
 
 def normal_semantic_pending_request(conn: sqlite3.Connection, order_id: int,

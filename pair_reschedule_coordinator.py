@@ -528,7 +528,7 @@ def _execute_pair_reschedule_under_lease(
                 raise PairRescheduleConflict("target meal cells are not empty")
             target_base = list(target_observed)
         else:
-            target_base = [target, target_label] + [""] * 11 + ["待列印"] + ["", "", ""]
+            target_base = [target.replace("-", "/"), target_label] + [""] * 11 + ["待列印"] + ["", "", ""]
         if len(target_base) != 17:
             raise PairRescheduleConflict("target row schema is incomplete")
 
@@ -539,7 +539,8 @@ def _execute_pair_reschedule_under_lease(
         source_after[2:12] = [""] * 10
         source_after[14:] = [source_id, str(order_id), successor_menu]
         target_after = list(target_base)
-        target_after[0], target_after[1] = target, target_label
+        # Same look as activation rows: 2026/10/30 + 第N週-週X.
+        target_after[0], target_after[1] = target.replace("-", "/"), target_label
         target_after[2:12] = list(trusted["source_columns"])[2:12]
         target_after[12], target_after[13] = "", "待列印"
         target_after[14:] = [target_id, str(order_id), successor_menu]
