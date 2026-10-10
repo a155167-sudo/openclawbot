@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any
 
 
@@ -255,6 +255,28 @@ def build_plain_subscription_menu_summary(plan_requests: Sequence[tuple], start_
             f"{target_date:%Y/%m/%d}（{day_name}）\n"
             f"午：{lunch['name']}\n"
             f"晚：{dinner['name']}"
+        )
+    return "\n\n".join(blocks)
+
+
+_MENU_WEEKDAYS = ("週一", "週二", "週三", "週四", "週五", "週六", "週日")
+
+
+def render_schedule_menu_text(rows) -> str:
+    """Render current schedule rows ``(YYYY-MM-DD, source_columns)`` as the
+    customer menu, in the same block shape as the activation summary.
+    Dates left empty by a reschedule are omitted."""
+    blocks = []
+    for day, columns in sorted(rows, key=lambda item: item[0]):
+        lunch = str(columns[2] or "").strip()
+        dinner = str(columns[5] or "").strip()
+        if lunch in ("", "無") and dinner in ("", "無"):
+            continue
+        service_date = date.fromisoformat(day)
+        blocks.append(
+            f"{service_date:%Y/%m/%d}（{_MENU_WEEKDAYS[service_date.weekday()]}）\n"
+            f"午：{lunch or '無'}\n"
+            f"晚：{dinner or '無'}"
         )
     return "\n\n".join(blocks)
 

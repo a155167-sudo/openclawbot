@@ -231,6 +231,7 @@ from subscription_meal_plan import (
     ensure_light_bento_coverage,
     get_subscription_form_uid,
     get_subscription_form_value,
+    render_schedule_menu_text,
     sanitize_legacy_subscription_menu,
 )
 from subscription_dispatch_contract import (
@@ -10331,9 +10332,29 @@ def get_subscription_menu_access(user_id):
         return "empty", None, remaining_meals, expiry_date
     if not current_plan:
         return "no_active_plan", None, remaining_meals, expiry_date
+    current_menu = _current_schedule_menu_text(int(current_plan[0]), user_id)
+    if current_menu:
+        return "active", current_menu, remaining_meals, current_plan[1]
     if not menu or not menu[0]:
         return "missing_menu", None, remaining_meals, expiry_date
     return "active", menu[0], remaining_meals, current_plan[1]
+
+
+def _current_schedule_menu_text(order_id: int, user_id: str):
+    """Menu text from the confirmed current schedule, or None to fall back to
+    the activation summary (no trusted schedule rows, or any doubt)."""
+    try:
+        from normal_reschedule_context import current_order_schedule_rows
+        with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = current_order_schedule_rows(
+                conn, order_id=order_id, owner_user_id=user_id)
+        if not rows:
+            return None
+        return render_schedule_menu_text(rows) or None
+    except Exception as exc:
+        print(f"⚠️ 包月菜單改用開通時菜單（order {order_id}）：{type(exc).__name__}")
+        return None
 
 
 def get_active_subscription_order_id(user_id):
