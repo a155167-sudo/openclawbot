@@ -222,3 +222,11 @@ def test_ledger_meal_id_ignores_retry_suffix():
     assert '":".join(operation_key[len("planned-meal:"):].split(":")[:2])' in src
     key = "planned-meal:dispatch-old:午餐:after-skip:2026-09-27T14:05:00+08:00"
     assert ":".join(key[len("planned-meal:"):].split(":")[:2]) == "dispatch-old:午餐"
+
+
+def test_rows_stay_in_meal_order_after_skip():
+    data = _base(skipped=True)
+    data["balance_records"] = [{"slot": "晚餐", "name": "雞肉低碳", "kcal": 379, "protein": 40,
+                                "source_type": "planned_meal", "subscription_meal_id": "d1:晚餐"}]
+    _, text = _card(data, at(21, 0))
+    assert text.index("午餐｜") < text.index("晚餐｜")

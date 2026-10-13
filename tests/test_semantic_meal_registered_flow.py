@@ -187,7 +187,7 @@ def test_registered_incomplete_provider_is_durable_unknown_and_replays_without_t
     server.processed_messages.clear()
     server.handle_message(event)
 
-    expected = "⚠️ AI估算結果待確認，原餐點草稿未變。額度未退還；請勿重試，需人工確認。"
+    expected = "⚠️ 這次估算沒有完成，沒有寫入任何紀錄。可以換個說法再傳一次，例如「午餐 雞胸肉 150 克」；如果是本店便當，直接打便當名稱就可以。"
     assert [reply.text for reply in replies] == [expected, expected]
     assert len(completions.calls) == 1
     with sqlite3.connect(db) as conn:

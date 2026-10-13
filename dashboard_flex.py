@@ -265,6 +265,9 @@ def build_dashboard_flex(data, *, now=None):
             label = f"預留 {_kcal(m['kcal'])}" if known else "營養待補"
             link = None
         rows.append((True, f"{m['slot']}｜{m['name']}", label, C_RES_TXT, link))
+    # 依餐別排序（早→午→晚→點心），同餐別保持原順序；改「沒吃」後順序不跳動。
+    slot_order = {"早餐": 0, "午餐": 1, "晚餐": 2, "點心": 3}
+    rows.sort(key=lambda row: slot_order.get(str(row[1]).split("｜", 1)[0], 4))
     extra = len(rows) - MAX_ROWS
     rows = rows[:MAX_ROWS]
 

@@ -628,7 +628,7 @@ def _require_text_meal_provider():
 
 
 def _photo_batch_cleanup_refusal_reply():
-    return TextSendMessage(text='⚠️ AI估算結果待確認，原餐點草稿未變。額度未退還；請勿重試，需人工確認。')
+    return TextSendMessage(text='⚠️ 這次估算沒有完成，沒有寫入任何紀錄。可以換個說法再傳一次，例如「午餐 雞胸肉 150 克」；如果是本店便當，直接打便當名稱就可以。')
 
 
 def _safe_fail_photo_ingredient_batch_children(conn, **kwargs):
@@ -7992,6 +7992,74 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
     return written
 
 
+_BENTO_NEGATION_RE = re.compile(r"沒吃|沒有吃|不吃|沒拿|沒領|不要|取消")
+_BENTO_QUESTION_RE = re.compile(r"[?？]|多少|幾大卡|幾卡|嗎|呢|能不能|可以吃|熱量|蛋白")
+_BENTO_LUNCH_WORDS = ("午餐", "中午", "午飯")
+_BENTO_DINNER_WORDS = ("晚餐", "晚上", "晚飯")
+
+
+def _menu_dish_in_text(compact_text):
+    """Longest menu dish name contained in the text, or None."""
+    best = None
+    for dish in MAIN_DISHES:
+        if dish.get("category") != "main":
+            continue  # 只認便當類；配菜／飲料名稱太常見，不當作本店餐點
+        name = re.sub(r"\s+", "", str(dish.get("name") or ""))
+        if name and name in compact_text and (best is None or len(name) > len(best[0])):
+            best = (name, dish)
+    return best[1] if best else None
+
+
+def planned_bento_text_reply(user_id, message_id, text, *, armed=False):
+    """「午餐吃了豬肉低碳」：菜單便當不需要克數。
+
+    - 今天排給這位顧客的包月便當 → 直接記成「已吃」（與自動已吃共用同一筆，
+      不會重複計算；午餐吃了排給晚餐的便當則走午晚餐對調）。
+    - 其他菜單品項 → 交回既有流程（選份量後確認），這裡不處理。
+    Returns a LINE message, or None to let the normal flow continue.
+    """
+    from customer_navigation import _meal_name_without_explicit_price
+
+    raw = str(text or "").strip()
+    compact = re.sub(r"\s+", "", raw)
+    if not compact or len(compact) > 40 or _BENTO_NEGATION_RE.search(compact):
+        return None
+    if not armed and (_BENTO_QUESTION_RE.search(compact) or not re.search(r"吃|喝|記|午餐|晚餐|早餐", compact)):
+        return None
+    dish = _menu_dish_in_text(compact)
+    if dish is None:
+        return None
+    dish_name = re.sub(r"\s+", "", str(dish.get("name") or ""))
+    said_lunch = any(word in compact for word in _BENTO_LUNCH_WORDS)
+    said_dinner = any(word in compact for word in _BENTO_DINNER_WORDS)
+
+    try:
+        data = get_dashboard_data(user_id, scope="home") or {}
+    except Exception as exc:
+        print(f"⚠️ 包月便當比對失敗：{type(exc).__name__}")
+        data = {}
+    planned = {
+        str(meal.get("slot")): meal for meal in data.get("balance_sub_meals") or []
+        if re.sub(r"\s+", "", _meal_name_without_explicit_price(meal.get("name") or "")) == dish_name
+    }
+    if planned:
+        slot = "晚餐" if (said_dinner and "晚餐" in planned) else (
+            "午餐" if "午餐" in planned and (said_lunch or "晚餐" not in planned) else next(iter(planned)))
+        meal = planned[slot]
+        if meal.get("eaten"):
+            return TextSendMessage(text=f"✅ 今天的{slot}「{dish_name}」已經記錄為已吃了，不會重複計算。")
+        lunch = next((m for m in data.get("balance_sub_meals") or [] if m.get("slot") == "午餐"), None)
+        if (slot == "晚餐" and said_lunch and lunch and lunch.get("swappable")
+                and not lunch.get("eaten") and not lunch.get("skipped")):
+            flex, message = mark_lunch_ate_dinner_bento(user_id, tw_today().isoformat())
+        else:
+            flex, message = mark_planned_meal_as_eaten(user_id, slot)
+        return flex or TextSendMessage(text=("✅ " if "已幫你確認" in str(message) else "⚠️ ") + str(message))
+
+    # 不是今天排的包月便當：交給既有的菜單品項流程（選份量 → 確認草稿）。
+    return None
+
+
 def _reply_planned_meal_skip(event, user_id, slot, meal_date):
     try:
         ok, text = mark_planned_meal_skipped(user_id, slot, meal_date)
@@ -14095,7 +14163,7 @@ def _handle_registered_semantic_meal(event, text, user_id, message_id):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="⚠️ AI估算結果待確認，原餐點草稿未變。額度未退還；請勿重試，需人工確認。"
+                text="⚠️ 這次估算沒有完成，沒有寫入任何紀錄。可以換個說法再傳一次，例如「午餐 雞胸肉 150 克」；如果是本店便當，直接打便當名稱就可以。"
             ),
         )
         return True, True
@@ -14138,12 +14206,12 @@ def _handle_registered_semantic_meal(event, text, user_id, message_id):
             _mark_semantic_meal_unknown(batch_id, user_id, exc)
             print(
                 "⚠️ semantic meal provider outcome unknown "
-                f"batch={batch_id} error={type(exc).__name__}"
+                f"batch={batch_id} error={type(exc).__name__}: {str(exc)[:120]}"
             )
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(
-                    text="⚠️ AI估算結果待確認，原餐點草稿未變。額度未退還；請勿重試，需人工確認。"
+                    text="⚠️ 這次估算沒有完成，沒有寫入任何紀錄。可以換個說法再傳一次，例如「午餐 雞胸肉 150 克」；如果是本店便當，直接打便當名稱就可以。"
                 ),
             )
             return True, True
@@ -18897,6 +18965,14 @@ def _natural_unit_label(unit):
 
 def build_natural_food_log_reply(*, user_id, message_id, event, request):
     """Resolve one explicit food-log request without invoking the LLM."""
+    original_text = str(getattr(getattr(event, "message", None), "text", "") or "")
+    try:
+        bento_reply = planned_bento_text_reply(user_id, message_id, original_text)
+    except Exception as exc:
+        print(f"⚠️ 包月便當文字記餐失敗：{type(exc).__name__}")
+        bento_reply = None
+    if bento_reply is not None:
+        return bento_reply
     try:
         request = dict(request)
         if request.get("meal_slot") == "宵夜":
@@ -21614,6 +21690,15 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                 event.reply_token, TextSendMessage(text="✅ 已取消這次文字記餐；沒有寫入飲食紀錄。")
             )
             return
+        try:
+            bento_reply = planned_bento_text_reply(uid, msg_id, msg, armed=True)
+        except Exception as exc:
+            print(f"⚠️ 包月便當文字記餐失敗：{type(exc).__name__}")
+            bento_reply = None
+        if bento_reply is not None:
+            finish_text_meal_input(uid, input_state["version"], "consumed")
+            line_bot_api.reply_message(event.reply_token, bento_reply)
+            return
         explicit_pending = parse_explicit_text_nutrition_log(msg)
         natural_pending = None if explicit_pending else parse_natural_food_log_intent(f"記錄 {msg}")
         if explicit_pending:
@@ -23722,6 +23807,14 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
     semantic_handled = False
     semantic_quota_claimed = False
     if not meal_change_intent and not is_ai_estimate and not contextual_followup:
+        try:
+            bento_reply = planned_bento_text_reply(uid, msg_id, msg)
+        except Exception as exc:
+            print(f"⚠️ 包月便當文字記餐失敗：{type(exc).__name__}")
+            bento_reply = None
+        if bento_reply is not None:
+            line_bot_api.reply_message(event.reply_token, bento_reply)
+            return
         semantic_handled, semantic_quota_claimed = _handle_registered_semantic_meal(
             event, msg, uid, msg_id
         )
