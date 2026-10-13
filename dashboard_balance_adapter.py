@@ -91,6 +91,7 @@ def adapt_dashboard_data(data: dict) -> dict:
             "protein": _number(raw.get("protein")),
             "eaten": eaten,
             "skipped": skipped,
+            "swappable": bool(raw.get("swappable")),
             "meal_date": str(raw.get("meal_date") or ""),
             "subscription_meal_id": meal_id,
         })

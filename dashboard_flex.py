@@ -226,7 +226,7 @@ def build_dashboard_flex(data, *, now=None):
                          {"type": "text", "text": c["hint"], "size": "sm", "wrap": True, "color": "#2F4A22"}]})
 
     # 今日紀錄（包月餐三狀態：待吃 → 吃了嗎 → 已吃；當天可改「沒吃」）
-    from planned_meal_status import PHASE_ASKING, meal_phase, skip_postback_data
+    from planned_meal_status import PHASE_ASKING, meal_phase, skip_postback_data, swap_postback_data
     render_now = now or datetime.now(ZoneInfo("Asia/Taipei"))
     rows = []
     for r in data.get("records", []):
@@ -246,8 +246,20 @@ def build_dashboard_flex(data, *, now=None):
             continue
         known = m.get("kcal") is not None and m.get("protein") is not None
         if meal_phase(m["slot"], render_now) == PHASE_ASKING:
-            label = "吃了嗎？"
+            label = f"吃了嗎？預留 {_kcal(m['kcal'])}" if known else "營養待補"  # 無營養資料：不能記已吃
             link = ("已吃", {"type": "message", "label": "已吃", "text": f"{m['slot']}已吃"}) if known else None
+            other = next((o for o in data.get("sub_meals", [])
+                          if o.get("slot") == "晚餐" and not o.get("eaten") and not o.get("skipped")
+                          and o.get("kcal") is not None and o.get("protein") is not None), None)
+            if known and m["slot"] == "午餐" and m.get("swappable") and other and m.get("meal_date"):
+                # 兩餐同時送達：讓顧客選中午吃的是哪一個便當。
+                link = [
+                    (f"吃了 {m['name']}", {"type": "message", "label": "已吃",
+                                          "text": "午餐已吃"}),
+                    (f"吃了 {other['name']}", {"type": "postback", "label": "吃了另一個",
+                                              "data": swap_postback_data(m["meal_date"]),
+                                              "displayText": f"午餐吃了{other['name']}"}),
+                ]
         else:
             # 待吃：沿用既有「預留」呈現（黃色＝還沒吃、已預留熱量）。
             label = f"預留 {_kcal(m['kcal'])}" if known else "營養待補"
@@ -274,8 +286,7 @@ def build_dashboard_flex(data, *, now=None):
                                 "contents": left},
                                {"type": "text", "text": kcal, "size": "sm", "color": color, "align": "end",
                                 "flex": 0}]})
-        if link:
-            link_text, action = link
+        for link_text, action in ([link] if isinstance(link, tuple) else (link or [])):
             record_box.append({"type": "text", "text": f"{link_text} ›", "size": "xs",
                                "color": C_GREEN if link_text != "沒吃" else C_SUB,
                                "align": "end", "decoration": "underline", "action": action})

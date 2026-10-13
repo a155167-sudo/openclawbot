@@ -173,3 +173,52 @@ def test_job_follows_the_sheet_the_customer_sees(srv):
     assert server.auto_mark_due_planned_meals(now=clock["now"]) == 0
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT count(*) FROM planned_meal_checks").fetchone()[0] == 0
+
+
+# --- 兩餐同時送達：午餐吃了排給晚餐的便當 -----------------------------------
+
+def test_lunch_window_offers_both_bentos_when_delivered_together():
+    data = _base(swappable=True)
+    data["balance_sub_meals"].append({"slot": "晚餐", "name": "豬肉低碳", "kcal": 373, "protein": 33,
+                                      "meal_date": DAY, "subscription_meal_id": "d1:晚餐"})
+    _, text = _card(data, at(12, 0))
+    from planned_meal_status import swap_postback_data
+    assert "吃了 雞肉低碳 ›" in text and '"text": "午餐已吃"' in text
+    assert "吃了 豬肉低碳 ›" in text and swap_postback_data(DAY) in text
+
+
+def test_swap_not_offered_once_swapped_or_for_dinner():
+    data = _base(swappable=False)
+    data["balance_sub_meals"].append({"slot": "晚餐", "name": "豬肉低碳", "kcal": 373, "protein": 33,
+                                      "meal_date": DAY, "subscription_meal_id": "d1:晚餐"})
+    _, text = _card(data, at(12, 0))
+    assert "pm:v1:swap:" not in text
+
+
+def test_job_on_swapped_day_logs_each_bento_once_under_its_own_id(srv):
+    db, clock = srv
+    with sqlite3.connect(db) as conn:
+        conn.execute(server._PLANNED_MEAL_SWAPS_DDL)
+        conn.execute("INSERT INTO planned_meal_swaps VALUES (?,?,?)", (OWNER, DAY, "x"))
+    assert server.auto_mark_due_planned_meals(now=clock["now"]) == 1
+    clock["now"] = at(20, 35)
+    assert server.auto_mark_due_planned_meals(now=clock["now"]) == 1
+    assert _logs(db) == [("午餐", "planned-meal:dispatch-old:晚餐", 1),
+                         ("晚餐", "planned-meal:dispatch-old:午餐", 1)]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT today_extra_cal FROM health_profile").fetchone()[0] == 1100
+
+
+def test_swap_refused_after_a_meal_is_already_recorded(srv):
+    _, clock = srv
+    server.auto_mark_due_planned_meals(now=clock["now"])
+    flex, text = server.mark_lunch_ate_dinner_bento(OWNER, DAY, now=clock["now"])
+    assert flex is None and "無法再對調" in text
+
+
+def test_ledger_meal_id_ignores_retry_suffix():
+    import inspect
+    src = inspect.getsource(server)
+    assert '":".join(operation_key[len("planned-meal:"):].split(":")[:2])' in src
+    key = "planned-meal:dispatch-old:午餐:after-skip:2026-09-27T14:05:00+08:00"
+    assert ":".join(key[len("planned-meal:"):].split(":")[:2]) == "dispatch-old:午餐"

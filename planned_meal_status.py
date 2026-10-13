@@ -22,6 +22,7 @@ PHASE_ASKING = "asking"   # 吃了嗎
 PHASE_AFTER = "after"     # 餐期已過 → 自動已吃
 
 SKIP_POSTBACK_PREFIX = "pm:v1:skip:"
+SWAP_POSTBACK_PREFIX = "pm:v1:swap:"
 
 
 def _taipei(now: datetime) -> datetime:
@@ -67,3 +68,20 @@ def parse_skip_postback(data: str):
     except ValueError:
         return None
     return slot, meal_date
+
+
+def swap_postback_data(meal_date: str) -> str:
+    """午餐吃的是排給晚餐的那個便當（兩餐同時送達）."""
+    return f"{SWAP_POSTBACK_PREFIX}{meal_date}"
+
+
+def parse_swap_postback(data: str):
+    """Return meal_date or None."""
+    if not str(data or "").startswith(SWAP_POSTBACK_PREFIX):
+        return None
+    meal_date = str(data)[len(SWAP_POSTBACK_PREFIX):]
+    try:
+        date.fromisoformat(meal_date)
+    except ValueError:
+        return None
+    return meal_date
