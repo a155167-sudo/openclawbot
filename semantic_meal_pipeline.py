@@ -346,6 +346,8 @@ def estimate_per_100_openai(client: Any, requests: list[Mapping[str, Any]], batc
                 "food_state空字串時仍須保留evidence內的明示狀態。"
                 "逐項原樣回傳item_id、food_name、basis_amount=100及相同basis_unit；"
                 "不可把g與ml互換，不可計算整份。estimate必須介於min與max。"
+                "外食便當、炒飯、麵等混合料理以整份平均（飯／麵、配菜、肉、湯汁一起）估算每100g，"
+                "常見約120–220kcal，油炸主菜為主才偏高。"
             )},
             {"role": "user", "content": json.dumps(safe_requests, ensure_ascii=False)},
         ],
@@ -547,6 +549,13 @@ def run_semantic_meal_pipeline(
                 clarifications.append(assessment["reason"])
                 continue
             factor = Decimal(str(request["amount"])) / Decimal("100")
+            if request.get("qty_origin") == "typical_portion":
+                whole = _number_or_none((estimate.get("nutrition") or {}).get("calories_kcal"))
+                if whole is not None and whole * factor > Decimal("1200"):
+                    clarifications.append(
+                        f"「{request['food_name']}」以一般份量估算約 {float(whole * factor):.0f} kcal，"
+                        "偏高不確定；請補充大約幾克或幾份，例如「排骨飯 半份」或「排骨飯 450 克」。")
+                    continue
             resolved[index] = {
                 "request": request,
                 "nutrition": _scale_nutrition(estimate.get("nutrition"), factor),
@@ -635,7 +644,9 @@ def estimate_natural_portion_grams_openai(client: Any, requests: list[Mapping[st
             {"role": "system", "content": (
                 "依schema估算每個品項『一個自然單位』在台灣常見外食／便當店的一般重量（公克，可食部分）。"
                 "自然單位依portion_assumption（例如一碗、一份、一個）；未寫時以一份一般份量計。"
-                "便當／飯類含飯與配菜全部可食部分。只回傳重量，不可估算營養。"
+                "便當／飯類含飯與配菜全部可食部分。參考範圍：台灣便當（排骨、雞腿等）約450–550g、"
+                "炒飯一盤約300–400g、一碗湯麵（含湯）約500–650g、乾麵一碗約300–400g、"
+                "滷肉飯小碗約200g；取常見中間值，不要取上限。只回傳重量，不可估算營養。"
                 "逐項原樣回傳item_id與food_name。"
             )},
             {"role": "user", "content": json.dumps(safe, ensure_ascii=False)},
@@ -650,3 +661,14 @@ def estimate_natural_portion_grams_openai(client: Any, requests: list[Mapping[st
     return [{"item_id": (raw or {}).get("item_id"), "food_name": (raw or {}).get("food_name"),
              "grams_per_unit": (raw or {}).get("grams_per_unit"), **trace}
             for raw in raw_items if isinstance(raw, Mapping)]
+
+
+def _number_or_none(value: Any) -> Decimal | None:
+    """Estimate value from a {estimate,min,max} range or a plain number."""
+    if isinstance(value, Mapping):
+        value = value.get("estimate")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return number if number.is_finite() else None

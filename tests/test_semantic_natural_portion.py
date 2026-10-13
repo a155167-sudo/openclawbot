@@ -71,3 +71,11 @@ def test_mixed_dish_category_has_bounds():
     # Specific categories still win (白飯 stays 主食澱粉類).
     assert assess_per100({"food_name": "白飯", "unit": "g"},
                          {"calories_kcal": 140, "protein_g": 2.5, "fat_g": 0.3, "carbohydrate_g": 31})["category"] == "主食澱粉類"
+
+
+def test_whole_portion_over_1200_kcal_asks_instead_of_drafting():
+    result, _ = _run("排骨飯", PORK_RICE,
+                     grams=lambda asks: [{"item_id": a["item_id"], "grams_per_unit": 600} for a in asks],
+                     per100={"calories_kcal": 250, "protein_g": 15, "fat_g": 10, "carbohydrate_g": 30})
+    assert result["status"] == "clarification"
+    assert "偏高不確定" in result["clarifications"][0]
