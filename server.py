@@ -7880,13 +7880,32 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
         conn.row_factory = sqlite3.Row
         try:
             ensure_subscription_menu_entitlement_schema(conn)
-            orders = conn.execute(
-                """SELECT o.id, o.user_id FROM subscription_menu_entitlements e
-                     JOIN subscription_orders o ON o.id=e.order_id AND o.user_id=e.user_id
-                    WHERE e.status='active' AND e.expires_on>=? AND o.status='activated'
-                      AND COALESCE(o.formalized_at,'')<>''""",
+            # Follow the schedule the customer actually sees on 今日總覽: the
+            # order published to their current personal worksheet
+            # (health_profile.sheet_name), not merely the entitlement's order —
+            # they differ when two orders of one customer overlap.
+            users = conn.execute(
+                """SELECT DISTINCT e.user_id, h.sheet_name
+                     FROM subscription_menu_entitlements e
+                     JOIN health_profile h ON h.user_id=e.user_id
+                    WHERE e.status='active' AND e.expires_on>=?
+                      AND COALESCE(h.sheet_name,'')<>''""",
                 (today,),
             ).fetchall()
+            orders = []
+            for user in users:
+                order = conn.execute(
+                    """SELECT o.id, o.user_id FROM subscription_orders o
+                        WHERE o.user_id=? AND o.status='activated'
+                          AND COALESCE(o.formalized_at,'')<>''
+                          AND EXISTS (SELECT 1 FROM subscription_dispatch_rows d
+                                       WHERE d.order_id=o.id AND d.customer_uid=o.user_id
+                                         AND d.worksheet_title=?)
+                        ORDER BY o.id DESC LIMIT 1""",
+                    (str(user["user_id"]), str(user["sheet_name"])),
+                ).fetchone()
+                if order:
+                    orders.append(order)
         except sqlite3.Error as exc:
             print(f"⚠️ 包月餐自動已吃：讀取訂單失敗 {type(exc).__name__}")
             return 0
