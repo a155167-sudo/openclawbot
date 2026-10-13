@@ -4686,20 +4686,24 @@ def sync_menu_to_food_catalog():
                          AND owner_user_id='system'""",
                     (name,),
                 ).fetchone()
-                if existing:
-                    conn.execute(
-                        """UPDATE food_catalog
-                           SET menu_category=?, visibility='public'
-                           WHERE food_id=?""",
-                        (menu_category, existing[0]),
-                    )
-                    continue
                 per_serving = {
                     "calories_kcal": dish.get("calories_kcal", 0),
                     "protein_g": dish.get("protein_g", 0),
                     "fat_g": dish.get("fat_g", 0),
                     "carbohydrate_g": dish.get("carbohydrate_g", 0),
                 }
+                if existing:
+                    # menu.csv is the approved source: keep search / 記一餐 on the
+                    # calibrated numbers.  Past food_logs keep their own snapshots.
+                    updated = conn.execute(
+                        """UPDATE food_catalog
+                           SET menu_category=?, visibility='public', per_serving_json=?,
+                               updated_at=CASE WHEN per_serving_json=? THEN updated_at ELSE ? END
+                           WHERE food_id=?""",
+                        (menu_category, json.dumps(per_serving), json.dumps(per_serving),
+                         now, existing[0]),
+                    )
+                    continue
                 fid = f"menu_{uuid.uuid4().hex[:16]}"
                 conn.execute(
                     """INSERT INTO food_catalog
@@ -9962,6 +9966,28 @@ def text_meal_cancel_quick_reply():
     return QuickReply(items=[QuickReplyButton(action=MessageAction(label="取消", text="取消"))])
 
 
+def _menu_nutrition_memo(compact_user_msg, has_mass_or_volume):
+    """本店菜單品項的營養與內容物（最長菜名優先，「豆腐食蔬」不會再配成「豆腐」）."""
+    exact_menu_matches = sorted((
+        dish for dish in MAIN_DISHES
+        if str(dish.get("name") or "")
+        and re.sub(r"\s+", "", str(dish.get("name"))) in compact_user_msg
+        and not has_mass_or_volume
+    ), key=lambda dish: -len(str(dish.get("name"))))
+    # 「豆腐食蔬」也包含「豆腐」：只保留沒被更長菜名涵蓋的品項。
+    kept_menu_matches = []
+    for dish in exact_menu_matches:
+        name = re.sub(r"\s+", "", str(dish.get("name")))
+        if not any(name in re.sub(r"\s+", "", str(kept.get("name"))) for kept in kept_menu_matches):
+            kept_menu_matches.append(dish)
+    return "\n".join(
+        f"- {dish['name']}（本店菜單數值，每份）：熱量 {float(dish.get('cal') or 0):g} 大卡、"
+        f"蛋白質 {float(dish.get('pro') or 0):g} 克、脂肪 {float(dish.get('fat') or 0):g} 克、"
+        f"碳水 {float(dish.get('carbs') or 0):g} 克；內容物：{dish.get('ingredients', '無資料')}"
+        for dish in kept_menu_matches[:3]
+    ) or "（一般食物：不提供整份菜單資料）"
+
+
 def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     ensure_daily_food_ledger_schema(conn)
@@ -10004,16 +10030,7 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
     has_mass_or_volume = bool(re.search(
         r"\d+(?:\.\d+)?(?:g|克|公克|ml|毫升|cc)", compact_user_msg, re.I
     ))
-    exact_menu_matches = [
-        dish for dish in MAIN_DISHES
-        if str(dish.get("name") or "")
-        and re.sub(r"\s+", "", str(dish.get("name"))) in compact_user_msg
-        and not has_mass_or_volume
-    ]
-    ingredients_memo = "\n".join(
-        f"- {dish['name']}：{dish.get('ingredients', '無資料')}"
-        for dish in exact_menu_matches[:3]
-    ) or "（一般食物：不提供整份菜單資料）"
+    ingredients_memo = _menu_nutrition_memo(compact_user_msg, has_mass_or_volume)
     
     food_items_text = food_items if food_items else "無"
     
@@ -10137,7 +10154,7 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
 
 {report}
 
-【本店餐點內容物 - 內部參考】
+【本店餐點營養與內容物（顧客問到這些品項時，熱量／蛋白質／脂肪／碳水必須照此回答）】
 {ingredients_memo}
 """
     
@@ -18728,7 +18745,11 @@ def build_food_search_result_bubble(item, *, action_data="", action_label="快�
         last_at = last_at.split("T")[0]
     food_id = item["food_id"]
 
-    if source_type == "user_meal_photo":
+    if _is_official_menu_item(item):
+        header_text = "🍱 一日樂食餐點"
+        header_color = "#FEF3C7"
+        text_color = "#5A4A1E"
+    elif source_type == "user_meal_photo":
         header_text = "📷 餐點照片"
         header_color = "#FFF3CD"
         text_color = "#7A4E00"
@@ -18748,7 +18769,10 @@ def build_food_search_result_bubble(item, *, action_data="", action_label="快�
         body.append(_kv("品牌", brand))
     if per_serving.get("calories_kcal"):
         body.append(_kv("每份熱量", f"{float(per_serving['calories_kcal']):.0f} kcal"))
-        body.append(_kv("每份蛋白質", f"{float(per_serving.get('protein_g', 0)):.1f}g"))
+        for field, label in (("protein_g", "蛋白質"), ("fat_g", "脂肪"), ("carbohydrate_g", "碳水")):
+            value = per_serving.get(field)
+            if value is not None and str(value).strip() != "":
+                body.append(_kv(f"每份{label}", f"{float(value):.1f}g"))
     for key, label in (
         ("starch_exchange", "主食"), ("protein_medium_exchange", "中脂蛋白"),
         ("protein_low_exchange", "低脂蛋白"), ("protein_high_exchange", "高脂蛋白"),
