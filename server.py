@@ -14189,12 +14189,19 @@ def _handle_registered_semantic_meal(event, text, user_id, message_id):
             _record_semantic_provider_stage(owned_batch_id, "nutrition_fallback", estimates)
             return estimates
 
+        def natural_portion_adapter(items, owned_batch_id):
+            from semantic_meal_pipeline import estimate_natural_portion_grams_openai
+            grams = estimate_natural_portion_grams_openai(client, items, owned_batch_id)
+            _record_semantic_provider_stage(owned_batch_id, "natural_portion", grams)
+            return grams
+
         result = run_semantic_meal_pipeline(
             text=text, user_id=user_id, message_id=message_id,
             claim_batch=lambda *_: claim,
             parse_semantics=parse_adapter,
             find_reference_nutrition=find_reference_nutrition,
             estimate_per_100=fallback_adapter,
+            estimate_natural_grams=natural_portion_adapter,
         )
         draft = _persist_semantic_meal_result(
             user_id=user_id, message_id=str(message_id), batch_id=batch_id, result=result,
