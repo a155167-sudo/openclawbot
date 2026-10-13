@@ -9861,6 +9861,39 @@ def _is_unsupported_two_meal_move(intent_text):
     )
 
 
+_PLANNED_MEAL_PRICE_RE = re.compile(r"[（(]\s*(?:NT)?\$\s*\d+(?:\.\d+)?\s*[)）]|(?:NT)?\$\s*\d+(?:\.\d+)?")
+
+
+def describe_planned_meal_for_ai(cell_text):
+    """Turn a Sheet meal cell like '豬肉低碳 ($200)' into AI-safe text.
+
+    The Sheet stores the price next to the dish name.  The AI must never see that
+    price, because with no nutrition data it reads $200 as 200 kcal.  When the dish
+    is on the menu, attach the menu's own calories/protein instead.
+    """
+    raw = str(cell_text or "").strip()
+    if not raw or raw == "無":
+        return "無"
+    cleaned = re.sub(r"\s+", " ", _PLANNED_MEAL_PRICE_RE.sub("", raw)).strip() or raw
+    compact = re.sub(r"\s+", "", cleaned)
+    best = None
+    for dish in MAIN_DISHES:
+        name = re.sub(r"\s+", "", str(dish.get("name") or ""))
+        if name and name in compact and (best is None or len(name) > len(re.sub(r"\s+", "", best["name"]))):
+            best = dish
+    if not best:
+        return f"{cleaned}（本店菜單無此品項營養資料）"
+    return (
+        f"{cleaned}（本店菜單數值：熱量 {float(best.get('cal') or 0):g} 大卡、"
+        f"蛋白質 {float(best.get('pro') or 0):g} 克）"
+    )
+
+
+def text_meal_cancel_quick_reply():
+    """Quick-reply 「取消」 shown while the bot waits for the customer's meal text."""
+    return QuickReply(items=[QuickReplyButton(action=MessageAction(label="取消", text="取消"))])
+
+
 def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     ensure_daily_food_ledger_schema(conn)
@@ -9968,7 +10001,7 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
     has_meal_today = (today_lunch != "無" or today_dinner != "無")
 
     if has_meal_today:
-        today_status = f"✅ 今天 ({today_str_zh}) 是您的【取餐日】\n🍱 午餐：{today_lunch}\n🌙 晚餐：{today_dinner}"
+        today_status = f"✅ 今天 ({today_str_zh}) 是您的【取餐日】\n🍱 午餐：{describe_planned_meal_for_ai(today_lunch)}\n🌙 晚餐：{describe_planned_meal_for_ai(today_dinner)}"
         base_cal_text = "【報告上的『當日熱量剩餘』】"
         base_pro_text = "【報告上的『蛋白質需補』】"
     else:
@@ -9997,6 +10030,7 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
 
 【核心守則（嚴格遵守）】
 1. 若顧客輸入的食物存在於本店資料庫 / 菜單，必須 100% 使用資料庫數值，不可改寫、補值或猜測。
+   - 今日排餐若附「本店菜單數值」，記錄該餐時只能用這組熱量與蛋白質；任何金額（例如 $200）都是售價，絕對不是熱量。
 2. 一般食物問句只回答，不可寫入正式紀錄；只有訊息以「請用一般估算記錄」開頭時，才估算並記錄。
 3. 若顧客明確表示是外部食物，或該食物不存在於本店資料庫，可用常識估算，但：
    - 不可給假精準到個位數的數字
@@ -21571,7 +21605,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             arm_text_meal_input(uid, msg_id)
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="請在下一則訊息輸入餐點與份量；輸入「取消」可離開。"),
+                TextSendMessage(text="請在下一則訊息輸入餐點與份量；輸入「取消」可離開。", quick_reply=text_meal_cancel_quick_reply()),
             )
             return
         if msg in {"取消", "取消記餐", "取消紀錄飲食", "取消記錄飲食"}:
@@ -21594,7 +21628,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         else:
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="請輸入一項實際吃下的食物與份量，或輸入「取消」。"),
+                TextSendMessage(text="請輸入一項實際吃下的食物與份量，或輸入「取消」。", quick_reply=text_meal_cancel_quick_reply()),
             )
             return
         with sqlite3.connect(DB_PATH) as conn:
@@ -23248,7 +23282,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         arm_text_meal_input(uid, msg_id)
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="請在下一則訊息回覆餐別、餐點和份量（例如：午餐半個雞肉便當），也可以直接傳餐點照片。輸入「取消」可離開；我會先提供草稿，經你確認後才記錄。"),
+            TextSendMessage(text="請在下一則訊息回覆餐別、餐點和份量（例如：午餐半個雞肉便當），也可以直接傳餐點照片。輸入「取消」可離開；我會先提供草稿，經你確認後才記錄。", quick_reply=text_meal_cancel_quick_reply()),
         )
         return
     elif msg == "運費怎麼算":
