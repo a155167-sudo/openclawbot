@@ -1143,7 +1143,8 @@ def _ledger_item_from_row(conn: sqlite3.Connection, row) -> dict:
         trust_integrity_status = "integrity_verification_failed"
     operation_key = str(row[25] or "")
     subscription_meal_id = (
-        operation_key[len("planned-meal:"):]
+        # "planned-meal:{dispatch}:{slot}[:after-skip:…|:again:…]" → "{dispatch}:{slot}"
+        ":".join(operation_key[len("planned-meal:"):].split(":")[:2])
         if operation_key.startswith("planned-meal:") else ""
     )
     return {
@@ -4864,6 +4865,14 @@ _PLANNED_MEAL_SKIPS_DDL = """CREATE TABLE IF NOT EXISTS planned_meal_skips (
 )"""
 
 
+_PLANNED_MEAL_SWAPS_DDL = """CREATE TABLE IF NOT EXISTS planned_meal_swaps (
+    user_id TEXT NOT NULL,
+    meal_date TEXT NOT NULL,
+    swapped_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, meal_date)
+)"""
+
+
 def init_db():
     # 單一資料路徑來源：必須遵守 DATA_DIR／DB_PATH，才能安全掛載 Railway Volume。
     os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
@@ -4934,6 +4943,7 @@ def init_db():
             PRIMARY KEY (user_id, meal_date, meal_slot)
         )''')
         c.execute(_PLANNED_MEAL_SKIPS_DDL)
+        c.execute(_PLANNED_MEAL_SWAPS_DDL)
         c.execute('''CREATE TABLE IF NOT EXISTS subscription_orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
@@ -7857,6 +7867,42 @@ def _planned_meal_number(value):
         return None
 
 
+def _planned_meals_swapped(user_id: str, meal_date: str) -> bool:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        conn.execute(_PLANNED_MEAL_SWAPS_DDL)
+        return bool(conn.execute(
+            "SELECT 1 FROM planned_meal_swaps WHERE user_id=? AND meal_date=?",
+            (user_id, meal_date),
+        ).fetchone())
+
+
+def mark_lunch_ate_dinner_bento(user_id: str, meal_date: str, *, now=None):
+    """兩餐同時送達，顧客午餐先吃了排給晚餐的便當：今天午晚餐對調並記午餐已吃。"""
+    from planned_meal_status import can_skip
+
+    now = now or tw_now()
+    if not can_skip(meal_date, now):
+        return None, "只能調整今天的包月餐。"
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        conn.execute(_PLANNED_MEAL_SWAPS_DDL)
+        conn.execute(_PLANNED_MEAL_SKIPS_DDL)
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute(
+                "SELECT 1 FROM planned_meal_checks WHERE user_id=? AND meal_date=?",
+                (user_id, meal_date)).fetchone() or conn.execute(
+                "SELECT 1 FROM planned_meal_skips WHERE user_id=? AND meal_date=?",
+                (user_id, meal_date)).fetchone():
+            conn.rollback()
+            return None, "今天的包月餐已經記錄過了，無法再對調；如需修改請輸入「找客服」。"
+        conn.execute(
+            "INSERT OR IGNORE INTO planned_meal_swaps (user_id, meal_date, swapped_at) VALUES (?,?,?)",
+            (user_id, meal_date, now.isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    return mark_planned_meal_as_eaten(user_id, "午餐")
+
+
 def auto_mark_due_planned_meals(*, now=None) -> int:
     """背景工作：餐期已過、顧客沒按「沒吃」的包月餐自動寫入已吃。
 
@@ -7920,8 +7966,11 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
     written = 0
     for user_id, record in todays:
         columns = record["source_columns"]
+        swapped = _planned_meals_swapped(user_id, today)
         for slot in due_slots:
-            name_i, kcal_i, pro_i = _PLANNED_MEAL_COLUMNS[slot]
+            # 午晚餐對調的日子：午餐是排給晚餐的便當，反之亦然。
+            bento = {"午餐": "晚餐", "晚餐": "午餐"}[slot] if swapped else slot
+            name_i, kcal_i, pro_i = _PLANNED_MEAL_COLUMNS[bento]
             name = _meal_name_without_explicit_price(str(columns[name_i] or "").strip())
             kcal, protein = _planned_meal_number(columns[kcal_i]), _planned_meal_number(columns[pro_i])
             if name in ("", "無") or kcal is None or protein is None:
@@ -7929,7 +7978,7 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
             try:
                 ok, _ = _record_planned_meal_eaten(
                     user_id, slot, name, kcal, protein,
-                    f"{record['dispatch_row_id']}:{slot}" if record.get("dispatch_row_id") else "",
+                    f"{record['dispatch_row_id']}:{bento}" if record.get("dispatch_row_id") else "",
                     source_text=f"{slot}自動已吃", skip_if_skipped=True,
                 )
                 written += int(ok)
@@ -8451,6 +8500,7 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
     ledger_names = []
     checked_slots = set()
     skipped_slots = set()
+    lunch_dinner_swapped = False
     workout_done = False
     frequent_foods = []
     ai_estimated_cal = 0.0
@@ -8530,6 +8580,9 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
                 c.execute(_PLANNED_MEAL_SKIPS_DDL)
                 c.execute("SELECT meal_slot FROM planned_meal_skips WHERE user_id=? AND meal_date=?", (user_id, today_str))
                 skipped_slots = {r[0] for r in c.fetchall()}
+                c.execute(_PLANNED_MEAL_SWAPS_DDL)
+                c.execute("SELECT 1 FROM planned_meal_swaps WHERE user_id=? AND meal_date=?", (user_id, today_str))
+                lunch_dinner_swapped = bool(c.fetchone())
                 if not home_only:
                     c.execute("SELECT 1 FROM workout_checks WHERE user_id=? AND workout_date=?", (user_id, today_str))
                     workout_done = bool(c.fetchone())
@@ -8708,6 +8761,14 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
 
     lunch_checked = "午餐" in checked_slots
     dinner_checked = "晚餐" in checked_slots
+    # 兩餐同時送達：顧客午餐吃了排給晚餐的便當 → 今天午晚餐對調。
+    # 每個便當保留自己的 subscription_meal_id（dispatch:原本餐別）。
+    bento_slot = {"午餐": "午餐", "晚餐": "晚餐"}
+    if lunch_dinner_swapped:
+        today_lunch, today_dinner = today_dinner, today_lunch
+        lunch_cal, dinner_cal = dinner_cal, lunch_cal
+        lunch_pro, dinner_pro = dinner_pro, lunch_pro
+        bento_slot = {"午餐": "晚餐", "晚餐": "午餐"}
 
     food_list = list(ledger_names)
     balance_records = [
@@ -8736,8 +8797,9 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
             "eaten": slot in checked_slots,
             "skipped": slot in skipped_slots and slot not in checked_slots,
             "subscription_meal_id": (
-                f"{subscription_dispatch_id}:{slot}" if subscription_dispatch_id else ""
+                f"{subscription_dispatch_id}:{bento_slot[slot]}" if subscription_dispatch_id else ""
             ),
+            "swappable": slot == "午餐" and not lunch_dinner_swapped,
         })
     recorded_count = len(food_list)
     task_logged_once = recorded_count >= 1 or any(
@@ -8828,8 +8890,8 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
         "food_list": food_list, "recorded_count": recorded_count, "lunch_checked": lunch_checked,
         "balance_records": balance_records, "balance_sub_meals": balance_sub_meals,
         "subscription_source_status": subscription_source_status,
-        "lunch_subscription_meal_id": f"{subscription_dispatch_id}:午餐" if subscription_dispatch_id else "",
-        "dinner_subscription_meal_id": f"{subscription_dispatch_id}:晚餐" if subscription_dispatch_id else "",
+        "lunch_subscription_meal_id": f"{subscription_dispatch_id}:{bento_slot['午餐']}" if subscription_dispatch_id else "",
+        "dinner_subscription_meal_id": f"{subscription_dispatch_id}:{bento_slot['晚餐']}" if subscription_dispatch_id else "",
         "dinner_checked": dinner_checked, "workout_done": workout_done, "task_logged_once": task_logged_once,
         "task_two_meals": task_two_meals, "task_protein_80": task_protein_80, "frequent_foods": frequent_foods,
         "future_days": future_days,
@@ -19444,6 +19506,17 @@ def handle_postback_event(event):
     skip = parse_skip_postback(data)
     if skip:
         return _reply_planned_meal_skip(event, uid, skip[0], skip[1])
+    from planned_meal_status import parse_swap_postback
+    swap_date = parse_swap_postback(data)
+    if swap_date:
+        try:
+            meal_flex, meal_text = mark_lunch_ate_dinner_bento(uid, swap_date)
+        except Exception as exc:
+            print(f"⚠️ 包月餐午晚餐對調失敗：{type(exc).__name__}")
+            meal_flex, meal_text = None, "暫時無法記錄，請稍後再試，或輸入「找客服」。"
+        line_bot_api.reply_message(
+            event.reply_token, meal_flex or TextSendMessage(text=meal_text))
+        return
     return handle_meal_photo_postback(event)
 
 
