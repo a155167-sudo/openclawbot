@@ -93,7 +93,8 @@ def srv(tmp_path, monkeypatch):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS health_profile (
             user_id TEXT PRIMARY KEY, today_extra_cal REAL, today_extra_pro REAL,
-            today_food_items TEXT, today_date TEXT, tdee REAL, protein REAL);
+            today_food_items TEXT, today_date TEXT, tdee REAL, protein REAL,
+            sheet_name TEXT);
         CREATE TABLE IF NOT EXISTS planned_meal_checks (
             user_id TEXT, meal_date TEXT, meal_slot TEXT, meal_name TEXT,
             cal REAL, pro REAL, checked_at TEXT,
@@ -103,7 +104,8 @@ def srv(tmp_path, monkeypatch):
             current_cal REAL, current_pro REAL, meal_date TEXT,
             source_text TEXT, updated_at TEXT, food_log_id TEXT);
     """)
-    conn.execute("INSERT OR REPLACE INTO health_profile VALUES (?,0,0,'',?,2000,120)", (OWNER, DAY))
+    # 'sheet-1' is the fixture order's published personal worksheet.
+    conn.execute("INSERT OR REPLACE INTO health_profile VALUES (?,0,0,'',?,2000,120,'sheet-1')", (OWNER, DAY))
     conn.commit()
     conn.close()
     clock = {"now": at(14, 5)}
@@ -160,3 +162,14 @@ def test_skip_refused_for_previous_day(srv):
     _, clock = srv
     ok, text = server.mark_planned_meal_skipped(OWNER, "午餐", "2026-09-26", now=clock["now"])
     assert not ok and "今天" in text
+
+
+def test_job_follows_the_sheet_the_customer_sees(srv):
+    """Two overlapping orders: 今日總覽 shows the order on health_profile.sheet_name;
+    the job must not mark another order's meals as eaten."""
+    db, clock = srv
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE health_profile SET sheet_name='another-order-tab'")
+    assert server.auto_mark_due_planned_meals(now=clock["now"]) == 0
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM planned_meal_checks").fetchone()[0] == 0
