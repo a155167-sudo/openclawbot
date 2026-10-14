@@ -550,12 +550,8 @@ def run_semantic_meal_pipeline(
                 continue
             factor = Decimal(str(request["amount"])) / Decimal("100")
             if request.get("qty_origin") == "typical_portion":
-                whole = _number_or_none((estimate.get("nutrition") or {}).get("calories_kcal"))
-                if whole is not None and whole * factor > Decimal("1200"):
-                    clarifications.append(
-                        f"「{request['food_name']}」以一般份量估算約 {float(whole * factor):.0f} kcal，"
-                        "偏高不確定；請補充大約幾克或幾份，例如「排骨飯 半份」或「排骨飯 450 克」。")
-                    continue
+                request, factor = _cap_typical_portion(request, estimate.get("nutrition"), factor)
+                parsed["items"][index] = request
             resolved[index] = {
                 "request": request,
                 "nutrition": _scale_nutrition(estimate.get("nutrition"), factor),
@@ -661,6 +657,49 @@ def estimate_natural_portion_grams_openai(client: Any, requests: list[Mapping[st
     return [{"item_id": (raw or {}).get("item_id"), "food_name": (raw or {}).get("food_name"),
              "grams_per_unit": (raw or {}).get("grams_per_unit"), **trace}
             for raw in raw_items if isinstance(raw, Mapping)]
+
+
+# 外食「一般份量」的合理上限（一份，kcal／蛋白質 g）。AI 常把份量和每100g蛋白質
+# 同時估高（排骨飯 900 kcal／P50、牛肉麵 1080 kcal／P60）；超過時把份量等比例
+# 縮到上限內，草稿註明已調整。顧客自己寫的克數不受影響。
+_TYPICAL_PORTION_CAPS = (
+    (("麵",), ("麵包",), Decimal("750"), Decimal("35")),
+    (("便當", "飯", "丼", "燴", "咖哩", "粥", "套餐"), ("飯糰",), Decimal("850"), Decimal("35")),
+)
+_TYPICAL_PORTION_DEFAULT_CAP = (Decimal("900"), Decimal("40"))
+
+
+def typical_portion_cap(food_name: str) -> tuple[Decimal, Decimal]:
+    name = str(food_name or "")
+    for keywords, excluded, kcal, protein in _TYPICAL_PORTION_CAPS:
+        if any(k in name for k in keywords) and not any(x in name for x in excluded):
+            return kcal, protein
+    return _TYPICAL_PORTION_DEFAULT_CAP
+
+
+def _cap_typical_portion(request: Mapping[str, Any], per100: Any,
+                         factor: Decimal) -> tuple[dict[str, Any], Decimal]:
+    """Shrink an AI typical portion whose whole-dish kcal/protein exceed the cap."""
+    nutrition = per100 if isinstance(per100, Mapping) else {}
+    kcal = _number_or_none(nutrition.get("calories_kcal"))
+    protein = _number_or_none(nutrition.get("protein_g"))
+    kcal_cap, protein_cap = typical_portion_cap(request.get("food_name"))
+    scale = Decimal("1")
+    if kcal and kcal > 0 and kcal * factor > kcal_cap:
+        scale = min(scale, kcal_cap / (kcal * factor))
+    if protein and protein > 0 and protein * factor > protein_cap:
+        scale = min(scale, protein_cap / (protein * factor))
+    if scale >= 1:
+        return dict(request), factor
+    grams = (Decimal(str(request["amount"])) * scale).quantize(Decimal("1"))
+    if grams < 1:
+        return dict(request), factor
+    assumption = re.sub(
+        r"一般份量約 [\d.]+ g（AI估算）",
+        f"一般份量約 {grams} g（AI估算，已依常見份量上限調整）",
+        str(request.get("portion_assumption") or ""))
+    capped = {**request, "amount": float(grams), "portion_assumption": assumption}
+    return capped, grams / Decimal("100")
 
 
 def _number_or_none(value: Any) -> Decimal | None:

@@ -13,7 +13,7 @@ def _run(text, items, grams=None, per100=None):
         calls["per100"].append(misses)
         return [{"item_id": m["item_id"], "food_name": m["food_name"], "basis_amount": 100,
                  "basis_unit": m["unit"], "nutrition": per100 or {
-                     "calories_kcal": 180, "protein_g": 8, "fat_g": 6, "carbohydrate_g": 24}}
+                     "calories_kcal": 180, "protein_g": 7, "fat_g": 6, "carbohydrate_g": 24}}
                 for m in misses]
 
     result = run_semantic_meal_pipeline(
@@ -73,9 +73,43 @@ def test_mixed_dish_category_has_bounds():
                          {"calories_kcal": 140, "protein_g": 2.5, "fat_g": 0.3, "carbohydrate_g": 31})["category"] == "主食澱粉類"
 
 
-def test_whole_portion_over_1200_kcal_asks_instead_of_drafting():
+def test_overestimated_rice_is_shrunk_to_typical_cap():
+    # 排骨飯 500 g × 180 kcal／P10 per 100 g = 900 kcal／P50 → capped at P35
     result, _ = _run("排骨飯", PORK_RICE,
+                     grams=lambda asks: [{"item_id": a["item_id"], "grams_per_unit": 500} for a in asks],
+                     per100={"calories_kcal": 180, "protein_g": 10, "fat_g": 6, "carbohydrate_g": 24})
+    assert result["status"] == "draft"
+    item = result["items"][0]
+    assert item["request"]["amount"] == 350
+    assert item["nutrition"]["calories_kcal"] == 630 and item["nutrition"]["protein_g"] == 35
+    assert "一般份量約 350 g（AI估算，已依常見份量上限調整）" in item["request"]["portion_assumption"]
+
+
+def test_overestimated_noodle_soup_uses_noodle_cap():
+    # 牛肉麵 600 g × 180 kcal／P10 = 1080 kcal／P60 → capped by P35 (and ≤750 kcal)
+    result, _ = _run("牛肉麵", [{"food_name": "牛肉麵", "amount": 1, "unit": "natural",
+                                 "portion_assumption": "一碗"}],
                      grams=lambda asks: [{"item_id": a["item_id"], "grams_per_unit": 600} for a in asks],
-                     per100={"calories_kcal": 250, "protein_g": 15, "fat_g": 10, "carbohydrate_g": 30})
-    assert result["status"] == "clarification"
-    assert "偏高不確定" in result["clarifications"][0]
+                     per100={"calories_kcal": 180, "protein_g": 10, "fat_g": 6, "carbohydrate_g": 24})
+    item = result["items"][0]
+    assert result["status"] == "draft"
+    assert item["nutrition"]["protein_g"] <= 35 and item["nutrition"]["calories_kcal"] <= 750
+
+
+def test_reasonable_portion_is_untouched_and_measured_grams_never_capped():
+    result, _ = _run("排骨飯", PORK_RICE,
+                     grams=lambda asks: [{"item_id": a["item_id"], "grams_per_unit": 450} for a in asks],
+                     per100={"calories_kcal": 160, "protein_g": 6, "fat_g": 6, "carbohydrate_g": 22})
+    assert result["items"][0]["request"]["amount"] == 450
+    assert "上限" not in result["items"][0]["request"]["portion_assumption"]
+    measured, _ = _run("排骨飯600g", [{"food_name": "排骨飯", "amount": 600, "unit": "g"}],
+                       per100={"calories_kcal": 180, "protein_g": 10, "fat_g": 6, "carbohydrate_g": 24})
+    assert measured["items"][0]["nutrition"]["protein_g"] == 60
+
+
+def test_caps_by_dish_type():
+    from semantic_meal_pipeline import typical_portion_cap
+    assert typical_portion_cap("牛肉麵") == (750, 35)
+    assert typical_portion_cap("雞腿便當") == (850, 35)
+    assert typical_portion_cap("菠蘿麵包") == (900, 40)
+    assert typical_portion_cap("飯糰") == (900, 40)
