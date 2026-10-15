@@ -242,8 +242,8 @@ def test_registered_known_delivery_quote_keeps_checkout_total_and_cta(
             "distance_text": "1.2 公里",
             "distance_meters": 1200,
             "duration_text": "6 分鐘",
-            "delivery_fee": 25,
-            "delivery_fee_text": "25 元",
+            "delivery_fee": 35,
+            "delivery_fee_text": "35 元",
             "hub_name": "南京店",
             "route_group": "NANJING",
             "delivery_zone": "1.5KM",
@@ -261,8 +261,11 @@ def test_registered_known_delivery_quote_keeps_checkout_total_and_cta(
     rendered = json.dumps(replies[-1].as_json_dict(), ensure_ascii=False)
     assert "包月粗估結果" in rendered
     assert address in rendered
-    assert "外送費：$300" in rendered
-    assert "本期合計：約 $4,280～$5,480" in rendered
+    assert "原運費 $35／趟" in rendered
+    assert "🐦 晚鳥半價 → $18／趟" in rendered
+    assert "外送 12 趟，外送費小計 $216" in rendered
+    assert "本期合計：約 $4,296～$5,496" in rendered
+    assert "折" not in rendered
     assert "可以，建立包月資料" in rendered
     payload = replies[-1].as_json_dict()
     form_uri = next(
@@ -455,8 +458,8 @@ def test_registered_vip_raw_order_with_known_delivery_still_creates_order(monkey
             "address": given_address,
             "distance_text": "1.2 公里",
             "duration_text": "6 分鐘",
-            "delivery_fee": 25,
-            "delivery_fee_text": "25 元",
+            "delivery_fee": 35,
+            "delivery_fee_text": "35 元",
         },
     )
     monkeypatch.setattr(
@@ -479,8 +482,9 @@ def test_registered_vip_raw_order_with_known_delivery_still_creates_order(monkey
     assert notified[0][:2] == (999, uid)
     assert len(replies) == 1
     assert "已收到您的包月訂單 #999" in replies[0]
-    assert "外送費粗估：$600" in replies[0]
-    assert "本期粗估合計：$4,680～$5,880" in replies[0]
+    assert "🐦 晚鳥半價 → $18／趟" in replies[0]
+    assert "外送 24 趟，外送費小計 $432" in replies[0]
+    assert "本期粗估合計：$4,512～$5,712" in replies[0]
 
 
 @pytest.mark.parametrize("delivery_available", [None, False], ids=["unknown", "out-of-range"])
