@@ -10919,7 +10919,7 @@ def calculate_delivery_quote(target_address: str):
     )
 
     route_group = infer_route_group(target_address)
-    carpool_hint = f"若同配送日有 {route_group} 同路客戶，可再套用順風車折扣。" if route_group != "OTHER" else "若有同區域併單，可再人工調整順風車折扣。"
+    carpool_hint = "若你的地址在現有配送路線上，包月外送每趟可再享順風車折扣。"
 
     return {
         "success": True,
@@ -11038,6 +11038,11 @@ DELIVERY_FEE_TIERS = (
     (2500, 50, "KM_2_2_5"),
     (3000, 60, "KM_2_5_3"),
 )
+# 順風車：新客加入某位現有包月外送客戶的路線，額外繞行 ≤ 7 分鐘即視為「順路」，每趟再折 $10（疊加晚鳥半價）。
+CARPOOL_MAX_DETOUR_SECONDS = 420
+CARPOOL_DISCOUNT_PER_TRIP = 10
+CARPOOL_DISCOUNT_ENABLED = os.environ.get("CARPOOL_DISCOUNT_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+CARPOOL_MAX_CANDIDATES = 10
 # 包月外送一律為「晚鳥外送」：午晚餐一起送、一天一趟，時段內送達（不指定時間），運費半價。
 LATE_BIRD_WINDOW_TEXT = "13:00–14:00"
 LATE_BIRD_CHOICE_TEXT = f"🐦 晚鳥外送　運費半價｜{LATE_BIRD_WINDOW_TEXT} 送達（不指定時間）"
@@ -11047,6 +11052,77 @@ def late_bird_fee(base_fee) -> int:
     """晚鳥每趟運費 = 原運費的一半，無條件進位到整數元（$35 → $18）。"""
     base = int(base_fee or 0)
     return (base + 1) // 2 if base > 0 else 0
+
+
+def get_travel_seconds(origin_address, target_address, mode="driving"):
+    """Google Distance Matrix 行車秒數；任何失敗回 None。"""
+    if not GOOGLE_MAPS_API_KEY or not origin_address or not target_address:
+        return None
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {"origins": origin_address, "destinations": target_address, "mode": mode, "language": "zh-TW", "key": GOOGLE_MAPS_API_KEY}
+    try:
+        data = requests.get(url, params=params, timeout=10).json()
+        if data.get("status") == "OK":
+            element = data["rows"][0]["elements"][0]
+            if element.get("status") == "OK":
+                return int(element["duration"]["value"])
+    except Exception as e:
+        print(f"⚠️ Google Maps 行車時間例外：{e}")
+    return None
+
+
+def list_active_delivery_addresses(exclude_uid: str = "", limit: int = CARPOOL_MAX_CANDIDATES) -> list:
+    """已開通(status='activated')且有外送(delivery_count>0 且 delivery_fee>0)的包月訂單地址，排除自己，最新優先。"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            rows = conn.execute(
+                """SELECT address FROM subscription_orders
+                   WHERE status='activated' AND delivery_count>0 AND delivery_fee>0
+                     AND TRIM(COALESCE(address,''))<>'' AND user_id<>?
+                   ORDER BY id DESC""",
+                (exclude_uid or "",),
+            ).fetchall()
+    except Exception as e:
+        print(f"⚠️ 順風車候選地址查詢失敗：{e}")
+        return []
+    seen, out = set(), []
+    for (addr,) in rows:
+        addr = str(addr).strip()
+        if addr and addr not in seen:
+            seen.add(addr)
+            out.append(addr)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def is_carpool_route(uid: str, address: str) -> bool:
+    """新客 B 對任一現有外送客戶 A：detour = min(t(A→B), t(店→B)+t(B→A)-t(店→A)) ≤ 門檻 即順路。
+    任何查詢失敗或無候選一律 False，不影響報價。不對外揭露 A 的身分或地點。
+    TODO: 續約(renewal)時應重新評估；現有客戶期中不重新計價。"""
+    if not CARPOOL_DISCOUNT_ENABLED or not address:
+        return False
+    try:
+        candidates = list_active_delivery_addresses(uid)
+        if not candidates:
+            return False
+        t_store_b = get_travel_seconds(STORE_ADDRESS, address)
+        if t_store_b is None:
+            return False
+        for a in candidates:
+            t_store_a = get_travel_seconds(STORE_ADDRESS, a)
+            t_a_b = get_travel_seconds(a, address)
+            if t_store_a is None or t_a_b is None:
+                continue
+            detour = t_a_b
+            t_b_a = get_travel_seconds(address, a)
+            if t_b_a is not None:
+                detour = min(detour, t_store_b + t_b_a - t_store_a)
+            if detour <= CARPOOL_MAX_DETOUR_SECONDS:
+                return True
+    except Exception as e:
+        print(f"⚠️ 順風車判斷失敗：{e}")
+    return False
 
 
 def format_distance_km(quote: dict) -> str:
@@ -11062,9 +11138,17 @@ def format_late_bird_delivery_lines(est: dict) -> list:
     base_fee = int(est.get("base_delivery_fee") or q.get("delivery_fee") or 0)
     distance = format_distance_km(q)
     distance_prefix = f"距離 {distance}｜" if distance else ""
-    return [
+    late_fee = int(est.get("late_bird_fee", est.get("delivery_fee")) or 0)
+    lines = [
         f"{distance_prefix}原運費 ${base_fee}／趟",
-        f"🐦 晚鳥半價 → ${int(est.get('delivery_fee') or 0)}／趟",
+        f"🐦 晚鳥半價 → ${late_fee}／趟",
+    ]
+    if CARPOOL_DISCOUNT_ENABLED and "carpool" in est:
+        if est.get("carpool"):
+            lines.append(f"🚗 順風車　✅ 你在現有路線上 → ${int(est.get('delivery_fee') or 0)}／趟")
+        else:
+            lines.append(f"🚗 順風車　你這一區目前還沒有路線，揪附近的同事或鄰居一起訂就能再折 ${CARPOOL_DISCOUNT_PER_TRIP}／趟")
+    return lines + [
         f"🕐 每天 {LATE_BIRD_WINDOW_TEXT} 送達（不指定時間）",
         f"外送 {int(est.get('delivery_count') or 0)} 趟，外送費小計 ${int(est.get('delivery_total') or 0):,}",
     ]
@@ -11251,7 +11335,13 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
     delivery_available = quote.get("delivery_available") if pickup_method == "外送" else True
     base_delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") and delivery_available is not False and pickup_method == "外送" else 0
     # 包月外送一律晚鳥：每趟收原運費半價（無條件進位）；delivery_fee 為實際每趟收費。
-    delivery_fee = late_bird_fee(base_delivery_fee)
+    late_fee = late_bird_fee(base_delivery_fee)
+    delivery_fee = late_fee
+    carpool = False
+    if base_delivery_fee > 0:
+        carpool = is_carpool_route(uid, address)
+        if carpool:
+            delivery_fee = max(0, late_fee - CARPOOL_DISCOUNT_PER_TRIP)
     if delivery_count is None:
         delivery_count = meal_count if pickup_method == "外送" else 0
     meal_low_total = meal_count * SUBSCRIPTION_MEAL_LOW
@@ -11267,6 +11357,8 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
         "meal_count": meal_count,
         "delivery_count": delivery_count,
         "base_delivery_fee": base_delivery_fee,
+        "late_bird_fee": late_fee,
+        "carpool": carpool,
         "delivery_fee": delivery_fee,
         "delivery_available": delivery_available,
         "meal_low_total": meal_low_total,

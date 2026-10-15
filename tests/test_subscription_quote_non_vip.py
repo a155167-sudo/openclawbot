@@ -265,7 +265,7 @@ def test_registered_known_delivery_quote_keeps_checkout_total_and_cta(
     assert "🐦 晚鳥半價 → $18／趟" in rendered
     assert "外送 12 趟，外送費小計 $216" in rendered
     assert "本期合計：約 $4,296～$5,496" in rendered
-    assert "折" not in rendered
+    assert "折抵" not in rendered  # 四週外送費折抵已取消（順風車「再折」文案除外）
     assert "可以，建立包月資料" in rendered
     payload = replies[-1].as_json_dict()
     form_uri = next(
