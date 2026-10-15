@@ -17,6 +17,9 @@ MEAL_WINDOWS = {
     "晚餐": (time(17, 30), time(20, 30)),
 }
 
+# 晚鳥外送（13:00–14:00 送達）客戶的午餐餐期：送達前不問、不自動已吃。
+LATE_BIRD_LUNCH_WINDOW = (time(13, 0), time(15, 30))
+
 PHASE_BEFORE = "before"   # 待吃
 PHASE_ASKING = "asking"   # 吃了嗎
 PHASE_AFTER = "after"     # 餐期已過 → 自動已吃
@@ -29,9 +32,16 @@ def _taipei(now: datetime) -> datetime:
     return now.replace(tzinfo=TAIPEI) if now.tzinfo is None else now.astimezone(TAIPEI)
 
 
-def meal_phase(slot: str, now: datetime) -> str:
+def meal_window(slot: str, *, late_bird: bool = False):
+    """(start, cutoff) of ``slot``; 晚鳥外送客戶的午餐用 LATE_BIRD_LUNCH_WINDOW."""
+    if late_bird and slot == "午餐":
+        return LATE_BIRD_LUNCH_WINDOW
+    return MEAL_WINDOWS.get(slot)
+
+
+def meal_phase(slot: str, now: datetime, *, late_bird: bool = False) -> str:
     """Phase of today's planned meal for ``slot`` at ``now`` (Taipei)."""
-    window = MEAL_WINDOWS.get(slot)
+    window = meal_window(slot, late_bird=late_bird)
     if window is None:
         return PHASE_BEFORE
     clock = _taipei(now).time()

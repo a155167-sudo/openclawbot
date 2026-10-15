@@ -245,7 +245,7 @@ def build_dashboard_flex(data, *, now=None):
                                       "text": f"{m['slot']}已吃"})))
             continue
         known = m.get("kcal") is not None and m.get("protein") is not None
-        if meal_phase(m["slot"], render_now) == PHASE_ASKING:
+        if meal_phase(m["slot"], render_now, late_bird=bool(data.get("late_bird"))) == PHASE_ASKING:
             label = f"吃了嗎？預留 {_kcal(m['kcal'])}" if known else "營養待補"  # 無營養資料：不能記已吃
             link = ("已吃", {"type": "message", "label": "已吃", "text": f"{m['slot']}已吃"}) if known else None
             other = next((o for o in data.get("sub_meals", [])

@@ -7918,6 +7918,26 @@ def mark_lunch_ate_dinner_bento(user_id: str, meal_date: str, *, now=None):
     return mark_planned_meal_as_eaten(user_id, "午餐")
 
 
+def is_late_bird_customer(conn_or_db, user_id: str) -> bool:
+    """目前訂閱是外送(晚鳥)：最新一筆 status='activated' 訂單 delivery_count>0。任何錯誤回 False.
+
+    ``conn_or_db`` 可為 sqlite3 連線或 DB 路徑。
+    """
+    try:
+        if not user_id:
+            return False
+        sql = ("SELECT delivery_count FROM subscription_orders "
+               "WHERE user_id=? AND status='activated' ORDER BY id DESC LIMIT 1")
+        if isinstance(conn_or_db, sqlite3.Connection):
+            row = conn_or_db.execute(sql, (str(user_id),)).fetchone()
+        else:
+            with closing(sqlite3.connect(conn_or_db, timeout=30)) as conn:
+                row = conn.execute(sql, (str(user_id),)).fetchone()
+        return bool(row and int(row[0] or 0) > 0)
+    except Exception:
+        return False
+
+
 def auto_mark_due_planned_meals(*, now=None) -> int:
     """背景工作：餐期已過、顧客沒按「沒吃」的包月餐自動寫入已吃。
 
@@ -7931,8 +7951,8 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
 
     now = now or tw_now()
     today = now.date().isoformat() if hasattr(now, "date") else tw_today().isoformat()
-    due_slots = [slot for slot in _PLANNED_MEAL_COLUMNS if meal_phase(slot, now) == PHASE_AFTER]
-    if not due_slots:
+    # 晚鳥午餐窗口較晚結束，其 due 集合是預設的子集，可先用預設提早返回。
+    if not [slot for slot in _PLANNED_MEAL_COLUMNS if meal_phase(slot, now) == PHASE_AFTER]:
         return 0
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
@@ -7951,6 +7971,7 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
                 (today,),
             ).fetchall()
             orders = []
+            late_bird_users = {}
             for user in users:
                 order = conn.execute(
                     """SELECT o.id, o.user_id FROM subscription_orders o
@@ -7964,6 +7985,8 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
                 ).fetchone()
                 if order:
                     orders.append(order)
+                    late_bird_users[str(order["user_id"])] = is_late_bird_customer(
+                        conn, str(order["user_id"]))
         except sqlite3.Error as exc:
             print(f"⚠️ 包月餐自動已吃：讀取訂單失敗 {type(exc).__name__}")
             return 0
@@ -7982,7 +8005,10 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
     for user_id, record in todays:
         columns = record["source_columns"]
         swapped = _planned_meals_swapped(user_id, today)
-        for slot in due_slots:
+        late_bird = late_bird_users.get(user_id, False)
+        for slot in _PLANNED_MEAL_COLUMNS:
+            if meal_phase(slot, now, late_bird=late_bird) != PHASE_AFTER:
+                continue
             # 午晚餐對調的日子：午餐是排給晚餐的便當，反之亦然。
             bento = {"午餐": "晚餐", "晚餐": "午餐"}[slot] if swapped else slot
             name_i, kcal_i, pro_i = _PLANNED_MEAL_COLUMNS[bento]
@@ -8963,6 +8989,7 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
             print(f"⚠️ 分區課表整合失敗: {e}")
 
     result = {
+        "late_bird": is_late_bird_customer(DB_PATH, user_id),
         "name": name or "你", "today_label": today_label, "tdee": tdee, "protein_goal": protein_goal,
         "extra_cal": extra_cal, "extra_pro": extra_pro, "extra_fat": extra_fat, "planned_cal": planned_cal, "planned_pro": planned_pro,
         "cal_remaining": cal_remaining, "pro_remaining": pro_remaining, "cal_pct": cal_pct, "pro_pct": pro_pct,
@@ -11099,7 +11126,7 @@ def list_active_delivery_addresses(exclude_uid: str = "", limit: int = CARPOOL_M
 def is_carpool_route(uid: str, address: str) -> bool:
     """新客 B 對任一現有外送客戶 A：detour = min(t(A→B), t(店→B)+t(B→A)-t(店→A)) ≤ 門檻 即順路。
     任何查詢失敗或無候選一律 False，不影響報價。不對外揭露 A 的身分或地點。
-    TODO: 續約(renewal)時應重新評估；現有客戶期中不重新計價。"""
+    續約不自動沿用順風車價：續約重新估價時依當下仍在訂的外送客戶重新判斷。"""
     if not CARPOOL_DISCOUNT_ENABLED or not address:
         return False
     try:
