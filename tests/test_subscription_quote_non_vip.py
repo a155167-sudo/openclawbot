@@ -261,10 +261,11 @@ def test_registered_known_delivery_quote_keeps_checkout_total_and_cta(
     rendered = json.dumps(replies[-1].as_json_dict(), ensure_ascii=False)
     assert "包月粗估結果" in rendered
     assert address in rendered
-    assert "原運費 $35／趟" in rendered
-    assert "🐦 晚鳥半價 → $18／趟" in rendered
-    assert "外送 12 趟，外送費小計 $216" in rendered
-    assert "本期合計：約 $4,296～$5,496" in rendered
+    assert "運費 $35／趟" in rendered
+    assert "約 11:30–12:00 送達" in rendered
+    assert "晚鳥" not in rendered
+    assert "外送 12 趟，外送費小計 $420" in rendered
+    assert "本期合計：約 $4,500～$5,700" in rendered
     assert "折抵" not in rendered  # 四週外送費折抵已取消（順風車「再折」文案除外）
     assert "可以，建立包月資料" in rendered
     payload = replies[-1].as_json_dict()
@@ -482,9 +483,9 @@ def test_registered_vip_raw_order_with_known_delivery_still_creates_order(monkey
     assert notified[0][:2] == (999, uid)
     assert len(replies) == 1
     assert "已收到您的包月訂單 #999" in replies[0]
-    assert "🐦 晚鳥半價 → $18／趟" in replies[0]
-    assert "外送 24 趟，外送費小計 $432" in replies[0]
-    assert "本期粗估合計：$4,512～$5,712" in replies[0]
+    assert "運費 $35／趟" in replies[0]
+    assert "外送 24 趟，外送費小計 $840" in replies[0]
+    assert "本期粗估合計：$4,920～$6,120" in replies[0]
 
 
 @pytest.mark.parametrize("delivery_available", [None, False], ids=["unknown", "out-of-range"])

@@ -21,7 +21,8 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "DB_PATH", db)
     with closing(sqlite3.connect(db)) as c:
         c.execute("""CREATE TABLE subscription_orders (id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT, address TEXT, delivery_fee INTEGER, delivery_count INTEGER, status TEXT)""")
+            user_id TEXT, address TEXT, delivery_fee INTEGER, delivery_count INTEGER, status TEXT,
+            delivery_type TEXT DEFAULT '')""")
         c.commit()
     monkeypatch.setattr(server, "get_customer_profile_for_order", lambda _uid: None)
     monkeypatch.setattr(server, "CARPOOL_DISCOUNT_ENABLED", True)
@@ -29,10 +30,10 @@ def _env(monkeypatch, tmp_path):
     yield db
 
 
-def _add(db, uid, addr=A_ADDR, fee=15, count=20, status="activated"):
+def _add(db, uid, addr=A_ADDR, fee=15, count=20, status="activated", dtype="晚鳥"):
     with closing(sqlite3.connect(db)) as c:
-        c.execute("INSERT INTO subscription_orders (user_id,address,delivery_fee,delivery_count,status) VALUES (?,?,?,?,?)",
-                  (uid, addr, fee, count, status))
+        c.execute("INSERT INTO subscription_orders (user_id,address,delivery_fee,delivery_count,status,delivery_type) VALUES (?,?,?,?,?,?)",
+                  (uid, addr, fee, count, status, dtype))
         c.commit()
 
 
@@ -47,8 +48,8 @@ def _travel(monkeypatch, a_to_b, store_a=600, store_b=600, b_to_a=None):
     monkeypatch.setattr(server, "get_travel_seconds", fake)
 
 
-def _est(uid="U-new"):
-    return server.calculate_subscription_estimate(uid, 20, address=B, delivery_count=20)
+def _est(uid="U-new", dtype="晚鳥"):
+    return server.calculate_subscription_estimate(uid, 20, address=B, delivery_count=20, delivery_type=dtype)
 
 
 def test_within_7_min_gets_discount(monkeypatch, _env):
@@ -131,3 +132,33 @@ def test_lines_text_and_privacy(monkeypatch, _env):
 def test_quote_hint_is_neutral_and_private():
     q = server.calculate_delivery_quote(B)
     assert A_ADDR not in q["carpool_hint"] and "同路客戶" not in q["carpool_hint"]
+
+
+def test_regular_delivery_carpool_applies_ten_off_base_fee(monkeypatch, _env):
+    _add(_env, "U-old", fee=30, dtype="一般外送")
+    _travel(monkeypatch, 400)
+    est = _est(dtype="一般外送")
+    assert est["carpool"] is True
+    assert est["base_delivery_fee"] == 30 and est["delivery_fee"] == 20
+    assert est["delivery_total"] == 20 * 20
+
+
+def test_carpool_only_matches_same_delivery_type(monkeypatch, _env):
+    _add(_env, "U-late", fee=15, dtype="晚鳥")
+    _travel(monkeypatch, 100)
+    reg = _est(dtype="一般外送")
+    assert reg["carpool"] is False and reg["delivery_fee"] == 30
+    _add(_env, "U-reg", fee=30, dtype="一般外送")
+    assert _est(dtype="一般外送")["carpool"] is True
+    assert _est(dtype="晚鳥")["carpool"] is True   # U-late 同為晚鳥
+    with closing(sqlite3.connect(_env)) as c:
+        c.execute("DELETE FROM subscription_orders WHERE user_id='U-late'")
+        c.commit()
+    assert _est(dtype="晚鳥")["carpool"] is False   # 只剩一般外送鄰居
+
+
+def test_legacy_order_without_type_counts_as_regular(monkeypatch, _env):
+    _add(_env, "U-legacy", fee=30, dtype="")
+    _travel(monkeypatch, 100)
+    assert _est(dtype="一般外送")["carpool"] is True
+    assert _est(dtype="晚鳥")["carpool"] is False

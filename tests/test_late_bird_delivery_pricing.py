@@ -86,7 +86,7 @@ def test_over_three_km_is_unavailable(monkeypatch):
 
     est = server.calculate_subscription_estimate(
         "U_LB_FAR", 40, ADDRESS, delivery_count=20, pickup_method="外送",
-        days_per_week=5, meals_per_day=2,
+        days_per_week=5, meals_per_day=2, delivery_type="晚鳥",
     )
     assert est["delivery_total"] == 0
     assert server.subscription_delivery_decision(est) == "rejected"
@@ -98,7 +98,7 @@ def test_five_day_2_1_km_quote_charges_late_bird_without_discount(monkeypatch):
 
     est = server.calculate_subscription_estimate(
         "U_LB_5D", 40, ADDRESS, delivery_count=20, pickup_method="外送",
-        days_per_week=5, meals_per_day=2,
+        days_per_week=5, meals_per_day=2, delivery_type="晚鳥",
     )
 
     assert est["base_delivery_fee"] == 50
@@ -131,7 +131,7 @@ def test_persisted_quote_row_stores_charged_late_bird_fee(monkeypatch, tmp_path)
                 meal_count INTEGER, address TEXT, distance_text TEXT, delivery_fee INTEGER,
                 delivery_count INTEGER, meal_low_total INTEGER, meal_high_total INTEGER,
                 delivery_total INTEGER, quote_low_total INTEGER, quote_high_total INTEGER,
-                status TEXT, created_at TEXT
+                status TEXT, created_at TEXT, delivery_type TEXT DEFAULT ''
             )"""
         )
         conn.commit()
@@ -139,17 +139,17 @@ def test_persisted_quote_row_stores_charged_late_bird_fee(monkeypatch, tmp_path)
     _distance(monkeypatch, 2100)
     est = server.calculate_subscription_estimate(
         "U_LB_ROW", 40, ADDRESS, delivery_count=20, pickup_method="外送",
-        days_per_week=5, meals_per_day=2,
+        days_per_week=5, meals_per_day=2, delivery_type="晚鳥",
     )
 
     order_id = server.create_subscription_order("U_LB_ROW", est)
 
     with closing(sqlite3.connect(db_path)) as conn:
         row = conn.execute(
-            "SELECT delivery_fee, delivery_count, delivery_total FROM subscription_orders WHERE id=?",
+            "SELECT delivery_fee, delivery_count, delivery_total, delivery_type FROM subscription_orders WHERE id=?",
             (order_id,),
         ).fetchone()
-    assert row == (25, 20, 500)
+    assert row == (25, 20, 500, "晚鳥")
 
 
 @pytest.mark.parametrize(("days", "bonus"), [(2, 0), (3, 1), (4, 1), (5, 2)])
@@ -178,13 +178,14 @@ def test_no_customer_facing_quote_text_mentions_delivery_discount(monkeypatch):
 
     for days in (2, 3, 4, 5):
         uid = f"U_LB_TEXT_{days}"
-        for index, text in enumerate(("開始包月估價", f"包月天數 {days}", "包月取餐 外送", ADDRESS)):
+        for index, text in enumerate(("開始包月估價", f"包月天數 {days}", "包月取餐 晚鳥", ADDRESS)):
             server.handle_message(_text_event(f"LB-{days}-{index}", text, uid))
 
     assert len(replies) == 16
     rendered = [json.dumps(message.as_json_dict(), ensure_ascii=False) for message in replies]
     pickup_prompts = rendered[1::4]
     assert all("🐦 晚鳥外送　運費半價｜13:00–14:00 送達（不指定時間）" in text for text in pickup_prompts)
+    assert all(server.REGULAR_CHOICE_TEXT in text for text in pickup_prompts)
     assert all("自取" in text for text in pickup_prompts)
 
     static_texts = [server.build_subscription_days_prompt_text(), server.build_subscription_intro_text("U")]
@@ -193,7 +194,7 @@ def test_no_customer_facing_quote_text_mentions_delivery_discount(monkeypatch):
     for days in (3, 5):
         est = server.calculate_subscription_estimate(
             "U_LB_TEXT", days * 8, ADDRESS, delivery_count=days * 4, pickup_method="外送",
-            days_per_week=days, meals_per_day=2,
+            days_per_week=days, meals_per_day=2, delivery_type="晚鳥",
         )
         static_texts.append(server.format_subscription_estimate(est))
 

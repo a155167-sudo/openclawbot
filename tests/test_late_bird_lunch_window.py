@@ -23,10 +23,13 @@ def test_late_bird_does_not_change_dinner_or_defaults():
     assert meal_phase("午餐", at(14, 0)) == PHASE_AFTER
 
 
-def _set_delivery(db, count):
+def _set_delivery(db, count, dtype="晚鳥"):
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE subscription_orders SET status='activated'")
         cols = {r[1] for r in conn.execute("PRAGMA table_info(subscription_orders)")}
+        if "delivery_type" not in cols:
+            conn.execute("ALTER TABLE subscription_orders ADD COLUMN delivery_type TEXT DEFAULT ''")
+        conn.execute("UPDATE subscription_orders SET delivery_type=?", (dtype,))
         if "delivery_count" not in cols:
             conn.execute("ALTER TABLE subscription_orders ADD COLUMN delivery_count INTEGER DEFAULT 0")
         conn.execute("UPDATE subscription_orders SET delivery_count=?", (count,))
@@ -40,6 +43,19 @@ def test_is_late_bird_customer(srv):
     _set_delivery(db, 0)
     assert server.is_late_bird_customer(str(db), OWNER) is False
     assert server.is_late_bird_customer("/nonexistent/x.db", OWNER) is False
+
+
+@pytest.mark.parametrize("dtype", ["一般外送", "自取", ""])
+def test_only_recorded_late_bird_gets_late_window(srv, dtype):
+    db, _ = srv
+    _set_delivery(db, 8, dtype=dtype)   # 一般外送 / 舊單(無類型) 都不是晚鳥
+    assert server.is_late_bird_customer(str(db), OWNER) is False
+
+
+def test_regular_delivery_keeps_default_lunch_window(srv):
+    db, clock = srv
+    _set_delivery(db, 8, dtype="一般外送")
+    assert server.auto_mark_due_planned_meals(now=clock["now"]) == 1   # 14:05 已過 14:00
 
 
 def test_job_waits_for_late_bird_lunch(srv):
