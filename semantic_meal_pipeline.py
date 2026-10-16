@@ -289,8 +289,10 @@ def parse_meal_semantics_openai(client: Any, text: str, batch_id: str, *,
                 "餐別僅能依使用者原文明示輸出中文enum，未明示輸出空字串。"
                 "每項以qty_origin與qty_evidence標出原文份量證據；明示g/ml時portion_assumption"
                 "必須為空，該欄只能放真正採用的份量假設，不可複製品名、份量或整句。"
-                "自然份量若無明確容量，unit用natural，amount保留自然計數，不可猜測g/ml容量，"
-                "並在clarification明說容量未知且需補充。food_name_evidence逐字摘錄原文食品片語，"
+                "自然份量（一份、一碗、一個，或未寫份量的餐點）若無明確容量，unit用natural，"
+                "amount保留自然計數（未寫則1），portion_assumption填該自然單位（例如一碗、一份），"
+                "不可猜測g/ml容量；這仍是meal_log，不要只因容量未知改成clarification。"
+                "food_name_evidence逐字摘錄原文食品片語，"
                 "food_name保留其中生熟、乾重、去皮、品種、調味等限定詞，不可自行刪除；"
                 "food_state另列這些狀態證據，沒有則空字串。疑問、否定、尚未吃與一般聊天不得"
                 "標成meal_log；但『尚未烹煮／還沒煮』若是在描述食材狀態或重量基準，不等於尚未吃，"
@@ -344,6 +346,8 @@ def estimate_per_100_openai(client: Any, requests: list[Mapping[str, Any]], batc
                 "food_state空字串時仍須保留evidence內的明示狀態。"
                 "逐項原樣回傳item_id、food_name、basis_amount=100及相同basis_unit；"
                 "不可把g與ml互換，不可計算整份。estimate必須介於min與max。"
+                "外食便當、炒飯、麵等混合料理以整份平均（飯／麵、配菜、肉、湯汁一起）估算每100g，"
+                "常見約120–220kcal，油炸主菜為主才偏高。"
             )},
             {"role": "user", "content": json.dumps(safe_requests, ensure_ascii=False)},
         ],
@@ -376,8 +380,17 @@ def run_semantic_meal_pipeline(
     find_reference_nutrition: Callable[[Mapping[str, Any]], Mapping[str, Any] | None],
     estimate_per_100: Callable[[list[Mapping[str, Any]], str], list[Mapping[str, Any]]],
     audit: Callable[[Mapping[str, Any]], None] | None = None,
+    estimate_natural_grams: Callable[[list[Mapping[str, Any]], str], list[Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """Run one no-persistence batch after native admission claims its sole receipt."""
+    """Run one no-persistence batch after native admission claims its sole receipt.
+
+    ``estimate_natural_grams`` (optional): when a customer gives a natural
+    portion with no g/ml (「排骨飯」「一碗牛肉麵」), ask for the typical grams of
+    ONE natural unit, convert to grams and continue through the normal
+    reference/per-100 path and plausibility checks.  The draft states the
+    assumption and still requires the customer's confirmation.  Without it,
+    natural portions keep asking for a measured amount (legacy behaviour).
+    """
     uid, mid = str(user_id or "").strip(), str(message_id or "").strip()
     message = str(text or "").strip()
     if not uid or not mid or not message:
@@ -409,13 +422,54 @@ def run_semantic_meal_pipeline(
             "writes_food_log": False, "audit": audit_events,
         }
 
+    portion_clarifications: list[str] = []
+    naturals = [(index, request) for index, request in enumerate(parsed["items"])
+                if request["unit"] == "natural"]
+    if naturals and estimate_natural_grams is not None:
+        asks = [{"item_id": f"item-{index}", "food_name": request["food_name"],
+                 "portion_assumption": request["portion_assumption"],
+                 "food_state": str(request.get("food_state") or ""),
+                 **({"food_name_evidence": request["food_name_evidence"]}
+                    if request.get("food_name_evidence") else {})}
+                for index, request in naturals]
+        grams = estimate_natural_grams(asks, batch_id)
+        if not isinstance(grams, list) or len(grams) != len(asks):
+            raise ValueError("AI一般份量估算未保留全部品項")
+        event = _audit_event("natural_portion", batch_id,
+                             grams[0] if grams and isinstance(grams[0], Mapping) else {})
+        audit_events.append(event)
+        if audit:
+            audit(event)
+        for (index, request), ask, estimate in zip(naturals, asks, grams):
+            if not isinstance(estimate, Mapping) or str(estimate.get("item_id") or "") != ask["item_id"]:
+                raise ValueError("AI一般份量估算識別錯誤")
+            try:
+                per_unit = _decimal(estimate.get("grams_per_unit"), "一般份量")
+                count = Decimal(str(request["amount"] or 1))
+            except (ValueError, InvalidOperation):
+                per_unit, count = Decimal("0"), Decimal("1")
+            total = per_unit * count
+            if not (Decimal("1") <= per_unit <= Decimal("1500")) or total > Decimal("3000"):
+                portion_clarifications.append(
+                    f"「{request['food_name']}」的份量無法合理估算；請補充大約幾克或幾份。")
+                continue
+            shown = request["portion_assumption"] or f"{float(count):g}份"
+            total_text = f"{float(total.quantize(Decimal('1'))):g}"
+            parsed["items"][index] = {
+                **request, "amount": float(total), "unit": "g",
+                "qty_origin": "typical_portion",
+                "portion_assumption": f"{shown}，一般份量約 {total_text} g（AI估算）",
+            }
+
     resolved: list[dict[str, Any] | None] = [None] * len(parsed["items"])
     misses: list[dict[str, Any]] = []
     miss_indexes: list[int] = []
-    clarifications: list[str] = []
+    clarifications: list[str] = list(portion_clarifications)
     unit_warnings: dict[int, str] = {}
 
     for index, request in enumerate(parsed["items"]):
+        if any(text.startswith(f"「{request['food_name']}」的份量無法合理估算") for text in portion_clarifications):
+            continue
         if request["unit"] == "natural":
             detail = request["portion_assumption"] or request["food_name"]
             clarifications.append(
@@ -495,6 +549,9 @@ def run_semantic_meal_pipeline(
                 clarifications.append(assessment["reason"])
                 continue
             factor = Decimal(str(request["amount"])) / Decimal("100")
+            if request.get("qty_origin") == "typical_portion":
+                request, factor = _cap_typical_portion(request, estimate.get("nutrition"), factor)
+                parsed["items"][index] = request
             resolved[index] = {
                 "request": request,
                 "nutrition": _scale_nutrition(estimate.get("nutrition"), factor),
@@ -560,3 +617,97 @@ def dispatch_semantic_meal_text(
         return False
     reply(result)
     return True
+
+
+def estimate_natural_portion_grams_openai(client: Any, requests: list[Mapping[str, Any]],
+                                          batch_id: str, *, model: str = "gpt-4o-mini",
+                                          ) -> list[dict[str, Any]]:
+    """Typical grams of ONE natural unit (一份／一碗／一個) in Taiwan; no nutrition."""
+    item_schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["item_id", "food_name", "grams_per_unit"],
+        "properties": {"item_id": {"type": "string"}, "food_name": {"type": "string"},
+                       "grams_per_unit": {"type": "number"}},
+    }
+    schema = {"type": "object", "additionalProperties": False, "required": ["items"],
+              "properties": {"items": {"type": "array", "items": item_schema}}}
+    safe = [{key: str(r.get(key) or "") for key in
+             ("item_id", "food_name", "portion_assumption", "food_state", "food_name_evidence")
+             if r.get(key) or key in ("item_id", "food_name")} for r in requests]
+    payload, trace = _completion_payload(
+        client, model=model,
+        messages=[
+            {"role": "system", "content": (
+                "依schema估算每個品項『一個自然單位』在台灣常見外食／便當店的一般重量（公克，可食部分）。"
+                "自然單位依portion_assumption（例如一碗、一份、一個）；未寫時以一份一般份量計。"
+                "便當／飯類含飯與配菜全部可食部分。參考範圍：台灣便當（排骨、雞腿等）約450–550g、"
+                "炒飯一盤約300–400g、一碗湯麵（含湯）約500–650g、乾麵一碗約300–400g、"
+                "滷肉飯小碗約200g；取常見中間值，不要取上限。只回傳重量，不可估算營養。"
+                "逐項原樣回傳item_id與food_name。"
+            )},
+            {"role": "user", "content": json.dumps(safe, ensure_ascii=False)},
+        ],
+        response_format={"type": "json_schema", "json_schema": {
+            "name": "natural_portion_grams", "strict": True, "schema": schema,
+        }}, max_tokens=max(300, 120 * len(safe)),
+    )
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        raise ValueError("AI一般份量估算格式無效")
+    return [{"item_id": (raw or {}).get("item_id"), "food_name": (raw or {}).get("food_name"),
+             "grams_per_unit": (raw or {}).get("grams_per_unit"), **trace}
+            for raw in raw_items if isinstance(raw, Mapping)]
+
+
+# 外食「一般份量」的合理上限（一份，kcal／蛋白質 g）。AI 常把份量和每100g蛋白質
+# 同時估高（排骨飯 900 kcal／P50、牛肉麵 1080 kcal／P60）；超過時把份量等比例
+# 縮到上限內，草稿註明已調整。顧客自己寫的克數不受影響。
+_TYPICAL_PORTION_CAPS = (
+    (("麵",), ("麵包",), Decimal("750"), Decimal("35")),
+    (("便當", "飯", "丼", "燴", "咖哩", "粥", "套餐"), ("飯糰",), Decimal("850"), Decimal("35")),
+)
+_TYPICAL_PORTION_DEFAULT_CAP = (Decimal("900"), Decimal("40"))
+
+
+def typical_portion_cap(food_name: str) -> tuple[Decimal, Decimal]:
+    name = str(food_name or "")
+    for keywords, excluded, kcal, protein in _TYPICAL_PORTION_CAPS:
+        if any(k in name for k in keywords) and not any(x in name for x in excluded):
+            return kcal, protein
+    return _TYPICAL_PORTION_DEFAULT_CAP
+
+
+def _cap_typical_portion(request: Mapping[str, Any], per100: Any,
+                         factor: Decimal) -> tuple[dict[str, Any], Decimal]:
+    """Shrink an AI typical portion whose whole-dish kcal/protein exceed the cap."""
+    nutrition = per100 if isinstance(per100, Mapping) else {}
+    kcal = _number_or_none(nutrition.get("calories_kcal"))
+    protein = _number_or_none(nutrition.get("protein_g"))
+    kcal_cap, protein_cap = typical_portion_cap(request.get("food_name"))
+    scale = Decimal("1")
+    if kcal and kcal > 0 and kcal * factor > kcal_cap:
+        scale = min(scale, kcal_cap / (kcal * factor))
+    if protein and protein > 0 and protein * factor > protein_cap:
+        scale = min(scale, protein_cap / (protein * factor))
+    if scale >= 1:
+        return dict(request), factor
+    grams = (Decimal(str(request["amount"])) * scale).quantize(Decimal("1"))
+    if grams < 1:
+        return dict(request), factor
+    assumption = re.sub(
+        r"一般份量約 [\d.]+ g（AI估算）",
+        f"一般份量約 {grams} g（AI估算，已依常見份量上限調整）",
+        str(request.get("portion_assumption") or ""))
+    capped = {**request, "amount": float(grams), "portion_assumption": assumption}
+    return capped, grams / Decimal("100")
+
+
+def _number_or_none(value: Any) -> Decimal | None:
+    """Estimate value from a {estimate,min,max} range or a plain number."""
+    if isinstance(value, Mapping):
+        value = value.get("estimate")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return number if number.is_finite() else None

@@ -146,17 +146,17 @@ def test_nutrition_ws_rejects_nonempty_conflicting_trailing_header(monkeypatch):
 @pytest.mark.parametrize(
     ("distance_meters", "expected_fee"),
     [
-        (0, 20),
-        (1, 20),
-        (1000, 20),
-        (1001, 25),
-        (1500, 25),
-        (1501, 30),
-        (2000, 30),
-        (2001, 40),
-        (2500, 40),
-        (2501, 50),
-        (3000, 50),
+        (0, 30),
+        (1, 30),
+        (1000, 30),
+        (1001, 35),
+        (1500, 35),
+        (1501, 40),
+        (2000, 40),
+        (2001, 50),
+        (2500, 50),
+        (2501, 60),
+        (3000, 60),
     ],
 )
 def test_delivery_quote_uses_new_distance_fee_boundaries(

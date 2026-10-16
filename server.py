@@ -4976,6 +4976,7 @@ def init_db():
         for _col, _ddl in [
             ("form_payload_json", "TEXT DEFAULT ''"),
             ("formalized_at", "TEXT DEFAULT ''"),
+            ("delivery_type", "TEXT DEFAULT ''"),  # '一般外送' | '晚鳥' | '自取'；空值(舊單)視為一般外送
         ]:
             try:
                 c.execute(f"ALTER TABLE subscription_orders ADD COLUMN {_col} {_ddl}")
@@ -5738,7 +5739,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         # 付款 gate：表單送出後先只建立 pending 訂單，不寫正式 health_profile / Master_API_View / 個人分頁。
         today_str_for_sheet = tw_now().strftime("%Y%m%d")
         safe_name = f"{name}_{user_id[-4:]}_{today_str_for_sheet}"
-        delivery_fee_per_trip = int(delivery_info.get("delivery_fee", 0) or 0)
+        delivery_type, delivery_fee_per_trip = resolve_form_delivery(user_id, is_delivery, address, delivery_info.get("delivery_fee", 0))
         delivery_days_count = len(active_days_list)
         delivery_total_fee = delivery_fee_per_trip * delivery_days_count if is_delivery else 0
         total_with_delivery = int(total_price) + delivery_total_fee
@@ -5747,7 +5748,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "user_id": user_id, "line_display_name": line_display_name,
             "name": name, "goal": goal, "restrictions": restrictions,
             "pickup_method": pickup_method, "address": address, "is_delivery": is_delivery,
-            "delivery_info": delivery_info, "delivery_fee_per_trip": delivery_fee_per_trip,
+            "delivery_info": delivery_info, "delivery_fee_per_trip": delivery_fee_per_trip, "delivery_type": delivery_type,
             "delivery_days_count": delivery_days_count, "delivery_total_fee": delivery_total_fee,
             "total_with_delivery": total_with_delivery, "weight": weight, "height": height,
             "age": age, "gender": gender, "activity": activity, "tdee": int(tdee),
@@ -5774,7 +5775,9 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
 
         pickup_line = f"\n📦 取餐方式：{pickup_method}" if pickup_method else ""
         address_line = f"\n📍 外送地址：{address}" if (is_delivery and address) else ""
-        delivery_line = f"\n🛵 單次外送運費：${delivery_fee_per_trip}（{delivery_info.get('distance_text', '未計算')}）" if (is_delivery and address) else ""
+        delivery_line = format_form_delivery_lines(
+            delivery_type, delivery_info.get("delivery_fee", 0), delivery_fee_per_trip, delivery_info.get("distance_text")
+        ) if (is_delivery and address) else ""
         delivery_days_line = f"\n📦 本期配送天數：{delivery_days_count} 天" if is_delivery else ""
         delivery_total_line = f"\n🚚 四週外送費：${delivery_total_fee}" if is_delivery else ""
         self_pickup_line = "\n🛍️ 本期為自取，不產生外送費。" if (pickup_method and not is_delivery) else ""
@@ -5922,13 +5925,15 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
 
         # 最後推播訊息給客人
         # 👉【修改】回覆客人的訊息中，補上本次排餐總額！
-        delivery_fee_per_trip = int(delivery_info.get("delivery_fee", 0) or 0)
+        delivery_type, delivery_fee_per_trip = resolve_form_delivery(user_id, is_delivery, address, delivery_info.get("delivery_fee", 0))
         delivery_days_count = len(active_days_list)
         delivery_total_fee = delivery_fee_per_trip * delivery_days_count if is_delivery else 0
         total_with_delivery = int(total_price) + delivery_total_fee
         pickup_line = f"\n📦 取餐方式：{pickup_method}" if pickup_method else ""
         address_line = f"\n📍 外送地址：{address}" if (is_delivery and address) else ""
-        delivery_line = f"\n🛵 單次外送運費：${delivery_fee_per_trip}（{delivery_info.get('distance_text', '未計算')}）" if (is_delivery and address) else ""
+        delivery_line = format_form_delivery_lines(
+            delivery_type, delivery_info.get("delivery_fee", 0), delivery_fee_per_trip, delivery_info.get("distance_text")
+        ) if (is_delivery and address) else ""
         delivery_days_line = f"\n📦 本期配送天數：{delivery_days_count} 天" if is_delivery else ""
         delivery_total_line = f"\n🚚 四週外送費：${delivery_total_fee}" if is_delivery else ""
         self_pickup_line = "\n🛍️ 本期為自取，不產生外送費。" if (pickup_method and not is_delivery) else ""
@@ -5953,7 +5958,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             f"UID：{user_id}\n"
             f"取餐方式：{pickup_method or '未填'}\n"
             f"外送地址：{address or '未提供'}\n"
-            f"單次外送費：${delivery_fee_per_trip}\n"
+            f"取餐類型：{DELIVERY_TYPE_LABELS[delivery_type]}\n"
+        f"單次外送費：${delivery_fee_per_trip}\n"
             f"配送天數：{delivery_days_count if is_delivery else '自取'}\n"
             f"排餐金額：${total_price}\n"
             f"本期預估總金額：${total_with_delivery}\n\n"
@@ -7910,6 +7916,31 @@ def mark_lunch_ate_dinner_bento(user_id: str, meal_date: str, *, now=None):
     return mark_planned_meal_as_eaten(user_id, "午餐")
 
 
+def is_late_bird_customer(conn_or_db, user_id: str) -> bool:
+    """目前訂閱是晚鳥外送：最新一筆 status='activated' 訂單記錄的 delivery_type == '晚鳥' 且 delivery_count>0。
+    一般外送、自取、未記錄類型的舊單都不是。任何錯誤回 False.
+
+    ``conn_or_db`` 可為 sqlite3 連線或 DB 路徑。
+    """
+    try:
+        if not user_id:
+            return False
+        sql = ("SELECT delivery_type, delivery_count FROM subscription_orders "
+               "WHERE user_id=? AND status='activated' ORDER BY id DESC LIMIT 1")
+        if isinstance(conn_or_db, sqlite3.Connection):
+            row = conn_or_db.execute(sql, (str(user_id),)).fetchone()
+        else:
+            with closing(sqlite3.connect(conn_or_db, timeout=30)) as conn:
+                row = conn.execute(sql, (str(user_id),)).fetchone()
+        return bool(
+            row
+            and str(row[0] or "").strip() == DELIVERY_TYPE_LATE_BIRD
+            and int(row[1] or 0) > 0
+        )
+    except Exception:
+        return False
+
+
 def auto_mark_due_planned_meals(*, now=None) -> int:
     """背景工作：餐期已過、顧客沒按「沒吃」的包月餐自動寫入已吃。
 
@@ -7923,8 +7954,8 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
 
     now = now or tw_now()
     today = now.date().isoformat() if hasattr(now, "date") else tw_today().isoformat()
-    due_slots = [slot for slot in _PLANNED_MEAL_COLUMNS if meal_phase(slot, now) == PHASE_AFTER]
-    if not due_slots:
+    # 晚鳥午餐窗口較晚結束，其 due 集合是預設的子集，可先用預設提早返回。
+    if not [slot for slot in _PLANNED_MEAL_COLUMNS if meal_phase(slot, now) == PHASE_AFTER]:
         return 0
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
@@ -7943,6 +7974,7 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
                 (today,),
             ).fetchall()
             orders = []
+            late_bird_users = {}
             for user in users:
                 order = conn.execute(
                     """SELECT o.id, o.user_id FROM subscription_orders o
@@ -7956,6 +7988,8 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
                 ).fetchone()
                 if order:
                     orders.append(order)
+                    late_bird_users[str(order["user_id"])] = is_late_bird_customer(
+                        conn, str(order["user_id"]))
         except sqlite3.Error as exc:
             print(f"⚠️ 包月餐自動已吃：讀取訂單失敗 {type(exc).__name__}")
             return 0
@@ -7974,7 +8008,10 @@ def auto_mark_due_planned_meals(*, now=None) -> int:
     for user_id, record in todays:
         columns = record["source_columns"]
         swapped = _planned_meals_swapped(user_id, today)
-        for slot in due_slots:
+        late_bird = late_bird_users.get(user_id, False)
+        for slot in _PLANNED_MEAL_COLUMNS:
+            if meal_phase(slot, now, late_bird=late_bird) != PHASE_AFTER:
+                continue
             # 午晚餐對調的日子：午餐是排給晚餐的便當，反之亦然。
             bento = {"午餐": "晚餐", "晚餐": "午餐"}[slot] if swapped else slot
             name_i, kcal_i, pro_i = _PLANNED_MEAL_COLUMNS[bento]
@@ -8955,6 +8992,7 @@ def get_dashboard_data(user_id: str, *, scope: str = "full") -> dict:
             print(f"⚠️ 分區課表整合失敗: {e}")
 
     result = {
+        "late_bird": is_late_bird_customer(DB_PATH, user_id),
         "name": name or "你", "today_label": today_label, "tdee": tdee, "protein_goal": protein_goal,
         "extra_cal": extra_cal, "extra_pro": extra_pro, "extra_fat": extra_fat, "planned_cal": planned_cal, "planned_pro": planned_pro,
         "cal_remaining": cal_remaining, "pro_remaining": pro_remaining, "cal_pct": cal_pct, "pro_pct": pro_pct,
@@ -10512,7 +10550,7 @@ SUBSCRIPTION_QUOTE_START_EXACT = "開始包月估價"
 SUBSCRIPTION_QUOTE_DAYS_EXACT = {
     "包月天數 2", "包月天數 3", "包月天數 4", "包月天數 5", "包月天數 不確定",
 }
-SUBSCRIPTION_QUOTE_PICKUP_EXACT = {"包月取餐 外送", "包月取餐 自取"}
+SUBSCRIPTION_QUOTE_PICKUP_EXACT = {"包月取餐 外送", "包月取餐 晚鳥", "包月取餐 自取"}
 SUBSCRIPTION_QUOTE_SELF_PICKUP_EXACT = {
     "自取餐數 1", "自取餐數 2", "自取餐數 3", "自取餐數 客服討論",
 }
@@ -10898,30 +10936,11 @@ def calculate_delivery_quote(target_address: str):
         }
 
     hub_match = None
-    if dist_meters <= 1000:
-        delivery_fee = 20
-        delivery_zone = "KM_0_1"
-        delivery_available = True
-    elif dist_meters <= 1500:
-        delivery_fee = 25
-        delivery_zone = "KM_1_1_5"
-        delivery_available = True
-    elif dist_meters <= 2000:
-        delivery_fee = 30
-        delivery_zone = "KM_1_5_2"
-        delivery_available = True
-    elif dist_meters <= 2500:
-        delivery_fee = 40
-        delivery_zone = "KM_2_2_5"
-        delivery_available = True
-    elif dist_meters <= 3000:
-        delivery_fee = 50
-        delivery_zone = "KM_2_5_3"
-        delivery_available = True
-    else:
-        delivery_fee = 0
-        delivery_zone = "UNAVAILABLE"
-        delivery_available = False
+    delivery_fee, delivery_zone, delivery_available = 0, "UNAVAILABLE", False
+    for max_meters, tier_fee, tier_zone in DELIVERY_FEE_TIERS:
+        if dist_meters <= max_meters:
+            delivery_fee, delivery_zone, delivery_available = tier_fee, tier_zone, True
+            break
 
     delivery_fee_text = (
         f"{delivery_fee} 元"
@@ -10930,7 +10949,7 @@ def calculate_delivery_quote(target_address: str):
     )
 
     route_group = infer_route_group(target_address)
-    carpool_hint = f"若同配送日有 {route_group} 同路客戶，可再套用順風車折扣。" if route_group != "OTHER" else "若有同區域併單，可再人工調整順風車折扣。"
+    carpool_hint = "若你的地址在現有配送路線上，包月外送每趟可再享順風車折扣。"
 
     return {
         "success": True,
@@ -10941,6 +10960,7 @@ def calculate_delivery_quote(target_address: str):
         "duration_text": duration_text,
         "delivery_fee": delivery_fee,
         "delivery_fee_text": delivery_fee_text,
+        "late_bird_fee": late_bird_fee(delivery_fee) if delivery_available else 0,
         "hub_name": hub_match or "",
         "route_group": route_group,
         "delivery_zone": delivery_zone,
@@ -11039,6 +11059,250 @@ def parse_subscription_order_message(msg: str):
 SUBSCRIPTION_PERIOD_WEEKS = 4
 SUBSCRIPTION_MEAL_LOW = 170
 SUBSCRIPTION_MEAL_HIGH = 220
+
+# 外送距離分級：(距離上限 meters, 每趟原運費, delivery_zone)；超過最後一級 = 不提供外送。
+DELIVERY_FEE_TIERS = (
+    (1000, 30, "KM_0_1"),
+    (1500, 35, "KM_1_1_5"),
+    (2000, 40, "KM_1_5_2"),
+    (2500, 50, "KM_2_2_5"),
+    (3000, 60, "KM_2_5_3"),
+)
+# 順風車：新客加入某位現有包月外送客戶的路線，額外繞行 ≤ 7 分鐘即視為「順路」，每趟再折 $10（疊加晚鳥半價）。
+CARPOOL_MAX_DETOUR_SECONDS = 420
+CARPOOL_DISCOUNT_PER_TRIP = 10
+CARPOOL_DISCOUNT_ENABLED = os.environ.get("CARPOOL_DISCOUNT_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+CARPOOL_MAX_CANDIDATES = 10
+# 包月取餐三種：一般外送（原運費）、晚鳥外送（運費半價）、自取。午晚餐一起送、一天一趟。
+DELIVERY_TYPE_REGULAR = "一般外送"
+DELIVERY_TYPE_LATE_BIRD = "晚鳥"
+DELIVERY_TYPE_PICKUP = "自取"
+DELIVERY_TYPE_LABELS = {
+    DELIVERY_TYPE_REGULAR: "🛵 一般外送",
+    DELIVERY_TYPE_LATE_BIRD: "🐦 晚鳥外送",
+    DELIVERY_TYPE_PICKUP: "自取",
+}
+REGULAR_WINDOW_TEXT = "約 11:30–12:00 送達（會盡量在 12:00 前送達，實際到達時間依當天配送狀況而定）"
+REGULAR_CHOICE_TEXT = f"🛵 一般外送　原運費｜{REGULAR_WINDOW_TEXT}"
+LATE_BIRD_WINDOW_TEXT = "13:00–14:00"
+LATE_BIRD_CHOICE_TEXT = f"🐦 晚鳥外送　運費半價｜{LATE_BIRD_WINDOW_TEXT} 送達（不指定時間）"
+# 報價按鈕文字 -> delivery_type（「包月取餐 外送」維持代表一般外送，向下相容）
+DELIVERY_TYPE_BY_PICKUP_BUTTON = {
+    "外送": DELIVERY_TYPE_REGULAR,
+    "晚鳥": DELIVERY_TYPE_LATE_BIRD,
+    "自取": DELIVERY_TYPE_PICKUP,
+}
+
+
+def normalize_delivery_type(value, is_delivery: bool = True) -> str:
+    """未記錄/未知的外送單視為一般外送；非外送一律為自取。"""
+    if not is_delivery:
+        return DELIVERY_TYPE_PICKUP
+    value = str(value or "").strip()
+    if value == DELIVERY_TYPE_LATE_BIRD:
+        return DELIVERY_TYPE_LATE_BIRD
+    return DELIVERY_TYPE_REGULAR
+
+
+def delivery_fee_for_type(base_fee, delivery_type) -> int:
+    """每趟收費（未含順風車）：一般外送=原運費；晚鳥=半價。"""
+    base = int(base_fee or 0)
+    if normalize_delivery_type(delivery_type) == DELIVERY_TYPE_LATE_BIRD:
+        return late_bird_fee(base)
+    return base
+
+
+def _ensure_order_delivery_type_column(conn):
+    """舊資料庫防呆：subscription_orders 缺 delivery_type 欄位時補上（啟動遷移之外的保險）。"""
+    try:
+        conn.execute("ALTER TABLE subscription_orders ADD COLUMN delivery_type TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+
+
+def _ensure_delivery_choice_table(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS subscription_delivery_choice ("
+        "user_id TEXT PRIMARY KEY, delivery_type TEXT DEFAULT '', address TEXT DEFAULT '', "
+        "delivery_fee INTEGER DEFAULT 0, updated_at TEXT DEFAULT '')"
+    )
+
+
+def remember_subscription_delivery_choice(uid: str, est: dict) -> None:
+    """報價時記下顧客選的取餐類型，之後填表建單才知道是一般外送或晚鳥。失敗不影響報價。"""
+    try:
+        is_delivery = (est.get("pickup_method") or "外送") == "外送"
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            _ensure_delivery_choice_table(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO subscription_delivery_choice "
+                "(user_id, delivery_type, address, delivery_fee, updated_at) VALUES (?,?,?,?,?)",
+                (str(uid), normalize_delivery_type(est.get("delivery_type"), is_delivery),
+                 str(est.get("address") or "").strip() if is_delivery else "",
+                 int(est.get("delivery_fee") or 0) if is_delivery else 0,
+                 tw_now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"⚠️ 記錄包月取餐類型失敗：{e}")
+
+
+def resolve_form_delivery(uid: str, is_delivery: bool, address: str, base_fee) -> tuple:
+    """表單建單：回傳 (delivery_type, 每趟收費)。類型取自報價時的選擇（無紀錄=一般外送）；
+    地址與報價相同時沿用報價的每趟費用（含順風車）。"""
+    if not is_delivery:
+        return DELIVERY_TYPE_PICKUP, 0
+    saved_type, saved_addr, saved_fee = "", "", None
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            _ensure_delivery_choice_table(conn)
+            row = conn.execute(
+                "SELECT delivery_type, address, delivery_fee FROM subscription_delivery_choice WHERE user_id=?",
+                (str(uid),),
+            ).fetchone()
+        if row:
+            saved_type, saved_addr, saved_fee = row[0], str(row[1] or "").strip(), row[2]
+    except Exception as e:
+        print(f"⚠️ 讀取包月取餐類型失敗：{e}")
+    dtype = normalize_delivery_type(saved_type)
+    fee = delivery_fee_for_type(base_fee, dtype)
+    if saved_fee is not None and saved_addr and saved_addr == str(address or "").strip() and 0 < int(saved_fee) <= fee:
+        fee = int(saved_fee)
+    return dtype, fee
+
+
+def format_form_delivery_lines(delivery_type: str, base_fee, fee_per_trip, distance_text) -> str:
+    base = int(base_fee or 0)
+    dist = distance_text or "未計算"
+    if delivery_type == DELIVERY_TYPE_LATE_BIRD:
+        return (
+            f"\n🛵 原運費 ${base}／趟（{dist}）"
+            f"\n🐦 晚鳥半價 → ${fee_per_trip}／趟"
+            f"\n🕐 每天 {LATE_BIRD_WINDOW_TEXT} 送達（不指定時間）"
+        )
+    return (
+        f"\n🛵 一般外送 ${fee_per_trip}／趟（{dist}）"
+        f"\n🕐 {REGULAR_WINDOW_TEXT}"
+    )
+
+
+def late_bird_fee(base_fee) -> int:
+    """晚鳥每趟運費 = 原運費的一半，無條件進位到整數元（$35 → $18）。"""
+    base = int(base_fee or 0)
+    return (base + 1) // 2 if base > 0 else 0
+
+
+def get_travel_seconds(origin_address, target_address, mode="driving"):
+    """Google Distance Matrix 行車秒數；任何失敗回 None。"""
+    if not GOOGLE_MAPS_API_KEY or not origin_address or not target_address:
+        return None
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {"origins": origin_address, "destinations": target_address, "mode": mode, "language": "zh-TW", "key": GOOGLE_MAPS_API_KEY}
+    try:
+        data = requests.get(url, params=params, timeout=10).json()
+        if data.get("status") == "OK":
+            element = data["rows"][0]["elements"][0]
+            if element.get("status") == "OK":
+                return int(element["duration"]["value"])
+    except Exception as e:
+        print(f"⚠️ Google Maps 行車時間例外：{e}")
+    return None
+
+
+def list_active_delivery_addresses(exclude_uid: str = "", limit: int = CARPOOL_MAX_CANDIDATES, delivery_type: str = DELIVERY_TYPE_REGULAR) -> list:
+    """已開通(status='activated')且有外送(delivery_count>0 且 delivery_fee>0)、且外送類型相同的包月訂單地址，
+    排除自己，最新優先。同一趟車才算順路：一般外送只比對一般外送、晚鳥只比對晚鳥；未記錄類型的舊單視為一般外送。"""
+    delivery_type = normalize_delivery_type(delivery_type)
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            rows = conn.execute(
+                """SELECT address FROM subscription_orders
+                   WHERE status='activated' AND delivery_count>0 AND delivery_fee>0
+                     AND TRIM(COALESCE(address,''))<>'' AND user_id<>?
+                     AND COALESCE(NULLIF(TRIM(delivery_type),''),?)=?
+                   ORDER BY id DESC""",
+                (exclude_uid or "", DELIVERY_TYPE_REGULAR, delivery_type),
+            ).fetchall()
+    except Exception as e:
+        print(f"⚠️ 順風車候選地址查詢失敗：{e}")
+        return []
+    seen, out = set(), []
+    for (addr,) in rows:
+        addr = str(addr).strip()
+        if addr and addr not in seen:
+            seen.add(addr)
+            out.append(addr)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def is_carpool_route(uid: str, address: str, delivery_type: str = DELIVERY_TYPE_REGULAR) -> bool:
+    """新客 B 對任一現有外送客戶 A：detour = min(t(A→B), t(店→B)+t(B→A)-t(店→A)) ≤ 門檻 即順路。
+    任何查詢失敗或無候選一律 False，不影響報價。不對外揭露 A 的身分或地點。
+    續約不自動沿用順風車價：續約重新估價時依當下仍在訂的外送客戶重新判斷。"""
+    if not CARPOOL_DISCOUNT_ENABLED or not address:
+        return False
+    try:
+        candidates = list_active_delivery_addresses(uid, delivery_type=delivery_type)
+        if not candidates:
+            return False
+        t_store_b = get_travel_seconds(STORE_ADDRESS, address)
+        if t_store_b is None:
+            return False
+        for a in candidates:
+            t_store_a = get_travel_seconds(STORE_ADDRESS, a)
+            t_a_b = get_travel_seconds(a, address)
+            if t_store_a is None or t_a_b is None:
+                continue
+            detour = t_a_b
+            t_b_a = get_travel_seconds(address, a)
+            if t_b_a is not None:
+                detour = min(detour, t_store_b + t_b_a - t_store_a)
+            if detour <= CARPOOL_MAX_DETOUR_SECONDS:
+                return True
+    except Exception as e:
+        print(f"⚠️ 順風車判斷失敗：{e}")
+    return False
+
+
+def format_distance_km(quote: dict) -> str:
+    meters = int((quote or {}).get("distance_meters") or 0)
+    if meters > 0:
+        return f"{meters / 1000:.1f} km"
+    return str((quote or {}).get("distance_text") or "").strip()
+
+
+def format_delivery_option_lines(est: dict) -> list:
+    """包月外送估價的運費明細。一般外送：運費、送達時段、順風車、趟數小計；
+    晚鳥：原運費、晚鳥半價、送達時段、順風車、趟數小計。"""
+    q = est.get("quote") or {}
+    base_fee = int(est.get("base_delivery_fee") or q.get("delivery_fee") or 0)
+    distance = format_distance_km(q)
+    distance_prefix = f"距離 {distance}｜" if distance else ""
+    delivery_type = normalize_delivery_type(est.get("delivery_type"))
+    if delivery_type == DELIVERY_TYPE_LATE_BIRD:
+        late_fee = int(est.get("late_bird_fee", est.get("delivery_fee")) or 0)
+        lines = [
+            f"{distance_prefix}原運費 ${base_fee}／趟",
+            f"🐦 晚鳥半價 → ${late_fee}／趟",
+        ]
+        window_line = f"🕐 每天 {LATE_BIRD_WINDOW_TEXT} 送達（不指定時間）"
+    else:
+        lines = [f"{distance_prefix}運費 ${base_fee}／趟"]
+        window_line = f"🕐 {REGULAR_WINDOW_TEXT}"
+    lines.append(window_line)
+    if CARPOOL_DISCOUNT_ENABLED and "carpool" in est:
+        if est.get("carpool"):
+            lines.append(f"🚗 順風車　✅ 你在現有路線上 → ${int(est.get('delivery_fee') or 0)}／趟")
+        else:
+            lines.append(f"🚗 順風車　你這一區目前還沒有路線，揪附近的同事或鄰居一起訂就能再折 ${CARPOOL_DISCOUNT_PER_TRIP}／趟")
+    return lines + [
+        f"外送 {int(est.get('delivery_count') or 0)} 趟，外送費小計 ${int(est.get('delivery_total') or 0):,}",
+    ]
+
+
+format_late_bird_delivery_lines = format_delivery_option_lines  # 舊名稱相容
 PAYMENT_BANK_NAME = "中國信託銀行"
 PAYMENT_BANK_BRANCH = "東門分行"
 PAYMENT_ACCOUNT_NAME = "一日樂食店"
@@ -11081,7 +11345,8 @@ def build_subscription_intro_text(uid: str) -> str:
         "你不需要自己算 TDEE，\n"
         "也不用每天研究熱量和蛋白質。\n\n"
         "✅ 一週 2～5 天可選\n"
-        "✅ 外送一天固定 2 餐，兩餐同一個時段配送，一天只送一次\n"
+        "✅ 外送二選一：一般外送（約 11:30–12:00，原運費）或晚鳥外送（13:00–14:00，運費半價）\n"
+        "✅ 午晚餐一起送、一天只送一次\n"
         "✅ 自取餐數更彈性\n"
         "✅ 週六可自取\n"
         "✅ LINE 協助追蹤與調整\n\n"
@@ -11107,7 +11372,7 @@ def build_subscription_intro_flex(uid: str):
                 {"type": "box", "layout": "vertical", "spacing": "xs", "margin": "lg", "paddingAll": "12px", "backgroundColor": "#FFFFFF", "cornerRadius": "12px", "contents": [
                     {"type": "text", "text": "包月特色", "weight": "bold", "size": "sm", "color": "#C45A18"},
                     {"type": "text", "text": "✅ 一週 2～5 天可選", "size": "xs", "color": "#5A4638"},
-                    {"type": "text", "text": "✅ 外送一天固定 2 餐，兩餐同一個時段配送，一天只送一次", "size": "xs", "color": "#5A4638", "wrap": True},
+                    {"type": "text", "text": "✅ 外送二選一：一般外送（約 11:30–12:00，原運費）或晚鳥外送（13:00–14:00，運費半價）；午晚餐一起送", "size": "xs", "color": "#5A4638", "wrap": True},
                     {"type": "text", "text": "✅ 自取餐數更彈性，週六可自取", "size": "xs", "color": "#5A4638", "wrap": True},
                     {"type": "text", "text": "✅ LINE 協助追蹤與調整", "size": "xs", "color": "#5A4638"}
                 ]}
@@ -11126,20 +11391,6 @@ def build_subscription_intro_flex(uid: str):
     return FlexSendMessage(alt_text="一日樂食包月 2.0", contents=bubble)
 
 
-def get_subscription_delivery_discount(days_per_week: int) -> int:
-    try:
-        days = int(days_per_week or 0)
-    except Exception:
-        days = 0
-    if days >= 5:
-        return 300
-    if days == 4:
-        return 200
-    if days == 3:
-        return 100
-    return 0
-
-
 def get_subscription_self_pickup_bonus(days_per_week: int) -> int:
     try:
         days = int(days_per_week or 0)
@@ -11153,18 +11404,60 @@ def get_subscription_self_pickup_bonus(days_per_week: int) -> int:
 
 
 def format_subscription_day_bonus(days_per_week: int) -> str:
-    discount = get_subscription_delivery_discount(days_per_week)
     bonus = get_subscription_self_pickup_bonus(days_per_week)
-    if not discount and not bonus:
-        return (
-            "小提醒：一週 3 天以上可享本期包月優惠。\n"
-            "外送可折抵運費，自取可加贈蛋白補充。"
-        )
+    if not bonus:
+        return "小提醒：一週 3 天以上選自取，可加贈蛋白補充。"
     return (
         "本期優惠：\n"
-        f"🚚 外送四週運費折 ${discount}\n"
         f"🛍 自取送 {bonus} 次蛋白補充"
     )
+
+
+def build_subscription_days_prompt_text() -> str:
+    return (
+        "🍱 你一週想吃幾天呢？\n\n"
+        f"{REGULAR_CHOICE_TEXT}\n"
+        f"{LATE_BIRD_CHOICE_TEXT}\n"
+        "・外送都是午晚餐一起送，一天只送一次\n\n"
+        "🛍 自取加贈蛋白補充\n"
+        "・每週 3 天以上：送 1 次\n"
+        "・每週 5 天以上：送 2 次\n\n"
+        "請先選擇一週想吃幾天。"
+    )
+
+
+def build_subscription_pickup_choice_text(days_per_week: int) -> str:
+    return (
+        f"✅ 好的，先用每週 {days_per_week} 天估算。\n\n"
+        f"{format_subscription_day_bonus(days_per_week)}\n\n"
+        "接著請選擇取餐方式：\n"
+        f"{REGULAR_CHOICE_TEXT}\n"
+        f"{LATE_BIRD_CHOICE_TEXT}\n"
+        "　外送一天固定 2 餐，午晚餐一起送、一天只送一次，會依地址估算外送費。\n"
+        "🛍 自取：餐數較彈性，也可以週六自取。"
+    )
+
+
+def build_subscription_delivery_address_prompt_text(delivery_type: str = DELIVERY_TYPE_REGULAR) -> str:
+    if normalize_delivery_type(delivery_type) == DELIVERY_TYPE_LATE_BIRD:
+        intro = (
+            "✅ 好的，晚鳥外送會以一天 2 餐估算。\n"
+            f"🐦 午晚餐一起送、一天只送一次，每天 {LATE_BIRD_WINDOW_TEXT} 送達（不指定時間），運費半價。\n\n"
+        )
+    else:
+        intro = (
+            "✅ 好的，一般外送會以一天 2 餐估算。\n"
+            f"🛵 午晚餐一起送、一天只送一次，{REGULAR_WINDOW_TEXT}，原運費。\n\n"
+        )
+    return (
+        intro +
+        "📍 請直接輸入你的外送地址，我幫你確認距離與預估外送費。\n\n"
+        "⚠️ 提醒：週六目前不提供外送。"
+    )
+
+
+def build_subscription_late_bird_address_prompt_text() -> str:  # 舊名稱相容
+    return build_subscription_delivery_address_prompt_text(DELIVERY_TYPE_LATE_BIRD)
 
 
 def subscription_days_quick_reply():
@@ -11178,7 +11471,8 @@ def subscription_days_quick_reply():
 
 def subscription_pickup_quick_reply():
     return QuickReply(items=[
-        QuickReplyButton(action=MessageAction(label="我要外送", text="包月取餐 外送")),
+        QuickReplyButton(action=MessageAction(label="🛵 一般外送", text="包月取餐 外送")),
+        QuickReplyButton(action=MessageAction(label="🐦 晚鳥外送（運費半價）", text="包月取餐 晚鳥")),
         QuickReplyButton(action=MessageAction(label="我要自取", text="包月取餐 自取")),
     ])
 
@@ -11192,7 +11486,8 @@ def subscription_self_pickup_meals_quick_reply():
     ])
 
 
-def calculate_subscription_estimate(uid: str, meal_count: int, address: str = "", delivery_count: int = None, pickup_method: str = "外送", days_per_week: int = None, meals_per_day: int = None):
+def calculate_subscription_estimate(uid: str, meal_count: int, address: str = "", delivery_count: int = None, pickup_method: str = "外送", days_per_week: int = None, meals_per_day: int = None, delivery_type: str = None):
+    delivery_type = normalize_delivery_type(delivery_type, is_delivery=(pickup_method == "外送"))
     profile = get_customer_profile_for_order(uid)
     name = profile[0] if profile else ""
     saved_address = profile[1] if profile and len(profile) > 1 else ""
@@ -11207,34 +11502,42 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
         quote["duration_text"] = quote.get("duration_text") or ""
         quote["route_group"] = quote.get("route_group") or infer_route_group(address)
     delivery_available = quote.get("delivery_available") if pickup_method == "外送" else True
-    delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") and delivery_available is not False and pickup_method == "外送" else 0
+    base_delivery_fee = int(quote.get("delivery_fee") or 0) if quote.get("success") and delivery_available is not False and pickup_method == "外送" else 0
+    # 一般外送每趟收原運費；晚鳥收半價（無條件進位）。順風車兩種都可再折，delivery_fee 為實際每趟收費。
+    late_fee = late_bird_fee(base_delivery_fee)
+    delivery_fee = delivery_fee_for_type(base_delivery_fee, delivery_type)
+    carpool = False
+    if base_delivery_fee > 0:
+        carpool = is_carpool_route(uid, address, delivery_type)
+        if carpool:
+            delivery_fee = max(0, delivery_fee - CARPOOL_DISCOUNT_PER_TRIP)
     if delivery_count is None:
         delivery_count = meal_count if pickup_method == "外送" else 0
     meal_low_total = meal_count * SUBSCRIPTION_MEAL_LOW
     meal_high_total = meal_count * SUBSCRIPTION_MEAL_HIGH
     delivery_total = delivery_fee * delivery_count
-    delivery_discount_available = get_subscription_delivery_discount(days_per_week) if pickup_method == "外送" else 0
-    delivery_discount_applied = min(delivery_total, delivery_discount_available) if delivery_total > 0 else 0
     self_pickup_bonus_count = get_subscription_self_pickup_bonus(days_per_week) if pickup_method == "自取" else 0
-    quote_low_total = meal_low_total + delivery_total - delivery_discount_applied
-    quote_high_total = meal_high_total + delivery_total - delivery_discount_applied
+    quote_low_total = meal_low_total + delivery_total
+    quote_high_total = meal_high_total + delivery_total
     return {
         "name": name,
         "address": address,
         "quote": quote,
         "meal_count": meal_count,
         "delivery_count": delivery_count,
+        "base_delivery_fee": base_delivery_fee,
+        "late_bird_fee": late_fee,
+        "carpool": carpool,
         "delivery_fee": delivery_fee,
         "delivery_available": delivery_available,
         "meal_low_total": meal_low_total,
         "meal_high_total": meal_high_total,
         "delivery_total": delivery_total,
-        "delivery_discount_available": delivery_discount_available,
-        "delivery_discount_applied": delivery_discount_applied,
         "self_pickup_bonus_count": self_pickup_bonus_count,
         "quote_low_total": quote_low_total,
         "quote_high_total": quote_high_total,
         "pickup_method": pickup_method,
+        "delivery_type": delivery_type,
         "days_per_week": days_per_week,
         "meals_per_day": meals_per_day,
         "period_weeks": SUBSCRIPTION_PERIOD_WEEKS,
@@ -11295,40 +11598,33 @@ def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> 
             "地圖暫時無法判讀，因此這次不會建立訂單或顯示未確認的本期合計；"
             "客服確認距離與運費後再協助下一步。"
         )
-    distance_line = f"📏 距離：{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("📏 距離：自取不需測距" if pickup_method == "自取" else f"📏 距離：{q.get('distance_text') or '已填地址，距離需客服確認'}")
-    delivery_text = q.get("delivery_fee_text") or ("自取無外送費" if pickup_method == "自取" else "尚未提供地址，外送費需人工確認")
     manual_review_note = format_delivery_manual_review_note(q) if pickup_method == "外送" else ""
     manual_review_line = f"\n{manual_review_note}" if manual_review_note else ""
     plan_line = f"📅 每週：{days} 天\n" if days else ""
     meals_line = f"🍽️ 餐數：每週 {days} 天 × 每天 {meals_per_day} 餐，本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐\n" if days and meals_per_day else f"🍱 餐數：{est['meal_count']} 餐\n"
-    discount_available = int(est.get("delivery_discount_available") or 0)
-    discount_applied = int(est.get("delivery_discount_applied") or 0)
     pickup_bonus = int(est.get("self_pickup_bonus_count") or 0)
-    if pickup_method == "外送" and discount_available:
-        discount_line = f"\n🎁 本期包月優惠：四週外送費折 ${discount_available}"
-        if discount_applied:
-            discount_line += f"（已折抵 ${discount_applied}）"
-        else:
-            discount_line += "（外送費需客服確認時，折抵會一起核算）"
-    elif pickup_method == "自取" and pickup_bonus:
-        discount_line = f"\n🎁 自取優惠：送 {pickup_bonus} 次蛋白補充"
+    if pickup_method == "自取" and pickup_bonus:
+        bonus_line = f"🎁 自取優惠：送 {pickup_bonus} 次蛋白補充\n"
     else:
-        discount_line = ""
+        bonus_line = ""
+    if pickup_method == "外送":
+        pickup_label = DELIVERY_TYPE_LABELS[normalize_delivery_type(est.get("delivery_type"))]
+        delivery_block = "\n".join(f"📏 {line}" if index == 0 else line for index, line in enumerate(format_delivery_option_lines(est))) + "\n\n"
+    else:
+        pickup_label = pickup_method
+        delivery_block = "📏 距離：自取不需測距\n🛵 外送費：自取無外送費\n\n"
     hint = ""
     if include_order_hint:
         hint = "\n\n價格可接受的話，請點「可以，建立包月資料」或回覆「我要填寫包月資料」。"
     return (
         "🧾 一日樂食包月粗估\n"
         f"{plan_line}"
-        f"🚚 取餐方式：{pickup_method}\n"
+        f"🚚 取餐方式：{pickup_label}\n"
         f"{meals_line}"
         f"📍 地址：{address if pickup_method == '外送' else '自取'}\n"
-        f"{distance_line}\n"
-        f"🛵 單次外送費：{delivery_text}\n"
-        f"🚚 估計配送次數：{est['delivery_count']} 次\n\n"
+        f"{delivery_block}"
         f"餐費粗估：${est['meal_low_total']:,}～${est['meal_high_total']:,}\n"
-        f"外送費粗估：${est['delivery_total']:,}\n"
-        f"{discount_line}\n"
+        f"{bonus_line}"
         f"本期粗估合計：${est['quote_low_total']:,}～${est['quote_high_total']:,}\n\n"
         "備註：這是下單前粗估，實際金額會由客服依菜單、餐數、外送距離、優惠與付款方式最後確認。"
         f"{manual_review_line}"
@@ -11377,16 +11673,8 @@ def build_subscription_estimate_flex(uid: str, est: dict):
     summary = f"每週 {days} 天 × 每天 {meals_per_day} 餐｜本期 {est.get('period_weeks', 4)} 週共 {est['meal_count']} 餐" if days and meals_per_day else f"共 {est['meal_count']} 餐"
     distance_text = f"{q.get('distance_text')} / {q.get('duration_text')}" if q.get("success") else ("自取不需測距" if pickup_method == "自取" else (q.get("distance_text") or "已填地址，距離需客服確認"))
     manual_review_note = format_delivery_manual_review_note(q) if pickup_method == "外送" else ""
-    discount_available = int(est.get("delivery_discount_available") or 0)
-    discount_applied = int(est.get("delivery_discount_applied") or 0)
     pickup_bonus = int(est.get("self_pickup_bonus_count") or 0)
-    if pickup_method == "外送" and discount_available:
-        promo_text = f"本期優惠：四週外送費折 ${discount_available}"
-        if discount_applied:
-            promo_text += f"｜已折 ${discount_applied}"
-        else:
-            promo_text += "｜客服確認外送費時一起核算"
-    elif pickup_method == "自取" and pickup_bonus:
+    if pickup_method == "自取" and pickup_bonus:
         promo_text = f"自取優惠：送 {pickup_bonus} 次蛋白補充"
     else:
         promo_text = ""
@@ -11402,9 +11690,18 @@ def build_subscription_estimate_flex(uid: str, est: dict):
             {"type": "button", "style": "link", "action": {"type": "message", "label": "找客服確認", "text": "找客服"}},
         ]
     else:
+        if pickup_method == "外送":
+            delivery_fee_contents = [
+                {"type": "text", "text": line, "size": "sm", "color": "#D85A1B" if line.startswith("🐦") else "#24513A", "weight": "bold", "wrap": True, "margin": "xs"}
+                for line in format_delivery_option_lines(est)
+            ]
+        else:
+            delivery_fee_contents = [
+                {"type": "text", "text": f"外送費：${est['delivery_total']:,}", "size": "sm", "color": "#24513A", "weight": "bold", "margin": "xs"},
+            ]
         price_contents = [
             {"type": "text", "text": f"餐費：${est['meal_low_total']:,}～${est['meal_high_total']:,}", "size": "sm", "color": "#24513A", "weight": "bold"},
-            {"type": "text", "text": f"外送費：${est['delivery_total']:,}", "size": "sm", "color": "#24513A", "weight": "bold", "margin": "xs"},
+            *delivery_fee_contents,
             *promo_contents,
             {"type": "text", "text": f"本期合計：約 ${est['quote_low_total']:,}～${est['quote_high_total']:,}", "size": "lg", "color": "#D85A1B", "weight": "bold", "wrap": True, "margin": "md"},
         ]
@@ -11412,6 +11709,16 @@ def build_subscription_estimate_flex(uid: str, est: dict):
             {"type": "button", "style": "primary", "color": "#2E8B57", "action": {"type": "uri", "label": "可以，建立包月資料", "uri": get_subscription_form_link(uid, est)}},
             {"type": "button", "style": "secondary", "action": {"type": "message", "label": "重新選天數", "text": "開始包月估價"}},
             {"type": "button", "style": "link", "action": {"type": "message", "label": "找客服確認", "text": "找客服"}},
+        ]
+    info_contents = [
+        {"type": "text", "text": f"取餐方式：{DELIVERY_TYPE_LABELS[normalize_delivery_type(est.get('delivery_type'))] if pickup_method == '外送' else pickup_method}", "size": "sm", "color": "#23352A", "wrap": True},
+        {"type": "text", "text": f"地址：{address if pickup_method == '外送' else '自取'}", "size": "sm", "color": "#23352A", "wrap": True},
+    ]
+    if pickup_method != "外送" or delivery_pending_confirmation:
+        # 外送已報價時，距離/趟數改在運費明細（運費→送達時段→趟數小計）呈現。
+        info_contents += [
+            {"type": "text", "text": f"距離：{distance_text}", "size": "sm", "color": "#23352A", "wrap": True},
+            {"type": "text", "text": f"配送次數：{est['delivery_count']} 次", "size": "sm", "color": "#23352A", "wrap": True},
         ]
     bubble = {
         "type": "bubble",
@@ -11425,12 +11732,7 @@ def build_subscription_estimate_flex(uid: str, est: dict):
                 {"type": "text", "text": "💰 包月粗估結果", "weight": "bold", "size": "xl", "color": "#24513A"},
                 {"type": "text", "text": summary, "size": "sm", "color": "#466152", "wrap": True, "margin": "sm"},
                 {"type": "separator", "margin": "lg", "color": "#CFE4D5"},
-                {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
-                    {"type": "text", "text": f"取餐方式：{pickup_method}", "size": "sm", "color": "#23352A", "wrap": True},
-                    {"type": "text", "text": f"地址：{address if pickup_method == '外送' else '自取'}", "size": "sm", "color": "#23352A", "wrap": True},
-                    {"type": "text", "text": f"距離：{distance_text}", "size": "sm", "color": "#23352A", "wrap": True},
-                    {"type": "text", "text": f"配送次數：{est['delivery_count']} 次", "size": "sm", "color": "#23352A", "wrap": True}
-                ]},
+                {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": info_contents},
                 {"type": "box", "layout": "vertical", "margin": "lg", "paddingAll": "14px", "backgroundColor": "#FFFFFF", "cornerRadius": "12px", "contents": price_contents},
                 {"type": "text", "text": "實際金額會依菜單、餐數、外送距離、優惠與客服確認為準。", "size": "xs", "color": "#6F7B72", "wrap": True, "margin": "md"}
             ]
@@ -11452,18 +11754,20 @@ def create_subscription_order(uid: str, est: dict):
         raise ValueError("subscription delivery is not ready for order creation")
     created_at = tw_now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(sqlite3.connect(DB_PATH)) as conn:
+        _ensure_order_delivery_type_column(conn)
         c = conn.cursor()
         c.execute("""
             INSERT INTO subscription_orders (
                 user_id, customer_name, meal_count, address, distance_text, delivery_fee, delivery_count,
                 meal_low_total, meal_high_total, delivery_total, quote_low_total, quote_high_total,
-                status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                status, created_at, delivery_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         """, (
             uid, est.get("name") or "", est["meal_count"], est.get("address") or "",
             est.get("quote", {}).get("distance_text") or "", est["delivery_fee"], est["delivery_count"],
             est["meal_low_total"], est["meal_high_total"], est["delivery_total"],
-            est["quote_low_total"], est["quote_high_total"], created_at
+            est["quote_low_total"], est["quote_high_total"], created_at,
+            normalize_delivery_type(est.get("delivery_type"), (est.get("pickup_method") or "外送") == "外送"),
         ))
         order_id = c.lastrowid
         conn.commit()
@@ -11478,7 +11782,8 @@ def notify_admin_new_subscription_order(order_id: int, uid: str, est: dict):
         f"餐數：{est['meal_count']} 餐\n"
         f"地址：{est.get('address') or '未提供'}\n"
         f"距離：{est.get('quote', {}).get('distance_text') or 'NA'}\n"
-        f"單次外送費：{est['delivery_fee']}\n"
+        f"取餐類型：{DELIVERY_TYPE_LABELS[normalize_delivery_type(est.get('delivery_type'), (est.get('pickup_method') or '外送') == '外送')]}\n"
+        f"單次外送費：{est['delivery_fee']}（原 {est.get('base_delivery_fee', est['delivery_fee'])}）\n"
         f"粗估合計：${est['quote_low_total']:,}～${est['quote_high_total']:,}\n\n"
         f"核准：#核准訂單 {order_id}\n"
         f"拒絕：#拒絕訂單 {order_id} 原因\n"
@@ -11500,13 +11805,14 @@ def create_pending_subscription_form_order(snapshot: dict) -> int:
     quote_total = int(snapshot.get("total_with_delivery") or snapshot.get("total_price") or 0)
     delivery_info = snapshot.get("delivery_info") or {}
     with closing(sqlite3.connect(DB_PATH)) as conn:
+        _ensure_order_delivery_type_column(conn)
         c = conn.cursor()
         c.execute("""
             INSERT INTO subscription_orders (
                 user_id, customer_name, meal_count, address, distance_text, delivery_fee, delivery_count,
                 meal_low_total, meal_high_total, delivery_total, quote_low_total, quote_high_total,
-                status, created_at, form_payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                status, created_at, form_payload_json, delivery_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         """, (
             snapshot.get("user_id") or "",
             snapshot.get("name") or "",
@@ -11521,7 +11827,8 @@ def create_pending_subscription_form_order(snapshot: dict) -> int:
             quote_total,
             quote_total,
             created_at,
-            json.dumps(snapshot, ensure_ascii=False)
+            json.dumps(snapshot, ensure_ascii=False),
+            normalize_delivery_type(snapshot.get("delivery_type"), bool(snapshot.get("is_delivery"))),
         ))
         order_id = c.lastrowid
         conn.commit()
@@ -11661,6 +11968,7 @@ def notify_admin_pending_subscription_form(order_id: int, snapshot: dict):
         f"UID：{uid or '未提供'}\n"
         f"取餐方式：{snapshot.get('pickup_method') or '未填'}\n"
         f"外送地址：{snapshot.get('address') or '未提供'}\n"
+        f"取餐類型：{DELIVERY_TYPE_LABELS[normalize_delivery_type(snapshot.get('delivery_type'), bool(snapshot.get('is_delivery')))]}\n"
         f"單次外送費：${int(snapshot.get('delivery_fee_per_trip') or 0)}\n"
         f"配送天數：{snapshot.get('delivery_days_count') if snapshot.get('is_delivery') else '自取'}\n"
         f"排餐金額：${int(snapshot.get('total_price') or 0)}\n"
@@ -14206,12 +14514,19 @@ def _handle_registered_semantic_meal(event, text, user_id, message_id):
             _record_semantic_provider_stage(owned_batch_id, "nutrition_fallback", estimates)
             return estimates
 
+        def natural_portion_adapter(items, owned_batch_id):
+            from semantic_meal_pipeline import estimate_natural_portion_grams_openai
+            grams = estimate_natural_portion_grams_openai(client, items, owned_batch_id)
+            _record_semantic_provider_stage(owned_batch_id, "natural_portion", grams)
+            return grams
+
         result = run_semantic_meal_pipeline(
             text=text, user_id=user_id, message_id=message_id,
             claim_batch=lambda *_: claim,
             parse_semantics=parse_adapter,
             find_reference_nutrition=find_reference_nutrition,
             estimate_per_100=fallback_adapter,
+            estimate_natural_grams=natural_portion_adapter,
         )
         draft = _persist_semantic_meal_result(
             user_id=user_id, message_id=str(message_id), batch_id=batch_id, result=result,
@@ -16563,6 +16878,38 @@ def _text_meal_provenance_disclosures(estimate):
     ]
 
 
+TEXT_MEAL_PORTION_CAP_MARKER = "上限調整"
+TEXT_MEAL_PORTION_CAP_NOTE = "一般份量已依常見份量上限調整"
+
+
+def _portion_assumptions_in(value, depth=0):
+    if depth > 4:
+        return
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            if key == "portion_assumption" and isinstance(inner, str):
+                yield inner
+            else:
+                yield from _portion_assumptions_in(inner, depth + 1)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from _portion_assumptions_in(inner, depth + 1)
+
+
+def _text_meal_portion_cap_lines(draft):
+    """semantic pipeline 把份量壓到常見上限時，在草稿卡上補一行小字說明。"""
+    try:
+        capped = any(
+            TEXT_MEAL_PORTION_CAP_MARKER in text
+            for text in _portion_assumptions_in(draft.get("request"))
+        )
+    except Exception:
+        capped = False
+    if not capped:
+        return []
+    return [{"type": "text", "text": TEXT_MEAL_PORTION_CAP_NOTE, "size": "xxs", "color": "#777777", "wrap": True}]
+
+
 def build_text_meal_estimate_flex(draft):
     from linebot.models import FlexSendMessage
     from nutrition_plausibility import assess_draft_for_display
@@ -16618,6 +16965,7 @@ def build_text_meal_estimate_flex(draft):
             {"type": "text", "text": estimate["food_name"], "weight": "bold", "wrap": True},
             *_text_meal_provenance_disclosures(estimate),
             {"type": "text", "text": portion_text, "size": "sm", "wrap": True},
+            *_text_meal_portion_cap_lines(draft),
             {"type": "text", "text": nutrient_text("熱量", "calories_kcal", "kcal"), "size": "sm", "wrap": True},
             {"type": "text", "text": nutrient_text("蛋白質", "protein_g", "g"), "size": "sm", "wrap": True},
             {"type": "text", "text": nutrient_text("脂肪", "fat_g", "g"), "size": "sm", "wrap": True},
@@ -20757,18 +21105,7 @@ def _handle_subscription_quote_text(event, quote_kind):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text=(
-                    "🍱 你一週想吃幾天呢？\n\n"
-                    "一週 3 天以上可享本期包月優惠：\n\n"
-                    "🚚 外送四週運費折抵\n"
-                    "・每週 3 天：折 $100\n"
-                    "・每週 4 天：折 $200\n"
-                    "・每週 5 天以上：折 $300\n\n"
-                    "🛍 自取加贈蛋白補充\n"
-                    "・每週 3 天以上：送 1 次\n"
-                    "・每週 5 天以上：送 2 次\n\n"
-                    "請先選擇一週想吃幾天。"
-                ),
+                text=build_subscription_days_prompt_text(),
                 quick_reply=subscription_days_quick_reply(),
             ),
         )
@@ -20798,13 +21135,7 @@ def _handle_subscription_quote_text(event, quote_kind):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text=(
-                    f"✅ 好的，先用每週 {days} 天估算。\n\n"
-                    f"{format_subscription_day_bonus(days)}\n\n"
-                    "接著請選擇取餐方式：\n"
-                    "🛵 外送：一天固定 2 餐，兩餐同一個時段配送、一天只送一次，會依地址估算外送費。\n"
-                    "🛍 自取：餐數較彈性，也可以週六自取。"
-                ),
+                text=build_subscription_pickup_choice_text(days),
                 quick_reply=subscription_pickup_quick_reply(),
             ),
         )
@@ -20813,17 +21144,14 @@ def _handle_subscription_quote_text(event, quote_kind):
     days = state["days_per_week"]
     if quote_kind == "pickup":
         pickup_method = raw_text[len("包月取餐 "):]
-        if pickup_method == "外送":
+        if pickup_method in ("外送", "晚鳥"):
+            delivery_type = DELIVERY_TYPE_BY_PICKUP_BUTTON[pickup_method]
             pending_subscription_state[uid] = {
                 "step": "delivery_address", "days_per_week": days,
-                "pickup_method": "外送", "quote_started_at": started_at,
+                "pickup_method": "外送", "delivery_type": delivery_type,
+                "quote_started_at": started_at,
             }
-            reply = TextSendMessage(text=(
-                "✅ 好的，外送會以一天 2 餐估算。\n"
-                "🛵 兩餐同一個時段配送、一天只送一次。\n\n"
-                "📍 請直接輸入你的外送地址，我幫你確認距離與預估外送費。\n\n"
-                "⚠️ 提醒：週六目前不提供外送。"
-            ))
+            reply = TextSendMessage(text=build_subscription_delivery_address_prompt_text(delivery_type))
         else:
             update_subscription_delivery_block(uid, True)
             pending_subscription_state[uid] = {
@@ -20854,6 +21182,7 @@ def _handle_subscription_quote_text(event, quote_kind):
             uid, meal_count, "", delivery_count=0, pickup_method="自取",
             days_per_week=days, meals_per_day=meals_per_day,
         )
+        remember_subscription_delivery_choice(uid, estimate)
     else:
         meals_per_day = 2
         meal_count = days * meals_per_day * SUBSCRIPTION_PERIOD_WEEKS
@@ -20862,8 +21191,10 @@ def _handle_subscription_quote_text(event, quote_kind):
         estimate = calculate_subscription_estimate(
             uid, meal_count, address, delivery_count=delivery_count,
             pickup_method="外送", days_per_week=days, meals_per_day=meals_per_day,
+            delivery_type=state.get("delivery_type"),
         )
         update_subscription_delivery_block(uid, estimate.get("delivery_available"))
+        remember_subscription_delivery_choice(uid, estimate)
     pending_subscription_state[uid] = {"step": "estimated", "estimate": estimate}
     line_bot_api.reply_message(
         event.reply_token, build_subscription_estimate_flex(uid, estimate)
@@ -22474,18 +22805,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text=(
-                    "🍱 你一週想吃幾天呢？\n\n"
-                    "一週 3 天以上可享本期包月優惠：\n\n"
-                    "🚚 外送四週運費折抵\n"
-                    "・每週 3 天：折 $100\n"
-                    "・每週 4 天：折 $200\n"
-                    "・每週 5 天以上：折 $300\n\n"
-                    "🛍 自取加贈蛋白補充\n"
-                    "・每週 3 天以上：送 1 次\n"
-                    "・每週 5 天以上：送 2 次\n\n"
-                    "請先選擇一週想吃幾天。"
-                ),
+                text=build_subscription_days_prompt_text(),
                 quick_reply=subscription_days_quick_reply()
             )
         )
@@ -22511,17 +22831,10 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             return
         days_int = int(raw_days)
         pending_subscription_state[uid] = {"step": "pickup", "days_per_week": days_int}
-        bonus_text = format_subscription_day_bonus(days_int)
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text=(
-                    f"✅ 好的，先用每週 {raw_days} 天估算。\n\n"
-                    f"{bonus_text}\n\n"
-                    "接著請選擇取餐方式：\n"
-                    "🛵 外送：一天固定 2 餐，兩餐同一個時段配送、一天只送一次，會依地址估算外送費。\n"
-                    "🛍 自取：餐數較彈性，也可以週六自取。"
-                ),
+                text=build_subscription_pickup_choice_text(days_int),
                 quick_reply=subscription_pickup_quick_reply()
             )
         )
@@ -22535,14 +22848,10 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="我先幫你從天數開始估算。", quick_reply=subscription_days_quick_reply()))
             pending_subscription_state[uid] = {"step": "days"}
             return
-        if pickup_method == "外送":
-            pending_subscription_state[uid] = {"step": "delivery_address", "days_per_week": days, "pickup_method": "外送"}
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
-                "✅ 好的，外送會以一天 2 餐估算。\n"
-                "🛵 兩餐同一個時段配送、一天只送一次。\n\n"
-                "📍 請直接輸入你的外送地址，我幫你確認距離與預估外送費。\n\n"
-                "⚠️ 提醒：週六目前不提供外送。"
-            )))
+        if pickup_method in ("外送", "晚鳥"):
+            delivery_type = DELIVERY_TYPE_BY_PICKUP_BUTTON[pickup_method]
+            pending_subscription_state[uid] = {"step": "delivery_address", "days_per_week": days, "pickup_method": "外送", "delivery_type": delivery_type}
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_subscription_delivery_address_prompt_text(delivery_type)))
             return
         if pickup_method == "自取":
             update_subscription_delivery_block(uid, True)
@@ -22570,6 +22879,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         meals_per_day = int(raw_meals)
         meal_count = int(days) * meals_per_day * SUBSCRIPTION_PERIOD_WEEKS
         est = calculate_subscription_estimate(uid, meal_count, "", delivery_count=0, pickup_method="自取", days_per_week=int(days), meals_per_day=meals_per_day)
+        remember_subscription_delivery_choice(uid, est)
         pending_subscription_state[uid] = {"step": "estimated", "estimate": est}
         line_bot_api.reply_message(event.reply_token, build_subscription_estimate_flex(uid, est))
         return
@@ -22590,8 +22900,9 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         meal_count = days * meals_per_day * SUBSCRIPTION_PERIOD_WEEKS
         delivery_count = days * SUBSCRIPTION_PERIOD_WEEKS
         address_text = msg.replace("#測距 ", "").replace("測距 ", "").strip()
-        est = calculate_subscription_estimate(uid, meal_count, address_text, delivery_count=delivery_count, pickup_method="外送", days_per_week=days, meals_per_day=meals_per_day)
+        est = calculate_subscription_estimate(uid, meal_count, address_text, delivery_count=delivery_count, pickup_method="外送", days_per_week=days, meals_per_day=meals_per_day, delivery_type=state.get("delivery_type"))
         update_subscription_delivery_block(uid, est.get("delivery_available"))
+        remember_subscription_delivery_choice(uid, est)
         pending_subscription_state[uid] = {"step": "estimated", "estimate": est}
         line_bot_api.reply_message(event.reply_token, build_subscription_estimate_flex(uid, est))
         return
@@ -22624,6 +22935,8 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                 f"📏 距本店距離：{quote.get('distance_text')}\n"
                 f"⏱️ 騎車時間：{quote.get('duration_text')}\n"
                 f"💰 運費評估：{quote.get('delivery_fee_text')}\n"
+                f"🛵 包月一般外送：${int(quote.get('delivery_fee') or 0)}／趟（{REGULAR_WINDOW_TEXT}）\n"
+                f"🐦 包月晚鳥外送：${late_bird_fee(quote.get('delivery_fee'))}／趟（{LATE_BIRD_WINDOW_TEXT} 送達，不指定時間）\n"
                 f"🧭 建議分線：{quote.get('route_group')} / {quote.get('delivery_zone')}\n"
                 f"💡 {quote.get('carpool_hint')}\n\n"
                 f"想了解包月方案，請回覆：了解包月方案"
@@ -23761,6 +24074,8 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                 f"📏 距本店距離：{quote.get('distance_text')}\n"
                 f"⏱️ 騎車時間：{quote.get('duration_text')}\n"
                 f"💰 運費評估：{quote.get('delivery_fee_text')}\n"
+                f"🛵 包月一般外送：${int(quote.get('delivery_fee') or 0)}／趟（{REGULAR_WINDOW_TEXT}）\n"
+                f"🐦 包月晚鳥外送：${late_bird_fee(quote.get('delivery_fee'))}／趟（{LATE_BIRD_WINDOW_TEXT} 送達，不指定時間）\n"
                 f"🧭 建議分線：{quote.get('route_group')} / {quote.get('delivery_zone')}\n"
                 f"💡 {quote.get('carpool_hint')}"
             )

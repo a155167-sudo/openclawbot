@@ -24,6 +24,14 @@ _CATEGORY_POLICIES = (
     ("蔬菜菇類", ("菜", "花椰", "菠菜", "菇", "番茄", "小黃瓜", "南瓜"), Decimal("3"), Decimal("250")),
     ("水果類", ("蘋果", "香蕉", "芭樂", "水果", "橘", "柳丁", "葡萄", "莓", "西瓜"), Decimal("5"), Decimal("250")),
     ("飲料類", ("果汁", "茶飲", "汽水", "可樂", "咖啡"), Decimal("0"), Decimal("200")),
+    # Last on purpose: only names no specific category claimed.  Typical Taiwan
+    # 外食 mixed dishes (rice + meat + vegetables + sauce) sit around 120–250
+    # kcal/100 g; 60–300 allows fried items yet withholds clear
+    # overestimates (e.g. 排骨飯 at 250 kcal/100 g × 600 g = 1500 kcal still passes
+    # the band, so portion guidance in the grams prompt matters too).
+    ("外食便當／混合料理類", ("便當", "飯", "炒", "燴", "丼", "粥", "餃", "咖哩", "套餐",
+                         "排骨", "雞腿", "滷肉", "漢堡", "披薩", "壽司", "三明治", "湯麵", "火鍋"),
+     Decimal("60"), Decimal("300")),
 )
 
 
