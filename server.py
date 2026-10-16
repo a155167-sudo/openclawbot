@@ -2688,7 +2688,7 @@ ADMIN_ONLY_EXACT_COMMANDS = {
     "#測試週報", "#測試晚報", "#生24", "#生48", "#延餐清單", "#待核訂單",
     "#清空熱量", "#刪除檔案", "#重置", "重置本週", "檢查數據", "#待審營養份量",
     "#待審餐點", "#待核換餐", "#查核換餐", "#取得換餐確認指令",
-    "#確認換餐已套用", "#確認換餐未套用", "#排餐鎖狀態"
+    "#確認換餐已套用", "#確認換餐未套用", "#排餐鎖狀態", "#營養師提醒"
 }
 ADMIN_ONLY_PREFIXES = (
     "@靜音 ", "@解除靜音 ", "#喚醒AI ", "#上傳點數\n", "#核准延餐 ", "#拒絕延餐 ",
@@ -2718,6 +2718,7 @@ PRIVILEGED_COMMAND_STEMS = (
     "#拒絕訂單", "#開通訂單", "#核准營養份量", "#待核換餐",
     "#查核換餐", "#取得換餐確認指令", "#確認換餐已套用", "#確認換餐未套用",
     "健康回報", "今日健康日報", "重新整理今日報告", "#排餐鎖狀態", "#解除排餐鎖",
+    "#營養師提醒",
 )
 PRIVILEGED_SHORT_COMMANDS = {"#教", "#管"}
 
@@ -3514,7 +3515,8 @@ async def lifespan(app: FastAPI):
     repair_staging_duplicate_dates_once()
     bootstrap_staging_reschedule_fixture_once()
     dedicated_health_check_trigger = _health_check_delivery_recovery_is_active()
-    if not ENABLE_SCHEDULER and not dedicated_health_check_trigger and not PLANNED_MEAL_AUTO_EATEN_ENABLED:
+    if (not ENABLE_SCHEDULER and not dedicated_health_check_trigger
+            and not PLANNED_MEAL_AUTO_EATEN_ENABLED and not DIETITIAN_ALERTS_ENABLED):
         print(f"⏸️ 自動定時器未啟動（APP_ENV={APP_ENV}）")
         yield
         return
@@ -3539,6 +3541,10 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(auto_mark_due_planned_meals, 'interval', minutes=5,
                           max_instances=1, coalesce=True)
         print("✅ 包月餐自動已吃：每 5 分鐘")
+    if DIETITIAN_ALERTS_ENABLED:
+        scheduler.add_job(send_dietitian_alerts, 'cron', hour=21, minute=0,
+                          max_instances=1, coalesce=True)
+        print("✅ 營養師提醒清單：每天 21:00（Asia/Taipei）")
 
     if ENABLE_SCHEDULER:
         try:
@@ -7870,6 +7876,91 @@ PLANNED_MEAL_AUTO_EATEN_ENABLED = (
     os.environ.get("PLANNED_MEAL_AUTO_EATEN_ENABLED", "").strip().lower() == "true"
 )
 _PLANNED_MEAL_COLUMNS = {"午餐": (2, 3, 4), "晚餐": (5, 6, 7)}
+
+DIETITIAN_ALERTS_ENABLED = (
+    os.environ.get("DIETITIAN_ALERTS_ENABLED", "false").strip().lower() == "true"
+)
+
+
+def _dietitian_alert_daily_totals(conn, user_id: str, day: str):
+    """與 今日總覽 相同來源與過濾的當日攝取 (cal, protein, logged)；未知營養回 None。"""
+    rows = _daily_food_rows(conn, user_id, day)
+    cal = pro = 0.0
+    cal_unknown = pro_unknown = False
+    counted = 0
+    for row in rows:
+        item = _ledger_item_from_row(conn, row)
+        if not item.get("is_nutrition_countable", True):
+            continue
+        if item.get("is_meal_photo_origin"):
+            if item.get("nutrition_authority") not in {
+                "approved_exchange", "user_confirmed_ai_nutrition_v2",
+            }:
+                continue
+        elif str(row[17] or "").strip():
+            continue
+        counted += 1
+        nutrition = item.get("nutrition") or {}
+        if nutrition.get("calories_kcal") is None:
+            cal_unknown = True
+        else:
+            cal += float(nutrition["calories_kcal"])
+        if nutrition.get("protein_g") is None:
+            pro_unknown = True
+        else:
+            pro += float(nutrition["protein_g"])
+    return (None if cal_unknown else cal, None if pro_unknown else pro, counted > 0)
+
+
+def _dietitian_alert_recipients() -> list:
+    """營養師 LINE UID：健檢工作台名單；否則找客服通知用的老闆 UID。"""
+    config = DIETITIAN_HEALTH_CHECK_CONFIG
+    uids = sorted(config.allowed_uids) if config.enabled else []
+    if not uids:
+        uids = sorted(DIETITIAN_HEALTH_CHECK_COMMAND_ALLOWED_UIDS)
+    if uids:
+        return uids
+    admin = str(get_admin_notify_uid() or "").strip()
+    print("ℹ️ 營養師提醒：未設定營養師 UID，改送老闆通知 UID")
+    return [admin] if admin else []
+
+
+def _dietitian_alerts_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        ensure_subscription_menu_entitlement_schema(conn)
+        from daily_health_report import ensure_daily_health_schema
+        ensure_daily_health_schema(conn)
+    except Exception as exc:
+        print(f"⚠️ 營養師提醒：schema 檢查失敗 {type(exc).__name__}")
+    return conn
+
+
+def send_dietitian_alerts(*, now=None) -> int:
+    """每日 21:00：推播一則營養師提醒清單；沒有人觸發就不送。回傳通知人數。"""
+    import dietitian_alerts
+
+    today = (now or tw_now()).date()
+    try:
+        with closing(_dietitian_alerts_conn()) as conn:
+            alerts = dietitian_alerts.compute_alerts(
+                conn, today, daily_totals=_dietitian_alert_daily_totals)
+            text = dietitian_alerts.format_message(alerts)
+            if not text:
+                return 0
+            sent = 0
+            for uid in _dietitian_alert_recipients():
+                try:
+                    line_bot_api.push_message(uid, TextSendMessage(text=text))
+                    sent += 1
+                except Exception as exc:
+                    print(f"⚠️ 營養師提醒推播失敗 {type(exc).__name__}")
+            if sent:
+                dietitian_alerts.record_sent(conn, alerts, today)
+            return len(alerts) if sent else 0
+    except Exception as exc:
+        print(f"⚠️ 營養師提醒失敗：{type(exc).__name__}: {exc}")
+        return 0
 
 
 def _planned_meal_number(value):
@@ -23805,6 +23896,20 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             return
         ok, result = update_subscription_order_status(int(order_id), "activated", uid)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+        return
+
+    elif msg == "#營養師提醒":
+        import dietitian_alerts
+        try:
+            with closing(_dietitian_alerts_conn()) as conn:
+                alerts = dietitian_alerts.compute_alerts(
+                    conn, tw_today(), daily_totals=_dietitian_alert_daily_totals,
+                    apply_dedup=False)
+            reply = dietitian_alerts.format_message(alerts) or "🩺 今日沒有需留意的包月顧客。"
+        except Exception as exc:
+            print(f"⚠️ #營養師提醒失敗：{type(exc).__name__}: {exc}")
+            reply = "⚠️ 營養師提醒計算失敗，請看伺服器日誌。"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     elif msg == "#排餐鎖狀態":
