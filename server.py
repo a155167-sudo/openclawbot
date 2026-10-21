@@ -43,6 +43,7 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from app_config import load_settings
+import first_batch_trial
 from dispatch_authority_bridge import import_initial_published_version
 from workbook_write_lease import (
     FULL_REQUIRED_WRITER_INVENTORY,
@@ -2688,7 +2689,8 @@ ADMIN_ONLY_EXACT_COMMANDS = {
     "#測試週報", "#測試晚報", "#生24", "#生48", "#延餐清單", "#待核訂單",
     "#清空熱量", "#刪除檔案", "#重置", "重置本週", "檢查數據", "#待審營養份量",
     "#待審餐點", "#待核換餐", "#查核換餐", "#取得換餐確認指令",
-    "#確認換餐已套用", "#確認換餐未套用", "#排餐鎖狀態", "#營養師提醒"
+    "#確認換餐已套用", "#確認換餐未套用", "#排餐鎖狀態", "#營養師提醒",
+    "#首批名額",
 }
 ADMIN_ONLY_PREFIXES = (
     "@靜音 ", "@解除靜音 ", "#喚醒AI ", "#上傳點數\n", "#核准延餐 ", "#拒絕延餐 ",
@@ -2718,7 +2720,7 @@ PRIVILEGED_COMMAND_STEMS = (
     "#拒絕訂單", "#開通訂單", "#核准營養份量", "#待核換餐",
     "#查核換餐", "#取得換餐確認指令", "#確認換餐已套用", "#確認換餐未套用",
     "健康回報", "今日健康日報", "重新整理今日報告", "#排餐鎖狀態", "#解除排餐鎖",
-    "#營養師提醒",
+    "#營養師提醒", "#首批名額",
 )
 PRIVILEGED_SHORT_COMMANDS = {"#教", "#管"}
 
@@ -3516,7 +3518,8 @@ async def lifespan(app: FastAPI):
     bootstrap_staging_reschedule_fixture_once()
     dedicated_health_check_trigger = _health_check_delivery_recovery_is_active()
     if (not ENABLE_SCHEDULER and not dedicated_health_check_trigger
-            and not PLANNED_MEAL_AUTO_EATEN_ENABLED and not DIETITIAN_ALERTS_ENABLED):
+            and not PLANNED_MEAL_AUTO_EATEN_ENABLED and not DIETITIAN_ALERTS_ENABLED
+            and not FIRST_BATCH_TRIAL_ENABLED):
         print(f"⏸️ 自動定時器未啟動（APP_ENV={APP_ENV}）")
         yield
         return
@@ -3545,6 +3548,10 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(send_dietitian_alerts, 'cron', hour=21, minute=0,
                           max_instances=1, coalesce=True)
         print("✅ 營養師提醒清單：每天 21:00（Asia/Taipei）")
+    if FIRST_BATCH_TRIAL_ENABLED:
+        scheduler.add_job(run_first_batch_payment_deadlines, 'interval', minutes=10,
+                          max_instances=1, coalesce=True)
+        print("✅ 包月首批付款期限：每 10 分鐘（週日 12:00 提醒、20:00 釋放名額）")
 
     if ENABLE_SCHEDULER:
         try:
@@ -5491,11 +5498,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                 safe_menu.append(dish)
 
         # 🔥 Phase 3: 計算起始日、訓練週期、4 週課表（移至此處供配餐使用）
-        today_start = tw_today()
-        days_ahead_start = 0 - today_start.weekday()
-        if days_ahead_start <= 0:
-            days_ahead_start += 7
-        start_date = today_start + timedelta(days=days_ahead_start)
+        # 下一個週一開始；週日 20:00（付款截止）後送出排到再下一個週一。
+        start_date = first_batch_trial.subscription_start_date(tw_now().replace(tzinfo=None))
 
         phase_name, weeks_to_race_val = calculate_training_phase(race_date)
         # ⚠️ generate_4week_plan 改為輕量呼叫：若 API 超時或失敗，使用 fallback 碳水邏輯
@@ -5772,6 +5776,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "raw_form_data": data,
         }
         order_id = create_pending_subscription_form_order(form_snapshot)
+        total_with_delivery = int(form_snapshot.get("total_with_delivery") or total_with_delivery)
+        first_batch_lines = format_first_batch_order_lines(form_snapshot)
         update_subscription_delivery_block(
             user_id,
             delivery_info.get("delivery_available") if is_delivery else True,
@@ -5794,6 +5800,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             f"🔥 TDEE: {int(tdee)} kcal\n"
             f"🥩 蛋白質目標: {int(protein)} g\n"
             f"💰 排餐金額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n"
+            f"{first_batch_lines}"
             f"🧾 本期預估總金額：${total_with_delivery}\n\n"
             "📌 下一步流程\n"
             "1️⃣ 客服確認餐數、取餐日期、外送費與最終金額\n"
@@ -7961,6 +7968,107 @@ def send_dietitian_alerts(*, now=None) -> int:
     except Exception as exc:
         print(f"⚠️ 營養師提醒失敗：{type(exc).__name__}: {exc}")
         return 0
+
+
+FIRST_BATCH_TRIAL_ENABLED = first_batch_trial.is_enabled()
+
+
+def _first_batch_push(uid: str, text: str) -> bool:
+    try:
+        line_bot_api.push_message(uid, TextSendMessage(text=text))
+        return True
+    except Exception as exc:
+        print(f"⚠️ 首批推播失敗 {type(exc).__name__}")
+        return False
+
+
+def run_first_batch_payment_deadlines(*, now=None) -> dict:
+    """每 10 分鐘：截止當天 12:00 提醒已核准未付款的首批客人；20:00 後逾期釋放名額。
+
+    只處理 first_batch=1 且 payment_deadline 有值的訂單；一般訂單不受影響。
+    """
+    now = (now or tw_now()).replace(tzinfo=None)
+    reminded, expired, admin_pending = [], [], []
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+            for order in first_batch_trial.due_reminders(conn, now):
+                if not first_batch_trial.mark_reminded(conn, order["id"], now):
+                    continue
+                conn.commit()
+                if order["status"] == "approved":
+                    deadline = first_batch_trial.format_deadline(order["payment_deadline"])
+                    _first_batch_push(order["user_id"], (
+                        f"⏰ 提醒：你的{FIRST_BATCH_TITLE}訂單 #{order['id']} 還沒完成付款\n\n"
+                        f"請在 {deadline} 前匯款，並回傳帳號末五碼或轉帳截圖，"
+                        "才能保留首批 9 折名額、明天準時開始。\n\n"
+                        f"{format_payment_info()}"
+                    ))
+                    reminded.append(order)
+                else:
+                    admin_pending.append(order)
+            for order in first_batch_trial.overdue(conn, now):
+                if order["status"] != "approved":
+                    # 還沒核准的單客人拿不到匯款資訊，不怪客人：保留名額，
+                    # 只在剛過期限的第一輪提醒管理員一次（工作每 10 分鐘跑）。
+                    deadline = datetime.strptime(order["payment_deadline"], first_batch_trial.DEADLINE_FORMAT)
+                    if now - deadline < timedelta(minutes=10):
+                        admin_pending.append(order)
+                    continue
+                if not first_batch_trial.expire(conn, order["id"], "approved", now):
+                    continue
+                conn.commit()
+                _first_batch_push(order["user_id"], (
+                    f"你的{FIRST_BATCH_TITLE}訂單 #{order['id']} 在付款期限前沒有收到付款，"
+                    "首批名額已先釋出給下一位。\n\n"
+                    "如果你其實已經匯款，直接回覆帳號末五碼，客服確認後會幫你恢復；"
+                    "想重新報名，也可以再點「包月方案」估價。"
+                ))
+                expired.append(order)
+    except sqlite3.Error as exc:
+        print(f"⚠️ 首批付款期限處理失敗：{type(exc).__name__}: {exc}")
+        return {"reminded": reminded, "expired": expired, "admin_pending": admin_pending}
+
+    lines = []
+    if reminded:
+        lines.append("⏰ 已提醒首批客人今晚 20:00 前付款：")
+        lines += [f"#{o['id']} {o['name'] or o['user_id'][-8:]}" for o in reminded]
+    if expired:
+        lines.append("🔓 付款期限已過，已自動取消並釋放首批名額：")
+        lines += [f"#{o['id']} {o['name'] or o['user_id'][-8:]}" for o in expired]
+        lines.append("（若客人其實已付款，直接 #開通訂單 編號 即可）")
+    if admin_pending:
+        lines.append("⚠️ 這些首批訂單還沒核准，客人收不到匯款資訊（名額先保留）：")
+        lines += [f"#{o['id']} {o['name'] or o['user_id'][-8:]}｜#核准訂單 {o['id']}" for o in admin_pending]
+    if lines:
+        try:
+            _first_batch_push(get_admin_notify_uid(), "🎟【首批付款期限】\n" + "\n".join(lines))
+        except Exception as exc:
+            print(f"⚠️ 首批管理員通知失敗 {type(exc).__name__}")
+    return {"reminded": reminded, "expired": expired, "admin_pending": admin_pending}
+
+
+FIRST_BATCH_STATUS_LABELS = {"pending": "待核准", "approved": "待付款", "activated": "已開通"}
+
+
+def build_first_batch_roster_text() -> str:
+    limit = first_batch_trial.seat_limit()
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            rows = first_batch_trial.roster(conn)
+            taken = first_batch_trial.seats_taken(conn)
+    except sqlite3.Error as exc:
+        print(f"⚠️ #首批名額失敗：{type(exc).__name__}")
+        return "⚠️ 首批名額查詢失敗，請看伺服器日誌。"
+    state = "開放中" if first_batch_trial.is_enabled() else "未開放（FIRST_BATCH_TRIAL_ENABLED 未開）"
+    lines = [f"🎟【{FIRST_BATCH_TITLE}】{state}", f"已佔 {taken}/{limit} 名，剩 {max(0, limit - taken)} 名"]
+    paid = sum(1 for r in rows if r["status"] == "activated")
+    lines.append(f"已開通 {paid} 人")
+    for r in rows:
+        deadline = first_batch_trial.format_deadline(r["payment_deadline"])
+        tail = f"｜期限 {deadline}" if deadline and r["status"] != "activated" else ""
+        lines.append(f"#{r['id']} {r['name'] or r['user_id'][-8:]}｜"
+                     f"{FIRST_BATCH_STATUS_LABELS.get(r['status'], r['status'])}｜-${r['discount']:,}{tail}")
+    return "\n".join(lines[:60])
 
 
 def _planned_meal_number(value):
@@ -11410,6 +11518,103 @@ def format_payment_info() -> str:
     )
 
 
+FIRST_BATCH_TITLE = "包月首批試跑"
+
+
+def get_first_batch_offer(uid: str) -> dict:
+    """首批名額狀態（只讀，不佔名額）；任何錯誤都當作沒有首批優惠。"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            return first_batch_trial.offer_for(conn, uid)
+    except sqlite3.Error as exc:
+        print(f"⚠️ 首批名額查詢失敗：{type(exc).__name__}")
+        return {"enabled": False, "eligible": False, "applies": False,
+                "seats_left": 0, "limit": 0, "holds_seat": False}
+
+
+def apply_first_batch_to_estimate(est: dict, offer: dict) -> dict:
+    """估價只顯示折扣，不佔名額；9 折只打餐費。"""
+    est["first_batch"] = bool(offer.get("applies"))
+    est["first_batch_seats_left"] = int(offer.get("seats_left") or 0)
+    est["first_batch_limit"] = int(offer.get("limit") or 0)
+    est["first_batch_full"] = bool(offer.get("enabled") and offer.get("eligible") and not offer.get("applies"))
+    if not est["first_batch"]:
+        return est
+    low = first_batch_trial.meal_discount(est["meal_low_total"])
+    high = first_batch_trial.meal_discount(est["meal_high_total"])
+    est["first_batch_discount_low"], est["first_batch_discount_high"] = low, high
+    est["meal_low_total_original"] = est["meal_low_total"]
+    est["meal_high_total_original"] = est["meal_high_total"]
+    est["meal_low_total"] -= low
+    est["meal_high_total"] -= high
+    est["quote_low_total"] -= low
+    est["quote_high_total"] -= high
+    return est
+
+
+def format_first_batch_estimate_line(est: dict) -> str:
+    if est.get("first_batch"):
+        low, high = est.get("first_batch_discount_low", 0), est.get("first_batch_discount_high", 0)
+        saved = f"${low:,}" if low == high else f"${low:,}～${high:,}"
+        return (f"🎟 {FIRST_BATCH_TITLE}：餐費已打 9 折（省 {saved}），"
+                f"目前剩 {est.get('first_batch_seats_left', 0)} 名")
+    if est.get("first_batch_full"):
+        return f"🎟 {FIRST_BATCH_TITLE} {est.get('first_batch_limit', 0)} 名已額滿，以下為原價"
+    return ""
+
+
+def format_first_batch_order_lines(snapshot: dict) -> str:
+    """表單送出後給客人的首批說明（含付款期限）；不是首批回空字串。"""
+    if not snapshot.get("first_batch"):
+        return ""
+    discount = int(snapshot.get("first_batch_discount") or 0)
+    deadline = first_batch_trial.format_deadline(snapshot.get("payment_deadline"))
+    lines = f"🎟 {FIRST_BATCH_TITLE}名額已保留：餐費 9 折 -${discount:,}\n"
+    if deadline:
+        lines += f"⏰ 請在 {deadline} 前完成付款，逾時名額會釋出給下一位\n"
+    return lines
+
+
+def _first_batch_order_info(order_id: int) -> dict:
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            return first_batch_trial.order_info(conn, order_id)
+    except sqlite3.Error:
+        return {"first_batch": False, "discount": 0, "payment_deadline": ""}
+
+
+def _first_batch_admin_line(order_id: int) -> str:
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            info = first_batch_trial.order_info(conn, order_id)
+            if not info["first_batch"]:
+                return ""
+            rank = first_batch_trial.seat_rank(conn, order_id)
+    except sqlite3.Error:
+        return ""
+    deadline = first_batch_trial.format_deadline(info["payment_deadline"])
+    line = (f"🎟 首批第 {rank}/{first_batch_trial.seat_limit()} 名｜"
+            f"餐費 9 折 -${info['discount']:,}（下方金額已折）\n")
+    if deadline:
+        line += f"⏰ 付款期限：{deadline}，逾時自動釋放名額\n"
+    return line
+
+
+def _first_batch_intro_contents(offer: dict) -> list:
+    if not offer.get("enabled") or not offer.get("eligible"):
+        return []
+    if offer.get("applies"):
+        sub = "首期餐費 9 折" + ("｜你的名額已保留" if offer.get("holds_seat") else f"｜目前剩 {offer.get('seats_left', 0)} 名")
+        return [{"type": "box", "layout": "vertical", "margin": "lg", "paddingAll": "12px",
+                 "backgroundColor": "#D96B2B", "cornerRadius": "12px", "contents": [
+                     {"type": "text", "text": f"🎟 {FIRST_BATCH_TITLE}｜限量 {offer.get('limit', 0)} 名",
+                      "weight": "bold", "size": "md", "color": "#FFFFFF", "wrap": True},
+                     {"type": "text", "text": sub, "size": "sm", "color": "#FFFFFF", "wrap": True, "margin": "xs"},
+                 ]}]
+    return [{"type": "text", "text": f"🎟 {FIRST_BATCH_TITLE} {offer.get('limit', 0)} 名已額滿，感謝支持！以下為一般方案。",
+             "size": "xs", "color": "#8A6A4F", "wrap": True, "margin": "lg"}]
+
+
 def get_line_display_name_safe(uid: str) -> str:
     """盡量用 LINE userId 抓顧客顯示名稱；失敗時回空字串，避免表單 webhook 中斷。"""
     if not uid:
@@ -11424,8 +11629,17 @@ def get_line_display_name_safe(uid: str) -> str:
 
 
 def build_subscription_intro_text(uid: str) -> str:
+    offer = get_first_batch_offer(uid)
+    first_batch = ""
+    if offer.get("enabled") and offer.get("eligible"):
+        if offer.get("applies"):
+            first_batch = (f"🎟 {FIRST_BATCH_TITLE}｜限量 {offer['limit']} 名\n"
+                           f"首期餐費 9 折，目前剩 {offer['seats_left']} 名\n\n")
+        else:
+            first_batch = f"🎟 {FIRST_BATCH_TITLE} {offer['limit']} 名已額滿，感謝支持！\n\n"
     return (
         "🍱 一日樂食 AI 包月計畫\n\n"
+        f"{first_batch}"
         "如果你常常覺得：\n\n"
         "「想吃健康一點，但不知道怎麼安排」\n"
         "「想減脂，但每天都要想吃什麼很累」\n"
@@ -11458,6 +11672,7 @@ def build_subscription_intro_flex(uid: str):
             "contents": [
                 {"type": "text", "text": "🍱 一日樂食 AI 包月計畫", "weight": "bold", "size": "xl", "color": "#7A3E16", "wrap": True},
                 {"type": "text", "text": "不用每天想吃什麼，也不用自己算熱量。", "size": "sm", "color": "#8A6A4F", "wrap": True, "margin": "sm"},
+                *_first_batch_intro_contents(get_first_batch_offer(uid)),
                 {"type": "separator", "margin": "lg", "color": "#E8D3B8"},
                 {"type": "text", "text": "如果你想吃健康一點、想減脂，或只是想把每天吃什麼變簡單，一日樂食會依照你的目標、用餐天數與取餐方式，協助安排適合的健康餐組合。", "size": "sm", "color": "#3F2F24", "wrap": True, "margin": "lg"},
                 {"type": "box", "layout": "vertical", "spacing": "xs", "margin": "lg", "paddingAll": "12px", "backgroundColor": "#FFFFFF", "cornerRadius": "12px", "contents": [
@@ -11610,7 +11825,7 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
     self_pickup_bonus_count = get_subscription_self_pickup_bonus(days_per_week) if pickup_method == "自取" else 0
     quote_low_total = meal_low_total + delivery_total
     quote_high_total = meal_high_total + delivery_total
-    return {
+    est = {
         "name": name,
         "address": address,
         "quote": quote,
@@ -11633,6 +11848,7 @@ def calculate_subscription_estimate(uid: str, meal_count: int, address: str = ""
         "meals_per_day": meals_per_day,
         "period_weeks": SUBSCRIPTION_PERIOD_WEEKS,
     }
+    return apply_first_batch_to_estimate(est, get_first_batch_offer(uid))
 
 
 def format_delivery_manual_review_note(q: dict) -> str:
@@ -11704,6 +11920,8 @@ def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> 
     else:
         pickup_label = pickup_method
         delivery_block = "📏 距離：自取不需測距\n🛵 外送費：自取無外送費\n\n"
+    first_batch_line = format_first_batch_estimate_line(est)
+    first_batch_line = f"{first_batch_line}\n" if first_batch_line else ""
     hint = ""
     if include_order_hint:
         hint = "\n\n價格可接受的話，請點「可以，建立包月資料」或回覆「我要填寫包月資料」。"
@@ -11715,6 +11933,7 @@ def format_subscription_estimate(est: dict, include_order_hint: bool = True) -> 
         f"📍 地址：{address if pickup_method == '外送' else '自取'}\n"
         f"{delivery_block}"
         f"餐費粗估：${est['meal_low_total']:,}～${est['meal_high_total']:,}\n"
+        f"{first_batch_line}"
         f"{bonus_line}"
         f"本期粗估合計：${est['quote_low_total']:,}～${est['quote_high_total']:,}\n\n"
         "備註：這是下單前粗估，實際金額會由客服依菜單、餐數、外送距離、優惠與付款方式最後確認。"
@@ -11770,6 +11989,12 @@ def build_subscription_estimate_flex(uid: str, est: dict):
     else:
         promo_text = ""
     promo_contents = [{"type": "text", "text": f"🎁 {promo_text}", "size": "sm", "color": "#D85A1B", "weight": "bold", "wrap": True, "margin": "xs"}] if promo_text else []
+    first_batch_text = format_first_batch_estimate_line(est)
+    if first_batch_text:
+        promo_contents.append({"type": "text", "text": first_batch_text, "size": "sm",
+                               "color": "#D85A1B" if est.get("first_batch") else "#6F7B72",
+                               "weight": "bold" if est.get("first_batch") else "regular",
+                               "wrap": True, "margin": "xs"})
     if delivery_pending_confirmation:
         price_contents = [
             {"type": "text", "text": f"餐費小計：${est['meal_low_total']:,}～${est['meal_high_total']:,}", "size": "sm", "color": "#24513A", "weight": "bold"},
@@ -11846,19 +12071,38 @@ def create_subscription_order(uid: str, est: dict):
     created_at = tw_now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(sqlite3.connect(DB_PATH)) as conn:
         _ensure_order_delivery_type_column(conn)
+        first_batch_trial.ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        is_first_batch = first_batch_trial.claim_seat(conn, uid)
+        if est.get("first_batch") and not is_first_batch:
+            # 估價時還有名額、下單時剛好額滿：恢復原價。
+            for key in ("meal_low_total", "quote_low_total"):
+                est[key] += int(est.get("first_batch_discount_low") or 0)
+            for key in ("meal_high_total", "quote_high_total"):
+                est[key] += int(est.get("first_batch_discount_high") or 0)
+            est["first_batch"] = False
+            est["first_batch_full"] = True
+        payment_deadline = ""
+        if is_first_batch:
+            start = first_batch_trial.subscription_start_date(tw_now().replace(tzinfo=None))
+            payment_deadline = first_batch_trial.payment_deadline_for(start).strftime(
+                first_batch_trial.DEADLINE_FORMAT)
         c = conn.cursor()
         c.execute("""
             INSERT INTO subscription_orders (
                 user_id, customer_name, meal_count, address, distance_text, delivery_fee, delivery_count,
                 meal_low_total, meal_high_total, delivery_total, quote_low_total, quote_high_total,
-                status, created_at, delivery_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                status, created_at, delivery_type, first_batch, first_batch_discount, payment_deadline
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
         """, (
             uid, est.get("name") or "", est["meal_count"], est.get("address") or "",
             est.get("quote", {}).get("distance_text") or "", est["delivery_fee"], est["delivery_count"],
             est["meal_low_total"], est["meal_high_total"], est["delivery_total"],
             est["quote_low_total"], est["quote_high_total"], created_at,
             normalize_delivery_type(est.get("delivery_type"), (est.get("pickup_method") or "外送") == "外送"),
+            1 if is_first_batch else 0,
+            int(est.get("first_batch_discount_high") or 0) if is_first_batch else 0,
+            payment_deadline,
         ))
         order_id = c.lastrowid
         conn.commit()
@@ -11875,6 +12119,7 @@ def notify_admin_new_subscription_order(order_id: int, uid: str, est: dict):
         f"距離：{est.get('quote', {}).get('distance_text') or 'NA'}\n"
         f"取餐類型：{DELIVERY_TYPE_LABELS[normalize_delivery_type(est.get('delivery_type'), (est.get('pickup_method') or '外送') == '外送')]}\n"
         f"單次外送費：{est['delivery_fee']}（原 {est.get('base_delivery_fee', est['delivery_fee'])}）\n"
+        f"{_first_batch_admin_line(order_id)}"
         f"粗估合計：${est['quote_low_total']:,}～${est['quote_high_total']:,}\n\n"
         f"核准：#核准訂單 {order_id}\n"
         f"拒絕：#拒絕訂單 {order_id} 原因\n"
@@ -11893,33 +12138,58 @@ def create_pending_subscription_form_order(snapshot: dict) -> int:
         raise ValueError("subscription delivery is not ready for pending order creation")
     created_at = snapshot.get("created_at") or tw_now().strftime("%Y-%m-%d %H:%M:%S")
     meal_count = len(snapshot.get("active_days_list") or []) * 2
-    quote_total = int(snapshot.get("total_with_delivery") or snapshot.get("total_price") or 0)
     delivery_info = snapshot.get("delivery_info") or {}
+    uid = snapshot.get("user_id") or ""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         _ensure_order_delivery_type_column(conn)
+        first_batch_trial.ensure_schema(conn)
+        # 首批名額：佔位判斷與寫入同一個交易，避免同時送出時超賣。
+        conn.execute("BEGIN IMMEDIATE")
+        is_first_batch = first_batch_trial.claim_seat(conn, uid)
+        meal_total = int(snapshot.get("total_price") or 0)
+        discount = first_batch_trial.meal_discount(meal_total) if is_first_batch else 0
+        payment_deadline = ""
+        if is_first_batch:
+            try:
+                start = date.fromisoformat(str(snapshot.get("start_date") or ""))
+                payment_deadline = first_batch_trial.payment_deadline_for(start).strftime(
+                    first_batch_trial.DEADLINE_FORMAT)
+            except ValueError:
+                payment_deadline = ""
+        # snapshot 是呼叫端的同一個 dict：表單回覆訊息會讀這些欄位顯示折扣後金額。
+        snapshot["first_batch"] = is_first_batch
+        snapshot["first_batch_discount"] = discount
+        snapshot["payment_deadline"] = payment_deadline
+        snapshot["total_with_delivery"] = meal_total - discount + int(snapshot.get("delivery_total_fee") or 0)
+        payable_meal_total = meal_total - discount
+        quote_total = int(snapshot["total_with_delivery"] or 0)
         c = conn.cursor()
         c.execute("""
             INSERT INTO subscription_orders (
                 user_id, customer_name, meal_count, address, distance_text, delivery_fee, delivery_count,
                 meal_low_total, meal_high_total, delivery_total, quote_low_total, quote_high_total,
-                status, created_at, form_payload_json, delivery_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                status, created_at, form_payload_json, delivery_type,
+                first_batch, first_batch_discount, payment_deadline
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
         """, (
-            snapshot.get("user_id") or "",
+            uid,
             snapshot.get("name") or "",
             meal_count,
             snapshot.get("address") or "",
             delivery_info.get("distance_text") or "",
             int(snapshot.get("delivery_fee_per_trip") or 0),
             int(snapshot.get("delivery_days_count") or 0),
-            int(snapshot.get("total_price") or 0),
-            int(snapshot.get("total_price") or 0),
+            payable_meal_total,
+            payable_meal_total,
             int(snapshot.get("delivery_total_fee") or 0),
             quote_total,
             quote_total,
             created_at,
             json.dumps(snapshot, ensure_ascii=False),
             normalize_delivery_type(snapshot.get("delivery_type"), bool(snapshot.get("is_delivery"))),
+            1 if is_first_batch else 0,
+            discount,
+            payment_deadline,
         ))
         order_id = c.lastrowid
         conn.commit()
@@ -12025,18 +12295,24 @@ def build_subscription_order_status_message(uid: str):
         return None
 
     order_id, status = row
+    fb = _first_batch_order_info(order_id)
+    deadline = first_batch_trial.format_deadline(fb["payment_deadline"]) if fb["first_batch"] else ""
     if status == "approved":
         text = (
             f"✅ 包月資料已核准（訂單 #{order_id}）\n\n"
             "目前待付款／付款確認；尚未正式開通，也還不能查看本期菜單。\n"
             "若已完成付款，請把帳號末五碼或轉帳截圖傳給客服確認。"
         )
+        if deadline:
+            text += f"\n\n🎟 首批 9 折名額保留到 {deadline}，請在這之前完成付款。"
     else:
         text = (
             f"📝 包月資料已收到（訂單 #{order_id}）\n\n"
             "目前待客服確認餐數、取餐日期與最終金額。\n"
             "尚未正式開通，也不需要重新填寫表單。"
         )
+        if fb["first_batch"]:
+            text += "\n\n🎟 你的首批 9 折名額已保留。"
     return TextSendMessage(
         text=text,
         quick_reply=QuickReply(items=[
@@ -12063,6 +12339,7 @@ def notify_admin_pending_subscription_form(order_id: int, snapshot: dict):
         f"單次外送費：${int(snapshot.get('delivery_fee_per_trip') or 0)}\n"
         f"配送天數：{snapshot.get('delivery_days_count') if snapshot.get('is_delivery') else '自取'}\n"
         f"排餐金額：${int(snapshot.get('total_price') or 0)}\n"
+        f"{_first_batch_admin_line(order_id)}"
         f"本期預估總金額：${int(snapshot.get('total_with_delivery') or 0)}\n"
         f"{delivery_review_line}\n\n"
         f"核准並發送匯款資訊：#核准訂單 {order_id}\n"
@@ -12756,12 +13033,24 @@ def update_subscription_order_status(order_id: int, status: str, admin_uid: str,
         oid, user_id, customer_name, meal_count, low_total, high_total, old_status, form_payload_json, formalized_at = row
         if status == "approved":
             c.execute("UPDATE subscription_orders SET status='approved', approved_at=?, approved_by=?, admin_note=? WHERE id=?", (now, admin_uid, note, order_id))
+            fb = first_batch_trial.order_info(conn, order_id)
+            if fb["first_batch"] and old_status == first_batch_trial.EXPIRED_STATUS:
+                # 管理員手動把逾期單救回來：不再自動逾期。
+                c.execute("UPDATE subscription_orders SET payment_deadline='' WHERE id=?", (order_id,))
+                fb["payment_deadline"] = ""
             amount_text = f"${low_total:,}" if int(low_total or 0) == int(high_total or 0) else f"${low_total:,}～${high_total:,}"
+            first_batch_text = ""
+            if fb["first_batch"]:
+                first_batch_text = f"🎟 {FIRST_BATCH_TITLE}：餐費已打 9 折（省 ${fb['discount']:,}）\n"
+                deadline = first_batch_trial.format_deadline(fb["payment_deadline"])
+                if deadline:
+                    first_batch_text += f"⏰ 付款期限：{deadline}，逾時首批名額會釋出\n"
             customer_msg = (
                 f"✅ 您的一日樂食包月訂單 #{order_id} 已確認！\n"
                 f"姓名：{customer_name or '未填'}\n"
                 f"餐數：{meal_count} 餐\n"
-                f"本期應匯款金額：{amount_text}\n\n"
+                f"本期應匯款金額：{amount_text}\n"
+                f"{first_batch_text}\n"
                 f"{format_payment_info()}\n\n"
                 "匯款完成後，請直接回傳匯款帳號末五碼，或傳送匯款截圖給客服確認。\n"
                 "付款確認後，我們會正式開通包月與 AI 營養管理。"
@@ -23910,6 +24199,10 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             print(f"⚠️ #營養師提醒失敗：{type(exc).__name__}: {exc}")
             reply = "⚠️ 營養師提醒計算失敗，請看伺服器日誌。"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    elif msg == "#首批名額":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_first_batch_roster_text()))
         return
 
     elif msg == "#排餐鎖狀態":
