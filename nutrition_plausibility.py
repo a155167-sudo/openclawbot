@@ -15,15 +15,18 @@ _FIELDS = ("calories_kcal", "protein_g", "fat_g", "carbohydrate_g")
 # product's true composition.  Exact catalog matches bypass this AI-only guard.
 _CATEGORY_POLICIES = (
     ("豆漿類", ("豆漿",), Decimal("25"), Decimal("60")),
-    ("乳品飲料類", ("牛奶", "鮮奶", "乳飲", "優酪乳", "優格"), Decimal("25"), Decimal("150")),
+    ("乳品飲料類", ("牛奶", "鮮奶", "乳飲", "優酪乳", "優格", "養樂多"), Decimal("25"), Decimal("150")),
     ("油脂類", ("食用油", "橄欖油", "沙拉油", "奶油", "豬油"), Decimal("500"), Decimal("950")),
-    ("蛋類", ("雞蛋", "水煮蛋", "蛋白", "蛋黃", "煎蛋", "荷包蛋"), Decimal("40"), Decimal("400")),
+    ("蛋類", ("雞蛋", "水煮蛋", "蛋白", "蛋黃", "煎蛋", "荷包蛋", "茶葉蛋", "滷蛋"), Decimal("40"), Decimal("400")),
     ("肉魚海鮮類", ("雞胸", "雞肉", "豬肉", "牛肉", "羊肉", "魚", "蝦", "蛤", "鮪魚", "鮭魚"), Decimal("30"), Decimal("500")),
     ("主食澱粉類", ("白飯", "米飯", "糙米", "麵", "吐司", "麵包", "燕麥", "地瓜", "馬鈴薯"), Decimal("20"), Decimal("500")),
     ("豆製品類", ("豆腐", "豆干", "毛豆", "黃豆"), Decimal("20"), Decimal("500")),
     ("蔬菜菇類", ("菜", "花椰", "菠菜", "菇", "番茄", "小黃瓜", "南瓜"), Decimal("3"), Decimal("250")),
     ("水果類", ("蘋果", "香蕉", "芭樂", "水果", "橘", "柳丁", "葡萄", "莓", "西瓜"), Decimal("5"), Decimal("250")),
-    ("飲料類", ("果汁", "茶飲", "汽水", "可樂", "咖啡"), Decimal("0"), Decimal("200")),
+    # 台灣手搖／超商飲料多半叫「XX茶」「XX拿鐵」「XX汁」；只寫「果汁」「茶飲」會把珍奶、綠茶、
+    # 拿鐵、柳橙汁全部擋成「類別不明」。上限 200 kcal/100 ml 仍能擋下把飲料估成正餐的錯誤。
+    ("飲料類", ("飲料", "果汁", "汁", "茶", "汽水", "可樂", "咖啡", "拿鐵", "可可", "多多",
+              "冰沙", "奶昔", "氣泡水", "運動飲"), Decimal("0"), Decimal("200")),
     # Last on purpose: only names no specific category claimed.  Typical Taiwan
     # 外食 mixed dishes (rice + meat + vegetables + sauce) sit around 120–250
     # kcal/100 g; 60–300 allows fried items yet withholds clear
