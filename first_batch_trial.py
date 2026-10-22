@@ -245,3 +245,13 @@ def roster(conn) -> list[dict]:
     return [{"id": r[0], "user_id": r[1], "name": r[2] or "", "status": r[3],
              "discount": int(r[4] or 0), "payment_deadline": r[5] or "", "created_at": r[6] or ""}
             for r in rows]
+
+
+def public_status(conn) -> dict:
+    """公開頁面用：只回開放狀態與名額數字，不含任何客人資料。"""
+    limit = seat_limit()
+    if not is_enabled() or limit <= 0:
+        return {"enabled": False, "limit": limit, "taken": 0, "left": 0}
+    ensure_schema(conn)
+    taken = min(limit, seats_taken(conn))
+    return {"enabled": True, "limit": limit, "taken": taken, "left": max(0, limit - taken)}

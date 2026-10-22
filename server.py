@@ -3642,6 +3642,21 @@ elif CUSTOMER_RESCHEDULE_LIFF_ENABLED:
     )
 
 
+import plan_landing
+
+plan_landing.register_plan_landing_routes(
+    app,
+    db_path_getter=lambda: DB_PATH,
+    page_context=lambda: {
+        "meal_low": SUBSCRIPTION_MEAL_LOW,
+        "meal_high": SUBSCRIPTION_MEAL_HIGH,
+        "fee_tiers": DELIVERY_FEE_TIERS,
+        "period_weeks": SUBSCRIPTION_PERIOD_WEEKS,
+        "store_address": STORE_ADDRESS,
+    },
+)
+
+
 @app.get("/health")
 def health_check():
     try:
