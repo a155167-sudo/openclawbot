@@ -29,7 +29,7 @@ DISHES = (
     ("couscous.jpg", "北非小米沙拉（本週特餐）"),
     ("pork.jpg", "豬肉沙拉"),
     ("fish.jpg", "鱸魚食蔬"),
-    ("chicken.jpg", "雞肉食蔬"),
+    ("chicken.jpg", "雞肉低碳"),
 )
 
 
@@ -190,6 +190,10 @@ section { padding-block: 64px; }
 .act { text-align: right; font-size: 12px; color: var(--green); text-decoration: underline; }
 .ai-note { font-size: 10px; color: #6B5A2A; }
 
+.photo-msg { margin-left: auto; width: 62%; aspect-ratio: 4 / 3; border-radius: 16px; background: #D9C9A8;
+  display: grid; place-items: center; align-content: center; gap: 4px; color: var(--char); font-size: 13px; font-weight: 700; }
+.photo-msg span { font-size: 28px; }
+.est .src { font-size: 11px; color: #777777; }
 .est { background: var(--card); border-radius: 16px; padding: 12px 14px; font-size: 14px; color: var(--teal); max-width: 90%; display: grid; gap: 4px; }
 .est b { font-size: 16px; }
 .est .btn { margin-top: 6px; background: var(--green); color: var(--paper); border-radius: 10px; text-align: center; padding: 6px; font-weight: 700; }
@@ -295,10 +299,10 @@ _DASH_MOCK = """
 </div>"""
 
 _CHAT_MOCK = """
-<div class="chat" role="img" aria-label="外食記錄畫面示意：傳排骨飯，回覆估算的熱量與蛋白質">
-  <div class="bubble me">排骨飯</div>
-  <div class="est"><span>排骨飯（一般份量估算）</span><b>約 820 kcal・蛋白質 33 g</b>
-    <span>沒寫克數就用一般份量估，有寫克數會照你寫的算。</span><div class="btn">確認記錄</div></div>
+<div class="chat" role="img" aria-label="外食拍照記錄畫面示意：傳一張排骨飯照片，回覆估算的熱量與蛋白質">
+  <div class="photo-msg"><span>📷</span>排骨飯的照片</div>
+  <div class="est"><span>排骨飯</span><b>約 820 kcal・蛋白質 33 g</b>
+    <span class="src">來源：AI 照片估算</span><div class="btn">確認記錄</div></div>
 </div>"""
 
 
@@ -337,10 +341,10 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>一日樂食包月｜四週午晚餐幫你排好</title>
-<meta name="description" content="依你的目標排好四週午晚餐，每天在 LINE 點一下就記好，營養師看過你的三日飲食。">
-<meta property="og:title" content="一日樂食包月｜不用想吃什麼，也不用算熱量">
-<meta property="og:description" content="依你的目標排好四週午晚餐，每天在 LINE 點一下就記好。">
+<title>一日樂食包月｜拍照幫你算熱量</title>
+<meta name="description" content="包月便當依你的目標排好四週，外面吃的拍張照就幫你算熱量，營養師看過你的三日飲食。">
+<meta property="og:title" content="一日樂食包月｜不用想吃什麼，拍照幫你算熱量">
+<meta property="og:description" content="包月便當依你的目標排好四週，外面吃的拍張照就幫你算熱量。">
 <meta property="og:image" content="/plan/assets/salmon.jpg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -353,8 +357,8 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
     <div class="brand">一日樂食 <small>Deli Express</small></div>
     <div class="hero-grid">
       <div>
-        <h1>不用想吃什麼，<br>也不用算熱量。</h1>
-        <p class="lede">依你的目標排好四週午晚餐，每天在 LINE 點一下就記好，營養師還會看過你三天的飲食。</p>
+        <h1>不用想吃什麼，<br>拍照幫你算熱量。</h1>
+        <p class="lede">包月便當依你的目標排好四週午晚餐；外面吃的拍張照，熱量和蛋白質幫你算好。</p>
         {_seat_block(status)}
         <a class="cta" href="{start}"><span class="line-badge">LINE</span>用 LINE 估價</a>
         <p class="cta-hint">會打開 LINE 並帶入「包月方案」，按送出就能開始估價。</p>
@@ -394,8 +398,8 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
         <p><span class="tag">畫面示意</span></p>
       </div>
       <div class="scene">
-        <h3>外面吃的：傳一句話就好</h3>
-        <p>傳「排骨飯」或拍照，系統幫你估熱量和蛋白質，確認後一起算進今天。</p>
+        <h3>外面吃的：拍張照就好</h3>
+        <p>拍照或傳一句「排骨飯」，系統幫你估熱量和蛋白質，你按確認才會記錄。</p>
         <div class="phone">{_CHAT_MOCK}</div>
         <p><span class="tag">畫面示意</span></p>
       </div>
@@ -406,10 +410,10 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <section class="rd" style="background:var(--butter)">
   <div class="wrap">
     <h2>AI 先整理，營養師看過才給你</h2>
-    <p class="lead">包月包含一次三日飲食健檢。報告由合作營養師逐條看過、需要時修改，確認後才會送到你的 LINE。</p>
+    <p class="lead">第一次訂包月，包含一次三日飲食健檢。報告由合作營養師逐條看過、需要時修改，確認後才會送到你的 LINE。</p>
     <div class="rd-grid">
       <ol class="timeline">
-        <li><span class="n">1</span><div><h3>照常吃三天</h3><p>包月餐點「吃了」，外食傳給我們，不用多做什麼。</p></div></li>
+        <li><span class="n">1</span><div><h3>照常吃三天</h3><p>包月餐點「吃了」，外食拍照傳上來，不用多做什麼。</p></div></li>
         <li><span class="n">2</span><div><h3>AI 整理成報告草稿</h3><p>三天吃了多少、蛋白質夠不夠、哪一餐最容易失衡。</p></div></li>
         <li class="rd"><span class="n">3</span><div><h3>營養師逐條看過</h3><p>不對的地方修改，確認沒問題才核准。</p></div></li>
         <li><span class="n">4</span><div><h3>你在 LINE 收到建議</h3><p>接下來 7 天可以怎麼調整，具體到吃什麼。</p></div></li>
@@ -481,7 +485,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
       <details class="q"><summary>什麼時候開始？</summary><p>每期四週，從下週一開始。週日晚上 8 點以後報名，會排到再下一個週一。</p></details>
       <details class="q"><summary>什麼時候要付款？</summary><p>開始前的週日晚上 8 點以前完成匯款。首批名額逾時沒付款，會釋出給下一位。</p></details>
       <details class="q"><summary>某一餐沒吃怎麼辦？</summary><p>在今日總覽點「沒吃」就好，當天晚上 11:59 前都能改。</p></details>
-      <details class="q"><summary>營養師健檢要另外付錢嗎？</summary><p>包月包含一次三日飲食健檢，不用另外付費。之後想請營養師持續追蹤，才需要加購。</p></details>
+      <details class="q"><summary>營養師健檢要另外付錢嗎？</summary><p>第一次訂包月時包含一次三日飲食健檢，不用另外付費。之後想請營養師持續追蹤，才需要加購。</p></details>
       <details class="q"><summary>我有不吃的食物</summary><p>填包月資料時寫上，排餐會避開。</p></details>
       <details class="q"><summary>首批 9 折怎麼算？</summary><p>只打餐費，運費不折；適用第一期，續約恢復一般價格。限第一次訂包月的朋友。</p></details>
     </div>

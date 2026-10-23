@@ -104,7 +104,7 @@ def test_non_vip_owned_self_pickup_sequence_renders_real_estimate_flex(monkeypat
     assert "包月粗估結果" in rendered
     assert "自取" in rendered
     assert "外送費：$0" in rendered
-    assert "本期合計：約 $4,080～$5,280" in rendered
+    assert "本期合計：約 $3,360～$5,280" in rendered
     assert "可以，建立包月資料" in rendered
     payload = replies[-1].as_json_dict()
     form_uri = next(
@@ -265,7 +265,7 @@ def test_registered_known_delivery_quote_keeps_checkout_total_and_cta(
     assert "約 11:30–12:00 送達" in rendered
     assert "晚鳥" not in rendered
     assert "外送 12 趟，外送費小計 $420" in rendered
-    assert "本期合計：約 $4,500～$5,700" in rendered
+    assert "本期合計：約 $3,780～$5,700" in rendered
     assert "折抵" not in rendered  # 四週外送費折抵已取消（順風車「再折」文案除外）
     assert "可以，建立包月資料" in rendered
     payload = replies[-1].as_json_dict()
@@ -323,7 +323,7 @@ def test_registered_delivery_quote_with_unknown_maps_result_is_not_checkout_read
     assert map_calls == [address]
     assert len(replies) == 4
     rendered = json.dumps(replies[-1].as_json_dict(), ensure_ascii=False)
-    assert "餐費小計：$4,080～$5,280" in rendered
+    assert "餐費小計：$3,360～$5,280" in rendered
     assert "外送費：待客服確認" in rendered
     assert "外送費：$0" not in rendered
     assert "本期合計" not in rendered
@@ -389,7 +389,7 @@ def test_registered_vip_raw_order_with_unknown_maps_result_does_not_create_order
     assert len(replies) == 1
     reply_text = replies[0].text
     assert "外送費需客服確認" in reply_text
-    assert "餐費粗估：$4,080～$5,280" in reply_text
+    assert "餐費粗估：$3,360～$5,280" in reply_text
     assert "外送費粗估：$0" not in reply_text
     assert "本期粗估合計" not in reply_text
     assert "已收到您的包月訂單" not in reply_text
@@ -432,7 +432,7 @@ def test_registered_vip_raw_estimate_with_unknown_maps_result_is_manual_only(mon
     assert created == []
     assert len(replies) == 1
     assert "外送費需客服確認" in replies[0]
-    assert "餐費粗估：$4,080～$5,280" in replies[0]
+    assert "餐費粗估：$3,360～$5,280" in replies[0]
     assert "$0" not in replies[0]
     assert "本期粗估合計" not in replies[0]
     assert "建立包月資料" not in replies[0]
@@ -485,7 +485,7 @@ def test_registered_vip_raw_order_with_known_delivery_still_creates_order(monkey
     assert "已收到您的包月訂單 #999" in replies[0]
     assert "運費 $35／趟" in replies[0]
     assert "外送 24 趟，外送費小計 $840" in replies[0]
-    assert "本期粗估合計：$4,920～$6,120" in replies[0]
+    assert "本期粗估合計：$4,200～$6,120" in replies[0]
 
 
 @pytest.mark.parametrize("delivery_available", [None, False], ids=["unknown", "out-of-range"])
