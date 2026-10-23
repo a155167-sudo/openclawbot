@@ -11300,7 +11300,7 @@ def parse_subscription_order_message(msg: str):
 
 
 SUBSCRIPTION_PERIOD_WEEKS = 4
-SUBSCRIPTION_MEAL_LOW = 170
+SUBSCRIPTION_MEAL_LOW = 140  # 包月一餐最低價（Jason 2026-10-23）
 SUBSCRIPTION_MEAL_HIGH = 220
 
 # 外送距離分級：(距離上限 meters, 每趟原運費, delivery_zone)；超過最後一級 = 不提供外送。

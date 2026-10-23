@@ -114,12 +114,12 @@ def test_five_day_2_1_km_quote_charges_late_bird_without_discount(monkeypatch):
     assert "🐦 晚鳥半價 → $25／趟" in text
     assert "🕐 每天 13:00–14:00 送達（不指定時間）" in text
     assert "外送 20 趟，外送費小計 $500" in text
-    assert "本期粗估合計：$7,300～$9,300" in text
+    assert "本期粗估合計：$6,100～$9,300" in text
 
     flex = json.dumps(server.build_subscription_estimate_flex("U_LB_5D", est).as_json_dict(), ensure_ascii=False)
     assert "🐦 晚鳥半價 → $25／趟" in flex
     assert "外送 20 趟，外送費小計 $500" in flex
-    assert "本期合計：約 $7,300～$9,300" in flex
+    assert "本期合計：約 $6,100～$9,300" in flex
 
 
 def test_persisted_quote_row_stores_charged_late_bird_fee(monkeypatch, tmp_path):

@@ -31,7 +31,7 @@ def test_page_shows_live_seats_and_line_cta(client, monkeypatch):
         assert "還剩 <b>13</b> 名" in r.text
         assert r.text.count('class="dot taken"') == 2
         assert "https://line.me/R/oaMessage/%40a25080337/?%E5%8C%85%E6%9C%88%E6%96%B9%E6%A1%88" in r.text
-        assert "$170" in r.text and "$220" in r.text
+        assert "$140" in r.text and "$220" in r.text
 
 
 def test_page_hides_seats_when_trial_off(client, monkeypatch):
