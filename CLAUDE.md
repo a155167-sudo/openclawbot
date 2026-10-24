@@ -50,11 +50,13 @@ Jason（老闆）用中文溝通，回覆一律用中文、口語、先講結論
 - **包月開始日**：下一個週一；週日 20:00 後送出排到再下一個週一。
 - **包月介紹頁**（`plan_landing.py`）：`/` 與 `/plan` 一頁式介紹，所有按鈕導回 LINE（`@a25080337`，帶入「包月方案」）；首批名額即時讀 DB，`/api/first-batch/seats` 只回數字。照片在 `static/plan/`（白名單）。預計綁 Cloudflare 網域 deliexpress-ai.com。
 - **包月一餐價格區間** $140–220（`SUBSCRIPTION_MEAL_LOW/HIGH`，估價與介紹頁共用）。三日健檢**每人一次**（第一次訂包月）。
+- **南京店健檢設定（2026-10-24）**：LINE Login 頻道「一日樂食(南京店)」`1654353734`。營養師工作台 LIFF `1654353734-ymoTnGmL` 已開（`DIETITIAN_HEALTH_CHECK_*`，名單目前只有 Jason）；顧客健檢 LIFF `1654353734-uPVw5UvX` 已建但**還沒開**（`VIP_HEALTH_CHECK_LIFF_ID`／`_LINE_LOGIN_CHANNEL_ID`／`VIP_HEALTH_CHECK_ENABLED` 未設），開之前要確認南京店改期 LIFF 也在同一頻道（程式要求）。營養師加名單：她在南京店傳「營養師報到」，UID 會推給老闆；`DIETITIAN_HEALTH_CHECK_ALLOWED_UIDS` 與 `_COMMAND_ALLOWED_UIDS` 必須一致（逗號分隔）。
 - 非 VIP 問營養問題不回應（只有包月方案介紹、我的方案、找客服、估價、開通）。
 
 ## 待辦
 
-- 營養師加南京店好友、傳「營養師報到」後，把她的 UID 設為提醒收件人（目前推給老闆）。
+- 營養師加南京店好友、傳「營養師報到」後，把她的 UID 加進兩個 ALLOWED_UIDS（提醒清單也會改送她）。
+- 健檢全流程（記三天→AI 草稿→營養師核准→客人收到）還沒實測過；首批開跑前要在電腦營養跑通，再開南京店顧客健檢。
 - 圖文選單：先用通用一套，下排「包月方案｜(名稱未定)｜記錄飲食」；系統認得「首頁／今日進度／我的狀態」可開今日總覽。之後人多再做 VIP 專屬選單（Messaging API per-user rich menu）。
 - 包月續約優惠（建議：提早續約送三日健檢、續約提醒附本期成果）。
 - 改期期限規則；草稿／紀錄卡來源文字統一；非管理員改期頁不應呼叫管理員 API。
