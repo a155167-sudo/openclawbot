@@ -2978,6 +2978,35 @@ SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
 # ==========================================
 # 🔑 功能一：老闆 LINE UID（靜音指令專用）
 # ==========================================
+DIETITIAN_CHECKIN_TEXTS = {"營養師報到", "#營養師報到"}
+DIETITIAN_CHECKIN_COOLDOWN_SECONDS = 600
+_dietitian_checkin_last: dict[str, float] = {}
+
+
+def handle_dietitian_checkin(event, user_id: str) -> None:
+    """營養師（或老闆）傳「營養師報到」：把自己的 LINE UID 推給老闆，供設定健檢工作台權限。
+
+    只回報傳訊者自己的 UID；同一人 10 分鐘內只通知一次，避免洗版。
+    """
+    now = time.time()
+    if now - _dietitian_checkin_last.get(user_id, 0) < DIETITIAN_CHECKIN_COOLDOWN_SECONDS:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="✅ 已經收到你的報到了，老闆設定好之後就能使用營養師工作台。"))
+        return
+    _dietitian_checkin_last[user_id] = now
+    name = get_line_display_name_safe(user_id) or "（抓不到名稱）"
+    try:
+        line_bot_api.push_message(get_admin_notify_uid(), TextSendMessage(text=(
+            "🩺【營養師報到】\n"
+            f"LINE 名稱：{name}\n"
+            f"UID：{user_id}\n\n"
+            "把這串 UID 交給 Claude，加進營養師工作台權限名單。")))
+    except Exception as exc:
+        print(f"⚠️ 營養師報到通知失敗 {type(exc).__name__}")
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text="✅ 已收到報到，已通知老闆。設定好之後，傳「#營養師健檢」就能打開營養師工作台。"))
+
+
 def get_admin_notify_uid():
     """回傳管理通知目的地；僅通知用途可在讀取失敗時使用預設值。"""
     try:
@@ -24788,6 +24817,9 @@ def handle_message(event):
                 line_bot_api.reply_message(event.reply_token, preview)
             return
         if _handle_registered_pair_reschedule(event, raw_message):
+            return
+        if message in DIETITIAN_CHECKIN_TEXTS:
+            handle_dietitian_checkin(event, user_id)
             return
         if is_dietitian_health_check_command_intent(raw_message):
             if not DIETITIAN_HEALTH_CHECK_CONFIG.enabled:
