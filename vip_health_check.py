@@ -623,8 +623,11 @@ def _preflight_rebuild_contracts(conn: sqlite3.Connection) -> set[str]:
         "vip_health_check_reviews", "vip_health_check_reports",
         "vip_health_check_deliveries", "vip_health_check_audit_log",
     }
+    # approval_operations 是營養師第一次核准時由 dietitian_health_check_approval 建立的
+    # 冪等紀錄表（自己驗證結構）；漏列會讓第一次核准後的下一次重啟直接失敗。
+    optional_vip_tables = {"vip_health_check_notifications", "vip_health_check_approval_operations"}
     if not expected_vip_tables.issubset(actual_vip_tables) or not actual_vip_tables <= (
-        expected_vip_tables | {"vip_health_check_notifications"}
+        expected_vip_tables | optional_vip_tables
     ):
         raise sqlite3.IntegrityError("unsupported VIP health-check table set before rebuild")
     if "vip_health_check_notifications" in actual_vip_tables:
