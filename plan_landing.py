@@ -410,12 +410,12 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <section class="rd" style="background:var(--butter)">
   <div class="wrap">
     <h2>營養師親自看過你的三天</h2>
-    <p class="lead">第一次訂包月，包含一次三日飲食健檢。系統先把三天的熱量和蛋白質整理好，合作營養師看過、寫好建議，確認後才送到你的 LINE。</p>
+    <p class="lead">第一次訂包月，包含一次三日飲食健檢。AI 先整理三天的紀錄、擬好建議，合作營養師逐條看過、修改，確認後才送到你的 LINE。</p>
     <div class="rd-grid">
       <ol class="timeline">
         <li><span class="n">1</span><div><h3>照常吃三天</h3><p>包月餐點「吃了」，外食拍照傳上來，不用多做什麼。</p></div></li>
-        <li><span class="n">2</span><div><h3>系統整理數據</h3><p>三天吃了多少、熱量和蛋白質離目標差多少。</p></div></li>
-        <li class="rd"><span class="n">3</span><div><h3>營養師看過、寫建議</h3><p>依你的目標和飲食習慣寫出具體建議，確認後才核准。</p></div></li>
+        <li><span class="n">2</span><div><h3>AI 整理、擬建議</h3><p>三天吃了多少、離目標差多少，先擬好建議草稿。</p></div></li>
+        <li class="rd"><span class="n">3</span><div><h3>營養師看過、修改</h3><p>依你的目標和飲食習慣調整建議，確認後才核准。</p></div></li>
         <li><span class="n">4</span><div><h3>你在 LINE 收到建議</h3><p>接下來 7 天可以怎麼調整，具體到吃什麼。</p></div></li>
       </ol>
       <div class="report" aria-label="營養師三日飲食健檢報告範例">

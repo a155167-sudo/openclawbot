@@ -44,7 +44,7 @@ def _html() -> str:
 <section id="mealTimeline" class="panel"><h2>三天餐點紀錄</h2><p class="meta">按需讀取受保護照片；切換日期或離開案件會立即清除。</p><div id="timelineTabs" class="timeline-tabs" role="tablist" aria-label="餐點日期"></div><div id="timelineDays"></div><section id="legacySources" hidden><h3>日期／餐別尚無可驗證資料</h3><p class="meta">保留既有未綁定來源；不借用其他日期推斷。</p><ul id="sourceLogs" class="days"></ul></section></section>
 <section id="aiSummary" class="panel"><h2>系統初步整理</h2><div id="latestReview" class="ai-box"></div><p class="meta">只整理可驗證來源；不是 AI 推論，也不是已儲存或可送出的報告。</p></section>
 <section id="dataLimitations" class="panel"><h2>資料限制</h2><div id="limitations" class="limitation"></div></section></div>
-<aside id="reviewPane"><section id="draftEditor" class="panel"><h2>營養師最後審核</h2><p class="meta">四欄文字沿用版本控管草稿；鎖版尚未送達，核准不等於送達。</p><button id="applySystemDraft" type="button">帶入系統初稿</button><p id="systemDraftHint" class="meta">只帶入資料觀察供編輯，不會自動儲存或送出；個人點評保留人工撰寫。</p><label class="draft-field"><span>做得好的地方</span><textarea id="good" maxlength="4000"></textarea></label><label class="draft-field"><span>目前優先事項</span><textarea id="priority" maxlength="4000"></textarea></label><label class="draft-field"><span>接下來 7 天</span><textarea id="next_7_days" maxlength="4000"></textarea></label><label class="draft-field"><span>營養師個人點評</span><textarea id="comment" maxlength="4000"></textarea></label><p id="draftState" role="status"></p><p id="draftError" class="error" role="alert"></p><p id="approvalState" role="status"></p><p id="approvalError" class="error" role="alert"></p><details id="supplementEditor"><summary>補件內容</summary><p id="supplementState" role="status"></p><div id="supplementControls"><label class="draft-field"><span>補件理由</span><textarea id="supplementReason" maxlength="1000"></textarea></label><label class="draft-field"><span>需要補充的內容</span><textarea id="supplementRequiredContent" maxlength="1000"></textarea></label></div><p id="supplementError" class="error" role="alert"></p><div id="supplementReadback" class="supplement-readback" hidden></div></details></section>
+<aside id="reviewPane"><section id="draftEditor" class="panel"><h2>營養師最後審核</h2><p class="meta">四欄文字沿用版本控管草稿；鎖版尚未送達，核准不等於送達。</p><button id="applySystemDraft" type="button">帶入系統初稿</button><button id="applyAiDraft" type="button">AI 擬稿</button><p id="systemDraftHint" class="meta">只帶入資料觀察供編輯，不會自動儲存或送出；個人點評保留人工撰寫。</p><p id="aiDraftHint" class="meta" role="status">AI 依三天紀錄擬「做得好的地方／優先事項／接下來 7 天」，請逐條確認修改；不會自動儲存或送出。</p><label class="draft-field"><span>做得好的地方</span><textarea id="good" maxlength="4000"></textarea></label><label class="draft-field"><span>目前優先事項</span><textarea id="priority" maxlength="4000"></textarea></label><label class="draft-field"><span>接下來 7 天</span><textarea id="next_7_days" maxlength="4000"></textarea></label><label class="draft-field"><span>營養師個人點評</span><textarea id="comment" maxlength="4000"></textarea></label><p id="draftState" role="status"></p><p id="draftError" class="error" role="alert"></p><p id="approvalState" role="status"></p><p id="approvalError" class="error" role="alert"></p><details id="supplementEditor"><summary>補件內容</summary><p id="supplementState" role="status"></p><div id="supplementControls"><label class="draft-field"><span>補件理由</span><textarea id="supplementReason" maxlength="1000"></textarea></label><label class="draft-field"><span>需要補充的內容</span><textarea id="supplementRequiredContent" maxlength="1000"></textarea></label></div><p id="supplementError" class="error" role="alert"></p><div id="supplementReadback" class="supplement-readback" hidden></div></details></section>
 <section id="draftPreview" class="panel" hidden><h2>顧客報告預覽</h2><p class="meta">草稿未送達；核准只鎖定這份已儲存且與目前來源一致的預覽，不承諾投遞已送達。</p><div id="draftPreviewContent" class="draft-preview-card"></div><div id="previewActions" class="draft-actions preview-actions"><button id="backDraftEdit" class="preview-button" type="button">返回編輯</button><button id="approveReview" class="preview-button" type="button">確認核准</button></div></section></aside></div>
 <div id="bottomActions" class="bottom-actions"><button id="requestMoreInfo" class="warn" type="button">要求補件</button><button id="saveDraft" type="button">儲存草稿</button><button id="openDraftPreview" class="primary" type="button">預覽正式報告</button></div></section>
 </main></div></body></html>"""
@@ -434,11 +434,36 @@ function usableSystemDraft(detail){{
   return seed;
 }}
 function updateSystemDraftControl(){{
+  updateAiDraftControl();
   const button=document.getElementById('applySystemDraft'),hint=document.getElementById('systemDraftHint');const detail=(detailsByCase.get(draftCaseId)||{{}}).value;const seed=usableSystemDraft(detail);
   if(!seed){{button.disabled=true;hint.textContent=detail&&Number.isInteger(detail.current_review_version)&&detail.current_review_version>0?'已有已儲存審核草稿，系統初稿不會覆蓋。':'目前沒有可帶入且與來源一致的系統初稿。';return;}}
   const hasContent=draftKeys.some(key=>Boolean(document.getElementById(key).value));
   button.disabled=hasContent||draftDirty()||!draftWritable();
   hint.textContent=button.disabled?'已有未儲存手動內容，不覆蓋；如需帶入請先自行清空並重新載入案件。':'只帶入資料觀察供編輯，不會自動儲存或送出；個人點評保留人工撰寫。';
+  updateAiDraftControl();
+}}
+let aiDrafting=false;
+function updateAiDraftControl(){{
+  const button=document.getElementById('applyAiDraft');if(!button)return;
+  const hasContent=draftKeys.some(key=>Boolean(document.getElementById(key).value));
+  button.disabled=aiDrafting||hasContent||draftDirty()||!draftWritable();
+}}
+async function applyAiDraft(){{
+  const hint=document.getElementById('aiDraftHint');
+  if(aiDrafting||!draftWritable()||draftDirty()||draftKeys.some(key=>Boolean(document.getElementById(key).value))){{hint.textContent='欄位已有內容，AI 擬稿不會覆蓋；要重擬請先清空欄位。';updateAiDraftControl();return;}}
+  const caseId=draftCaseId;aiDrafting=true;updateAiDraftControl();hint.textContent='AI 擬稿中，大約 10–30 秒…';
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),70000);
+  try{{
+    const response=await fetch(`/api/dietitian/health-checks/${{encodeURIComponent(caseId)}}/ai-draft`,{{method:'POST',headers:{{Authorization:'Bearer '+idToken}},cache:'no-store',credentials:'omit',signal:controller.signal}});
+    let body={{}};try{{body=await response.json();}}catch(_e){{body={{}};}}
+    if(caseId!==draftCaseId)return;
+    if(!response.ok){{hint.textContent='AI 擬稿沒有完成：'+(typeof body.detail==='string'?body.detail:'請稍後再試或手寫。');return;}}
+    if(draftDirty()||draftKeys.some(key=>Boolean(document.getElementById(key).value))){{hint.textContent='擬稿期間欄位已有內容，沒有覆蓋。';return;}}
+    for(const key of ['good','priority','next_7_days'])if(typeof body[key]==='string')document.getElementById(key).value=body[key];
+    draftRetry=null;approvalRetry=null;previewSignature='';updateDraftState();
+    hint.textContent='已帶入 AI 擬稿（'+(body.model||'AI')+'）。請逐條確認、修改，「營養師個人點評」請自己寫，再儲存。';
+  }}catch(_error){{if(caseId===draftCaseId)hint.textContent='AI 擬稿逾時或連線中斷，請再按一次或手寫。';}}
+  finally{{clearTimeout(timer);aiDrafting=false;updateAiDraftControl();}}
 }}
 function applySystemDraft(){{
   const detail=(detailsByCase.get(draftCaseId)||{{}}).value,seed=usableSystemDraft(detail);
@@ -814,6 +839,7 @@ for(const key of draftKeys)document.getElementById(key).addEventListener('input'
 for(const id of ['supplementReason','supplementRequiredContent'])document.getElementById(id).addEventListener('input',()=>{{supplementRetry=null;document.getElementById('supplementError').textContent='';updateSupplementState();}});
 document.getElementById('saveDraft').addEventListener('click',saveDraft);
 document.getElementById('applySystemDraft').addEventListener('click',applySystemDraft);
+document.getElementById('applyAiDraft')?.addEventListener('click',applyAiDraft);
 document.getElementById('approveReview').addEventListener('click',approveReview);
 document.getElementById('requestMoreInfo').addEventListener('click',requestMoreInfo);
 document.getElementById('openDraftPreview').addEventListener('click',previewDraft);

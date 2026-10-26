@@ -4832,6 +4832,36 @@ def get_dietitian_health_check(case_id: str):
         return load_health_check_detail(conn, case_id=case_id)
 
 
+HEALTH_CHECK_AI_DRAFT_MODEL = (os.environ.get("HEALTH_CHECK_AI_DRAFT_MODEL") or "gpt-4o").strip()
+HEALTH_CHECK_AI_DRAFT_COOLDOWN_SECONDS = 20
+HEALTH_CHECK_AI_DRAFT_HOURLY_LIMIT = 40
+_health_check_ai_draft_calls: list[float] = []
+_health_check_ai_draft_last_by_case: dict[str, float] = {}
+
+
+def ai_draft_dietitian_health_check(case_id: str, actor_id: str):
+    """營養師按「AI 擬稿」：讀案件（唯讀）→ 去識別 → 請 AI 擬三欄草稿；不儲存。"""
+    import dietitian_health_check_ai_draft as ai_draft
+    now = time.time()
+    if now - _health_check_ai_draft_last_by_case.get(case_id, 0) < HEALTH_CHECK_AI_DRAFT_COOLDOWN_SECONDS:
+        raise ai_draft.AiDraftUnavailable("剛剛才擬過，請等幾秒再按。")
+    recent = [t for t in _health_check_ai_draft_calls if now - t < 3600]
+    if len(recent) >= HEALTH_CHECK_AI_DRAFT_HOURLY_LIMIT:
+        raise ai_draft.AiDraftUnavailable("這一小時 AI 擬稿次數已達上限，請稍後再試或手寫。")
+    with closing(_open_read_only_database()) as conn:
+        detail = load_health_check_detail(conn, case_id=case_id)
+        if detail is None:
+            return None
+        names = ai_draft.meal_names_for(
+            conn, [log.get("log_id") for log in detail.get("source_logs") or ()])
+    payload = ai_draft.build_ai_draft_input(detail, names)
+    _health_check_ai_draft_last_by_case[case_id] = now
+    _health_check_ai_draft_calls[:] = recent + [now]
+    fields = ai_draft.request_ai_draft(client, payload, model=HEALTH_CHECK_AI_DRAFT_MODEL)
+    print(f"✅ 健檢 AI 擬稿完成 model={HEALTH_CHECK_AI_DRAFT_MODEL}")
+    return {**fields, "model": HEALTH_CHECK_AI_DRAFT_MODEL, "persistence": "not_saved"}
+
+
 def get_dietitian_health_check_image(case_id: str, log_id: str):
     """Return a bounded preview selected only by canonical server-side bindings."""
     with closing(_open_read_only_database()) as conn:
@@ -4909,6 +4939,7 @@ def register_dietitian_health_check_api(target_app=app):
         approval_saver=approve_dietitian_health_check_review,
         supplement_saver=request_dietitian_health_check_supplement,
         allowed_uid_loader=_current_dietitian_health_check_allowed_uids,
+        ai_drafter=ai_draft_dietitian_health_check,
     )
     attach_dietitian_health_check_liff_routes(
         target_app, DIETITIAN_HEALTH_CHECK_CONFIG
