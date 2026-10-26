@@ -342,7 +342,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>一日樂食包月｜拍照幫你算熱量</title>
-<meta name="description" content="包月便當依你的目標排好四週，外面吃的拍張照就幫你算熱量，營養師看過你的三日飲食。">
+<meta name="description" content="包月便當依你的目標排好四週，外面吃的拍張照就幫你算熱量，營養師親自看過你的三日飲食。">
 <meta property="og:title" content="一日樂食包月｜不用想吃什麼，拍照幫你算熱量">
 <meta property="og:description" content="包月便當依你的目標排好四週，外面吃的拍張照就幫你算熱量。">
 <meta property="og:image" content="/plan/assets/salmon.jpg">
@@ -409,13 +409,13 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 
 <section class="rd" style="background:var(--butter)">
   <div class="wrap">
-    <h2>AI 先整理，營養師看過才給你</h2>
-    <p class="lead">第一次訂包月，包含一次三日飲食健檢。報告由合作營養師逐條看過、需要時修改，確認後才會送到你的 LINE。</p>
+    <h2>營養師親自看過你的三天</h2>
+    <p class="lead">第一次訂包月，包含一次三日飲食健檢。系統先把三天的熱量和蛋白質整理好，合作營養師看過、寫好建議，確認後才送到你的 LINE。</p>
     <div class="rd-grid">
       <ol class="timeline">
         <li><span class="n">1</span><div><h3>照常吃三天</h3><p>包月餐點「吃了」，外食拍照傳上來，不用多做什麼。</p></div></li>
-        <li><span class="n">2</span><div><h3>AI 整理成報告草稿</h3><p>三天吃了多少、蛋白質夠不夠、哪一餐最容易失衡。</p></div></li>
-        <li class="rd"><span class="n">3</span><div><h3>營養師逐條看過</h3><p>不對的地方修改，確認沒問題才核准。</p></div></li>
+        <li><span class="n">2</span><div><h3>系統整理數據</h3><p>三天吃了多少、熱量和蛋白質離目標差多少。</p></div></li>
+        <li class="rd"><span class="n">3</span><div><h3>營養師看過、寫建議</h3><p>依你的目標和飲食習慣寫出具體建議，確認後才核准。</p></div></li>
         <li><span class="n">4</span><div><h3>你在 LINE 收到建議</h3><p>接下來 7 天可以怎麼調整，具體到吃什麼。</p></div></li>
       </ol>
       <div class="report" aria-label="營養師三日飲食健檢報告範例">

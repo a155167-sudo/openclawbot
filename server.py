@@ -2696,7 +2696,7 @@ ADMIN_ONLY_PREFIXES = (
     "@靜音 ", "@解除靜音 ", "#喚醒AI ", "#上傳點數\n", "#核准延餐 ", "#拒絕延餐 ",
     "#核准訂單 ", "#拒絕訂單 ", "#開通訂單 ", "#核准營養份量 ",
     "#查核換餐 ", "#取得換餐確認指令 ", "#確認換餐已套用 ",
-    "#確認換餐未套用 ", "#解除排餐鎖 "
+    "#確認換餐未套用 ", "#解除排餐鎖 ", "#健檢測試 "
 )
 
 BOUND_ADMIN_EXACT_COMMANDS = {
@@ -2720,7 +2720,7 @@ PRIVILEGED_COMMAND_STEMS = (
     "#拒絕訂單", "#開通訂單", "#核准營養份量", "#待核換餐",
     "#查核換餐", "#取得換餐確認指令", "#確認換餐已套用", "#確認換餐未套用",
     "健康回報", "今日健康日報", "重新整理今日報告", "#排餐鎖狀態", "#解除排餐鎖",
-    "#營養師提醒", "#首批名額",
+    "#營養師提醒", "#首批名額", "#健檢測試",
 )
 PRIVILEGED_SHORT_COMMANDS = {"#教", "#管"}
 
@@ -8089,6 +8089,54 @@ def run_first_batch_payment_deadlines(*, now=None) -> dict:
         except Exception as exc:
             print(f"⚠️ 首批管理員通知失敗 {type(exc).__name__}")
     return {"reminded": reminded, "expired": expired, "admin_pending": admin_pending}
+
+
+def run_staging_health_check_qa(target_uid: str) -> str:
+    """電腦營養專用：把測試帳號的健檢案件挪前 3 天並補記 3 天午晚餐（見 health_check_qa.py）。"""
+    import csv
+    import health_check_qa
+    if APP_ENV != "staging":
+        return "⚠️ 這個測試指令只能在電腦營養使用。"
+    target_uid = str(target_uid or "").strip()
+    if not re.fullmatch(r"U[0-9a-f]{32}", target_uid):
+        return "⚠️ 請輸入測試帳號的完整 UID，例如：#健檢測試 U1234…（或 #健檢測試 我）。\n讓測試帳號在電腦營養傳「營養師報到」就能拿到它的 UID。"
+    if not _health_check_maintenance_is_active():
+        return "⚠️ 電腦營養的健檢功能沒有開（VIP_HEALTH_CHECK_ENABLED），先請 Claude 打開。"
+    with open(Path(__file__).with_name("menu.csv"), encoding="utf-8-sig") as handle:
+        meals = health_check_qa.seed_meals_from_menu(list(csv.DictReader(handle)))
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+            configure_vip_health_check_connection(conn)
+            ensure_vip_health_check_schema(conn)
+            ensure_daily_food_ledger_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = health_check_qa.run_health_check_qa(
+                    conn, user_id=target_uid, now=tw_now(), meals=meals,
+                    create_food_log=create_daily_food_log,
+                    refresh_case=refresh_user_health_check_case,
+                )
+            except health_check_qa.QaRefused as exc:
+                conn.rollback()
+                return f"⚠️ {exc}"
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
+    except Exception as exc:
+        print(f"⚠️ #健檢測試失敗：{type(exc).__name__}: {exc}")
+        return f"⚠️ 健檢測試資料建立失敗（{type(exc).__name__}），請把這則訊息截圖給 Claude。"
+    status_text = {"ready_for_review": "待營養師審核 ✅", "collecting": "還在收集中",
+                   "needs_more_info": "等客人補件"}.get(result["status"], result["status"])
+    return (
+        "🧪【健檢測試資料已建立】\n"
+        f"帳號：…{target_uid[-6:]}\n"
+        f"補記：{result['first_day']} 起 3 天的午餐、晚餐（新增 {result['seeded']} 筆）\n"
+        f"有效天數：{result['valid_day_count']} 天\n"
+        f"案件狀態：{status_text}\n\n"
+        "下一步：傳「#營養師健檢」打開工作台，點這個案件，按「帶入系統初稿」，寫建議後核准；"
+        "測試帳號應該會收到「營養師三日飲食健檢報告」。"
+    )
 
 
 FIRST_BATCH_STATUS_LABELS = {"pending": "待核准", "approved": "待付款", "activated": "已開通"}
@@ -24243,6 +24291,12 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             print(f"⚠️ #營養師提醒失敗：{type(exc).__name__}: {exc}")
             reply = "⚠️ 營養師提醒計算失敗，請看伺服器日誌。"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    elif msg.startswith("#健檢測試 "):
+        target = msg.split(" ", 1)[1].strip()
+        target_uid = uid if target == "我" else target
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=run_staging_health_check_qa(target_uid)))
         return
 
     elif msg == "#首批名額":
