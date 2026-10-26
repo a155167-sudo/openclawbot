@@ -1271,6 +1271,7 @@ def create_dietitian_health_check_router(
     supplement_saver: Callable[..., Mapping[str, object]] | None = None,
     allowed_uid_loader: Callable[[], frozenset[str]] | None = None,
     token_verifier: Callable[..., str] = verify_line_id_token,
+    ai_drafter: Callable[[str, str], Mapping[str, object]] | None = None,
 ) -> APIRouter:
     if not CHANNEL_ID_PATTERN.fullmatch(channel_id):
         raise ValueError("invalid LINE Login Channel ID")
@@ -1347,6 +1348,35 @@ def create_dietitian_health_check_router(
             return JSONResponse(payload, headers=NO_STORE_HEADERS)
         except Exception:
             return _response("health-check data unavailable", 503)
+
+    if ai_drafter is not None:
+        @router.post(
+            "/api/dietitian/health-checks/{case_id}/ai-draft",
+            response_class=JSONResponse,
+        )
+        def ai_draft(
+            case_id: str,
+            authorization: str | None = Header(default=None),
+        ) -> JSONResponse:
+            # 只回傳草稿文字給工作台填入；不儲存、不送出。
+            denied, actor_id = authorize(authorization)
+            if denied is not None:
+                return denied
+            assert actor_id is not None
+            if not CASE_ID_PATTERN.fullmatch(case_id):
+                return _response("invalid case id", 422)
+            from dietitian_health_check_ai_draft import AiDraftUnavailable
+            try:
+                result = ai_drafter(case_id, actor_id)
+            except AiDraftUnavailable as exc:
+                return JSONResponse({"detail": str(exc)}, status_code=409, headers=NO_STORE_HEADERS)
+            except LookupError:
+                return _response("health-check case not found", 404)
+            except Exception:
+                return _response("AI 擬稿暫時無法使用，請稍後再試或手寫。", 503)
+            if result is None:
+                return _response("health-check case not found", 404)
+            return JSONResponse(dict(result), headers=NO_STORE_HEADERS)
 
     if draft_saver is not None:
         @router.post(
@@ -1661,6 +1691,7 @@ def attach_dietitian_health_check_routes(
     supplement_saver: Callable[..., Mapping[str, object]] | None = None,
     allowed_uid_loader: Callable[[], frozenset[str]] | None = None,
     token_verifier: Callable[..., str] = verify_line_id_token,
+    ai_drafter: Callable[[str, str], Mapping[str, object]] | None = None,
 ) -> bool:
     if not config.enabled:
         return False
@@ -1692,8 +1723,17 @@ def attach_dietitian_health_check_routes(
                 path,
             ) is not None
         )
+        is_ai_draft_post = (
+            ai_drafter is not None
+            and request.method == "POST"
+            and re.fullmatch(
+                r"/api/dietitian/health-checks/[A-Za-z0-9][A-Za-z0-9_-]{0,127}/ai-draft",
+                path,
+            ) is not None
+        )
         if (
             request.method != "GET"
+            and not is_ai_draft_post
             and not is_draft_post
             and not is_approval_post
             and not is_supplement_route
@@ -1718,6 +1758,7 @@ def attach_dietitian_health_check_routes(
             supplement_saver=supplement_saver,
             allowed_uid_loader=allowed_uid_loader,
             token_verifier=token_verifier,
+            ai_drafter=ai_drafter,
         )
     )
     return True
