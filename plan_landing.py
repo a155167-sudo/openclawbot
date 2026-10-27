@@ -199,17 +199,6 @@ section { padding-block: 64px; }
 .est .btn { margin-top: 6px; background: var(--green); color: var(--paper); border-radius: 10px; text-align: center; padding: 6px; font-weight: 700; }
 
 /* 營養師 */
-.rd-grid { display: grid; gap: 34px; margin-top: 28px; }
-.timeline { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; }
-.timeline li { display: grid; grid-template-columns: 44px 1fr; gap: 14px; position: relative; padding-bottom: 22px; }
-.timeline li:last-child { padding-bottom: 0; }
-.timeline li::before { content: ""; position: absolute; left: 21px; top: 40px; bottom: 0; width: 2px; background: var(--char); opacity: .25; }
-.timeline li:last-child::before { display: none; }
-.timeline .n { width: 44px; height: 44px; border-radius: 50%; background: var(--brand); border: 2.5px solid var(--char);
-  display: grid; place-items: center; font: 400 26px/1 "Bebas Neue", sans-serif; color: var(--char); }
-.timeline .rd .n { background: var(--char); color: var(--brand); }
-.timeline h3 { font-size: 18px; margin-top: 8px; }
-.timeline p { font-size: 15px; margin-top: 2px; }
 
 .report { background: var(--paper); border: 3px solid var(--char); border-radius: 20px; padding: 20px; display: grid; gap: 14px; max-width: 440px; align-self: start; }
 .report-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
@@ -221,12 +210,6 @@ section { padding-block: 64px; }
 
 /* steps：真的是先後順序 */
 .steps { background: var(--paper); }
-.steps ol { list-style: none; margin: 24px 0 0; padding: 0; display: grid; gap: 14px; counter-reset: s; }
-.steps li { display: grid; grid-template-columns: 40px 1fr; gap: 12px; align-items: baseline; font-size: 18px; color: var(--char); }
-.steps li::before { counter-increment: s; content: counter(s); font: 400 40px/0.9 "Bebas Neue", sans-serif; color: var(--brand);
-  -webkit-text-stroke: 1.5px var(--char); }
-.steps li b { font-weight: 700; }
-.steps li span { color: var(--ink); font-size: 16px; display: block; }
 
 /* price & delivery */
 table { width: 100%; border-collapse: collapse; font-size: 16px; font-variant-numeric: tabular-nums; }
@@ -236,10 +219,6 @@ td:last-child, th:last-child { padding-right: 0; text-align: right; }
 th { color: var(--char); font-weight: 700; font-size: 14px; }
 .note { font-size: 15px; margin-top: 14px; }
 .note.strong { color: var(--char); font-weight: 700; }
-.pickup { display: grid; gap: 12px; margin-top: 24px; }
-.pickup div { border: 2.5px solid var(--char); border-radius: 16px; padding: 14px 16px; }
-.pickup h3 { font-size: 18px; }
-.pickup p { font-size: 15px; margin-top: 4px; }
 .fees { margin-top: 16px; }
 .fees summary { cursor: pointer; font-weight: 700; color: var(--char); }
 .fees table { margin-top: 8px; }
@@ -259,14 +238,34 @@ details.q p { margin-top: 10px; }
 footer { background: var(--char); color: #E9E2D8; padding-block: 28px 40px; font-size: 14px; }
 footer a { color: var(--paper); }
 
+/* 圖示列與流程：取代長段文字 */
+.icons { list-style: none; margin: 4px 0 6px; padding: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 380px; }
+.icons li { display: grid; justify-items: center; gap: 6px; text-align: center; font-size: 14px; line-height: 1.35; font-weight: 700; color: var(--char); }
+.icons svg, .flow svg { fill: none; stroke: var(--char); stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.icons svg { width: 52px; height: 52px; padding: 12px; border-radius: 16px; background: var(--butter); }
+.flow { list-style: none; margin: 24px 0 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.flow li { position: relative; background: var(--paper); border: 2.5px solid var(--char); border-radius: 18px; padding: 16px 12px 14px;
+  display: grid; justify-items: center; text-align: center; gap: 2px; }
+.flow .no { position: absolute; top: 8px; left: 10px; font: 400 22px/1 "Bebas Neue", sans-serif; color: var(--char); opacity: .55; }
+.flow svg { width: 40px; height: 40px; margin-bottom: 6px; }
+.flow b { color: var(--char); font-size: 17px; font-weight: 900; }
+.flow small { font-size: 13px; color: var(--ink); }
+.flow li.hi { background: var(--char); }
+.flow li.hi svg { stroke: var(--brand); }
+.flow li.hi b, .flow li.hi small, .flow li.hi .no { color: var(--paper); }
+.steps .flow li { background: var(--butter); }
+.rd .report { margin-top: 28px; }
+table.pickup { margin-top: 22px; }
+table.pickup th[scope="row"] { font-size: 16px; white-space: nowrap; }
+table.pickup td:nth-child(2) { white-space: nowrap; }
+
 @media (min-width: 820px) {
+  .flow { grid-template-columns: repeat(4, 1fr); }
   body { font-size: 18px; }
   .hero-grid { grid-template-columns: 1.05fr 1fr; align-items: center; padding-bottom: 40px; }
   .plate { margin: 0 -60px 0 0; }
   .strip { grid-auto-columns: 30%; padding: 0 max(20px, calc((100vw - 1000px) / 2)); scroll-padding-inline: max(20px, calc((100vw - 1000px) / 2)); }
-  .log-grid, .rd-grid { grid-template-columns: 1fr 1fr; column-gap: 56px; }
-  .steps ol { grid-template-columns: 1fr 1fr; column-gap: 48px; }
-  .pickup { grid-template-columns: repeat(3, 1fr); }
+  .log-grid { grid-template-columns: 1fr 1fr; column-gap: 56px; }
   .two { display: grid; grid-template-columns: 1fr 1.4fr; gap: 48px; }
 }
 @media (prefers-reduced-motion: no-preference) {
@@ -306,6 +305,46 @@ _CHAT_MOCK = """
 </div>"""
 
 
+# 線條圖示（24×24，stroke 畫法），用來取代長段文字。
+_ICONS = {
+    "tap": '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+    "chart": '<path d="M4 20h16"/><path d="M7 16v-5"/><path d="M12 16V6"/><path d="M17 16v-8"/>',
+    "clock": '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+    "camera": '<path d="M4 8.5h3.2L9 6h6l1.8 2.5H20V19H4z"/><circle cx="12" cy="13.5" r="3.5"/>',
+    "flame": '<path d="M12 21a6.5 6.5 0 0 0 6.5-6.5c0-4.5-4-6.5-4.5-11-2.5 2-3.8 4.3-3.8 7-1-.6-1.6-1.6-1.8-3C6.6 9.4 5.5 11.8 5.5 14.5A6.5 6.5 0 0 0 12 21z"/>',
+    "ok": '<rect x="4" y="4" width="16" height="16" rx="4"/><path d="M8 12.2l2.8 2.8L16 9.5"/>',
+    "bowl": '<path d="M3.5 11.5h17a8.5 8.5 0 0 1-17 0z"/><path d="M9 8c0-1.5 1.5-1.5 1.5-3M13.5 8c0-1.5 1.5-1.5 1.5-3"/>',
+    "doc": '<path d="M6.5 3.5h8l3.5 3.5v13.5h-11.5z"/><path d="M9.5 11.5h5.5M9.5 15h5.5"/>',
+    "pen": '<path d="M4.5 19.5l1-4.2L15.8 5l3.2 3.2L8.7 18.5z"/><path d="M13.5 7.3l3.2 3.2"/>',
+    "line": '<path d="M4 5.5h16v10.5H10l-4.5 3.5V16H4z"/><path d="M8 10.8h8"/>',
+    "form": '<rect x="5.5" y="4.5" width="13" height="16" rx="2"/><path d="M9 4.5V3h6v1.5"/><path d="M8.5 10h7M8.5 13.5h7M8.5 17h4"/>',
+    "card": '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18M7 14.5h3"/>',
+}
+
+
+def _icon(name: str) -> str:
+    return (f'<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">{_ICONS[name]}</svg>')
+
+
+def _icon_row(items) -> str:
+    """一排 3 個圖示＋短標籤，取代一段說明文字。"""
+    return '<ul class="icons">' + "".join(
+        f'<li>{_icon(icon)}<span>{label}</span></li>' for icon, label in items
+    ) + "</ul>"
+
+
+def _flow(items, *, highlight: int = -1) -> str:
+    """有順序的步驟：編號＋圖示＋短標籤（手機 2×2、電腦一排 4 格）。"""
+    cells = []
+    for i, (icon, title, sub) in enumerate(items):
+        cls = ' class="hi"' if i == highlight else ""
+        cells.append(
+            f'<li{cls}><span class="no">{i + 1}</span>{_icon(icon)}'
+            f'<b>{title}</b><small>{sub}</small></li>'
+        )
+    return '<ol class="flow">' + "".join(cells) + "</ol>"
+
+
 def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, period_weeks: int,
                 store_address: str) -> str:
     start = html.escape(line_start_url(), quote=True)
@@ -329,6 +368,29 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
     first_batch_note = (
         '<p class="note strong">首批試跑期間，第一期餐費再打 9 折（運費不折）。</p>'
         if first_batch_open else ""
+    )
+    eat_icons = _icon_row((("tap", "點「吃了」<br>就記好"), ("chart", "剩多少<br>一眼看到"),
+                           ("clock", "忘了點<br>自動記")))
+    photo_icons = _icon_row((("camera", "拍照或<br>打一句話"), ("flame", "估熱量<br>和蛋白質"),
+                             ("ok", "你確認<br>才記錄")))
+    rd_flow = _flow((
+        ("bowl", "照常吃三天", "不用多做什麼"),
+        ("doc", "AI 整理", "擬好建議草稿"),
+        ("pen", "營養師修改", "看過才核准"),
+        ("line", "LINE 收到", "下 7 天怎麼吃"),
+    ), highlight=2)
+    steps_flow = _flow((
+        ("line", "LINE 估價", "30 秒看金額"),
+        ("form", "填資料", "身高體重、目標"),
+        ("card", "匯款開通", "下週一開始"),
+        ("bowl", "開吃", "每天點一下"),
+    ))
+    half = lambda fee: _money(-(-fee // 2))  # noqa: E731
+    fee_low, fee_high = fee_tiers[0][1], fee_tiers[-1][1]
+    pickup_rows = (
+        f"<tr><th scope=\"row\">🛵 一般外送</th><td>11:30–12:00</td><td>{_money(fee_low)}～{_money(fee_high)}</td></tr>"
+        f"<tr><th scope=\"row\">🐦 晚鳥外送</th><td>13:00–14:00</td><td>{half(fee_low)}～{half(fee_high)}</td></tr>"
+        "<tr><th scope=\"row\">🛍 到店自取</th><td>週六也能取</td><td>免運</td></tr>"
     )
     dishes = "".join(
         f'<figure><img src="/plan/assets/{f}" alt="{html.escape(name)}" loading="lazy" '
@@ -389,17 +451,17 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <section class="log">
   <div class="wrap">
     <h2>每天只要點一下</h2>
-    <p class="lead">包月餐的熱量和蛋白質系統都算好了，你只要告訴它有沒有吃。</p>
+    <p class="lead">包月餐的熱量、蛋白質都算好了，你只要說有沒有吃。</p>
     <div class="log-grid">
       <div class="scene">
-        <h3>包月餐：點「吃了」就記好</h3>
-        <p>打開今日總覽，熱量和蛋白質還剩多少一看就知道。兩個便當一起送到時，選中午吃的是哪一個。忘了點也沒關係，餐期過了會自動記成已吃。</p>
+        <h3>包月餐</h3>
+        {eat_icons}
         <div class="phone">{_DASH_MOCK}</div>
         <p><span class="tag">畫面示意</span></p>
       </div>
       <div class="scene">
-        <h3>外面吃的：拍張照就好</h3>
-        <p>拍照或傳一句「排骨飯」，系統幫你估熱量和蛋白質，你按確認才會記錄。</p>
+        <h3>外面吃的</h3>
+        {photo_icons}
         <div class="phone">{_CHAT_MOCK}</div>
         <p><span class="tag">畫面示意</span></p>
       </div>
@@ -410,14 +472,9 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <section class="rd" style="background:var(--butter)">
   <div class="wrap">
     <h2>營養師親自看過你的三天</h2>
-    <p class="lead">第一次訂包月，包含一次三日飲食健檢。AI 先整理三天的紀錄、擬好建議，合作營養師逐條看過、修改，確認後才送到你的 LINE。</p>
-    <div class="rd-grid">
-      <ol class="timeline">
-        <li><span class="n">1</span><div><h3>照常吃三天</h3><p>包月餐點「吃了」，外食拍照傳上來，不用多做什麼。</p></div></li>
-        <li><span class="n">2</span><div><h3>AI 整理、擬建議</h3><p>三天吃了多少、離目標差多少，先擬好建議草稿。</p></div></li>
-        <li class="rd"><span class="n">3</span><div><h3>營養師看過、修改</h3><p>依你的目標和飲食習慣調整建議，確認後才核准。</p></div></li>
-        <li><span class="n">4</span><div><h3>你在 LINE 收到建議</h3><p>接下來 7 天可以怎麼調整，具體到吃什麼。</p></div></li>
-      </ol>
+    <p class="lead">第一次訂包月，送一次三日飲食健檢。</p>
+    {rd_flow}
+    <div>
       <div class="report" aria-label="營養師三日飲食健檢報告範例">
         <div class="report-head"><b>營養師三日飲食健檢報告</b><span class="tag">範例</span></div>
         <dl>
@@ -434,12 +491,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <section class="steps">
   <div class="wrap">
     <h2>從估價到開吃</h2>
-    <ol>
-      <li><div><b>用 LINE 估價</b><span>選天數和取餐方式，馬上看到金額。</span></div></li>
-      <li><div><b>填包月資料</b><span>身高體重、目標、不吃的食物。</span></div></li>
-      <li><div><b>匯款開通</b><span>付款後開通，下週一開始。</span></div></li>
-      <li><div><b>開吃，每天點一下</b><span>包月餐和外食都記在 LINE。</span></div></li>
-    </ol>
+    {steps_flow}
   </div>
 </section>
 
@@ -463,11 +515,11 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <section class="delivery" style="background:var(--butter)">
   <div class="wrap">
     <h2>怎麼拿到便當</h2>
-    <div class="pickup">
-      <div><h3>一般外送</h3><p>11:30–12:00 左右送達，午晚兩個便當一起送。</p></div>
-      <div><h3>晚鳥外送</h3><p>13:00–14:00 送達，運費半價。</p></div>
-      <div><h3>到店自取</h3><p>週六也能取。每週 3 天以上送蛋白補充。</p></div>
-    </div>
+    <table class="pickup">
+      <thead><tr><th>方式</th><th>送達</th><th>運費／趟</th></tr></thead>
+      <tbody>{pickup_rows}</tbody>
+    </table>
+    <p class="note">外送午晚兩個便當一起送；自取每週 3 天以上送蛋白補充。</p>
     <details class="fees"><summary>看外送運費</summary>
       <table>
         <thead><tr><th>距離</th><th>一般外送／趟</th><th>晚鳥／趟</th></tr></thead>
