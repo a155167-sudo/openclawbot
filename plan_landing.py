@@ -21,12 +21,12 @@ import first_batch_trial
 LINE_OA_ID = "@a25080337"
 LINE_START_TEXT = "包月方案"
 ASSET_DIR = Path(__file__).with_name("static") / "plan"
-ASSETS = {"salmon.jpg", "fish.jpg", "pork.jpg", "chicken.jpg", "couscous.jpg"}
+ASSETS = {"salmon.jpg", "fish.jpg", "pork.jpg", "chicken.jpg", "pasta.jpg"}
 
 # 菜色名稱待 Jason 確認（沿用 menu.csv 的命名方式）
 DISHES = (
     ("salmon.jpg", "鮭魚便當"),
-    ("couscous.jpg", "北非小米沙拉（本週特餐）"),
+    ("pasta.jpg", "番茄牛肉義大利麵"),
     ("pork.jpg", "豬肉沙拉"),
     ("fish.jpg", "鱸魚食蔬"),
     ("chicken.jpg", "雞肉低碳"),
