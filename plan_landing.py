@@ -8,6 +8,8 @@ dietitian_health_check_delivery.py（健檢報告欄位）；那邊改字時這�
 from __future__ import annotations
 
 import html
+import os
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -345,6 +347,34 @@ def _flow(items, *, highlight: int = -1) -> str:
     return '<ol class="flow">' + "".join(cells) + "</ol>"
 
 
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def line_tag_snippet() -> str:
+    """LINE Tag 基本程式碼（記錄看過介紹頁的好友，之後可只群發給他們）。
+
+    只在設定 env LINE_TAG_ID 時輸出；電腦營養不設，避免測試流量混進正式名單。
+    """
+    tag_id = os.environ.get("LINE_TAG_ID", "").strip().lower()
+    if not _UUID_RE.match(tag_id):
+        return ""
+    return f"""<!-- LINE Tag Base Code -->
+<script>
+(function(g,d,o){{
+  g._ltq=g._ltq||[];g._lt=g._lt||function(){{g._ltq.push(arguments)}};
+  var h='https://d.line-scdn.net';
+  var s=d.createElement('script');s.async=1;
+  s.src=o||h+'/n/line_tag/public/release/v1/lt.js';
+  var t=d.getElementsByTagName('script')[0];t.parentNode.insertBefore(s,t);
+}})(window, document);
+_lt('init', {{customerType: 'account', tagId: '{tag_id}'}});
+_lt('send', 'pv', ['{tag_id}']);
+</script>
+<noscript><img height="1" width="1" style="display:none" alt=""
+  src="https://tr.line.me/tag.gif?c_t=lap&amp;t_id={tag_id}&amp;e=pv&amp;noscript=1"></noscript>
+<!-- End LINE Tag Base Code -->"""
+
+
 def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, period_weeks: int,
                 store_address: str) -> str:
     start = html.escape(line_start_url(), quote=True)
@@ -412,6 +442,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
 <style>{CSS}</style>
+{line_tag_snippet()}
 </head>
 <body>
 <header class="hero">
