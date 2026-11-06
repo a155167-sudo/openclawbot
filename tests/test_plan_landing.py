@@ -58,3 +58,16 @@ def test_assets_whitelist(client):
     assert client.get("/plan/assets/nope.jpg").status_code == 404
     for name in plan_landing.ASSETS:
         assert (plan_landing.ASSET_DIR / name).is_file()
+
+
+def test_line_tag_only_when_configured(monkeypatch):
+    import plan_landing
+
+    monkeypatch.delenv("LINE_TAG_ID", raising=False)
+    assert plan_landing.line_tag_snippet() == ""
+    monkeypatch.setenv("LINE_TAG_ID", "not-a-uuid'</script>")
+    assert plan_landing.line_tag_snippet() == ""
+    tag = "ebd751a1-3d20-461f-87e6-f08ed325fa7d"
+    monkeypatch.setenv("LINE_TAG_ID", tag)
+    snippet = plan_landing.line_tag_snippet()
+    assert f"tagId: '{tag}'" in snippet and "d.line-scdn.net" in snippet
