@@ -164,3 +164,19 @@ def test_form_grid_single_pick(tmp_path, monkeypatch):
     snapshot, _ = _run_form(tmp_path, monkeypatch, {"想固定吃的餐點（選填，可複選）": answer})
     assert snapshot["fixed_picks"] == ["豬肉低碳"]
     assert all(row[3] == "豬肉低碳" for row in snapshot["master_api_rows"])
+
+
+def test_grid_with_rows_and_columns_swapped_still_works():
+    answer = [None] * len(fmp.GRID_COLUMNS)
+    answer[fmp.GRID_COLUMNS.index("低碳")] = ["雞肉"]
+    assert fmp.extract_form_names({"想固定吃的餐點": answer}) == ["雞肉低碳"]
+    assert fmp.extract_form_names({"想固定吃的餐點 [低碳]": "雞肉, 鮭魚"}) == ["雞肉低碳", "鮭魚低碳"]
+
+
+def test_current_staging_staple_question_title_is_read(tmp_path, monkeypatch):
+    snapshot, _ = _run_form(
+        tmp_path, monkeypatch,
+        {"您的主食選擇（可複選）": "",
+         "想優先安排哪類主食？系統會依照你的選擇優先排餐（可複選": ["飯食派"]},
+    )
+    assert snapshot["pref_staple"] == "飯食派"
