@@ -135,3 +135,32 @@ def test_form_without_question_is_unchanged(tmp_path, monkeypatch):
     snapshot, _ = _run_form(tmp_path, monkeypatch, {})
     assert snapshot["fixed_picks"] == []
     assert snapshot["fixed_picks_admin_line"] == ""
+
+
+def test_grid_answer_from_apps_script_maps_rows_in_order():
+    answer = [None] * len(fmp.GRID_ROWS)
+    answer[fmp.GRID_ROWS.index("雞肉")] = ["低碳", "便當"]
+    answer[fmp.GRID_ROWS.index("鮭魚")] = ["沙拉"]
+    assert fmp.extract_form_names({"想固定吃的餐點（選填，可複選）": answer}) == [
+        "雞肉低碳", "雞肉便當", "鮭魚沙拉"]
+
+
+def test_grid_answer_from_named_values():
+    data = {"想固定吃的餐點（選填，可複選） [雞肉]": "低碳, 便當", "想固定吃的餐點 [鮭魚]": ["沙拉"],
+            "飲食禁忌": "不吃牛"}
+    assert fmp.extract_form_names(data) == ["雞肉低碳", "雞肉便當", "鮭魚沙拉"]
+
+
+def test_grid_with_wrong_row_count_is_not_guessed():
+    names = fmp.extract_form_names({"想固定吃的餐點": [None, ["低碳"]]})
+    usable, unsafe, unknown = fmp.resolve_fixed_picks(names, [], [])
+    assert usable == [] and unknown and "表格" in fmp.admin_line(usable, unsafe, unknown)
+    assert "表格" not in fmp.customer_lines(usable, unsafe, unknown)
+
+
+def test_form_grid_single_pick(tmp_path, monkeypatch):
+    answer = [None] * len(fmp.GRID_ROWS)
+    answer[fmp.GRID_ROWS.index("豬肉")] = ["低碳"]
+    snapshot, _ = _run_form(tmp_path, monkeypatch, {"想固定吃的餐點（選填，可複選）": answer})
+    assert snapshot["fixed_picks"] == ["豬肉低碳"]
+    assert all(row[3] == "豬肉低碳" for row in snapshot["master_api_rows"])

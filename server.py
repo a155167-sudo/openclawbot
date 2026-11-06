@@ -5689,9 +5689,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             and any(kw in dish['name'] for kw in MEAL_PLAN_KEYWORDS)
         ]
         fixed_usable, fixed_unsafe, fixed_unknown = fixed_meal_picks.resolve_fixed_picks(
-            fixed_meal_picks.parse_fixed_pick_names(
-                get_val(*fixed_meal_picks.FORM_KEYWORDS)
-            ),
+            fixed_meal_picks.extract_form_names(data),
             safe_menu,
             _plannable_menu,
         )
