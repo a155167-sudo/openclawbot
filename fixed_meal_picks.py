@@ -15,9 +15,59 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping, Sequence
 
-# 表單題目建議標題：「想固定吃的餐點（選填，可複選）」
+# 表單題目建議標題：「想固定吃的餐點（選填，可複選）」，題型「核取方塊格狀」：
+# 列＝蛋白質（順序要跟 GRID_ROWS 一樣），欄＝餐盒類型；品名＝列＋欄，例如「雞肉」×「低碳」＝雞肉低碳。
 FORM_KEYWORDS = ("想固定吃的餐點", "想固定吃", "指定品項", "固定吃的餐點")
+GRID_ROWS = ("豆腐", "鷹嘴豆", "雞肉", "豬肉", "牛肉", "番牛", "鱸魚", "鮭魚")
+GRID_COLUMNS = ("便當", "食蔬", "低碳", "沙拉", "番茄麵", "青蔬麵")
 _SPLIT_RE = re.compile(r"[,，、;；\n]+")
+_ROW_SUFFIX_RE = re.compile(r"\[([^\[\]]+)\]\s*$")
+
+
+def _cells(value) -> list[str]:
+    """一列的答案（字串、清單或 None）→ 欄名清單。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            out.extend(_cells(item))
+        return out
+    return [re.sub(r"\s+", "", t) for t in _SPLIT_RE.split(str(value)) if t.strip()]
+
+
+def extract_form_names(data: Mapping) -> list[str]:
+    """從表單 webhook 原始資料取出指定品名，支援三種格式：
+
+    1. 格狀題、Apps Script getResponse()：{題目: [[欄,…] 或 None, …]}，依 GRID_ROWS 順序對應列。
+    2. 格狀題、試算表 namedValues：{"題目 [雞肉]": "低碳, 便當", …}。
+    3. 一般核取方塊：{題目: ["雞肉低碳", …]} 或逗號字串。
+    列數對不上 GRID_ROWS 時不猜，回傳空清單外加一個「表格」標記讓管理員知道。
+    """
+    names: list[str] = []
+    for key, value in data.items():
+        label = re.sub(r"\s+", "", str(key))
+        if not any(keyword in label for keyword in FORM_KEYWORDS) or not value:
+            continue
+        row_match = _ROW_SUFFIX_RE.search(str(key))
+        if row_match:
+            row = re.sub(r"\s+", "", row_match.group(1))
+            names.extend(row + col for col in _cells(value))
+        elif isinstance(value, (list, tuple)) and any(
+            item is None or isinstance(item, (list, tuple)) for item in value
+        ):
+            if len(value) != len(GRID_ROWS):
+                names.append("（表格列數和系統設定不同）")
+                continue
+            for row, cols in zip(GRID_ROWS, value):
+                names.extend(row + col for col in _cells(cols))
+        else:
+            names.extend(parse_fixed_pick_names(",".join(_cells(value))))
+    deduped: list[str] = []
+    for name in names:
+        if name and name not in deduped:
+            deduped.append(name)
+    return deduped
 
 
 def parse_fixed_pick_names(answer: str | None) -> list[str]:
@@ -103,7 +153,7 @@ def customer_lines(usable: Sequence[Mapping], unsafe: Sequence[str], unknown: Se
             lines.append(f"🍱 指定品項：{names}（每天午餐，晚餐由系統搭配）")
         else:
             lines.append(f"🍱 指定品項：{names}（輪流排）")
-    skipped = list(unsafe) + list(unknown)
+    skipped = [name for name in list(unsafe) + list(unknown) if not name.startswith("（")]
     if skipped:
         lines.append(f"⚠️ {'、'.join(skipped)} 不符合你的飲食禁忌或目前沒有供應，已略過。")
     if not usable:
