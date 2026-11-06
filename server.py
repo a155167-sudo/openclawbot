@@ -5321,6 +5321,15 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
     try:
         data = await request.json()
         print("ℹ️ form_callback status=received")
+        if APP_ENV == "staging":
+            # 診斷用（只在電腦營養）：題目名稱與指定品項題的答案格式，不含個人資料。
+            try:
+                print("ℹ️ form_callback keys=" + json.dumps(list(data.keys()), ensure_ascii=False))
+                for _k, _v in data.items():
+                    if any(kw in str(_k) for kw in fixed_meal_picks.FORM_KEYWORDS):
+                        print("ℹ️ form_callback fixed_raw=" + json.dumps({str(_k): _v}, ensure_ascii=False))
+            except Exception:
+                pass
         
         def get_val(
             *keywords,
