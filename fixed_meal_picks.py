@@ -52,15 +52,21 @@ def extract_form_names(data: Mapping) -> list[str]:
         row_match = _ROW_SUFFIX_RE.search(str(key))
         if row_match:
             row = re.sub(r"\s+", "", row_match.group(1))
-            names.extend(row + col for col in _cells(value))
+            if row in GRID_COLUMNS:  # 表單把列欄對調（列＝餐盒類型）
+                names.extend(cell + row for cell in _cells(value))
+            else:
+                names.extend(row + col for col in _cells(value))
         elif isinstance(value, (list, tuple)) and any(
             item is None or isinstance(item, (list, tuple)) for item in value
         ):
-            if len(value) != len(GRID_ROWS):
+            if len(value) == len(GRID_ROWS):
+                for row, cols in zip(GRID_ROWS, value):
+                    names.extend(row + col for col in _cells(cols))
+            elif len(value) == len(GRID_COLUMNS):  # 列欄對調：列＝餐盒類型
+                for col, rows in zip(GRID_COLUMNS, value):
+                    names.extend(row + col for row in _cells(rows))
+            else:
                 names.append("（表格列數和系統設定不同）")
-                continue
-            for row, cols in zip(GRID_ROWS, value):
-                names.extend(row + col for col in _cells(cols))
         else:
             names.extend(parse_fixed_pick_names(",".join(_cells(value))))
     deduped: list[str] = []

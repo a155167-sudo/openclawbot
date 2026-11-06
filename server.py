@@ -5379,7 +5379,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             raise HTTPException(status_code=422, detail="沒有符合飲食禁忌的可排餐點")
         _early_pref_staple = get_val(
             "您的主食選擇（可複選）", "主食選擇", "您的主食偏好是？(可複選)",
-            "主食偏好", "偏好的主食",
+            "主食偏好", "偏好的主食", "哪類主食",
             excluded_fragments=("不喜歡", "避免", "備註", "原因"),
         )
         if (
@@ -5537,7 +5537,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         # 2. 抓取顧客喜好標籤
         pref_staple = get_val(
             "您的主食選擇（可複選）", "主食選擇", "您的主食偏好是？(可複選)",
-            "主食偏好", "偏好的主食",
+            "主食偏好", "偏好的主食", "哪類主食",
             excluded_fragments=("不喜歡", "避免", "備註", "原因"),
         )
         pref_protein = get_val(
