@@ -44,6 +44,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from app_config import load_settings
 import first_batch_trial
+import fixed_meal_picks
 from dispatch_authority_bridge import import_initial_published_version
 from workbook_write_lease import (
     FULL_REQUIRED_WRITER_INVENTORY,
@@ -5681,13 +5682,29 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
 
         # 排序確保顯示順序正確
         plan_requests.sort(key=lambda x: (x[0], x[1]))
+        # 指定品項（選填）：有可用品項就輪流排，且不強制每週食蔬。
+        _plannable_menu = [
+            dish for dish in MAIN_DISHES
+            if dish.get('category') == 'main'
+            and any(kw in dish['name'] for kw in MEAL_PLAN_KEYWORDS)
+        ]
+        fixed_usable, fixed_unsafe, fixed_unknown = fixed_meal_picks.resolve_fixed_picks(
+            fixed_meal_picks.parse_fixed_pick_names(
+                get_val(*fixed_meal_picks.FORM_KEYWORDS)
+            ),
+            safe_menu,
+            _plannable_menu,
+        )
         try:
-            plan_requests = ensure_light_bento_coverage(
-                plan_requests,
-                safe_menu=safe_menu,
-                pref_staple=pref_staple,
-                liked_proteins=liked_proteins,
-            )
+            if fixed_usable:
+                plan_requests = fixed_meal_picks.apply_fixed_picks(plan_requests, fixed_usable)
+            else:
+                plan_requests = ensure_light_bento_coverage(
+                    plan_requests,
+                    safe_menu=safe_menu,
+                    pref_staple=pref_staple,
+                    liked_proteins=liked_proteins,
+                )
         except ValueError as exc:
             raise HTTPException(
                 status_code=422,
@@ -5849,6 +5866,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "phase_name": phase_name, "weeks_to_race": weeks_to_race_val,
             "created_at": tw_now().strftime("%Y-%m-%d %H:%M:%S"),
             "raw_form_data": data,
+            "fixed_picks": [dish["name"] for dish in fixed_usable],
+            "fixed_picks_admin_line": fixed_meal_picks.admin_line(fixed_usable, fixed_unsafe, fixed_unknown),
         }
         order_id = create_pending_subscription_form_order(form_snapshot)
         total_with_delivery = int(form_snapshot.get("total_with_delivery") or total_with_delivery)
@@ -5876,7 +5895,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             f"🥩 蛋白質目標: {int(protein)} g\n"
             f"💰 排餐金額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n"
             f"{first_batch_lines}"
-            f"🧾 本期預估總金額：${total_with_delivery}\n\n"
+            f"🧾 本期預估總金額：${total_with_delivery}\n"
+            f"{fixed_meal_picks.customer_lines(fixed_usable, fixed_unsafe, fixed_unknown)}\n"
             "📌 下一步流程\n"
             "1️⃣ 客服確認餐數、取餐日期、外送費與最終金額\n"
             "2️⃣ 確認無誤後提供付款資訊\n"
@@ -12464,6 +12484,7 @@ def notify_admin_pending_subscription_form(order_id: int, snapshot: dict):
         f"排餐金額：${int(snapshot.get('total_price') or 0)}\n"
         f"{_first_batch_admin_line(order_id)}"
         f"本期預估總金額：${int(snapshot.get('total_with_delivery') or 0)}\n"
+        f"{snapshot.get('fixed_picks_admin_line') or ''}"
         f"{delivery_review_line}\n\n"
         f"核准並發送匯款資訊：#核准訂單 {order_id}\n"
         f"付款完成後正式開通：#開通訂單 {order_id}\n\n"
