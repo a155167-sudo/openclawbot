@@ -73,13 +73,14 @@ def test_line_tag_only_when_configured(monkeypatch):
     assert f"tagId: '{tag}'" in snippet and "d.line-scdn.net" in snippet
 
 
-def test_feature_overview_lists_all_groups():
+def test_usage_guide_lists_every_item_under_faq():
     import plan_landing
 
     html = plan_landing.render_page(
         status={"enabled": False, "limit": 15, "taken": 0, "left": 0}, meal_low=140, meal_high=220,
         fee_tiers=[(1000, 30, ""), (3000, 60, "")], period_weeks=4, store_address="x")
-    assert "包月在 LINE 裡能做的事" in html
-    for _title, items in plan_landing.FEATURE_GROUPS:
-        for _icon, name, _sub in items:
+    assert 'id="guide"' in html and "使用教學" in html
+    assert html.index("常見問題") < html.index("使用教學")
+    for _title, items in plan_landing.GUIDE_GROUPS:
+        for _icon, name, _body in items:
             assert name in html
