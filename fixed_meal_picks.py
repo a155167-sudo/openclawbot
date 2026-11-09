@@ -36,6 +36,40 @@ def _cells(value) -> list[str]:
     return [re.sub(r"\s+", "", t) for t in _SPLIT_RE.split(str(value)) if t.strip()]
 
 
+def _split_flat_grid(text: str, rows: Sequence[str], cols: Sequence[str]) -> list[list[str]] | None:
+    """Apps Script 把格狀題 String[][] 直接轉字串：列與列、同列多格都用逗號接，沒勾的列是空字串。
+
+    例：「,,低碳,低碳,,,,」＝第 3、4 列各勾低碳。同一列的欄一定依欄位順序、不重複，
+    所以把 token 切成剛好 len(rows) 段、每段是空字串或欄序遞增；唯一解才採用，否則回 None。
+    """
+    tokens = [re.sub(r"\s+", "", t) for t in str(text).split(",")]
+    if any(t and t not in cols for t in tokens):
+        return None
+    order = {c: i for i, c in enumerate(cols)}
+    n_rows, n_tok = len(rows), len(tokens)
+    solutions: list[list[list[str]]] = []
+
+    def walk(pos: int, groups: list[list[str]]) -> None:
+        if len(solutions) > 1:
+            return
+        if len(groups) == n_rows:
+            if pos == n_tok:
+                solutions.append([list(g) for g in groups])
+            return
+        if pos >= n_tok:
+            return
+        if tokens[pos] == "":
+            walk(pos + 1, groups + [[]])
+            return
+        end = pos
+        while end < n_tok and tokens[end] and (end == pos or order[tokens[end]] > order[tokens[end - 1]]):
+            walk(end + 1, groups + [tokens[pos:end + 1]])
+            end += 1
+
+    walk(0, [])
+    return solutions[0] if len(solutions) == 1 else None
+
+
 def extract_form_names(data: Mapping) -> list[str]:
     """從表單 webhook 原始資料取出指定品名，支援三種格式：
 
@@ -67,6 +101,22 @@ def extract_form_names(data: Mapping) -> list[str]:
                     names.extend(row + col for row in _cells(rows))
             else:
                 names.append("（表格列數和系統設定不同）")
+        elif isinstance(value, str) and "," in value and all(
+            not t.strip() or re.sub(r"\s+", "", t) in GRID_COLUMNS + GRID_ROWS
+            for t in value.split(",")
+        ):
+            # 格狀題被攤平成一串字（目前的表單就是這樣送）
+            grid = _split_flat_grid(value, GRID_ROWS, GRID_COLUMNS)
+            if grid is not None:
+                for row, cols in zip(GRID_ROWS, grid):
+                    names.extend(row + col for col in cols)
+                continue
+            swapped = _split_flat_grid(value, GRID_COLUMNS, GRID_ROWS)
+            if swapped is not None:
+                for col, picked_rows in zip(GRID_COLUMNS, swapped):
+                    names.extend(row + col for row in picked_rows)
+                continue
+            names.append("（表格答案看不懂，請人工確認）")
         else:
             names.extend(parse_fixed_pick_names(",".join(_cells(value))))
     deduped: list[str] = []
@@ -136,11 +186,14 @@ def apply_fixed_picks(plan_requests: Sequence[tuple], fixed: Sequence[Mapping]) 
     return out
 
 
-def admin_line(usable: Sequence[Mapping], unsafe: Sequence[str], unknown: Sequence[str]) -> str:
+def admin_line(usable: Sequence[Mapping], unsafe: Sequence[str], unknown: Sequence[str],
+               total_meals: int = 0) -> str:
     """管理員通知用一行；沒有指定品項回空字串。"""
     if not (usable or unsafe or unknown):
         return ""
     parts = [f"指定品項：{'、'.join(d['name'] for d in usable) or '（都不能用，已改自動配餐）'}"]
+    if total_meals and len(usable) > total_meals:
+        parts.append(f"（勾了 {len(usable)} 樣、這期 {total_meals} 餐，隨機排其中 {total_meals} 樣）")
     if unsafe:
         parts.append(f"略過（含禁忌）：{'、'.join(unsafe)}")
     if unknown:
@@ -148,7 +201,8 @@ def admin_line(usable: Sequence[Mapping], unsafe: Sequence[str], unknown: Sequen
     return "\n".join(parts) + "\n"
 
 
-def customer_lines(usable: Sequence[Mapping], unsafe: Sequence[str], unknown: Sequence[str]) -> str:
+def customer_lines(usable: Sequence[Mapping], unsafe: Sequence[str], unknown: Sequence[str],
+                   total_meals: int = 0) -> str:
     """客人確認訊息用；沒有指定品項回空字串。"""
     if not (usable or unsafe or unknown):
         return ""
@@ -159,6 +213,8 @@ def customer_lines(usable: Sequence[Mapping], unsafe: Sequence[str], unknown: Se
             lines.append(f"🍱 指定品項：{names}（每天午餐，晚餐由系統搭配）")
         else:
             lines.append(f"🍱 指定品項：{names}（輪流排）")
+            if total_meals and len(usable) > total_meals:
+                lines.append(f"你勾了 {len(usable)} 樣，這期共 {total_meals} 餐，會隨機排其中 {total_meals} 樣。")
     skipped = [name for name in list(unsafe) + list(unknown) if not name.startswith("（")]
     if skipped:
         lines.append(f"⚠️ {'、'.join(skipped)} 不符合你的飲食禁忌或目前沒有供應，已略過。")

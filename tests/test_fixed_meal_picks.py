@@ -180,3 +180,36 @@ def test_current_staging_staple_question_title_is_read(tmp_path, monkeypatch):
          "想優先安排哪類主食？系統會依照你的選擇優先排餐（可複選": ["飯食派"]},
     )
     assert snapshot["pref_staple"] == "飯食派"
+
+
+def test_flattened_grid_string_from_current_form():
+    # 2026-11-09 電腦營養實際收到的格式
+    assert fmp.extract_form_names({"想固定吃的餐點": ",,低碳,低碳,低碳,低碳,,"}) == [
+        "雞肉低碳", "豬肉低碳", "牛肉低碳", "番牛低碳"]
+
+
+def test_flattened_grid_with_two_cells_in_one_row():
+    assert fmp.extract_form_names({"想固定吃的餐點": ",,便當,低碳,低碳,,,,"}) == [
+        "雞肉便當", "雞肉低碳", "豬肉低碳"]
+
+
+def test_flattened_grid_empty_means_no_picks():
+    assert fmp.extract_form_names({"想固定吃的餐點": ",,,,,,,"}) == []
+
+
+def test_more_picks_than_meals_is_explained():
+    picks = [_dish(f"P{i}", 180) for i in range(12)]
+    out = fmp.apply_fixed_picks(_plan(5, _dish("X", 1), _dish("Y", 1)), picks)
+    used = [n for r in out for n in (r[4]["name"], r[5]["name"])]
+    assert len(set(used)) == 10
+    assert "隨機排其中 10 樣" in fmp.customer_lines(picks, [], [], total_meals=10)
+    assert "隨機排其中 10 樣" in fmp.admin_line(picks, [], [], total_meals=10)
+    assert "隨機" not in fmp.customer_lines(picks[:3], [], [], total_meals=10)
+
+
+def test_form_flattened_grid_end_to_end(tmp_path, monkeypatch):
+    snapshot, pushes = _run_form(
+        tmp_path, monkeypatch, {"想固定吃的餐點": ",,便當,低碳,,,,"})
+    names = {meal for row in snapshot["master_api_rows"] for meal in (row[3], row[4])}
+    assert names == {"雞肉便當", "豬肉低碳"}
+    assert any("輪流排" in text for _uid, text in pushes)
