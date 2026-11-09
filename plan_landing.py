@@ -261,22 +261,15 @@ table.pickup { margin-top: 22px; }
 table.pickup th[scope="row"] { font-size: 16px; white-space: nowrap; }
 table.pickup td:nth-child(2) { white-space: nowrap; }
 
-/* 功能一覽 */
-.fgroup { margin-top: 28px; }
-.fgroup h3 { font-size: 18px; margin: 0 0 12px; color: var(--char); }
-.ftiles { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.ftiles li { background: var(--paper); border: 2.5px solid var(--char); border-radius: 16px; padding: 14px 8px;
-  display: grid; justify-items: center; text-align: center; gap: 2px; }
-.ftiles svg { width: 32px; height: 32px; margin-bottom: 4px; fill: none; stroke: var(--char); stroke-width: 1.9;
+/* 使用教學 */
+.ghead { font-size: 16px; margin: 26px 0 0; color: var(--ink); letter-spacing: .04em; }
+.ghead:first-child { margin-top: 0; }
+details.guide { border-bottom-color: var(--paper); }
+details.guide .gt { display: inline-flex; align-items: center; gap: 10px; }
+details.guide svg { width: 26px; height: 26px; flex: none; fill: none; stroke: var(--char); stroke-width: 1.9;
   stroke-linecap: round; stroke-linejoin: round; }
-.ftiles b { font-size: 16px; font-weight: 900; color: var(--char); line-height: 1.3; }
-.ftiles small { font-size: 13px; color: var(--ink); line-height: 1.35; }
 
 @media (min-width: 820px) {
-  .ftiles { grid-template-columns: repeat(4, 1fr); }
-  .ftiles li { grid-template-columns: 34px 1fr; justify-items: start; text-align: left; column-gap: 10px;
-    align-items: center; padding: 14px 12px; }
-  .ftiles svg { grid-row: span 2; margin-bottom: 0; width: 34px; height: 34px; }
   .flow { grid-template-columns: repeat(4, 1fr); }
   body { font-size: 18px; }
   .hero-grid { grid-template-columns: 1.05fr 1fr; align-items: center; padding-bottom: 40px; }
@@ -398,36 +391,51 @@ _lt('send', 'pv', ['{tag_id}']);
 <!-- End LINE Tag Base Code -->"""
 
 
-# 顧客在 LINE 裡能用的功能（只列南京店已上線的）。
-FEATURE_GROUPS = (
+# 使用教學（放在常見問題下面，點開才展開）。只寫南京店已上線、客人自己做得到的操作。
+GUIDE_GROUPS = (
     ("吃什麼，你可以決定", (
-        ("menu", "專屬菜單", "四週排好，隨時查"),
-        ("pin", "指定想吃的", "固定吃某幾樣也行"),
-        ("swap", "兩餐互換", "今天想先吃另一個"),
-        ("calendar", "改期、延餐", "臨時不在也不浪費"),
+        ("menu", "查看本期菜單",
+         "傳「查看菜單」，就會列出這四週每天的午餐、晚餐和價格。改期或互換過的餐也會照新的顯示。"),
+        ("pin", "固定吃某幾樣",
+         "填包月表單時，在「想固定吃的餐點」表格勾想吃的（肉類 × 餐盒）。勾 2 樣以上會輪流排；"
+         "只勾 1 樣，每天午餐固定這道、晚餐照你的偏好搭配。不勾就由系統配。"),
+        ("swap", "兩餐互換",
+         "傳「我要互換兩餐」，再照提示打日期和餐別，例如「把 11/12 午餐與 11/14 晚餐互換」。"
+         "客服確認後菜單就會更新。"),
+        ("calendar", "臨時不在，延後某一餐",
+         "傳「我要申請延餐」，再打「#延餐 11/12 午餐 -> 11/14 晚餐」。客服確認後才會改，不會直接變動。"),
     )),
     ("記錄，越簡單越好", (
-        ("tap", "吃了點一下", "忘了點也會自動記"),
-        ("camera", "外食拍照估算", "飲料也能記"),
-        ("heart", "常吃一鍵記", "不用每次重打"),
-        ("sliders", "份量微調", "加飯、少飯、去醬"),
+        ("tap", "包月餐吃了沒",
+         "午餐 11:30–14:00、晚餐 17:30–20:30 會問你「吃了嗎」，點「已吃」就記好；午晚一起送時，選你吃的是哪一個。"
+         "忘了點，餐期過後會自動算已吃。沒吃的話，當天晚上 11:59 前點「沒吃」就好。"),
+        ("camera", "外食、飲料怎麼記",
+         "直接傳照片，或打一句話，例如「排骨飯」「珍奶半糖」。系統先估熱量和蛋白質，你按「確認記錄」才會記進去；"
+         "份量不對可以先調整。有寫克數會更準。"),
+        ("chart", "看今天吃了多少",
+         "傳「首頁」或「今日進度」，會看到今天的熱量、蛋白質還差多少，以及每一筆紀錄。"),
     )),
     ("有人幫你看著", (
-        ("chart", "今日總覽", "熱量蛋白質剩多少"),
-        ("pen", "營養師三日健檢", "第一次訂就送"),
-        ("ticket", "我的方案", "剩幾餐、到期日"),
-        ("chat", "找客服", "LINE 直接問真人"),
+        ("pen", "營養師三日健檢",
+         "第一次開通後 7 天內，有 3 天每天記滿 2 餐以上（包月餐點「已吃」也算），"
+         "營養師看過你的紀錄、寫好建議後，報告會直接傳到 LINE。"),
+        ("ticket", "我的方案",
+         "傳「我的方案」，看剩幾餐、到期日和目前狀態。"),
+        ("chat", "找客服",
+         "傳「找客服」，真人客服會在 LINE 回你。要改地址、取餐方式或有任何問題都可以問。"),
     )),
 )
 
 
-def _feature_groups() -> str:
+def _guide_groups() -> str:
     out = []
-    for title, items in FEATURE_GROUPS:
-        tiles = "".join(
-            f'<li>{_icon(icon)}<b>{name}</b><small>{sub}</small></li>' for icon, name, sub in items
+    for title, items in GUIDE_GROUPS:
+        rows = "".join(
+            f'<details class="q guide"><summary><span class="gt">{_icon(icon)}{name}</span></summary>'
+            f'<p>{body}</p></details>'
+            for icon, name, body in items
         )
-        out.append(f'<div class="fgroup"><h3>{title}</h3><ul class="ftiles">{tiles}</ul></div>')
+        out.append(f'<h3 class="ghead">{title}</h3>{rows}')
     return "".join(out)
 
 
@@ -582,13 +590,6 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
   </div>
 </section>
 
-<section class="features" style="background:var(--butter)">
-  <div class="wrap">
-    <h2>包月在 LINE 裡能做的事</h2>
-    {_feature_groups()}
-  </div>
-</section>
-
 <section class="price">
   <div class="wrap two">
     <div>
@@ -635,6 +636,16 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
       <details class="q"><summary>我有不吃的食物</summary><p>填包月資料時寫上，排餐會避開。</p></details>
       <details class="q"><summary>首批 9 折怎麼算？</summary><p>只打餐費，運費不折；適用第一期，續約恢復一般價格。限第一次訂包月的朋友。</p></details>
     </div>
+  </div>
+</section>
+
+<section class="guide-sec" id="guide" style="background:var(--butter)">
+  <div class="wrap two">
+    <div>
+      <h2>使用教學</h2>
+      <p class="lead">已經訂了？點開看怎麼用。</p>
+    </div>
+    <div class="faq-list">{_guide_groups()}</div>
   </div>
 </section>
 
