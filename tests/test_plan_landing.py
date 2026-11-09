@@ -80,7 +80,7 @@ def test_usage_guide_lists_every_item_under_faq():
         status={"enabled": False, "limit": 15, "taken": 0, "left": 0}, meal_low=140, meal_high=220,
         fee_tiers=[(1000, 30, ""), (3000, 60, "")], period_weeks=4, store_address="x")
     assert 'id="guide"' in html and "使用教學" in html
-    assert html.index("常見問題") < html.index("使用教學")
+    assert html.index("<h2>常見問題</h2>") < html.index("<h2>使用教學</h2>")
     for _title, items in plan_landing.GUIDE_GROUPS:
         for _icon, name, _body in items:
             assert name in html
