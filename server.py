@@ -5704,6 +5704,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         )
         try:
             if fixed_usable:
+                # 打亂順序再輪流：勾的比餐數多時，每期隨機輪到不同品項，不會永遠排前面幾樣。
+                fixed_usable = random.sample(fixed_usable, len(fixed_usable))
                 plan_requests = fixed_meal_picks.apply_fixed_picks(plan_requests, fixed_usable)
             else:
                 plan_requests = ensure_light_bento_coverage(
@@ -5874,7 +5876,8 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             "created_at": tw_now().strftime("%Y-%m-%d %H:%M:%S"),
             "raw_form_data": data,
             "fixed_picks": [dish["name"] for dish in fixed_usable],
-            "fixed_picks_admin_line": fixed_meal_picks.admin_line(fixed_usable, fixed_unsafe, fixed_unknown),
+            "fixed_picks_admin_line": fixed_meal_picks.admin_line(
+                fixed_usable, fixed_unsafe, fixed_unknown, total_meals=len(plan_requests) * 2),
         }
         order_id = create_pending_subscription_form_order(form_snapshot)
         total_with_delivery = int(form_snapshot.get("total_with_delivery") or total_with_delivery)
@@ -5903,7 +5906,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
             f"💰 排餐金額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n"
             f"{first_batch_lines}"
             f"🧾 本期預估總金額：${total_with_delivery}\n"
-            f"{fixed_meal_picks.customer_lines(fixed_usable, fixed_unsafe, fixed_unknown)}\n"
+            f"{fixed_meal_picks.customer_lines(fixed_usable, fixed_unsafe, fixed_unknown, total_meals=len(plan_requests) * 2)}\n"
             "📌 下一步流程\n"
             "1️⃣ 客服確認餐數、取餐日期、外送費與最終金額\n"
             "2️⃣ 確認無誤後提供付款資訊\n"
