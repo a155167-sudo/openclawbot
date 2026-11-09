@@ -261,7 +261,22 @@ table.pickup { margin-top: 22px; }
 table.pickup th[scope="row"] { font-size: 16px; white-space: nowrap; }
 table.pickup td:nth-child(2) { white-space: nowrap; }
 
+/* 功能一覽 */
+.fgroup { margin-top: 28px; }
+.fgroup h3 { font-size: 18px; margin: 0 0 12px; color: var(--char); }
+.ftiles { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.ftiles li { background: var(--paper); border: 2.5px solid var(--char); border-radius: 16px; padding: 14px 8px;
+  display: grid; justify-items: center; text-align: center; gap: 2px; }
+.ftiles svg { width: 32px; height: 32px; margin-bottom: 4px; fill: none; stroke: var(--char); stroke-width: 1.9;
+  stroke-linecap: round; stroke-linejoin: round; }
+.ftiles b { font-size: 16px; font-weight: 900; color: var(--char); line-height: 1.3; }
+.ftiles small { font-size: 13px; color: var(--ink); line-height: 1.35; }
+
 @media (min-width: 820px) {
+  .ftiles { grid-template-columns: repeat(4, 1fr); }
+  .ftiles li { grid-template-columns: 34px 1fr; justify-items: start; text-align: left; column-gap: 10px;
+    align-items: center; padding: 14px 12px; }
+  .ftiles svg { grid-row: span 2; margin-bottom: 0; width: 34px; height: 34px; }
   .flow { grid-template-columns: repeat(4, 1fr); }
   body { font-size: 18px; }
   .hero-grid { grid-template-columns: 1.05fr 1fr; align-items: center; padding-bottom: 40px; }
@@ -321,6 +336,14 @@ _ICONS = {
     "line": '<path d="M4 5.5h16v10.5H10l-4.5 3.5V16H4z"/><path d="M8 10.8h8"/>',
     "form": '<rect x="5.5" y="4.5" width="13" height="16" rx="2"/><path d="M9 4.5V3h6v1.5"/><path d="M8.5 10h7M8.5 13.5h7M8.5 17h4"/>',
     "card": '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18M7 14.5h3"/>',
+    "menu": '<rect x="5" y="3.5" width="14" height="17" rx="2"/><path d="M8.5 8h7M8.5 12h7M8.5 16h4"/>',
+    "pin": '<path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/>',
+    "swap": '<path d="M5 8.5h13l-3.5-3.5"/><path d="M19 15.5H6l3.5 3.5"/>',
+    "calendar": '<rect x="4" y="5.5" width="16" height="15" rx="2"/><path d="M4 10h16M8.5 3.5v4M15.5 3.5v4"/><path d="M9.5 15h5"/>',
+    "heart": '<path d="M12 19.5s-7.5-4.4-7.5-9.6A4.1 4.1 0 0 1 12 7.6a4.1 4.1 0 0 1 7.5 2.3c0 5.2-7.5 9.6-7.5 9.6z"/>',
+    "sliders": '<path d="M5 7h14M5 12h14M5 17h14"/><circle cx="9" cy="7" r="1.8"/><circle cx="15" cy="12" r="1.8"/><circle cx="8" cy="17" r="1.8"/>',
+    "chat": '<path d="M4.5 6h15v10h-8l-4.5 3.5V16H4.5z"/><path d="M8.5 10.5h.01M12 10.5h.01M15.5 10.5h.01"/>',
+    "ticket": '<path d="M4 7.5h16v3a1.5 1.5 0 0 0 0 3v3H4v-3a1.5 1.5 0 0 0 0-3z"/><path d="M14 7.5v9"/>',
 }
 
 
@@ -373,6 +396,39 @@ _lt('send', 'pv', ['{tag_id}']);
 <noscript><img height="1" width="1" style="display:none" alt=""
   src="https://tr.line.me/tag.gif?c_t=lap&amp;t_id={tag_id}&amp;e=pv&amp;noscript=1"></noscript>
 <!-- End LINE Tag Base Code -->"""
+
+
+# 顧客在 LINE 裡能用的功能（只列南京店已上線的）。
+FEATURE_GROUPS = (
+    ("吃什麼，你可以決定", (
+        ("menu", "專屬菜單", "四週排好，隨時查"),
+        ("pin", "指定想吃的", "固定吃某幾樣也行"),
+        ("swap", "兩餐互換", "今天想先吃另一個"),
+        ("calendar", "改期、延餐", "臨時不在也不浪費"),
+    )),
+    ("記錄，越簡單越好", (
+        ("tap", "吃了點一下", "忘了點也會自動記"),
+        ("camera", "外食拍照估算", "飲料也能記"),
+        ("heart", "常吃一鍵記", "不用每次重打"),
+        ("sliders", "份量微調", "加飯、少飯、去醬"),
+    )),
+    ("有人幫你看著", (
+        ("chart", "今日總覽", "熱量蛋白質剩多少"),
+        ("pen", "營養師三日健檢", "第一次訂就送"),
+        ("ticket", "我的方案", "剩幾餐、到期日"),
+        ("chat", "找客服", "LINE 直接問真人"),
+    )),
+)
+
+
+def _feature_groups() -> str:
+    out = []
+    for title, items in FEATURE_GROUPS:
+        tiles = "".join(
+            f'<li>{_icon(icon)}<b>{name}</b><small>{sub}</small></li>' for icon, name, sub in items
+        )
+        out.append(f'<div class="fgroup"><h3>{title}</h3><ul class="ftiles">{tiles}</ul></div>')
+    return "".join(out)
 
 
 def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, period_weeks: int,
@@ -523,6 +579,13 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
   <div class="wrap">
     <h2>從估價到開吃</h2>
     {steps_flow}
+  </div>
+</section>
+
+<section class="features" style="background:var(--butter)">
+  <div class="wrap">
+    <h2>包月在 LINE 裡能做的事</h2>
+    {_feature_groups()}
   </div>
 </section>
 
