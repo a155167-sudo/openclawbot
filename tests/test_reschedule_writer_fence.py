@@ -269,7 +269,7 @@ def test_ast_reviewed_sheet_mutators_are_gated_or_trusted_inner():
         "receive_form_data", "sync_user_sheet_from_master",
         "update_4week_plan_background", "background_log_workout_to_sheet",
         "get_ai_response_with_memory", "replace_schedule", "_upsert_master_api_rows",
-        "run_weekly_coach", "_nutrition_ws", "_upsert_raw_sheet_row",
+        "_generate_weekly_coach", "_nutrition_ws", "_upsert_raw_sheet_row",
         "_handle_message_impl", "auto_daily_evening_report", "get_lobster_targets",
     }
     trusted_inner = {

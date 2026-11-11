@@ -45,6 +45,7 @@ from pydantic import BaseModel
 from app_config import load_settings
 import first_batch_trial
 import fixed_meal_picks
+import weekly_coach_runs
 from dispatch_authority_bridge import import_initial_published_version
 from workbook_write_lease import (
     FULL_REQUIRED_WRITER_INVENTORY,
@@ -13448,9 +13449,52 @@ def redeem_code(uid, code):
 # ==========================================
 # 📅 功能四：每週教練排課核心函數
 # ==========================================
-def run_weekly_coach(uid, reply_token=None):
+def run_weekly_coach(uid, reply_token=None, force=False):
+    """每週教練排課：同一人同一週只跑一次 AI、只寫一次 Sheet。回傳 (成功與否, 訊息文字)。
+
+    已排過就直接重送上次的課表；正在排就請客人稍等。force=True 才會重新生成。
+    """
+    _today = tw_today()
+    _next_monday = _today + timedelta(days=(7 - _today.weekday()) % 7 or 7)
+    week_start = _next_monday.strftime("%Y/%m/%d")
+
+    def _send(text):
+        try:
+            if reply_token: line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
+            else: line_bot_api.push_message(uid, TextSendMessage(text=text))
+        except Exception as exc:
+            print(f"❌ 週課表訊息推播失敗: {type(exc).__name__}")
+
+    try:
+        claimed = weekly_coach_runs.claim(DB_PATH, uid, week_start, tw_now().replace(tzinfo=None), force=force)
+    except Exception as exc:
+        print(f"⚠️ 週課表去重檢查失敗，本次不執行: {type(exc).__name__}: {exc}")
+        msg = "⚠️ 系統忙碌中，課表暫時無法安排，請稍後再試。"
+        _send(msg)
+        return False, msg
+    if claimed["state"] == "done":
+        print("ℹ️ 週課表本週已生成，重送上次結果（未呼叫 AI、未寫 Sheet）")
+        _send(claimed["line_message"])
+        return True, claimed["line_message"]
+    if claimed["state"] == "running":
+        msg = "⏳ 下週課表正在安排中，完成後會直接傳給你，請稍等一下。"
+        _send(msg)
+        return False, msg
+    try:
+        ok, message, daily_plan = _generate_weekly_coach(uid, reply_token)
+    except Exception:
+        weekly_coach_runs.release(DB_PATH, uid, week_start)
+        raise
+    if ok:
+        weekly_coach_runs.finish(DB_PATH, uid, week_start, tw_now().replace(tzinfo=None), message, daily_plan)
+    else:
+        weekly_coach_runs.release(DB_PATH, uid, week_start)
+    return ok, message
+
+
+def _generate_weekly_coach(uid, reply_token=None):
+    """實際流程：抓資料 → AI 生成 → 寫 Sheet → 推播 LINE。回傳 (ok, 訊息, daily_plan)。"""
     _require_controlled_workbook_writer("weekly_coach")
-    """執行每週教練排課完整流程：抓資料 → AI生成 → 寫Sheet → 推播LINE"""
 
     # 1. 從 SQLite 取得用戶個人設定
     conn = sqlite3.connect(DB_PATH)
@@ -13466,7 +13510,7 @@ def run_weekly_coach(uid, reply_token=None):
             if reply_token: line_bot_api.reply_message(reply_token, TextSendMessage(text=msg))
             else: line_bot_api.push_message(uid, TextSendMessage(text=msg))
         except: pass
-        return False, msg
+        return False, msg, {}
     
     # 解析健康檔案
     name, goal, restrictions, active_days, tdee, protein, race_date = hp
@@ -13597,7 +13641,7 @@ def run_weekly_coach(uid, reply_token=None):
     if race_date and race_date != "無":
         try:
             _rd = datetime.strptime(str(race_date), "%Y/%m/%d").date()
-            _race_weeks_left = max(0, (_rd - today.date()).days // 7)
+            _race_weeks_left = max(0, (_rd - today).days // 7)
         except: pass
 
     if _race_weeks_left == 0 or not race_date or race_date == "無":
@@ -13932,7 +13976,7 @@ line_message 末尾必須標明：「本週總 eTSS：XXX（TSS/預算{budget}�
             if reply_token: line_bot_api.reply_message(reply_token, TextSendMessage(text=error_msg))
             else: line_bot_api.push_message(uid, TextSendMessage(text=error_msg))
         except: pass
-        return False, error_msg
+        return False, error_msg, {}
 
     # 7b. 解析 LLM 回傳的 JSON
     line_message = raw_content  # fallback
@@ -13960,11 +14004,12 @@ line_message 末尾必須標明：「本週總 eTSS：XXX（TSS/預算{budget}�
     if gc and daily_plan:
         try:
             new_rows_to_add = [] 
+            cell_updates = []
             for date_str, plan_text in daily_plan.items():
                 if date_str in row_date_map:
-                    # 狀況 A：原本就有的格子，直接更新 (寫入第 10 欄 Plan_Week)
+                    # 狀況 A：原本就有的格子，先收集起來，等一下一次寫入 (第 10 欄 Plan_Week)
                     row_idx = row_date_map[date_str]
-                    api_sheet.update_cell(row_idx, 10, plan_text)
+                    cell_updates.append({"range": f"J{row_idx}", "values": [[plan_text]]})
                 else:
                     # 狀況 B：沒格子的週末，準備自動補齊 18 個欄位
                     # ⚠️ 注意：這裡把 plan_text 放在第 10 個位子 (Plan_Week)
@@ -13975,6 +14020,8 @@ line_message 末尾必須標明：「本週總 eTSS：XXX（TSS/預算{budget}�
                         run_pace, bike_ftp, swim_pace
                     ])
             
+            if cell_updates:
+                api_sheet.batch_update(cell_updates)
             # 如果有沒訂餐的週末課表，一口氣加進 Sheet 裡
             if new_rows_to_add:
                 print(f"📡 DEBUG: 準備寫入，長度為 {len(new_rows_to_add[0])} 欄")
@@ -13994,8 +14041,7 @@ line_message 末尾必須標明：「本週總 eTSS：XXX（TSS/預算{budget}�
     except Exception as e:
         print(f"❌ LINE 推播失敗: {e}")
 
-    # 必須要有這行 return，把結果丟回給前面的 callback
-    return line_message, daily_plan
+    return True, line_message, daily_plan
 
 
 _line_webhook_inbox = None
@@ -24636,37 +24682,22 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
     # ==========================================
     # 📅 功能四：每週課表觸發（LINE 指令）
     # ==========================================
-    if msg in ["請安排下週課表", "排下週課表", "下週課表", "週課表"]:
-        # 🌟 重要：先確保 user_id 有被正確賦值
-        target_user_id = event.source.user_id 
-        
+    if msg in ["請安排下週課表", "排下週課表", "下週課表", "週課表", "重排下週課表"]:
+        target_user_id = event.source.user_id
         try:
-            # 1. 立即回應，守住 reply_token
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text="⏳ 收到！正在分析您的體能數據並編排下週課表，請稍等約 30 秒...")
             )
-
-            # 2. 執行 AI 運算 (請確認你的函數名稱與回傳值正確)
-            # 注意：這裡會跑到你寫入 Google Sheet 的邏輯
-            ai_message, ai_plan = run_weekly_coach(target_user_id) 
-
-            # 3. 運算完後，使用 push_message 推送
-            if ai_message:
-                line_bot_api.push_message(
-                    target_user_id, 
-                    TextSendMessage(text=ai_message)
-                )
-                print(f"✅ 課表已成功推送給用戶: {target_user_id}")
-            
+            # 課表訊息由 run_weekly_coach 自己推播一次；這裡不再重複推。
+            run_weekly_coach(target_user_id, force=(msg == "重排下週課表"))
         except Exception as e:
-            # 🌟 這裡就是報錯的地方！確保這裡面沒有提到 'affected'
             print(f"❌ 安排課表發生錯誤: {e}")
             line_bot_api.push_message(
-                target_user_id, 
+                target_user_id,
                 TextSendMessage(text="⚠️ 系統編排課表時發生錯誤，請稍後再試。")
             )
-        return # 處理完畢，直接返回
+        return
      # 🟢 顧客一般對話 (串接 AI) 🟢
     # This is deliberately after every structured command/state handler and before both
     # quota debit and generic AI.  Non-consultation replies never expose a quota footer.
@@ -25533,6 +25564,6 @@ async def lobster_weekly_coach(payload: WeeklyCoachPayload):
         raise HTTPException(status_code=401, detail="Unauthorized")
     success, result = run_weekly_coach(payload.user_id)
     if success:
-        return {"status": "success", "msg": "每週課表已生成並推播", "plan_preview": result[:100] + "..."}
+        return {"status": "success", "msg": "每週課表已生成並推播", "plan_preview": str(result)[:100] + "..."}
     else:
         raise HTTPException(status_code=500, detail=result)
