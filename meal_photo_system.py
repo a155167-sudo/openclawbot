@@ -2879,7 +2879,7 @@ def build_meal_photo_estimate_bubble(
             "type": "box", "layout": "vertical", "spacing": "md",
             "contents": [
                 *nutrition_lines,
-                line("⚠️ 待營養師審核，尚未扣入個人營養計畫。", "#B26A00"),
+                line("⚠️ 待審核，尚未扣入個人營養計畫。", "#B26A00"),
                 line("未知維持NA；只有你明確選『沒有』才顯示0份。", "#777777", "xs"),
             ],
         },

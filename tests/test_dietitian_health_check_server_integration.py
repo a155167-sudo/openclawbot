@@ -459,7 +459,7 @@ print(json.dumps({'result':delivery,'stored':stored,'target':call[0],
     assert evidence["result"]["cleanup"] == "completed"
     assert evidence["stored"] == ["delivered", 1]
     assert evidence["target"] == "U11111111111111111111111111111111"
-    assert evidence["alt_text"] == "營養師三日飲食健檢報告"
+    assert evidence["alt_text"] == "三日飲食分析報告"
     assert evidence["retry_key"]
     assert evidence["base_headers"] == {"Authorization": "Bearer dummy"}
     assert evidence["call_headers"] == {"Authorization": "Bearer dummy"}
@@ -785,7 +785,7 @@ print(json.dumps({'first':first,'replay':replay,'calls':len(fake.calls),
     assert evidence["calls"] == 1
     assert evidence["target"] == "U11111111111111111111111111111111"
     assert evidence["retry_key"]
-    assert evidence["alt_text"] == "營養師請您補充三日飲食健檢資料"
+    assert evidence["alt_text"] == "請補充三日飲食分析資料"
     assert evidence["detail"]["notified"] is True
     assert evidence["case_status"] == "needs_more_info"
 

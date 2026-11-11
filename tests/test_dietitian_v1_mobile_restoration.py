@@ -92,7 +92,7 @@ def test_sticky_preview_is_primary_and_approval_exists_only_in_visible_preview()
         "做得好的地方",
         "目前優先事項",
         "接下來 7 天",
-        "營養師個人點評",
+        "店家的話",
         "資料限制",
     ):
         assert label in page

@@ -44,7 +44,7 @@ def _stored_delivery(path):
 
 def _assert_exact_approved_flex(message: dict) -> None:
     assert message["type"] == "flex"
-    assert message["altText"] == "營養師三日飲食健檢報告"
+    assert message["altText"] == "三日飲食分析報告"
     assert message["contents"]["type"] == "bubble"
     sections = message["contents"]["body"]["contents"]
     assert [
@@ -54,7 +54,7 @@ def _assert_exact_approved_flex(message: dict) -> None:
         ("做得好的地方", "好"),
         ("目前優先事項", "優先"),
         ("接下來 7 天", "行動"),
-        ("營養師個人點評", "限制"),
+        ("店家的話", "限制"),
         ("資料限制", "資料有限"),
     ]
 
@@ -77,7 +77,7 @@ def test_versioned_report_renders_personal_comment_and_limitations_separately():
         ("做得好的地方", "完整記錄"),
         ("目前優先事項", "增加蔬菜"),
         ("接下來 7 天", "午餐增加一份菜"),
-        ("營養師個人點評", "你做得到，先穩定一件事。"),
+        ("店家的話", "你做得到，先穩定一件事。"),
         ("資料限制", "一筆來源缺少可驗證餐別。"),
     ]
 

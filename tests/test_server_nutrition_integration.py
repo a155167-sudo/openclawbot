@@ -6964,7 +6964,7 @@ def test_customer_estimate_pushes_review_request_to_configured_admin(tmp_path, m
 
     server.handle_meal_photo_postback(event)
 
-    assert replies[0].alt_text == "餐點照片估算完成，等待營養師審核"
+    assert replies[0].alt_text == "餐點照片估算完成，等待審核"
     customer_text = json.dumps(json.loads(str(replies[0].contents)), ensure_ascii=False)
     assert "審核並加入" not in customer_text
     assert len(pushes) == 2
@@ -7728,7 +7728,7 @@ def test_admin_meal_photo_review_postbacks_apply_formal_totals(tmp_path, monkeyp
         assert totals["protein_medium_exchange"] == 2.5
         assert admin_totals["starch_exchange"] == 0.0
     assert pushes and pushes[-1][0] == "U_CUSTOMER"
-    assert "已由營養師核准" in pushes[-1][1].text
+    assert "已核准並計入正式紀錄" in pushes[-1][1].text
     push_count = len(pushes)
     if refresh_mode != "spy":
         with sqlite3.connect(db) as conn:

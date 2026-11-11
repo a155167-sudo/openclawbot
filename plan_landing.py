@@ -200,7 +200,7 @@ section { padding-block: 64px; }
 .est b { font-size: 16px; }
 .est .btn { margin-top: 6px; background: var(--green); color: var(--paper); border-radius: 10px; text-align: center; padding: 6px; font-weight: 700; }
 
-/* 營養師 */
+/* 三日飲食分析 */
 
 .report { background: var(--paper); border: 3px solid var(--char); border-radius: 20px; padding: 20px; display: grid; gap: 14px; max-width: 440px; align-self: start; }
 .report-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
@@ -416,9 +416,9 @@ GUIDE_GROUPS = (
          "傳「首頁」或「今日進度」，會看到今天的熱量、蛋白質還差多少，以及每一筆紀錄。"),
     )),
     ("有人幫你看著", (
-        ("pen", "營養師三日健檢",
+        ("pen", "三日飲食分析",
          "第一次開通後 7 天內，有 3 天每天記滿 2 餐以上（包月餐點「已吃」也算），"
-         "營養師看過你的紀錄、寫好建議後，報告會直接傳到 LINE。"),
+         "AI 整理你的紀錄、擬好建議，店家看過後，報告會直接傳到 LINE。"),
         ("ticket", "我的方案",
          "傳「我的方案」，看剩幾餐、到期日和目前狀態。"),
         ("chat", "找客服",
@@ -470,7 +470,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
     rd_flow = _flow((
         ("bowl", "照常吃三天", "不用多做什麼"),
         ("doc", "AI 整理", "擬好建議草稿"),
-        ("pen", "營養師修改", "看過才核准"),
+        ("pen", "店家把關", "看過才送出"),
         ("line", "LINE 收到", "下 7 天怎麼吃"),
     ), highlight=2)
     steps_flow = _flow((
@@ -498,7 +498,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>一日樂食包月｜拍照幫你算熱量</title>
-<meta name="description" content="包月便當依你的目標排好四週，外面吃的拍張照就幫你算熱量，營養師親自看過你的三日飲食。">
+<meta name="description" content="包月便當依你的目標排好四週，外面吃的拍張照就幫你算熱量，還送你一份三日飲食分析。">
 <meta property="og:title" content="一日樂食包月｜不用想吃什麼，拍照幫你算熱量">
 <meta property="og:description" content="包月便當依你的目標排好四週，外面吃的拍張照就幫你算熱量。">
 <meta property="og:image" content="/plan/assets/salmon.jpg">
@@ -566,12 +566,12 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
 
 <section class="rd" style="background:var(--butter)">
   <div class="wrap">
-    <h2>營養師親自看過你的三天</h2>
-    <p class="lead">第一次訂包月，送一次三日飲食健檢。</p>
+    <h2>三日飲食分析</h2>
+    <p class="lead">第一次訂包月，送一次：AI 整理你的三天紀錄，店家看過才送給你。</p>
     {rd_flow}
     <div>
-      <div class="report" aria-label="營養師三日飲食健檢報告範例">
-        <div class="report-head"><b>營養師三日飲食健檢報告</b><span class="tag">範例</span></div>
+      <div class="report" aria-label="三日飲食分析報告範例">
+        <div class="report-head"><b>三日飲食分析報告</b><span class="tag">範例</span></div>
         <dl>
           <div><dt>做得好的地方</dt><dd>三天的包月餐都有吃完，每天都有兩份以上的蔬菜。</dd></div>
           <div><dt>目前優先事項</dt><dd>早餐蛋白質偏少，三天平均約 12 g，下午比較容易餓。</dd></div>
@@ -579,7 +579,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
         </dl>
       </div>
     </div>
-    <p class="fine">三日健檢之後，如果想請營養師每週持續追蹤，可以另外加購。</p>
+    <p class="fine">AI 依你的紀錄整理的飲食建議，不是醫療或營養師診斷。</p>
   </div>
 </section>
 
@@ -632,7 +632,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
       <details class="q"><summary>什麼時候開始？</summary><p>每期四週，從下週一開始。週日晚上 8 點以後報名，會排到再下一個週一。</p></details>
       <details class="q"><summary>什麼時候要付款？</summary><p>開始前的週日晚上 8 點以前完成匯款。首批名額逾時沒付款，會釋出給下一位。</p></details>
       <details class="q"><summary>某一餐沒吃怎麼辦？</summary><p>在今日總覽點「沒吃」就好，當天晚上 11:59 前都能改。</p></details>
-      <details class="q"><summary>營養師健檢要另外付錢嗎？</summary><p>第一次訂包月時包含一次三日飲食健檢，不用另外付費。之後想請營養師持續追蹤，才需要加購。</p></details>
+      <details class="q"><summary>三日飲食分析要另外付錢嗎？</summary><p>不用。第一次訂包月就送一次，AI 整理你的三天紀錄，店家看過後傳到你的 LINE。</p></details>
       <details class="q"><summary>我有不吃的食物</summary><p>填包月資料時寫上，排餐會避開。</p></details>
       <details class="q"><summary>首批 9 折怎麼算？</summary><p>只打餐費，運費不折；適用第一期，續約恢復一般價格。限第一次訂包月的朋友。</p></details>
     </div>

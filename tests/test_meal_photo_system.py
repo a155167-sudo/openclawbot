@@ -1877,7 +1877,7 @@ def test_estimate_card_actions_match_workflow_and_viewer(
 
     assert expected_heading in text
     if workflow_version == "expert_review_v1":
-        assert "待營養師審核，尚未扣入個人營養計畫" in text
+        assert "待審核，尚未扣入個人營養計畫" in text
         assert "確認後會記入飲食紀錄" not in text
     else:
         assert "確認後會記入飲食紀錄" in text
