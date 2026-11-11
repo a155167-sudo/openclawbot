@@ -179,7 +179,7 @@ def test_fresh_ready_preview_edit_lock_fake_line_success_once_and_concurrent_cla
         ("做得好的地方", final_fields["good"]),
         ("目前優先事項", final_fields["priority"]),
         ("接下來 7 天", final_fields["next_7_days"]),
-        ("營養師個人點評", final_fields["comment"]),
+        ("店家的話", final_fields["comment"]),
         ("資料限制", "資料有限"),
     ]
     assert "舊點評" not in json.dumps(calls[0][1], ensure_ascii=False)

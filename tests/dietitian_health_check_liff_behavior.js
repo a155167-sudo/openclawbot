@@ -244,7 +244,7 @@ async function formalPreviewMatchesPersistedReportAndActualLineLiterally() {
   assert.ok(renderedText(reviewReference).includes('審核參考，不含於送出內容'));
   assert.ok(renderedText(reviewReference).includes('未同時綁定日期與餐別'));
   assert.deepEqual(previewSections.map(section => section.label), [
-    '做得好的地方', '目前優先事項', '接下來 7 天', '營養師個人點評', '資料限制',
+    '做得好的地方', '目前優先事項', '接下來 7 天', '店家的話', '資料限制',
   ]);
 }
 
@@ -602,7 +602,7 @@ async function verifiedApiReviewProjectionIsRenderedInChinese() {
   const app = await createApp(async path => path.includes('?') ? jsonResponse(fixtureListing) : jsonResponse(apiFixture));
   const text = renderedText(app.ids.latestReview);
   for (const expected of ['資料來源：6 筆可驗證營養快照', '營養計算', '整體重點：資料不足']) assert.ok(text.includes(expected), expected);
-  for (const forbidden of ['記錄完整', '增加蔬菜', '午餐補一份蔬菜', '營養師個人點評', '審核狀態', '審核版本', 'review-2', apiFixture.source_manifest_hash, '/srv/', 'activation-secret']) {
+  for (const forbidden of ['記錄完整', '增加蔬菜', '午餐補一份蔬菜', '店家的話', '審核狀態', '審核版本', 'review-2', apiFixture.source_manifest_hash, '/srv/', 'activation-secret']) {
     if (forbidden) assert.ok(!text.includes(forbidden), `AI summary must not render human draft or technical metadata: ${forbidden}`);
   }
 

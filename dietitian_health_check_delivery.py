@@ -50,9 +50,10 @@ _V2_REPORT_LABELS = (
     "做得好的地方",
     "目前優先事項",
     "接下來 7 天",
-    "營養師個人點評",
+    "店家的話",
     "資料限制",
 )
+REPORT_DISCLAIMER = "這份是 AI 依你的三天紀錄整理、店家看過的飲食建議，不是醫療或營養師診斷。"
 DELIVERY_RECOVERY_FLAG = "DIETITIAN_HEALTH_CHECK_DELIVERY_RECOVERY_ENABLED"
 NONRETRYABLE_ERROR_PREFIX = "nonretryable:"
 
@@ -118,7 +119,7 @@ def render_approved_health_check_flex(report: dict[str, str]) -> dict[str, objec
         )
     return {
         "type": "flex",
-        "altText": "營養師三日飲食健檢報告",
+        "altText": "三日飲食分析報告",
         "contents": {
             "type": "bubble",
             "size": "mega",
@@ -127,6 +128,13 @@ def render_approved_health_check_flex(report: dict[str, str]) -> dict[str, objec
                 "layout": "vertical",
                 "spacing": "lg",
                 "contents": sections,
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": REPORT_DISCLAIMER, "size": "xxs", "wrap": True, "color": "#6B7280"}
+                ],
             },
         },
     }

@@ -46,7 +46,7 @@ def test_persisted_request_sends_flex_and_projects_notified_true(tmp_path):
     assert len(calls) == 1
     recipient, flex, retry_key = calls[0]
     assert recipient == "U11111111111111111111111111111111"
-    assert flex["altText"] == "營養師請您補充三日飲食健檢資料"
+    assert flex["altText"] == "請補充三日飲食分析資料"
     rendered = str(flex)
     assert "運動日前後資訊不足" in rendered
     assert "請補飲料與點心時間份量" in rendered

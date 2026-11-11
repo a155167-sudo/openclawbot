@@ -70,7 +70,7 @@ def build_customer_health_services_contents(services: dict) -> dict | None:
     health_url = str(services.get("health_check_url") or "").strip()
     if health_url.startswith("https://liff.line.me/"):
         actions.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
-                        "action": {"type": "uri", "label": "三日飲食健檢", "uri": health_url}})
+                        "action": {"type": "uri", "label": "三日飲食分析", "uri": health_url}})
 
     coaching_status_copy = {
         "payment_pending": "等待付款",
@@ -97,7 +97,7 @@ def build_customer_health_services_contents(services: dict) -> dict | None:
             "type": "box", "layout": "vertical", "margin": "md",
             "backgroundColor": "#F7FAF7", "cornerRadius": "10px", "paddingAll": "12px",
             "contents": [
-                {"type": "text", "text": "4 週營養師陪跑", "size": "sm", "weight": "bold", "color": "#243B2D"},
+                {"type": "text", "text": "4 週 AI 飲食陪跑", "size": "sm", "weight": "bold", "color": "#243B2D"},
                 {"type": "text", "text": coaching_copy, "size": "sm", "color": "#66736B", "wrap": True, "margin": "xs"},
             ],
         })

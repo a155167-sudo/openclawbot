@@ -23,13 +23,13 @@ def render_health_check_supplement_flex(reason: str, required_content: str) -> d
         raise SupplementNotificationConflict("invalid persisted required content")
     return {
         "type": "flex",
-        "altText": "營養師請您補充三日飲食健檢資料",
+        "altText": "請補充三日飲食分析資料",
         "contents": {
             "type": "bubble",
             "body": {
                 "type": "box", "layout": "vertical", "spacing": "lg",
                 "contents": [
-                    {"type": "text", "text": "三日飲食健檢需要補充資料", "weight": "bold", "size": "lg", "wrap": True},
+                    {"type": "text", "text": "三日飲食分析需要補充資料", "weight": "bold", "size": "lg", "wrap": True},
                     {"type": "text", "text": "補件理由", "weight": "bold", "size": "sm", "color": "#0F766E"},
                     {"type": "text", "text": reason, "size": "sm", "wrap": True},
                     {"type": "text", "text": "請補充", "weight": "bold", "size": "sm", "color": "#0F766E"},

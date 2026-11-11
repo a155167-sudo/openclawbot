@@ -5891,7 +5891,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         push_msg = (
             f"🎉 {name}，包月資料已收到！\n\n"
             f"訂單編號：#{order_id}\n"
-            "AI 營養師已先為您完成初步精算，但尚未正式開通：\n"
+            "AI 營養助理已先為您完成初步精算，但尚未正式開通：\n"
             f"🔥 TDEE: {int(tdee)} kcal\n"
             f"🥩 蛋白質目標: {int(protein)} g\n"
             f"💰 排餐金額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n"
@@ -6048,7 +6048,7 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
         self_pickup_line = "\n🛍️ 本期為自取，不產生外送費。" if (pickup_method and not is_delivery) else ""
         push_msg = (
             f"🎉 {name}，包月資料已收到！\n\n"
-            "AI 營養師已先為您完成初步精算：\n"
+            "AI 營養助理已先為您完成初步精算：\n"
             f"🔥 TDEE: {int(tdee)} kcal\n"
             f"🥩 蛋白質目標: {int(protein)} g\n"
             f"💰 排餐金額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n"
@@ -8187,7 +8187,7 @@ def run_staging_health_check_qa(target_uid: str) -> str:
         f"有效天數：{result['valid_day_count']} 天\n"
         f"案件狀態：{status_text}\n\n"
         "下一步：傳「#營養師健檢」打開工作台，點這個案件，按「帶入系統初稿」，寫建議後核准；"
-        "測試帳號應該會收到「營養師三日飲食健檢報告」。"
+        "測試帳號應該會收到「三日飲食分析報告」。"
     )
 
 
@@ -11198,7 +11198,7 @@ def send_tomorrow_reminders():
 
     count = 0
     for uid, name in users:
-        msg = f"🌙 {name} 晚安！\n明天 ({tomorrow_str}) 是您的專屬取餐日喔！\n\n💪 營養師溫馨提醒：\n為確保您的營養達標，明天需要幫您額外準備【舒肥雞胸肉】或【無糖豆漿】來補足蛋白質缺口嗎？\n(直接回覆需要的品項，店長明天就會幫您準備好！)"
+        msg = f"🌙 {name} 晚安！\n明天 ({tomorrow_str}) 是您的專屬取餐日喔！\n\n💪 溫馨提醒：\n為確保您的營養達標，明天需要幫您額外準備【舒肥雞胸肉】或【無糖豆漿】來補足蛋白質缺口嗎？\n(直接回覆需要的品項，店長明天就會幫您準備好！)"
         try: 
             line_bot_api.push_message(uid, TextSendMessage(text=msg))
             count += 1
@@ -13301,7 +13301,7 @@ def send_subscription_expiry_reminders(days_before: int = 3):
             msg = (
                 f"⏰ {name or '會員'} 您好！\n"
                 f"您的方案將於 {expiry_date} 到期，目前剩餘 {remaining_meals or 0} 餐。\n\n"
-                "若想不中斷配餐與 AI 營養師服務，建議這幾天就先續訂下一期包月喔！"
+                "若想不中斷配餐與 AI 營養助理服務，建議這幾天就先續訂下一期包月喔！"
             )
             try:
                 line_bot_api.push_message(user_id, TextSendMessage(text=msg))
@@ -20129,7 +20129,7 @@ def build_meal_photo_approved_bubble(draft, result):
         "type": "bubble",
         "header": {
             "type": "box", "layout": "vertical", "backgroundColor": "#D1FAE5",
-            "contents": [{"type": "text", "text": "✅ 營養師已核准｜已計入正式份量", "weight": "bold", "size": "md", "color": "#065F46"}],
+            "contents": [{"type": "text", "text": "✅ 已核准｜已計入正式份量", "weight": "bold", "size": "md", "color": "#065F46"}],
         },
         "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body_contents},
     }
@@ -20306,7 +20306,7 @@ def _push_meal_photo_owner_notification_once(draft, notification_kind, text):
 
 def push_meal_photo_return_to_owner(draft):
     text = (
-        "↩️ 你的餐點照片已由營養師退回，尚未計入正式營養紀錄。\n"
+        "↩️ 你的餐點照片已被退回，尚未計入正式營養紀錄。\n"
         "請重新拍攝清楚的完整餐點，或補充食材與份量後再次送審。"
     )
     return _push_meal_photo_owner_notification_once(
@@ -20318,7 +20318,7 @@ def push_meal_photo_approval_to_owner(draft, result):
     exact = result.get("approved_exchange") or {}
     estimated = result.get("estimated_nutrition") or {}
     text = (
-        "✅ 你的餐點已由營養師核准並計入正式紀錄。\n"
+        "✅ 你的餐點已核准並計入正式紀錄。\n"
         f"主食 {float(exact.get('starch_exchange', 0) or 0):g}份｜"
         f"蔬菜 {float(exact.get('vegetable_exchange', 0) or 0):g}份\n"
         f"估算熱量 {float(estimated.get('calories_kcal', 0) or 0):g} kcal｜"
@@ -21127,7 +21127,7 @@ def handle_meal_photo_postback(event):
                 elif draft["status"] == "estimated":
                     from linebot.models import FlexSendMessage
                     reply = FlexSendMessage(
-                        alt_text="餐點照片估算完成，待營養師審核",
+                        alt_text="餐點照片估算完成，待審核",
                         contents=build_meal_photo_estimate_bubble(
                             draft, allow_admin_review=True
                         ),
@@ -21183,7 +21183,7 @@ def handle_meal_photo_postback(event):
             elif kind == "review_cancelled":
                 from linebot.models import FlexSendMessage
                 reply = FlexSendMessage(
-                    alt_text="餐點照片估算完成，待營養師審核",
+                    alt_text="餐點照片估算完成，待審核",
                     contents=build_meal_photo_estimate_bubble(
                         draft, allow_admin_review=True
                     ),
@@ -21364,7 +21364,7 @@ def handle_meal_photo_postback(event):
                 push_meal_photo_review_request(draft)
             reply = FlexSendMessage(
                 alt_text=(
-                    "餐點照片估算完成，等待營養師審核"
+                    "餐點照片估算完成，等待審核"
                     if draft.get("workflow_version") == "expert_review_v1"
                     else "餐點照片估算完成，請確認記錄"
                 ),
@@ -23264,7 +23264,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                 ))
         except Exception as exc:
             print(f"⚠️ 營養推薦失敗：{exc}")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="目前無法計算個人餐點推薦，請稍後再試或聯繫營養師。"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="目前無法計算個人餐點推薦，請稍後再試或聯繫客服。"))
         return
 
     # ======================================================
@@ -24239,7 +24239,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
     elif msg == "我的會員狀態":
         allow, q_msg = check_permission_and_quota(uid)
         if allow: reply_text = f"💎 您的 VIP 會員狀態：\n\n您目前還剩下：\n{q_msg}\n\n請繼續保持健康的飲食習慣喔！"
-        else: reply_text = "您目前尚未開通 VIP 方案，或是方案已到期。\n請輸入您的 VIP 邀請碼 (例如 #VIP24-XXXXXX) 來解鎖專屬 AI 營養師與訂餐服務！"
+        else: reply_text = "您目前尚未開通 VIP 方案，或是方案已到期。\n請輸入您的 VIP 邀請碼 (例如 #VIP24-XXXXXX) 來解鎖專屬 AI 營養助理與訂餐服務！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
 
@@ -24394,7 +24394,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                             notify_count += 1
                         except Exception: pass
                     elif old_meals == 2 and new_meals == 1:
-                        last_meal_msg = f"⏰ {u_name} 提醒您：明天將是您目前方案的最後一餐。\n若想不中斷外送與 AI 營養師服務，建議今天就先續訂下一期包月喔！"
+                        last_meal_msg = f"⏰ {u_name} 提醒您：明天將是您目前方案的最後一餐。\n若想不中斷外送與 AI 營養助理服務，建議今天就先續訂下一期包月喔！"
                         try:
                             line_bot_api.push_message(u_id, TextSendMessage(text=last_meal_msg))
                             notify_count += 1

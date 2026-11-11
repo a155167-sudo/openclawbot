@@ -148,7 +148,7 @@ $('openReschedule').addEventListener('click',openReschedule);
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <title>VIP 3 日飲食健檢</title>
+  <title>VIP 3 日飲食分析</title>
   <style>
     :root{{--ink:#16332a;--muted:#61736c;--green:#126b4f;--cream:#faf8f0;--paper:#fffef9;--line:#dce5df;--amber:#9a6214}}
     *{{box-sizing:border-box}}body{{margin:0;background:#e8eee9;color:var(--ink);font-family:"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif;line-height:1.55}}
@@ -165,22 +165,22 @@ $('openReschedule').addEventListener('click',openReschedule);
   <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 </head>
 <body><main class="app">
-  <div class="brand">一日樂食・VIP 健檢<small>首次 VIP 權益｜7 天內完成 3 個有效紀錄日</small></div>
-  <section id="loading" class="card"><h2>正在確認你的健檢進度…</h2><p>請保持此頁開啟。</p></section>
+  <div class="brand">一日樂食・VIP 飲食分析<small>首次 VIP 權益｜7 天內完成 3 個有效紀錄日</small></div>
+  <section id="loading" class="card"><h2>正在確認你的分析進度…</h2><p>請保持此頁開啟。</p></section>
   <section id="error" class="card error" hidden><h2 id="errorTitle">暫時無法載入</h2><p id="errorCopy"></p></section>
-  <section id="empty" class="card" hidden><h1>目前沒有進行中的 3 日健檢</h1><p>此權益會在符合資格的首次 VIP 正式開通時自動建立，不需要另外輸入序號。</p></section>
+  <section id="empty" class="card" hidden><h1>目前沒有進行中的 3 日飲食分析</h1><p>此權益會在符合資格的首次 VIP 正式開通時自動建立，不需要另外輸入序號。</p></section>
   <div id="content" hidden>
-    <section class="card progress"><small>3 日飲食健檢進度</small><div class="count"><b id="count">0</b><span>/3 個有效日</span></div><div class="bar"><i id="bar"></i></div><p id="statusCopy"></p></section>
+    <section class="card progress"><small>3 日飲食分析進度</small><div class="count"><b id="count">0</b><span>/3 個有效日</span></div><div class="bar"><i id="bar"></i></div><p id="statusCopy"></p></section>
     <section class="card"><div class="label">紀錄窗口</div><h2 id="windowText"></h2><div id="days" class="days"></div></section>
     <section class="card"><h2>下一步</h2><p id="nextCopy"></p><button id="backToLine">回到 LINE 紀錄飲食</button></section>
-    <section id="supplement" class="card" hidden><div class="label">營養師補件要求</div><h2 id="supplementTitle">請先完成指定紀錄</h2><p id="supplementReason"></p><p id="supplementContent"></p><p id="supplementRequestedAt"></p><button id="submitSupplement">已補充，送回審查</button><p id="supplementSubmitState" aria-live="polite"></p></section>
-    <section id="report" class="card" hidden><div class="label">營養師核准報告</div><h1>3 日飲食基準報告</h1><h2>做得好的地方</h2><p id="reportGood"></p><h2>優先調整</h2><p id="reportPriority"></p><h2>接下來 7 天</h2><p id="reportNext"></p><h2>資料限制</h2><p id="reportLimit"></p></section>
+    <section id="supplement" class="card" hidden><div class="label">補件要求</div><h2 id="supplementTitle">請先完成指定紀錄</h2><p id="supplementReason"></p><p id="supplementContent"></p><p id="supplementRequestedAt"></p><button id="submitSupplement">已補充，送回審查</button><p id="supplementSubmitState" aria-live="polite"></p></section>
+    <section id="report" class="card" hidden><div class="label">店家確認後的報告</div><h1>3 日飲食基準報告</h1><h2>做得好的地方</h2><p id="reportGood"></p><h2>優先調整</h2><p id="reportPriority"></p><h2>接下來 7 天</h2><p id="reportNext"></p><h2>資料限制</h2><p id="reportLimit"></p></section>
   </div>{reschedule_card}
 </main>
 <script>
 const LIFF_ID={liff_json};
 const REQUEST_TIMEOUT_MS=15000;
-const statusCopy={{collecting:'繼續使用原本的飲食紀錄方式。',ready_for_review:'3 個有效日已完成，資料正在整理並等待營養師審核。',needs_more_info:'營養師需要你補充部分紀錄。',approved_pending_delivery:'報告已核准，正在準備送達。',delivery_failed:'報告暫時未送達，系統會重送同一版本。',delivered:'你的基準報告已完成。',expired:'本次 7 天紀錄期限已結束，如需協助請回到 LINE 聯絡客服。',cancelled:'本次健檢已取消，如有疑問請回到 LINE 聯絡客服。'}};
+const statusCopy={{collecting:'繼續使用原本的飲食紀錄方式。',ready_for_review:'3 個有效日已完成，資料正在整理並等待店家確認。',needs_more_info:'需要你補充部分紀錄。',approved_pending_delivery:'報告已核准，正在準備送達。',delivery_failed:'報告暫時未送達，系統會重送同一版本。',delivered:'你的基準報告已完成。',expired:'本次 7 天紀錄期限已結束，如需協助請回到 LINE 聯絡客服。',cancelled:'本次健檢已取消，如有疑問請回到 LINE 聯絡客服。'}};
 const $=id=>document.getElementById(id);
 let idToken='',currentState=null,viewGeneration=0,completionSaving=null,completionRetry=null;
 function showError(title,copy){{$('loading').hidden=true;$('error').hidden=false;$('errorTitle').textContent=title;$('errorCopy').textContent=copy}}
@@ -196,7 +196,7 @@ function render(payload){{
 function completionMessage(status){{if(status===409)return '尚未偵測到實質補件變更，請先補充紀錄後再提交；不會自動更新或重送。';if(status===401)return 'LINE 身分驗證失敗，請重新開啟頁面。';if(status===404)return '目前找不到可提交的補件，請重新載入。';if(status===422)return '補件提交格式無效，請重新載入。';return '提交結果未知或服務暫時不可用；可用同一請求重試。'}}
 async function submitSupplement(){{
   if(completionSaving)return;const request=validSupplement(currentState);if(!request)return;
-  if(!window.confirm('確認已依營養師要求補充紀錄，並送回重新審查？'))return;
+  if(!window.confirm('確認已依要求補充紀錄，並送回重新審查？'))return;
   const binding=request.supplement_request_id+'\\n'+request.expected_source_token;
   const payload=completionRetry&&completionRetry.binding===binding?completionRetry.payload:{{request_id:crypto.randomUUID(),expected_supplement_request_id:request.supplement_request_id,expected_source_token:request.expected_source_token}};
   completionRetry={{binding,payload}};const ownedGeneration=viewGeneration,ownedCase=currentState.case_id,operation={{}};const controller=new AbortController();let timeoutId,timedOut=false;
