@@ -47,6 +47,7 @@ import first_batch_trial
 import fixed_meal_picks
 import weekly_coach_runs
 import user_memory_store
+from db_util import db_session, describe_storage
 from dispatch_authority_bridge import import_initial_published_version
 from workbook_write_lease import (
     FULL_REQUIRED_WRITER_INVENTORY,
@@ -511,7 +512,7 @@ def confirm_meal_photo_revision(
     draft_token: str,
 ) -> dict:
     """Confirm/replay a trusted revision, then repair local derived consumers."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         _prepare_health_check_refresh_connection(conn)
         result = confirm_user_meal_photo_revision(
@@ -605,7 +606,7 @@ def _unknown_error():
 
 def _mark_provider_unknown(*, token, user_id, attempt_id, error_kind):
     marked_at = tw_now().isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
@@ -1180,7 +1181,7 @@ def get_daily_food_ledger(user_id: str, date_text: str) -> dict:
         datetime.strptime(date_text, "%Y-%m-%d")
     except ValueError as exc:
         raise ValueError("日期格式必須是 YYYY-MM-DD") from exc
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         rows = _daily_food_rows(conn, user_id, date_text)
         items = [_ledger_item_from_row(conn, row) for row in rows]
@@ -1253,7 +1254,7 @@ def apply_daily_food_log_edit(
     event_id = str(event_id or "").strip()
     if not event_id:
         raise ValueError("缺少操作事件識別碼")
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         _prepare_health_check_refresh_connection(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -1482,7 +1483,7 @@ def clear_daily_food_ledger(user_id: str, *, event_id: str) -> dict:
     if not user_id or not event_id:
         raise ValueError("缺少清空事件識別碼")
     today = tw_today().isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         _prepare_health_check_refresh_connection(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -1755,7 +1756,7 @@ def set_daily_food_edit_state(
     *, field: str = "", pending_value=None, payload: dict | None = None,
 ) -> None:
     now = tw_now()
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute(
             """INSERT INTO daily_food_edit_states
@@ -1778,7 +1779,7 @@ def set_daily_food_edit_state(
 
 
 def get_daily_food_edit_state(user_id: str) -> dict | None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         row = conn.execute(
             """SELECT log_id,expected_version,input_type,field,pending_value,
@@ -1803,7 +1804,7 @@ def get_daily_food_edit_state(user_id: str) -> dict | None:
 
 
 def clear_daily_food_edit_state(user_id: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("DELETE FROM daily_food_edit_states WHERE user_id=?", (user_id,))
         conn.commit()
@@ -1816,7 +1817,7 @@ def _claim_meal_photo_revision_text(
     """Fence metered revision inference with the durable per-user edit state."""
     claim_token = secrets.token_hex(16)
     now = tw_now()
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -1847,7 +1848,7 @@ def _claim_meal_photo_revision_text(
 
 
 def _restore_meal_photo_revision_claim(user_id: str, claim_token: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -1866,7 +1867,7 @@ def _restore_meal_photo_revision_claim(user_id: str, claim_token: str) -> None:
 def _complete_meal_photo_revision_claim(
     *, user_id: str, claim_token: str, draft: dict, correction: str, message_id: str,
 ) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -1898,7 +1899,7 @@ def _recover_meal_photo_revision_claim(
     now_dt = tw_now()
     now = now_dt.isoformat(timespec="seconds")
     request_hash = hashlib.sha256(correction.encode("utf-8")).hexdigest()
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         ensure_meal_photo_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -2055,7 +2056,7 @@ def _retire_unadopted_meal_photo_revision_draft(
     *, user_id: str, log_id: str, from_version: int, draft: dict,
 ) -> str:
     """Cancel an orphaned late-worker draft without racing a preview adoption/confirm."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         ensure_meal_photo_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -2116,7 +2117,7 @@ def _process_claimed_meal_photo_revision(
         _confirmed_meal_photo_revision_source(
             user_id, ledger_state["log_id"], ledger_state["expected_version"]
         )
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             draft = create_meal_photo_revision_draft(
                 conn, user_id=user_id, log_id=ledger_state["log_id"],
                 from_version=ledger_state["expected_version"], request_text=correction,
@@ -2153,7 +2154,7 @@ def _confirmed_meal_photo_revision_source(
     user_id: str, log_id: str, expected_version: int,
 ) -> dict:
     """Load only owner-bound, current, trusted v2 meal-photo revision input."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         ensure_meal_photo_schema(conn)
         row = conn.execute(
@@ -2251,7 +2252,7 @@ def build_confirmed_meal_photo_revision_success_flex(result: dict):
 
 
 def _daily_food_log_brief(user_id: str, log_id: str) -> dict:
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         row = conn.execute(
             """SELECT fc.product_name,fl.nutrition_snapshot_json,fl.consumed_servings,
@@ -2315,7 +2316,7 @@ def save_daily_log_as_private_food(user_id: str, log_id: str, private_name: str)
     private_name = " ".join(str(private_name or "").split())[:80]
     if not private_name:
         raise ValueError("我的食品名稱不能空白")
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         row = conn.execute(
             """SELECT fl.nutrition_snapshot_json,fl.consumed_servings
@@ -2625,6 +2626,12 @@ DB_DIR = (
 )
 DB_PATH = os.path.join(DB_DIR, "user_quota.db")
 os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
+# 資料保存檢查：Railway 上資料庫一定要放在 Volume 裡，否則每次部署資料都會消失。
+_storage_ok, _storage_detail = describe_storage(DB_DIR)
+if _storage_ok:
+    print(f"✅ 資料庫儲存位置：{_storage_detail}")
+else:
+    print(f"🚨 資料庫不在 Railway Volume 上（{_storage_detail}）；重新部署後資料會消失，請檢查 Volume 掛載與 DATA_DIR")
 try:
     os.chmod(DB_DIR, 0o700)
 except OSError:
@@ -2634,7 +2641,7 @@ except OSError:
 # 🌟 自動升級資料庫：確保 health_profile 有 status 欄位
 # ==========================================
 import sqlite3
-with sqlite3.connect(DB_PATH) as conn:
+with db_session(sqlite3.connect(DB_PATH)) as conn:
     try:
         conn.execute("ALTER TABLE health_profile ADD COLUMN status TEXT")
         print("✅ 成功為 health_profile 新增 status (分班) 欄位！")
@@ -3080,7 +3087,7 @@ def save_jason_health_checkin(user_id: str, text: str, *, now=None) -> str:
     current = (now or tw_now()).astimezone(TW_TZ)
     values = parse_health_checkin(text)
     report_date = current.date().isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_health_schema(conn)
         save_daily_health_checkin(
             conn,
@@ -3150,7 +3157,7 @@ def fetch_daily_intervals_summary(user_id: str, report_date: str):
 def build_jason_daily_health_report(user_id: str, report_date: str) -> str:
     if not get_jason_health_report_uid() or user_id != get_jason_health_report_uid():
         raise PermissionError("目前只有Jason啟用每日健康日報")
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         ensure_nutrition_schema(conn)
         ensure_daily_health_schema(conn)
         ensure_meal_photo_schema(conn)
@@ -3187,7 +3194,7 @@ def _send_jason_daily_message(kind: str, text_factory, *, now=None) -> bool:
     user_id = get_jason_health_report_uid()
     if not user_id:
         return False
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         ensure_daily_health_schema(conn)
         claim_token = claim_daily_delivery(
             conn,
@@ -3204,7 +3211,7 @@ def _send_jason_daily_message(kind: str, text_factory, *, now=None) -> bool:
             user_id, TextSendMessage(text=text), timeout=12
         )
     except Exception as exc:
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_session(sqlite3.connect(DB_PATH, timeout=30)) as conn:
             ensure_daily_health_schema(conn)
             finish_daily_delivery(
                 conn,
@@ -3218,7 +3225,7 @@ def _send_jason_daily_message(kind: str, text_factory, *, now=None) -> bool:
             )
         print(f"⚠️ Jason每日健康{kind}推送失敗：{type(exc).__name__}")
         return False
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         ensure_daily_health_schema(conn)
         finish_daily_delivery(
             conn,
@@ -3436,7 +3443,7 @@ def deliver_next_health_check_report():
     with _health_check_delivery_queue_lock:
         try:
             uri = f"file:{Path(DB_PATH).resolve()}?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=10) as conn:
+            with db_session(sqlite3.connect(uri, uri=True, timeout=10)) as conn:
                 delivery_key = _select_health_check_queue_key(
                     conn,
                     f"""SELECT delivery_key,created_at AS queue_time,
@@ -3462,7 +3469,7 @@ def recover_next_delivered_health_check_cleanup():
     with _health_check_cleanup_queue_lock:
         try:
             uri = f"file:{Path(DB_PATH).resolve()}?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=10) as conn:
+            with db_session(sqlite3.connect(uri, uri=True, timeout=10)) as conn:
                 delivery_key = _select_health_check_queue_key(
                     conn,
                     """SELECT d.delivery_key,d.delivered_at AS queue_time,
@@ -3496,7 +3503,7 @@ def notify_next_health_check_supplement():
     with _health_check_supplement_queue_lock:
         try:
             uri = f"file:{Path(DB_PATH).resolve()}?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=10) as conn:
+            with db_session(sqlite3.connect(uri, uri=True, timeout=10)) as conn:
                 case_id = _select_health_check_queue_key(
                     conn,
                     """SELECT s.case_id AS delivery_key,s.requested_at AS queue_time,
@@ -3643,7 +3650,7 @@ elif CUSTOMER_RESCHEDULE_LIFF_ENABLED:
 
     def _load_customer_sheet_reschedule_context(user_id):
         try:
-            with sqlite3.connect(Path(DB_PATH).resolve().as_posix()) as conn:
+            with db_session(sqlite3.connect(Path(DB_PATH).resolve().as_posix())) as conn:
                 conn.row_factory = sqlite3.Row
                 # Use the same owner-bound, unexpired formal order as the LINE
                 # entry; an arbitrary historical active entitlement is not it.
@@ -3692,7 +3699,7 @@ plan_landing.register_plan_landing_routes(
 @app.get("/health")
 def health_check():
     try:
-        with sqlite3.connect(DB_PATH, timeout=5) as conn:
+        with db_session(sqlite3.connect(DB_PATH, timeout=5)) as conn:
             existing = {
                 row[0] for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
@@ -3735,7 +3742,7 @@ async def get_coach_data(admin_uid: str):
     if admin_uid not in COACH_UIDS:
         return {"error": "Unauthorized"}
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
         c.execute("""
             SELECT user_id, workout_date, workout_type, duration_min, aerobic_te, load_value, avg_hr 
@@ -3847,7 +3854,7 @@ async def update_student_group(payload: UpdateGroupPayload):
     
     try:
         # --- 動作 1：更新本機資料庫 ---
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             # 順便把學員名字撈出來，等等寫入表格會用到
             c.execute("SELECT name FROM health_profile WHERE user_id = ?", (payload.target_uid,))
@@ -4127,7 +4134,7 @@ async def update_training_group(payload: UpdateTrainingGroupPayload):
     if not training_group:
         return {"success": False, "error": "請輸入 1~6 的區別"}
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute("UPDATE health_profile SET training_group=? WHERE user_id=?", (training_group, payload.target_uid))
             conn.commit()
@@ -4731,7 +4738,7 @@ def sync_menu_to_food_catalog():
     if not MAIN_DISHES:
         return
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             ensure_nutrition_schema(conn)
             now = datetime.now().astimezone().isoformat(timespec="seconds")
             inserted = 0
@@ -5212,7 +5219,7 @@ def init_db():
 init_db()
 if CUSTOMER_RESCHEDULE_LIFF_ENABLED and not ISOLATED_RESCHEDULE_QA_ENABLED:
     from normal_reschedule_policy import ensure_normal_reschedule_anchors
-    with sqlite3.connect(DB_PATH) as _normal_anchor_conn:
+    with db_session(sqlite3.connect(DB_PATH)) as _normal_anchor_conn:
         ensure_normal_reschedule_anchors(_normal_anchor_conn)
 
 
@@ -5924,8 +5931,9 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
 
         _require_controlled_workbook_writer("legacy_receive_form")
         # 更新 SQLite
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("""
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("""
             INSERT OR REPLACE INTO health_profile (
                 user_id, name, tdee, protein, goal, restrictions, summary_text, active_days,
                 today_extra_cal, today_date, sheet_name, is_coaching_enabled, is_carb_cycling_enabled,
@@ -5933,157 +5941,157 @@ async def receive_form_data(request: Request, background_tasks: BackgroundTasks)
                 delivery_fee, delivery_zone, route_group, delivery_note
             ) VALUES (?,?,?,?,?,?,?,?,0,'',?,?,?,?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(active_days_list),
-            safe_name, is_coaching_enabled, is_carb_cycling_enabled, '', user_level, race_date,
-            address, delivery_info.get("distance_text", ""), delivery_info.get("distance_meters", 0),
-            delivery_info.get("delivery_fee", 0), delivery_info.get("delivery_zone", ""),
-            delivery_info.get("route_group", ""), delivery_info.get("carpool_hint", "")
-        ))
-        conn.commit()
-        # 同步顧客清單：從 usage 讀剩餘餐數與狀態
-        _u = conn.execute("SELECT status, remaining_meals, expiry_date FROM usage WHERE user_id=?", (user_id,)).fetchone()
-        conn.close()
-        if _u:
-            sync_customer_sheet(user_id, name, _u[0], _u[1], _u[2], int(tdee))
+                user_id, name, int(tdee), protein, goal, restrictions, schedule_text, ",".join(active_days_list),
+                safe_name, is_coaching_enabled, is_carb_cycling_enabled, '', user_level, race_date,
+                address, delivery_info.get("distance_text", ""), delivery_info.get("distance_meters", 0),
+                delivery_info.get("delivery_fee", 0), delivery_info.get("delivery_zone", ""),
+                delivery_info.get("route_group", ""), delivery_info.get("carpool_hint", "")
+            ))
+            conn.commit()
+            # 同步顧客清單：從 usage 讀剩餘餐數與狀態
+            _u = conn.execute("SELECT status, remaining_meals, expiry_date FROM usage WHERE user_id=?", (user_id,)).fetchone()
+            conn.close()
+            if _u:
+                sync_customer_sheet(user_id, name, _u[0], _u[1], _u[2], int(tdee))
 
-        # ==========================================
-        # 6. 寫入 Google 試算表 (包含個人分頁與機器人總表)
-        # ==========================================
-        if gc:
-            try:
-                print(f"📊 [DEBUG] 開始寫入 Google Sheet，共 {len(master_api_rows)} 筆資料")
-                sheet = gc.open_by_url(SHEET_URL)
-                
-                # (1) 寫入歷史總表
-                main_sheet = _order_history_worksheet(sheet)
-                now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
-                main_sheet.append_row([now_str, name, goal, int(tdee), int(protein), restrictions, total_price, ",".join(active_days_list), schedule_text])
-                
-                # (2) 為客戶建立專屬分頁
+            # ==========================================
+            # 6. 寫入 Google 試算表 (包含個人分頁與機器人總表)
+            # ==========================================
+            if gc:
                 try:
-                    try: user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="20")
-                    except:
-                        user_sheet = sheet.worksheet(safe_name)
-                        user_sheet.clear()
+                    print(f"📊 [DEBUG] 開始寫入 Google Sheet，共 {len(master_api_rows)} 筆資料")
+                    sheet = gc.open_by_url(SHEET_URL)
+                
+                    # (1) 寫入歷史總表
+                    main_sheet = _order_history_worksheet(sheet)
+                    now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+                    main_sheet.append_row([now_str, name, goal, int(tdee), int(protein), restrictions, total_price, ",".join(active_days_list), schedule_text])
+                
+                    # (2) 為客戶建立專屬分頁
+                    try:
+                        try: user_sheet = sheet.add_worksheet(title=safe_name, rows="1000", cols="20")
+                        except:
+                            user_sheet = sheet.worksheet(safe_name)
+                            user_sheet.clear()
                         
-                    profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}", f"💰 排餐總額: ${total_price}"], [""]]
-                    menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
-                    tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
+                        profile_data = [["【VIP 客戶檔案】", f"姓名: {name}", f"目前體重: {weight} kg", f"目標: {goal}", f"TDEE: {int(tdee)} kcal", f"蛋白質: {int(protein)} g", f"禁忌: {restrictions}", f"喜好: {pref_staple} + {pref_protein}", f"💰 排餐總額: ${total_price}"], [""]]
+                        menu_title = [["【專屬排餐計畫 (第1週~第4週)】"]]
+                        tracking_headers = [[""], ["================================================================="], ["【日常飲食與動態追蹤】"], ["紀錄時間", "紀錄類型", "客人傳送內容", "數值變化(kcal)"]]
                     
-                    user_sheet.append_rows(profile_data + menu_title + schedule_sheet_rows + tracking_headers)
+                        user_sheet.append_rows(profile_data + menu_title + schedule_sheet_rows + tracking_headers)
+                    except Exception: pass
+
+                    # 🔥 (3) 同步將資料塞進 Master_API_View (Phase 3: 先刪舊行，再寫 28 天)
+                    try:
+                        try:
+                            api_sheet = sheet.worksheet("Master_API_View")
+                        except gspread.exceptions.WorksheetNotFound:
+                            api_sheet = sheet.add_worksheet(title="Master_API_View", rows="2000", cols="20")
+                            api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key", "Training_Freq", "Normal_Train_Time", "Long_Train_Day", "Run_Pace", "Bike_FTP", "Swim_Pace", "User_Level", "Race_Date", "Is_Carb_Cycling_Enabled"])
+
+                        # 🗑️ 刪掉此用戶的舊行（由下往上，避免 index 偏移）
+                        try:
+                            all_vals = api_sheet.get_all_values()
+                            rows_to_del = [
+                                i + 1  # 1-indexed sheet row (i=0 是 header)
+                                for i, row in enumerate(all_vals)
+                                if i > 0 and len(row) > 1 and row[1] == user_id
+                            ]
+                            for rn in sorted(rows_to_del, reverse=True):
+                                api_sheet.delete_rows(rn)
+                            if rows_to_del:
+                                print(f"✅ 已刪除 {len(rows_to_del)} 行舊資料")
+                        except Exception as _del_e:
+                            print(f"⚠️ 刪除舊行失敗: {_del_e}")
+
+                        # 📅 補上非取餐日的訓練行（來自 4 週課表）
+                        meal_dates = {row[0] for row in master_api_rows}
+                        extra_training_rows = []
+                        for _dstr in sorted(four_week_plan.keys()):
+                            if _dstr not in meal_dates:
+                                _pi = four_week_plan[_dstr]
+                                extra_training_rows.append([
+                                    _dstr, user_id, int(tdee), "無", "無", "", is_coaching_enabled,
+                                    goal, sport_type, _pi.get("workout", ""), "", "",
+                                    training_freq, normal_train_time, long_train_day,
+                                    run_pace, bike_ftp, swim_pace, user_level, race_date, is_carb_cycling_enabled
+                                ])
+
+                        # 合併排序後一次寫入
+                        all_new_rows = sorted(master_api_rows + extra_training_rows, key=lambda r: str(r[0]))
+                        if all_new_rows:
+                            api_sheet.append_rows(all_new_rows)
+                        print(f"✅ 成功將 {len(all_new_rows)} 行寫入 Master_API_View！")
+
+                        # 🔥 背景生成 4 週訓練課表 + 碳循環菜單重新分配（方案 C）
+                        if is_coaching_enabled:
+                            background_tasks.add_task(update_4week_plan_background, user_id, start_date, {
+                                "sport_type": sport_type,
+                                "training_freq": training_freq,
+                                "long_train_day": long_train_day,
+                                "run_pace": run_pace,
+                                "bike_ftp": bike_ftp,
+                                "swim_pace": swim_pace,
+                                "phase_name": phase_name,
+                                "weeks_to_race": weeks_to_race_val,
+                                "restrictions": restrictions or "",
+                                "is_carb_cycling_enabled": is_carb_cycling_enabled,
+                            })
+                    except Exception as e:
+                        print(f"⚠️ 寫入 Master_API_View 失敗: {e}")
+                    
                 except Exception: pass
 
-                # 🔥 (3) 同步將資料塞進 Master_API_View (Phase 3: 先刪舊行，再寫 28 天)
-                try:
-                    try:
-                        api_sheet = sheet.worksheet("Master_API_View")
-                    except gspread.exceptions.WorksheetNotFound:
-                        api_sheet = sheet.add_worksheet(title="Master_API_View", rows="2000", cols="20")
-                        api_sheet.append_row(["Date", "User_ID", "TDEE", "Lunch_Item", "Dinner_Item", "Tomorrow_Training", "Is_Coaching_Enabled", "Plan_Type", "Sport_Type", "Plan_Week", "Intervals_ID", "Intervals_API_Key", "Training_Freq", "Normal_Train_Time", "Long_Train_Day", "Run_Pace", "Bike_FTP", "Swim_Pace", "User_Level", "Race_Date", "Is_Carb_Cycling_Enabled"])
-
-                    # 🗑️ 刪掉此用戶的舊行（由下往上，避免 index 偏移）
-                    try:
-                        all_vals = api_sheet.get_all_values()
-                        rows_to_del = [
-                            i + 1  # 1-indexed sheet row (i=0 是 header)
-                            for i, row in enumerate(all_vals)
-                            if i > 0 and len(row) > 1 and row[1] == user_id
-                        ]
-                        for rn in sorted(rows_to_del, reverse=True):
-                            api_sheet.delete_rows(rn)
-                        if rows_to_del:
-                            print(f"✅ 已刪除 {len(rows_to_del)} 行舊資料")
-                    except Exception as _del_e:
-                        print(f"⚠️ 刪除舊行失敗: {_del_e}")
-
-                    # 📅 補上非取餐日的訓練行（來自 4 週課表）
-                    meal_dates = {row[0] for row in master_api_rows}
-                    extra_training_rows = []
-                    for _dstr in sorted(four_week_plan.keys()):
-                        if _dstr not in meal_dates:
-                            _pi = four_week_plan[_dstr]
-                            extra_training_rows.append([
-                                _dstr, user_id, int(tdee), "無", "無", "", is_coaching_enabled,
-                                goal, sport_type, _pi.get("workout", ""), "", "",
-                                training_freq, normal_train_time, long_train_day,
-                                run_pace, bike_ftp, swim_pace, user_level, race_date, is_carb_cycling_enabled
-                            ])
-
-                    # 合併排序後一次寫入
-                    all_new_rows = sorted(master_api_rows + extra_training_rows, key=lambda r: str(r[0]))
-                    if all_new_rows:
-                        api_sheet.append_rows(all_new_rows)
-                    print(f"✅ 成功將 {len(all_new_rows)} 行寫入 Master_API_View！")
-
-                    # 🔥 背景生成 4 週訓練課表 + 碳循環菜單重新分配（方案 C）
-                    if is_coaching_enabled:
-                        background_tasks.add_task(update_4week_plan_background, user_id, start_date, {
-                            "sport_type": sport_type,
-                            "training_freq": training_freq,
-                            "long_train_day": long_train_day,
-                            "run_pace": run_pace,
-                            "bike_ftp": bike_ftp,
-                            "swim_pace": swim_pace,
-                            "phase_name": phase_name,
-                            "weeks_to_race": weeks_to_race_val,
-                            "restrictions": restrictions or "",
-                            "is_carb_cycling_enabled": is_carb_cycling_enabled,
-                        })
-                except Exception as e:
-                    print(f"⚠️ 寫入 Master_API_View 失敗: {e}")
-                    
-            except Exception: pass
-
-        # 最後推播訊息給客人
-        # 👉【修改】回覆客人的訊息中，補上本次排餐總額！
-        delivery_type, delivery_fee_per_trip = resolve_form_delivery(user_id, is_delivery, address, delivery_info.get("delivery_fee", 0))
-        delivery_days_count = len(active_days_list)
-        delivery_total_fee = delivery_fee_per_trip * delivery_days_count if is_delivery else 0
-        total_with_delivery = int(total_price) + delivery_total_fee
-        pickup_line = f"\n📦 取餐方式：{pickup_method}" if pickup_method else ""
-        address_line = f"\n📍 外送地址：{address}" if (is_delivery and address) else ""
-        delivery_line = format_form_delivery_lines(
-            delivery_type, delivery_info.get("delivery_fee", 0), delivery_fee_per_trip, delivery_info.get("distance_text")
-        ) if (is_delivery and address) else ""
-        delivery_days_line = f"\n📦 本期配送天數：{delivery_days_count} 天" if is_delivery else ""
-        delivery_total_line = f"\n🚚 四週外送費：${delivery_total_fee}" if is_delivery else ""
-        self_pickup_line = "\n🛍️ 本期為自取，不產生外送費。" if (pickup_method and not is_delivery) else ""
-        push_msg = (
-            f"🎉 {name}，包月資料已收到！\n\n"
-            "AI 營養助理已先為您完成初步精算：\n"
-            f"🔥 TDEE: {int(tdee)} kcal\n"
-            f"🥩 蛋白質目標: {int(protein)} g\n"
-            f"💰 排餐金額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n"
-            f"🧾 本期預估總金額：${total_with_delivery}\n\n"
-            "📌 下一步流程\n"
-            "1️⃣ 客服確認餐數、取餐日期、外送費與最終金額\n"
-            "2️⃣ 確認無誤後提供付款資訊\n"
-            "3️⃣ 付款完成後，客服會傳送 VIP 開通碼給您\n"
-            "4️⃣ 開通後即可使用專屬菜單與 AI 營養管理\n\n"
-            "您也可以先點選選單的『查看菜單』查看初步排餐。"
-        )
-        line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
-        admin_form_msg = (
-            f"📝【包月表單已完成】\n"
-            f"顧客：{name or user_id[:8]}\n"
-            f"UID：{user_id}\n"
-            f"取餐方式：{pickup_method or '未填'}\n"
-            f"外送地址：{address or '未提供'}\n"
-            f"取餐類型：{DELIVERY_TYPE_LABELS[delivery_type]}\n"
-        f"單次外送費：${delivery_fee_per_trip}\n"
-            f"配送天數：{delivery_days_count if is_delivery else '自取'}\n"
-            f"排餐金額：${total_price}\n"
-            f"本期預估總金額：${total_with_delivery}\n\n"
-            "下一步：請客服確認金額與付款資訊；付款後再開通 VIP。"
-        )
-        try:
-            admin_notify_uid = get_admin_notify_uid()
-            line_bot_api.push_message(admin_notify_uid, TextSendMessage(text=admin_form_msg))
-            print("✅ form_callback admin_notification=success")
-        except Exception:
-            print("⚠️ form_callback admin_notification=failed")
-        print("✅ form_callback status=success")
-        return {"status": "success"}
+            # 最後推播訊息給客人
+            # 👉【修改】回覆客人的訊息中，補上本次排餐總額！
+            delivery_type, delivery_fee_per_trip = resolve_form_delivery(user_id, is_delivery, address, delivery_info.get("delivery_fee", 0))
+            delivery_days_count = len(active_days_list)
+            delivery_total_fee = delivery_fee_per_trip * delivery_days_count if is_delivery else 0
+            total_with_delivery = int(total_price) + delivery_total_fee
+            pickup_line = f"\n📦 取餐方式：{pickup_method}" if pickup_method else ""
+            address_line = f"\n📍 外送地址：{address}" if (is_delivery and address) else ""
+            delivery_line = format_form_delivery_lines(
+                delivery_type, delivery_info.get("delivery_fee", 0), delivery_fee_per_trip, delivery_info.get("distance_text")
+            ) if (is_delivery and address) else ""
+            delivery_days_line = f"\n📦 本期配送天數：{delivery_days_count} 天" if is_delivery else ""
+            delivery_total_line = f"\n🚚 四週外送費：${delivery_total_fee}" if is_delivery else ""
+            self_pickup_line = "\n🛍️ 本期為自取，不產生外送費。" if (pickup_method and not is_delivery) else ""
+            push_msg = (
+                f"🎉 {name}，包月資料已收到！\n\n"
+                "AI 營養助理已先為您完成初步精算：\n"
+                f"🔥 TDEE: {int(tdee)} kcal\n"
+                f"🥩 蛋白質目標: {int(protein)} g\n"
+                f"💰 排餐金額: ${total_price}{pickup_line}{address_line}{delivery_line}{delivery_days_line}{delivery_total_line}{self_pickup_line}\n"
+                f"🧾 本期預估總金額：${total_with_delivery}\n\n"
+                "📌 下一步流程\n"
+                "1️⃣ 客服確認餐數、取餐日期、外送費與最終金額\n"
+                "2️⃣ 確認無誤後提供付款資訊\n"
+                "3️⃣ 付款完成後，客服會傳送 VIP 開通碼給您\n"
+                "4️⃣ 開通後即可使用專屬菜單與 AI 營養管理\n\n"
+                "您也可以先點選選單的『查看菜單』查看初步排餐。"
+            )
+            line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
+            admin_form_msg = (
+                f"📝【包月表單已完成】\n"
+                f"顧客：{name or user_id[:8]}\n"
+                f"UID：{user_id}\n"
+                f"取餐方式：{pickup_method or '未填'}\n"
+                f"外送地址：{address or '未提供'}\n"
+                f"取餐類型：{DELIVERY_TYPE_LABELS[delivery_type]}\n"
+            f"單次外送費：${delivery_fee_per_trip}\n"
+                f"配送天數：{delivery_days_count if is_delivery else '自取'}\n"
+                f"排餐金額：${total_price}\n"
+                f"本期預估總金額：${total_with_delivery}\n\n"
+                "下一步：請客服確認金額與付款資訊；付款後再開通 VIP。"
+            )
+            try:
+                admin_notify_uid = get_admin_notify_uid()
+                line_bot_api.push_message(admin_notify_uid, TextSendMessage(text=admin_form_msg))
+                print("✅ form_callback admin_notification=success")
+            except Exception:
+                print("⚠️ form_callback admin_notification=failed")
+            print("✅ form_callback status=success")
+            return {"status": "success"}
 
     except HTTPException:
         raise
@@ -6278,39 +6286,39 @@ def parse_defer_command(msg: str):
 
 
 def create_deferred_meal_request(user_id, customer_name, original_date, original_meal_type, target_date, target_meal_type, is_cross_period, has_conflict, note=""):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    created_at = tw_now().isoformat()
-    c.execute("""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        created_at = tw_now().isoformat()
+        c.execute("""
         INSERT INTO deferred_meals (
             user_id, customer_name, original_date, original_meal_type,
             target_date, target_meal_type, is_cross_period, has_conflict,
             status, note, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
     """, (
-        user_id, customer_name, original_date, original_meal_type,
-        target_date, target_meal_type, int(is_cross_period), int(has_conflict),
-        note, created_at
-    ))
-    request_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return request_id
+            user_id, customer_name, original_date, original_meal_type,
+            target_date, target_meal_type, int(is_cross_period), int(has_conflict),
+            note, created_at
+        ))
+        request_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return request_id
 
 
 def list_pending_deferred_meals(limit=10):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("""
         SELECT id, customer_name, original_date, original_meal_type, target_date, target_meal_type, is_cross_period, has_conflict, note
         FROM deferred_meals
         WHERE status='pending'
         ORDER BY id ASC
         LIMIT ?
     """, (limit,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+        rows = c.fetchall()
+        conn.close()
+        return rows
 
 
 def _atomic_update_meal_cells(spreadsheet, worksheet, updates):
@@ -6377,7 +6385,7 @@ def _persist_deferred_unknown_note(request_id, user_id, payload):
     """Append the warning once; failure never releases the durable operation locks."""
     warning = "⚠️ 延餐結果未確認，請人工核對菜單，請勿自行重試。"
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             changed = conn.execute(
                 "UPDATE deferred_meals SET note=CASE "
                 "WHEN instr(COALESCE(note,''),?)>0 THEN note "
@@ -6439,7 +6447,7 @@ def _execute_deferred_meal_move_unfenced(
     access, _, _, _ = get_subscription_menu_access(user_id)
     if access != "active":
         return False, _DeferredMealMessage("⚠️ 目前沒有有效包月方案，已停止修改本期菜單。")
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         res = conn.execute(
             "SELECT sheet_name FROM health_profile WHERE user_id=?", (user_id,)
         ).fetchone()
@@ -6613,7 +6621,7 @@ def approve_deferred_meal_request(request_id, admin_uid=""):
     # Cross-user approval is authorized by the current persisted admin binding,
     # never by ADMIN_UID fallback or by the deferred request owner.
     try:
-        with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True) as conn:
+        with db_session(sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)) as conn:
             bound = conn.execute(
                 "SELECT value FROM admin_settings WHERE key='admin_id'"
             ).fetchone()
@@ -6676,30 +6684,30 @@ def approve_deferred_meal_request(request_id, admin_uid=""):
 
 
 def reject_deferred_meal_request(request_id, reason="", admin_uid=""):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT user_id, status FROM deferred_meals WHERE id=?", (request_id,))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return "❌ 找不到這筆延餐申請。"
-    user_id, status = row
-    if status != "pending":
-        conn.close()
-        return "⚠️ 這筆延餐申請已不是待審核狀態。"
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id, status FROM deferred_meals WHERE id=?", (request_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return "❌ 找不到這筆延餐申請。"
+        user_id, status = row
+        if status != "pending":
+            conn.close()
+            return "⚠️ 這筆延餐申請已不是待審核狀態。"
 
-    c.execute("""
+        c.execute("""
         UPDATE deferred_meals
         SET status='rejected', note=?, approved_at=?, approved_by=?
         WHERE id=?
     """, (reason, tw_now().isoformat(), admin_uid, request_id))
-    conn.commit()
-    conn.close()
-    try:
-        line_bot_api.push_message(user_id, TextSendMessage(text=f"⚠️ 您的延餐申請未通過\n原因：{reason or '請聯絡客服確認'}"))
-    except Exception:
-        pass
-    return f"✅ 已拒絕延餐申請 #{request_id}"
+        conn.commit()
+        conn.close()
+        try:
+            line_bot_api.push_message(user_id, TextSendMessage(text=f"⚠️ 您的延餐申請未通過\n原因：{reason or '請聯絡客服確認'}"))
+        except Exception:
+            pass
+        return f"✅ 已拒絕延餐申請 #{request_id}"
 
 
 class _MealSwapMessage(str):
@@ -6781,7 +6789,7 @@ def _execute_meal_swap_unfenced(user_id, d1, m1, d2, m2, *, operation_id=""):
 
     reservation = None
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             res = conn.execute(
                 "SELECT sheet_name FROM health_profile WHERE user_id=?", (user_id,)
             ).fetchone()
@@ -7813,7 +7821,7 @@ def build_add_workout_entry_flex():
 
 
 def replace_recent_meal_with_name(user_id: str, meal_name: str):
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         rec = conn.execute(
             """SELECT r.meal_name,r.meal_date,r.food_log_id,fl.version
@@ -7847,7 +7855,7 @@ def replace_recent_meal_with_name(user_id: str, meal_name: str):
             "nutrition": {"calories_kcal": new_cal, "protein_g": new_pro},
         },
     )
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         hp = conn.execute(
             "SELECT today_extra_cal,today_extra_pro,tdee,protein FROM health_profile WHERE user_id=?",
             (user_id,),
@@ -8031,14 +8039,14 @@ def _dietitian_alert_recipients() -> list:
 
 
 def _dietitian_alerts_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    try:
-        ensure_subscription_menu_entitlement_schema(conn)
-        from daily_health_report import ensure_daily_health_schema
-        ensure_daily_health_schema(conn)
-    except Exception as exc:
-        print(f"⚠️ 營養師提醒：schema 檢查失敗 {type(exc).__name__}")
-    return conn
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        try:
+            ensure_subscription_menu_entitlement_schema(conn)
+            from daily_health_report import ensure_daily_health_schema
+            ensure_daily_health_schema(conn)
+        except Exception as exc:
+            print(f"⚠️ 營養師提醒：schema 檢查失敗 {type(exc).__name__}")
+        return conn
 
 
 def send_dietitian_alerts(*, now=None) -> int:
@@ -8547,23 +8555,23 @@ def background_log_workout_to_sheet(user_id: str, day_str: str, rpe_score: int, 
         
     try:
         # 從資料庫重新讀取必要資訊
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT sheet_name FROM health_profile WHERE user_id=?", (user_id,))
-        row = c.fetchone()
-        conn.close()
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT sheet_name FROM health_profile WHERE user_id=?", (user_id,))
+            row = c.fetchone()
+            conn.close()
 
-        if row and row[0]:
-            sheet_name = row[0]
-            sheet = gc.open_by_url(SHEET_URL)
-            now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
-            sheet.worksheet(sheet_name).append_row([
-                now_str, 
-                f"🏃 {day_str}運動狀態回報", 
-                f"狀態：【完美達標】(RPE: {rpe_score})", 
-                f"產生 sRPE 訓練負荷：{srpe_score} (預估時長 {duration_mins}m)"
-            ])
-            print(f"✅ [背景任務] 成功將 {user_id} 的運動紀錄寫入 Google Sheet")
+            if row and row[0]:
+                sheet_name = row[0]
+                sheet = gc.open_by_url(SHEET_URL)
+                now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+                sheet.worksheet(sheet_name).append_row([
+                    now_str, 
+                    f"🏃 {day_str}運動狀態回報", 
+                    f"狀態：【完美達標】(RPE: {rpe_score})", 
+                    f"產生 sRPE 訓練負荷：{srpe_score} (預估時長 {duration_mins}m)"
+                ])
+                print(f"✅ [背景任務] 成功將 {user_id} 的運動紀錄寫入 Google Sheet")
     except Exception as e:
         print(f"⚠️ [背景任務] 寫入 Google Sheet 運動狀態失敗: {e}")
 
@@ -8611,32 +8619,32 @@ def mark_workout_done_with_srpe(user_id: str, rpe_score: int, day_str: str = "�
     # 🧮 計算 sRPE
     srpe_score = duration_mins * rpe_score
     
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
     
-    # 寫入 SQLite
-    c.execute("INSERT OR REPLACE INTO workout_checks (user_id, workout_date, workout_name, checked_at) VALUES (?, ?, ?, ?)",
-              (user_id, target_date, workout_name, tw_now().isoformat()))
+        # 寫入 SQLite
+        c.execute("INSERT OR REPLACE INTO workout_checks (user_id, workout_date, workout_name, checked_at) VALUES (?, ?, ?, ?)",
+                  (user_id, target_date, workout_name, tw_now().isoformat()))
               
-    c.execute("INSERT OR IGNORE INTO user_achievements (user_id, xp_total, streak_days, weekly_srpe) VALUES (?, 0, 0, 0)", (user_id,))
+        c.execute("INSERT OR IGNORE INTO user_achievements (user_id, xp_total, streak_days, weekly_srpe) VALUES (?, 0, 0, 0)", (user_id,))
     
-    c.execute("""
+        c.execute("""
         UPDATE user_achievements 
         SET weekly_srpe = COALESCE(weekly_srpe, 0) + ?, 
             xp_total = COALESCE(xp_total, 0) + 20 
         WHERE user_id = ?
     """, (srpe_score, user_id))
     
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
     
-    # 🌟 魔法在這裡！利用 Python 內建的 threading 把耗時工作丟到背景
-    threading.Thread(
-        target=background_log_workout_to_sheet, 
-        args=(user_id, day_str, rpe_score, srpe_score, duration_mins)
-    ).start()
+        # 🌟 魔法在這裡！利用 Python 內建的 threading 把耗時工作丟到背景
+        threading.Thread(
+            target=background_log_workout_to_sheet, 
+            args=(user_id, day_str, rpe_score, srpe_score, duration_mins)
+        ).start()
             
-    return f"🔥 太棒了！已紀錄{day_str}訓練完成。\n\n📊 本次訓練累積了 【{srpe_score} sRPE】 的負荷積分！\n⭐ 達成任務，獲得 +20 XP！"
+        return f"🔥 太棒了！已紀錄{day_str}訓練完成。\n\n📊 本次訓練累積了 【{srpe_score} sRPE】 的負荷積分！\n⭐ 達成任務，獲得 +20 XP！"
 def build_edit_content_flex():
     from linebot.models import FlexSendMessage
     bubble = {
@@ -8693,7 +8701,7 @@ def apply_portion_adjustment(user_id: str, action: str):
     }
     if action not in rules:
         return None, "不支援的修正選項"
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         rec = conn.execute(
             """SELECT r.meal_name,r.base_cal,r.base_pro,r.meal_date,r.food_log_id,
@@ -8723,7 +8731,7 @@ def apply_portion_adjustment(user_id: str, action: str):
         event_id=f"legacy-portion:{user_id}:{log_id}:{version}:{action}",
         action="patch_nutrition", value=patch_values,
     )
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         hp = conn.execute(
             "SELECT today_extra_cal,today_extra_pro FROM health_profile WHERE user_id=?", (user_id,)
         ).fetchone() or (0, 0)
@@ -9458,248 +9466,248 @@ def _build_legacy_dashboard_flex(user_id: str):
     except ImportError:
         def calculate_training_phase(date_str): return "健康維持", 0
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
     
-    # 分開撈取，確保不漏資料！
-    # 撈賽事日期
-    c.execute("SELECT race_date FROM health_profile WHERE user_id=?", (user_id,))
-    race_row = c.fetchone()
-    race_date_str = race_row[0] if race_row else ""
+        # 分開撈取，確保不漏資料！
+        # 撈賽事日期
+        c.execute("SELECT race_date FROM health_profile WHERE user_id=?", (user_id,))
+        race_row = c.fetchone()
+        race_date_str = race_row[0] if race_row else ""
     
-    # 🌟 獨立精準撈取 XP 與 sRPE！
-    c.execute("SELECT xp_total, weekly_srpe FROM user_achievements WHERE user_id=?", (user_id,))
-    ach_row = c.fetchone()
-    # (原本的 conn.close() 已刪除)
+        # 🌟 獨立精準撈取 XP 與 sRPE！
+        c.execute("SELECT xp_total, weekly_srpe FROM user_achievements WHERE user_id=?", (user_id,))
+        ach_row = c.fetchone()
+        # (原本的 conn.close() 已刪除)
     
-    xp_total = ach_row[0] if ach_row else 0
-    weekly_srpe = ach_row[1] if ach_row else 0
+        xp_total = ach_row[0] if ach_row else 0
+        weekly_srpe = ach_row[1] if ach_row else 0
     
-    phase_name, weeks_left = calculate_training_phase(race_date_str)
-    countdown_text = "無賽事安排"
-    if race_date_str:
-        try:
-            rd = datetime.strptime(race_date_str, "%Y/%m/%d").replace(tzinfo=TW_TZ)
-            delta_days = (rd - tw_now()).days + 1
-            countdown_text = f"賽事倒數 {delta_days} 天" if delta_days >= 0 else "賽事已結束"
-        except: pass
+        phase_name, weeks_left = calculate_training_phase(race_date_str)
+        countdown_text = "無賽事安排"
+        if race_date_str:
+            try:
+                rd = datetime.strptime(race_date_str, "%Y/%m/%d").replace(tzinfo=TW_TZ)
+                delta_days = (rd - tw_now()).days + 1
+                countdown_text = f"賽事倒數 {delta_days} 天" if delta_days >= 0 else "賽事已結束"
+            except: pass
 
-    # --- 4. 準備成就、任務狀態與日曆 ---
-    xp_pct = d.get("xp_progress_percent", 0)
-    current_tss_target = 1000 # 未來可從 AI 預算抓取
-    srpe_pct = min(100, round((weekly_srpe / max(1, current_tss_target)) * 100))
+        # --- 4. 準備成就、任務狀態與日曆 ---
+        xp_pct = d.get("xp_progress_percent", 0)
+        current_tss_target = 1000 # 未來可從 AI 預算抓取
+        srpe_pct = min(100, round((weekly_srpe / max(1, current_tss_target)) * 100))
     
-    today_date = tw_today()
-    yesterday = today_date - _td(days=1)
-    tomorrow = today_date + _td(days=1)
+        today_date = tw_today()
+        yesterday = today_date - _td(days=1)
+        tomorrow = today_date + _td(days=1)
     
-    today_workout = d.get("today_workout", "待安排")
-    today_workout_done = d.get("workout_done", False)
-    tomorrow_workout = d["future_days"][0].get("workout", "休息日") if d.get("future_days") else "休息日"
+        today_workout = d.get("today_workout", "待安排")
+        today_workout_done = d.get("workout_done", False)
+        tomorrow_workout = d["future_days"][0].get("workout", "休息日") if d.get("future_days") else "休息日"
     
-    # 任務打勾判定
-    task_1 = '✅' if d.get('task_log_once_done') else '⬜'
-    task_2 = '✅' if d.get('task_log_two_meals_done') else '⬜'
-    task_3 = '✅' if d.get('task_protein_80_done') else '⬜'
-    task_4 = '✅' if d.get('task_workout_done') else '⬜'
+        # 任務打勾判定
+        task_1 = '✅' if d.get('task_log_once_done') else '⬜'
+        task_2 = '✅' if d.get('task_log_two_meals_done') else '⬜'
+        task_3 = '✅' if d.get('task_protein_80_done') else '⬜'
+        task_4 = '✅' if d.get('task_workout_done') else '⬜'
 
-    # 🌟 查詢本週 7 天打卡狀態
-    monday_date = today_date - _td(days=today_date.weekday())
-    week_dates_str = [(monday_date + _td(days=i)).isoformat() for i in range(7)]
+        # 🌟 查詢本週 7 天打卡狀態
+        monday_date = today_date - _td(days=today_date.weekday())
+        week_dates_str = [(monday_date + _td(days=i)).isoformat() for i in range(7)]
     
-    c.execute("SELECT workout_date FROM workout_checks WHERE user_id=? AND workout_date >= ? AND workout_date <= ?", 
-              (user_id, week_dates_str[0], week_dates_str[-1]))
-    done_dates = {row[0] for row in c.fetchall()}
-    conn.close()
+        c.execute("SELECT workout_date FROM workout_checks WHERE user_id=? AND workout_date >= ? AND workout_date <= ?", 
+                  (user_id, week_dates_str[0], week_dates_str[-1]))
+        done_dates = {row[0] for row in c.fetchall()}
+        conn.close()
 
-    weekdays_zh = ["一", "二", "三", "四", "五", "六", "日"]
-    week_checks_ui = []
-    days_completed_this_week = 0
+        weekdays_zh = ["一", "二", "三", "四", "五", "六", "日"]
+        week_checks_ui = []
+        days_completed_this_week = 0
     
-    for i in range(7):
-        is_done = week_dates_str[i] in done_dates
-        if is_done: days_completed_this_week += 1
-        icon = "✅" if is_done else "⬜"
-        color = "#06C755" if is_done else "#AAAAAA"
-        weight = "bold" if is_done else "regular"
+        for i in range(7):
+            is_done = week_dates_str[i] in done_dates
+            if is_done: days_completed_this_week += 1
+            icon = "✅" if is_done else "⬜"
+            color = "#06C755" if is_done else "#AAAAAA"
+            weight = "bold" if is_done else "regular"
         
-        if week_dates_str[i] == today_date.isoformat():
-            text_label = f"[{weekdays_zh[i]}]\n{icon}"
-        else:
-            text_label = f"{weekdays_zh[i]}\n{icon}"
+            if week_dates_str[i] == today_date.isoformat():
+                text_label = f"[{weekdays_zh[i]}]\n{icon}"
+            else:
+                text_label = f"{weekdays_zh[i]}\n{icon}"
             
-        week_checks_ui.append({
-            "type": "text", "text": text_label, "size": "xxs", "color": color, 
-            "align": "center", "weight": weight, "flex": 1, "wrap": True
-        })
+            week_checks_ui.append({
+                "type": "text", "text": text_label, "size": "xxs", "color": color, 
+                "align": "center", "weight": weight, "flex": 1, "wrap": True
+            })
 
-    # ==========================================
-    # 👈 左卡：純飲食儀表板 Bubble
-    # ==========================================
-    recorded_foods = [str(item or "").strip() for item in d.get("food_list", []) if str(item or "").strip()]
-    food_summary = "、".join(item[:32] for item in recorded_foods[:3]) or "尚無紀錄"
-    if len(recorded_foods) > 3:
-        food_summary += f"，另有 {len(recorded_foods) - 3} 筆"
-    ai_estimate_notice = []
-    if d.get("ai_estimated_count", 0):
-        ai_estimate_notice = [{
-            "type": "text",
-            "text": "含 AI 估算，非營養師核准",
-            "size": "xxs", "color": "#9A6700", "margin": "md", "wrap": True,
-        }]
+        # ==========================================
+        # 👈 左卡：純飲食儀表板 Bubble
+        # ==========================================
+        recorded_foods = [str(item or "").strip() for item in d.get("food_list", []) if str(item or "").strip()]
+        food_summary = "、".join(item[:32] for item in recorded_foods[:3]) or "尚無紀錄"
+        if len(recorded_foods) > 3:
+            food_summary += f"，另有 {len(recorded_foods) - 3} 筆"
+        ai_estimate_notice = []
+        if d.get("ai_estimated_count", 0):
+            ai_estimate_notice = [{
+                "type": "text",
+                "text": "含 AI 估算，非營養師核准",
+                "size": "xxs", "color": "#9A6700", "margin": "md", "wrap": True,
+            }]
 
-    diet_bubble = {
-        "type": "bubble", "size": "mega",
-        "header": {
-            "type": "box", "layout": "vertical", "paddingAll": "16px", "backgroundColor": "#06C755",
-            "contents": [
-                {"type": "text", "text": f"👋 {d['name']}，{greeting}", "color": "#ffffff", "size": "sm", "weight": "bold"},
-                {"type": "text", "text": "今日飲食儀表板", "color": "#ffffff", "size": "xl", "weight": "bold", "margin": "sm"},
-                {"type": "text", "text": d['today_label'], "color": "#ccffcc", "size": "xs", "margin": "sm"}
-            ]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "contents": [
-                {"type": "text", "text": "🔥 熱量進度", "size": "xs", "color": "#888888"},
-                {"type": "text", "text": f"已攝取 {display_number(d['extra_cal'])} kcal", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm", "wrap": True},
-                {"type": "text", "text": f"目標 {display_number(d['tdee'])} kcal・剩餘 {remaining_number(d['tdee'], d['extra_cal'])} kcal", "size": "xs", "color": "#666666", "margin": "xs", "wrap": True},
-                dual_progress_bar(d["cal_recorded_segment"], d["cal_planned_segment"], d["cal_remaining_segment"], "#06C755", "#B7E8C8"),
-                {"type": "separator", "margin": "md"},
+        diet_bubble = {
+            "type": "bubble", "size": "mega",
+            "header": {
+                "type": "box", "layout": "vertical", "paddingAll": "16px", "backgroundColor": "#06C755",
+                "contents": [
+                    {"type": "text", "text": f"👋 {d['name']}，{greeting}", "color": "#ffffff", "size": "sm", "weight": "bold"},
+                    {"type": "text", "text": "今日飲食儀表板", "color": "#ffffff", "size": "xl", "weight": "bold", "margin": "sm"},
+                    {"type": "text", "text": d['today_label'], "color": "#ccffcc", "size": "xs", "margin": "sm"}
+                ]
+            },
+            "body": {
+                "type": "box", "layout": "vertical", "paddingAll": "20px",
+                "contents": [
+                    {"type": "text", "text": "🔥 熱量進度", "size": "xs", "color": "#888888"},
+                    {"type": "text", "text": f"已攝取 {display_number(d['extra_cal'])} kcal", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm", "wrap": True},
+                    {"type": "text", "text": f"目標 {display_number(d['tdee'])} kcal・剩餘 {remaining_number(d['tdee'], d['extra_cal'])} kcal", "size": "xs", "color": "#666666", "margin": "xs", "wrap": True},
+                    dual_progress_bar(d["cal_recorded_segment"], d["cal_planned_segment"], d["cal_remaining_segment"], "#06C755", "#B7E8C8"),
+                    {"type": "separator", "margin": "md"},
                 
-                {"type": "text", "text": "🥩 蛋白進度", "size": "xs", "color": "#888888", "margin": "md"},
-                {"type": "text", "text": f"已攝取 {display_number(d['extra_pro'])} g", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm", "wrap": True},
-                {"type": "text", "text": f"目標 {display_number(d['protein_goal'])} g・剩餘 {remaining_number(d['protein_goal'], d['extra_pro'])} g", "size": "xs", "color": "#666666", "margin": "xs", "wrap": True},
-                dual_progress_bar(d["pro_recorded_segment"], d["pro_planned_segment"], d["pro_remaining_segment"], "#FF6B35", "#FFD2C2"),
-                *ai_estimate_notice,
-                {"type": "separator", "margin": "md"},
+                    {"type": "text", "text": "🥩 蛋白進度", "size": "xs", "color": "#888888", "margin": "md"},
+                    {"type": "text", "text": f"已攝取 {display_number(d['extra_pro'])} g", "size": "md", "weight": "bold", "color": "#222222", "margin": "sm", "wrap": True},
+                    {"type": "text", "text": f"目標 {display_number(d['protein_goal'])} g・剩餘 {remaining_number(d['protein_goal'], d['extra_pro'])} g", "size": "xs", "color": "#666666", "margin": "xs", "wrap": True},
+                    dual_progress_bar(d["pro_recorded_segment"], d["pro_planned_segment"], d["pro_remaining_segment"], "#FF6B35", "#FFD2C2"),
+                    *ai_estimate_notice,
+                    {"type": "separator", "margin": "md"},
 
-                {"type": "text", "text": "🍽️ 今日飲食紀錄", "size": "xs", "color": "#888888", "margin": "md"},
-                {"type": "text", "text": food_summary, "size": "sm", "color": "#333333", "margin": "sm", "wrap": True},
-                {"type": "separator", "margin": "lg"},
+                    {"type": "text", "text": "🍽️ 今日飲食紀錄", "size": "xs", "color": "#888888", "margin": "md"},
+                    {"type": "text", "text": food_summary, "size": "sm", "color": "#333333", "margin": "sm", "wrap": True},
+                    {"type": "separator", "margin": "lg"},
 
-                {"type": "box", "layout": "vertical", "margin": "md", "backgroundColor": "#f8f8f8", "cornerRadius": "8px", "paddingAll": "12px", "contents": [
-                    {"type": "text", "text": "📋 今日安排", "size": "xs", "color": "#888888"},
-                    {"type": "text", "text": lunch_line, "size": "sm", "color": "#333333", "margin": "sm", "wrap": True},
-                    {"type": "button", "action": {"type": "message", "label": ("✅ 午餐已吃" if d.get("lunch_checked") else "☀️ 午餐已吃"), "text": "午餐已吃"}, "style": "secondary", "height": "sm", "margin": "sm"},
-                    {"type": "text", "text": dinner_line, "size": "sm", "color": "#333333", "margin": "md", "wrap": True},
-                    {"type": "button", "action": {"type": "message", "label": ("✅ 晚餐已吃" if d.get("dinner_checked") else "🌙 晚餐已吃"), "text": "晚餐已吃"}, "style": "secondary", "height": "sm", "margin": "sm"}
-                ]},
+                    {"type": "box", "layout": "vertical", "margin": "md", "backgroundColor": "#f8f8f8", "cornerRadius": "8px", "paddingAll": "12px", "contents": [
+                        {"type": "text", "text": "📋 今日安排", "size": "xs", "color": "#888888"},
+                        {"type": "text", "text": lunch_line, "size": "sm", "color": "#333333", "margin": "sm", "wrap": True},
+                        {"type": "button", "action": {"type": "message", "label": ("✅ 午餐已吃" if d.get("lunch_checked") else "☀️ 午餐已吃"), "text": "午餐已吃"}, "style": "secondary", "height": "sm", "margin": "sm"},
+                        {"type": "text", "text": dinner_line, "size": "sm", "color": "#333333", "margin": "md", "wrap": True},
+                        {"type": "button", "action": {"type": "message", "label": ("✅ 晚餐已吃" if d.get("dinner_checked") else "🌙 晚餐已吃"), "text": "晚餐已吃"}, "style": "secondary", "height": "sm", "margin": "sm"}
+                    ]},
 
-                {"type": "box", "layout": "horizontal", "spacing": "sm", "margin": "md", "contents": [
-                    {"type": "button", "action": {"type": "message", "label": "✏️ 記錄一餐", "text": "記錄一餐"}, "style": "primary", "color": "#06C755", "flex": 1, "height": "sm"},
-                    {"type": "button", "action": {"type": "message", "label": "🍚 修正內容", "text": "我要修改飲食紀錄"}, "style": "secondary", "flex": 1, "height": "sm"}
-                ]},
+                    {"type": "box", "layout": "horizontal", "spacing": "sm", "margin": "md", "contents": [
+                        {"type": "button", "action": {"type": "message", "label": "✏️ 記錄一餐", "text": "記錄一餐"}, "style": "primary", "color": "#06C755", "flex": 1, "height": "sm"},
+                        {"type": "button", "action": {"type": "message", "label": "🍚 修正內容", "text": "我要修改飲食紀錄"}, "style": "secondary", "flex": 1, "height": "sm"}
+                    ]},
 
-                {"type": "box", "layout": "vertical", "margin": "md", "backgroundColor": "#FFFDF5", "cornerRadius": "8px", "paddingAll": "10px", "contents": frequent_contents}
-            ]
+                    {"type": "box", "layout": "vertical", "margin": "md", "backgroundColor": "#FFFDF5", "cornerRadius": "8px", "paddingAll": "10px", "contents": frequent_contents}
+                ]
+            }
         }
-    }
 
-    # ==========================================
-    # 👉 右卡：運動與成就專區 Bubble (完整包含日曆與昨/明區塊)
-    # ==========================================
-    sport_bubble = {
-        "type": "bubble", "size": "mega",
-        "header": {
-            "type": "box", "layout": "vertical", "paddingAll": "16px", "backgroundColor": "#3B82F6",
-            "contents": [
-                {"type": "text", "text": "🏆 運動戰情指揮中心", "color": "#ffffff", "size": "lg", "weight": "bold"},
-                {"type": "text", "text": d['today_label'], "color": "#dbeafe", "size": "xs", "margin": "sm"}
-            ]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "contents": [
-                # ─── 1. 戰情區 (Tags) ───
-                {"type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
-                    badge_tag(f"🔥 {phase_name or '健康維持'}", "#EF4444"),
-                    badge_tag(f"⏳ {countdown_text}", "#10B981")
-                ]},
+        # ==========================================
+        # 👉 右卡：運動與成就專區 Bubble (完整包含日曆與昨/明區塊)
+        # ==========================================
+        sport_bubble = {
+            "type": "bubble", "size": "mega",
+            "header": {
+                "type": "box", "layout": "vertical", "paddingAll": "16px", "backgroundColor": "#3B82F6",
+                "contents": [
+                    {"type": "text", "text": "🏆 運動戰情指揮中心", "color": "#ffffff", "size": "lg", "weight": "bold"},
+                    {"type": "text", "text": d['today_label'], "color": "#dbeafe", "size": "xs", "margin": "sm"}
+                ]
+            },
+            "body": {
+                "type": "box", "layout": "vertical", "paddingAll": "20px",
+                "contents": [
+                    # ─── 1. 戰情區 (Tags) ───
+                    {"type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
+                        badge_tag(f"🔥 {phase_name or '健康維持'}", "#EF4444"),
+                        badge_tag(f"⏳ {countdown_text}", "#10B981")
+                    ]},
                 
-                # ─── 2. 負荷進度條 (sRPE) ───
-                {"type": "box", "layout": "vertical", "margin": "xl", "contents": [
-                    {"type": "text", "text": "📊 本週訓練負荷 (sRPE)", "size": "xs", "color": "#888888", "weight": "bold"},
-                    {"type": "box", "layout": "baseline", "margin": "sm", "contents": [
-                        {"type": "text", "text": str(weekly_srpe), "size": "3xl", "weight": "bold", "color": "#3B82F6"},
-                        {"type": "text", "text": f" / {current_tss_target}", "size": "sm", "color": "#AAAAAA", "weight": "bold", "margin": "sm"}
-                    ]},
-                    single_progress_bar(srpe_pct, "#3B82F6"),
-                    {"type": "text", "text": "💬 穩定累積，避免單次過度負荷！", "size": "xxs", "color": "#64748B", "margin": "sm"}
-                ]},
-                {"type": "separator", "margin": "lg"},
-
-                # ─── 🌟 3. 動態 7 天打勾日曆 (加回來了！) ───
-                {"type": "text", "text": f"📅 本週執行狀態 (完成 {days_completed_this_week} 天)", "size": "xs", "weight": "bold", "color": "#888888", "margin": "md"},
-                {"type": "box", "layout": "horizontal", "margin": "md", "contents": week_checks_ui},
-                {"type": "separator", "margin": "lg"},
-
-                # ─── 4. 成就中心 (XP & 任務) ───
-                {"type": "box", "layout": "vertical", "margin": "lg", "contents": [
-                    {"type": "box", "layout": "horizontal", "contents": [
-                        {"type": "text", "text": "🏅 成就中心", "size": "sm", "color": "#EAB308", "weight": "bold"},
-                        {"type": "text", "text": f"{xp_total} XP", "size": "xs", "color": "#888888", "align": "end"}
-                    ]},
-                    {"type": "text", "text": d.get('current_badge_name', '小種子'), "size": "xl", "weight": "bold", "color": "#222222", "margin": "sm"},
-                    {"type": "text", "text": f"還差 {d.get('xp_to_next_level', 0)} XP 升級為【{d.get('next_badge_name', '下一階')}】", "size": "xs", "color": "#555555", "margin": "xs"},
-                    {"type": "box", "layout": "vertical", "margin": "sm", "contents": [
-                        {"type": "text", "text": f"進度條 {xp_pct}%", "size": "xxs", "color": "#888888", "margin": "xs"},
-                        single_progress_bar(xp_pct, "#10B981")
-                    ]},
-                    {"type": "text", "text": f"🔥 {d.get('streak_days', 0)} 天連續紀錄", "size": "sm", "weight": "bold", "color": "#222222", "margin": "md"},
-                    
-                    # 今日任務清單
-                    {"type": "text", "text": "✅ 今日任務", "size": "sm", "weight": "bold", "color": "#10B981", "margin": "md"},
-                    {"type": "box", "layout": "horizontal", "margin": "xs", "contents": [
-                        {"type": "box", "layout": "vertical", "flex": 1, "contents": [
-                            {"type": "text", "text": f"{task_1} 完成紀錄", "size": "xs", "color": "#333333"}, 
-                            {"type": "text", "text": f"{task_2} 記錄 2 餐", "size": "xs", "color": "#333333", "margin": "xs"}
+                    # ─── 2. 負荷進度條 (sRPE) ───
+                    {"type": "box", "layout": "vertical", "margin": "xl", "contents": [
+                        {"type": "text", "text": "📊 本週訓練負荷 (sRPE)", "size": "xs", "color": "#888888", "weight": "bold"},
+                        {"type": "box", "layout": "baseline", "margin": "sm", "contents": [
+                            {"type": "text", "text": str(weekly_srpe), "size": "3xl", "weight": "bold", "color": "#3B82F6"},
+                            {"type": "text", "text": f" / {current_tss_target}", "size": "sm", "color": "#AAAAAA", "weight": "bold", "margin": "sm"}
                         ]},
-                        {"type": "box", "layout": "vertical", "flex": 1, "contents": [
-                            {"type": "text", "text": f"{task_3} 蛋白 80%", "size": "xs", "color": "#333333"}, 
-                            {"type": "text", "text": f"{task_4} 今日運動", "size": "xs", "color": "#333333", "margin": "xs"}
+                        single_progress_bar(srpe_pct, "#3B82F6"),
+                        {"type": "text", "text": "💬 穩定累積，避免單次過度負荷！", "size": "xxs", "color": "#64748B", "margin": "sm"}
+                    ]},
+                    {"type": "separator", "margin": "lg"},
+
+                    # ─── 🌟 3. 動態 7 天打勾日曆 (加回來了！) ───
+                    {"type": "text", "text": f"📅 本週執行狀態 (完成 {days_completed_this_week} 天)", "size": "xs", "weight": "bold", "color": "#888888", "margin": "md"},
+                    {"type": "box", "layout": "horizontal", "margin": "md", "contents": week_checks_ui},
+                    {"type": "separator", "margin": "lg"},
+
+                    # ─── 4. 成就中心 (XP & 任務) ───
+                    {"type": "box", "layout": "vertical", "margin": "lg", "contents": [
+                        {"type": "box", "layout": "horizontal", "contents": [
+                            {"type": "text", "text": "🏅 成就中心", "size": "sm", "color": "#EAB308", "weight": "bold"},
+                            {"type": "text", "text": f"{xp_total} XP", "size": "xs", "color": "#888888", "align": "end"}
+                        ]},
+                        {"type": "text", "text": d.get('current_badge_name', '小種子'), "size": "xl", "weight": "bold", "color": "#222222", "margin": "sm"},
+                        {"type": "text", "text": f"還差 {d.get('xp_to_next_level', 0)} XP 升級為【{d.get('next_badge_name', '下一階')}】", "size": "xs", "color": "#555555", "margin": "xs"},
+                        {"type": "box", "layout": "vertical", "margin": "sm", "contents": [
+                            {"type": "text", "text": f"進度條 {xp_pct}%", "size": "xxs", "color": "#888888", "margin": "xs"},
+                            single_progress_bar(xp_pct, "#10B981")
+                        ]},
+                        {"type": "text", "text": f"🔥 {d.get('streak_days', 0)} 天連續紀錄", "size": "sm", "weight": "bold", "color": "#222222", "margin": "md"},
+                    
+                        # 今日任務清單
+                        {"type": "text", "text": "✅ 今日任務", "size": "sm", "weight": "bold", "color": "#10B981", "margin": "md"},
+                        {"type": "box", "layout": "horizontal", "margin": "xs", "contents": [
+                            {"type": "box", "layout": "vertical", "flex": 1, "contents": [
+                                {"type": "text", "text": f"{task_1} 完成紀錄", "size": "xs", "color": "#333333"}, 
+                                {"type": "text", "text": f"{task_2} 記錄 2 餐", "size": "xs", "color": "#333333", "margin": "xs"}
+                            ]},
+                            {"type": "box", "layout": "vertical", "flex": 1, "contents": [
+                                {"type": "text", "text": f"{task_3} 蛋白 80%", "size": "xs", "color": "#333333"}, 
+                                {"type": "text", "text": f"{task_4} 今日運動", "size": "xs", "color": "#333333", "margin": "xs"}
+                            ]}
+                        ]}
+                    ]},
+                    {"type": "separator", "margin": "lg"},
+
+                    # ─── 5. 今日課表安排 (版面修正版) ───
+                    {"type": "box", "layout": "vertical", "margin": "md", "backgroundColor": "#F8FAFC", "paddingAll": "12px", "cornerRadius": "8px", "contents": [
+                        {"type": "text", "text": f"🌟 今日課表 {today_date.strftime('%m/%d')}", "size": "sm", "weight": "bold", "color": "#EAB308"},
+                        {"type": "text", "text": f"🚴 {today_workout}", "size": "md", "weight": "bold", "color": "#222222", "margin": "md", "wrap": True},
+                        # 💡 修正 1：移除 flex 屬性，讓系統自動均分寬度
+                        # 💡 修正 2：如果文字真的太長，將 layout 改成 vertical 讓按鈕上下排列（我們這裡先保留 horizontal，靠拿掉 flex 解決）
+                        {"type": "box", "layout": "horizontal", "margin": "md", "spacing": "sm", "contents": [
+                            {"type": "button", "action": {"type": "message", "label": "✅ 完美達標", "text": "✅ 今日完美達標"}, "style": "primary", "color": "#10B981", "height": "sm"},
+                            {"type": "button", "action": {"type": "message", "label": "⚠️ 調整", "text": "⚠️ 今日調整"}, "style": "secondary", "height": "sm"}
+                        ]}
+                    ]},
+
+                    # ─── 🌟 6. 昨日 / 明日 緊湊區 (加回來了！) ───
+                    {"type": "box", "layout": "horizontal", "margin": "lg", "spacing": "md", "contents": [
+                        {"type": "box", "layout": "vertical", "flex": 1, "backgroundColor": "#FFF5F5", "paddingAll": "12px", "cornerRadius": "8px", "contents": [
+                            {"type": "text", "text": f"📆 昨日 {yesterday.strftime('%m/%d')}", "size": "xs", "color": "#888888"},
+                            {"type": "text", "text": "⚠️ 尚未回報", "size": "sm", "color": "#EF4444", "margin": "sm", "weight": "bold"},
+                            {"type": "button", "action": {"type": "message", "label": "補登", "text": "✅ 昨日補登達標"}, "style": "primary", "color": "#F97316", "height": "sm", "margin": "md"}
+                        ]},
+                        {"type": "box", "layout": "vertical", "flex": 1, "backgroundColor": "#F1F5F9", "paddingAll": "12px", "cornerRadius": "8px", "contents": [
+                            {"type": "text", "text": f"📆 明日 {tomorrow.strftime('%m/%d')}", "size": "xs", "color": "#888888"},
+                            {"type": "text", "text": f"{tomorrow_workout[:10]}...", "size": "sm", "color": "#333333", "margin": "sm", "weight": "bold", "wrap": True},
+                            {"type": "button", "action": {"type": "message", "label": "新增", "text": "新增運動"}, "style": "primary", "color": "#64748B", "height": "sm", "margin": "md"}
                         ]}
                     ]}
-                ]},
-                {"type": "separator", "margin": "lg"},
-
-                # ─── 5. 今日課表安排 (版面修正版) ───
-                {"type": "box", "layout": "vertical", "margin": "md", "backgroundColor": "#F8FAFC", "paddingAll": "12px", "cornerRadius": "8px", "contents": [
-                    {"type": "text", "text": f"🌟 今日課表 {today_date.strftime('%m/%d')}", "size": "sm", "weight": "bold", "color": "#EAB308"},
-                    {"type": "text", "text": f"🚴 {today_workout}", "size": "md", "weight": "bold", "color": "#222222", "margin": "md", "wrap": True},
-                    # 💡 修正 1：移除 flex 屬性，讓系統自動均分寬度
-                    # 💡 修正 2：如果文字真的太長，將 layout 改成 vertical 讓按鈕上下排列（我們這裡先保留 horizontal，靠拿掉 flex 解決）
-                    {"type": "box", "layout": "horizontal", "margin": "md", "spacing": "sm", "contents": [
-                        {"type": "button", "action": {"type": "message", "label": "✅ 完美達標", "text": "✅ 今日完美達標"}, "style": "primary", "color": "#10B981", "height": "sm"},
-                        {"type": "button", "action": {"type": "message", "label": "⚠️ 調整", "text": "⚠️ 今日調整"}, "style": "secondary", "height": "sm"}
-                    ]}
-                ]},
-
-                # ─── 🌟 6. 昨日 / 明日 緊湊區 (加回來了！) ───
-                {"type": "box", "layout": "horizontal", "margin": "lg", "spacing": "md", "contents": [
-                    {"type": "box", "layout": "vertical", "flex": 1, "backgroundColor": "#FFF5F5", "paddingAll": "12px", "cornerRadius": "8px", "contents": [
-                        {"type": "text", "text": f"📆 昨日 {yesterday.strftime('%m/%d')}", "size": "xs", "color": "#888888"},
-                        {"type": "text", "text": "⚠️ 尚未回報", "size": "sm", "color": "#EF4444", "margin": "sm", "weight": "bold"},
-                        {"type": "button", "action": {"type": "message", "label": "補登", "text": "✅ 昨日補登達標"}, "style": "primary", "color": "#F97316", "height": "sm", "margin": "md"}
-                    ]},
-                    {"type": "box", "layout": "vertical", "flex": 1, "backgroundColor": "#F1F5F9", "paddingAll": "12px", "cornerRadius": "8px", "contents": [
-                        {"type": "text", "text": f"📆 明日 {tomorrow.strftime('%m/%d')}", "size": "xs", "color": "#888888"},
-                        {"type": "text", "text": f"{tomorrow_workout[:10]}...", "size": "sm", "color": "#333333", "margin": "sm", "weight": "bold", "wrap": True},
-                        {"type": "button", "action": {"type": "message", "label": "新增", "text": "新增運動"}, "style": "primary", "color": "#64748B", "height": "sm", "margin": "md"}
-                    ]}
-                ]}
-            ]
-        },
-        "footer": {
-            "type": "box", "layout": "vertical", "paddingAll": "12px",
-            "contents": [
-                {"type": "button", "action": {"type": "message", "label": "📅 查看本週完整課表", "text": "本週完整課表"}, "style": "primary", "color": "#3B82F6", "height": "sm"}
-            ]
+                ]
+            },
+            "footer": {
+                "type": "box", "layout": "vertical", "paddingAll": "12px",
+                "contents": [
+                    {"type": "button", "action": {"type": "message", "label": "📅 查看本週完整課表", "text": "本週完整課表"}, "style": "primary", "color": "#3B82F6", "height": "sm"}
+                ]
+            }
         }
-    }
 
-    carousel = {"type": "carousel", "contents": [diet_bubble, sport_bubble]}
-    return FlexSendMessage(alt_text="今日儀表板", contents=carousel)
+        carousel = {"type": "carousel", "contents": [diet_bubble, sport_bubble]}
+        return FlexSendMessage(alt_text="今日儀表板", contents=carousel)
 
 
 def build_dashboard_flex(user_id: str):
@@ -10119,7 +10127,7 @@ def load_ai_estimate_replay(user_id, operation_key):
         if payload.get("type") == "text" and isinstance(payload.get("text"), str):
             return TextSendMessage(text=payload["text"])
         raise ValueError("invalid replay message")
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         draft_row = conn.execute(
             """SELECT token,status,confirmed_log_id FROM pending_text_meal_estimates
@@ -10208,7 +10216,7 @@ def claim_ai_estimate_request(user_id, operation_key, lease_seconds=120):
     if not operation_key or not user_id:
         return "invalid"
     now = tw_now()
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -10241,7 +10249,7 @@ def claim_ai_estimate_request(user_id, operation_key, lease_seconds=120):
 def fail_ai_estimate_request(user_id, operation_key, *, refund_quota):
     user_id = str(user_id or "").strip()
     operation_key = str(operation_key or "")[:180]
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """DELETE FROM daily_food_log_events
@@ -10372,113 +10380,114 @@ def _menu_nutrition_memo(compact_user_msg, has_mass_or_volume):
 
 
 def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    ensure_daily_food_ledger_schema(conn)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        ensure_daily_food_ledger_schema(conn)
     
-    # 抓取客人資料
-    c.execute("SELECT summary_text, tdee, active_days, protein, user_level, race_date FROM health_profile WHERE user_id=?", (user_id,))
-    hp = c.fetchone()
+        # 抓取客人資料
+        c.execute("SELECT summary_text, tdee, active_days, protein, user_level, race_date FROM health_profile WHERE user_id=?", (user_id,))
+        hp = c.fetchone()
     
-    today_str = tw_today().isoformat()
-    # 抓取今日外食紀錄 (多抓 today_food_items)
-    c.execute("SELECT today_extra_cal, today_date, sheet_name, name, today_extra_pro, today_food_items FROM health_profile WHERE user_id=?", (user_id,))
-    daily_rec = c.fetchone()
+        today_str = tw_today().isoformat()
+        # 抓取今日外食紀錄 (多抓 today_food_items)
+        c.execute("SELECT today_extra_cal, today_date, sheet_name, name, today_extra_pro, today_food_items FROM health_profile WHERE user_id=?", (user_id,))
+        daily_rec = c.fetchone()
     
-    # 判斷是不是新的一天，如果是就歸零 (包含食物清單)
-    if daily_rec and daily_rec[1] != today_str:
-        c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0, today_food_items='', today_date=? WHERE user_id=?", (today_str, user_id))
-        conn.commit() 
-        extra_cal, extra_pro, food_items = 0, 0, ""
-    else:
-        extra_cal = daily_rec[0] if daily_rec else 0
-        extra_pro = daily_rec[4] if (daily_rec and len(daily_rec) > 4 and daily_rec[4] is not None) else 0
-        food_items = daily_rec[5] if (daily_rec and len(daily_rec) > 5 and daily_rec[5] is not None) else ""
+        # 判斷是不是新的一天，如果是就歸零 (包含食物清單)
+        if daily_rec and daily_rec[1] != today_str:
+            c.execute("UPDATE health_profile SET today_extra_cal=0, today_extra_pro=0, today_food_items='', today_date=? WHERE user_id=?", (today_str, user_id))
+            conn.commit() 
+            extra_cal, extra_pro, food_items = 0, 0, ""
+        else:
+            extra_cal = daily_rec[0] if daily_rec else 0
+            extra_pro = daily_rec[4] if (daily_rec and len(daily_rec) > 4 and daily_rec[4] is not None) else 0
+            food_items = daily_rec[5] if (daily_rec and len(daily_rec) > 5 and daily_rec[5] is not None) else ""
 
-    report = f"\n【絕對參考報告內容】:\n{hp[0]}" if hp else "\n檔案未填，請引導客人填表。"
-    tdee_val = hp[1] if hp else 2000
-    active_days = hp[2] if hp else ""
-    protein_val = hp[3] if hp else 100
-    history = user_memory.get(user_id, [])[-6:]
-    # General AI is read-only for meal mutations.  Explicit requests and a directly
-    # adjacent short confirmation are stopped before model-derived logging or Sheet writes.
-    if _meal_change_intent_text(user_msg, history):
-        ans = _meal_change_safe_mode_reply()
-        conn.close()
-        user_memory[user_id] = history + [
-            {"role": "user", "content": user_msg},
-            {"role": "assistant", "content": ans},
-        ]
-        return (ans, None)
-    compact_user_msg = re.sub(r"\s+", "", str(user_msg or ""))
-    has_mass_or_volume = bool(re.search(
-        r"\d+(?:\.\d+)?(?:g|克|公克|ml|毫升|cc)", compact_user_msg, re.I
-    ))
-    ingredients_memo = _menu_nutrition_memo(compact_user_msg, has_mass_or_volume)
+        report = f"\n【絕對參考報告內容】:\n{hp[0]}" if hp else "\n檔案未填，請引導客人填表。"
+        tdee_val = hp[1] if hp else 2000
+        active_days = hp[2] if hp else ""
+        protein_val = hp[3] if hp else 100
+        history = user_memory.get(user_id, [])[-6:]
+        # General AI is read-only for meal mutations.  Explicit requests and a directly
+        # adjacent short confirmation are stopped before model-derived logging or Sheet writes.
+        if _meal_change_intent_text(user_msg, history):
+            ans = _meal_change_safe_mode_reply()
+            conn.close()
+            user_memory[user_id] = history + [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": ans},
+            ]
+            return (ans, None)
+        compact_user_msg = re.sub(r"\s+", "", str(user_msg or ""))
+        has_mass_or_volume = bool(re.search(
+            r"\d+(?:\.\d+)?(?:g|克|公克|ml|毫升|cc)", compact_user_msg, re.I
+        ))
+        ingredients_memo = _menu_nutrition_memo(compact_user_msg, has_mass_or_volume)
     
-    food_items_text = food_items if food_items else "無"
+        food_items_text = food_items if food_items else "無"
     
-    # === 新增：從 Google Sheets 讀取當天排餐 ===
-    today_date_str = tw_today().strftime("%Y/%m/%d")
-    weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
-    today_str_zh = weekdays[tw_today().weekday()]
+        # === 新增：從 Google Sheets 讀取當天排餐 ===
+        today_date_str = tw_today().strftime("%Y/%m/%d")
+        weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+        today_str_zh = weekdays[tw_today().weekday()]
 
-    # 🌟 1. 預設空值 (加入運動變數)
-    today_lunch, today_dinner = "無", "無"
-    today_workout, tomorrow_workout = "無", "無" # 新增用來存運動的變數
+        # 🌟 1. 預設空值 (加入運動變數)
+        today_lunch, today_dinner = "無", "無"
+        today_workout, tomorrow_workout = "無", "無" # 新增用來存運動的變數
 
-    # 🌟 2. 取得今日與明日的日期字串 (嚴格比對用)
-    today_date_str = tw_today().strftime("%Y/%m/%d")
-    tomorrow_date_str = (tw_today() + timedelta(days=1)).strftime("%Y/%m/%d")
+        # 🌟 2. 取得今日與明日的日期字串 (嚴格比對用)
+        today_date_str = tw_today().strftime("%Y/%m/%d")
+        tomorrow_date_str = (tw_today() + timedelta(days=1)).strftime("%Y/%m/%d")
 
-    user_sheet_name = daily_rec[2] if daily_rec and len(daily_rec) > 2 else ""
+        user_sheet_name = daily_rec[2] if daily_rec and len(daily_rec) > 2 else ""
 
-    if gc and user_sheet_name:
-        try:
-            # 去個人的專屬分頁找排餐與運動
-            book = gc.open_by_key(SPREADSHEET_ID)
-            user_sheet, resolved_sheet_name, resolved_source = get_or_create_user_sheet(book, user_id, daily_rec[3] if daily_rec else "", user_sheet_name)
-            if user_sheet:
-                if resolved_sheet_name != user_sheet_name:
-                    user_sheet_name = resolved_sheet_name
-                    print(f"ℹ️ 對話引擎已校正 sheet_name：{user_id} -> {resolved_sheet_name} ({resolved_source})")
+        if gc and user_sheet_name:
+            try:
+                # 去個人的專屬分頁找排餐與運動
+                book = gc.open_by_key(SPREADSHEET_ID)
+                user_sheet, resolved_sheet_name, resolved_source = get_or_create_user_sheet(book, user_id, daily_rec[3] if daily_rec else "", user_sheet_name)
+                if user_sheet:
+                    if resolved_sheet_name != user_sheet_name:
+                        user_sheet_name = resolved_sheet_name
+                        print(f"ℹ️ 對話引擎已校正 sheet_name：{user_id} -> {resolved_sheet_name} ({resolved_source})")
 
-                all_rows = get_user_sheet_rows(user_sheet)
+                    all_rows = get_user_sheet_rows(user_sheet)
                 
-                for row in all_rows:
-                    row_date = _pick_first(row, ["日期", "實際日期", "取餐日期", "Date"], "")
+                    for row in all_rows:
+                        row_date = _pick_first(row, ["日期", "實際日期", "取餐日期", "Date"], "")
                     
-                    # 🎯 比對今天：抓午晚餐 + 今日的 Sport_Type
-                    if normalize_date_str(row_date) == normalize_date_str(today_date_str):
-                        today_lunch = _pick_first(row, ["午餐", "午餐安排", "Lunch_Item"], "無")
-                        today_dinner = _pick_first(row, ["晚餐", "晚餐安排", "Dinner_Item"], "無")
-                        today_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
+                        # 🎯 比對今天：抓午晚餐 + 今日的 Sport_Type
+                        if normalize_date_str(row_date) == normalize_date_str(today_date_str):
+                            today_lunch = _pick_first(row, ["午餐", "午餐安排", "Lunch_Item"], "無")
+                            today_dinner = _pick_first(row, ["晚餐", "晚餐安排", "Dinner_Item"], "無")
+                            today_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
                         
-                    # 🎯 比對明天：抓明日的 Sport_Type
-                    elif normalize_date_str(row_date) == normalize_date_str(tomorrow_date_str):
-                        tomorrow_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
+                        # 🎯 比對明天：抓明日的 Sport_Type
+                        elif normalize_date_str(row_date) == normalize_date_str(tomorrow_date_str):
+                            tomorrow_workout = _pick_first(row, ["Sport_Type", "運動強度", "運動", "Workout"], "無")
                         
-        except Exception as e:
-            print(f"⚠️ 讀取當天排餐/運動失敗: {e}")
+            except Exception as e:
+                print(f"⚠️ 讀取當天排餐/運動失敗: {e}")
 
-    # 週期化飲食：從 DB 讀取用戶等級與賽事日期
-    user_level = hp[4] if (hp and hp[4] is not None) else 2
-    race_date_str = hp[5] if (hp and hp[5]) else "無"
-    mode, countdown = calculate_carb_cycle(user_level, race_date_str)
+        # 週期化飲食：從 DB 讀取用戶等級與賽事日期
+        user_level = hp[4] if (hp and hp[4] is not None) else 2
+        race_date_str = hp[5] if (hp and hp[5]) else "無"
+        mode, countdown = calculate_carb_cycle(user_level, race_date_str)
 
-    # 判斷是否有排餐
-    has_meal_today = (today_lunch != "無" or today_dinner != "無")
+        # 判斷是否有排餐
+        has_meal_today = (today_lunch != "無" or today_dinner != "無")
 
-    if has_meal_today:
-        today_status = f"✅ 今天 ({today_str_zh}) 是您的【取餐日】\n🍱 午餐：{describe_planned_meal_for_ai(today_lunch)}\n🌙 晚餐：{describe_planned_meal_for_ai(today_dinner)}"
-        base_cal_text = "【報告上的『當日熱量剩餘』】"
-        base_pro_text = "【報告上的『蛋白質需補』】"
-    else:
-        # 把原本的 ❌ 改成 🎉，讓無排餐日的氛圍更歡樂
-        today_status = f"🎉 今天 ({today_str_zh}) 是您的【無排餐日】，擁有今日完整額度喔！"
-        base_cal_text = str(int(tdee_val))
-        base_pro_text = str(int(protein_val))
+        if has_meal_today:
+            today_status = f"✅ 今天 ({today_str_zh}) 是您的【取餐日】\n🍱 午餐：{describe_planned_meal_for_ai(today_lunch)}\n🌙 晚餐：{describe_planned_meal_for_ai(today_dinner)}"
+            base_cal_text = "【報告上的『當日熱量剩餘』】"
+            base_pro_text = "【報告上的『蛋白質需補』】"
+        else:
+            # 把原本的 ❌ 改成 🎉，讓無排餐日的氛圍更歡樂
+            today_status = f"🎉 今天 ({today_str_zh}) 是您的【無排餐日】，擁有今日完整額度喔！"
+            base_cal_text = str(int(tdee_val))
+            base_pro_text = str(int(protein_val))
 
-    system_prompt = f"""你是「一日樂食（Deli Express）」的專屬飲食紀錄助理。
+        system_prompt = f"""你是「一日樂食（Deli Express）」的專屬飲食紀錄助理。
 
 【回覆風格最高指導原則】
 🚨 請用精簡、口語化、有活力的台灣中文回覆。
@@ -10541,115 +10550,115 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
 {ingredients_memo}
 """
     
-    try:
-        messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
-        res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2000, temperature=0.3)
-        ans = res.choices[0].message.content
-    except Exception as e:
-        if should_ai_create_food_log(user_msg):
-            record_nutrition_estimate_audit(
-                _nutrition_estimate_audit_path(), model="gpt-4o-mini",
-                response={"error": type(e).__name__}, operation_id=operation_key, outcome="provider_error",
-            )
-        print(f"⚠️ AI 大腦呼叫失敗：{type(e).__name__}")
-        return ("⚠️ AI 助理暫時忙碌中，請稍後再試；若持續發生請聯繫客服。", None)
-
-    # A model-emitted mutation marker is never authority.  Stop before LOG_NUTRITION
-    # parsing so compound nutrition + mutation output cannot partially write either side.
-    if re.search(r"\[SWAP_MEAL\b", str(ans or ""), flags=re.IGNORECASE):
-        ans = _meal_change_safe_mode_reply()
-        conn.close()
-        user_memory[user_id] = history + [
-            {"role": "user", "content": user_msg},
-            {"role": "assistant", "content": ans},
-        ]
-        return (ans, None)
-        
-    meal_log_flex = None
-    parsed_tag = (
-        parse_log_nutrition_tag(ans)
-        or parse_log_nutrition_fallback(ans, user_msg)
-        or parse_ai_estimate_range_fallback(ans, user_msg)
-    )
-
-    # Legacy LOG_NUTRITION output is evidence for a confirmation draft only.
-    # It never authorizes a formal food_logs mutation by itself.
-    legacy_trace = ""
-    if parsed_tag or should_ai_create_food_log(user_msg):
-        raw_nutrition_tag = re.search(r"\[LOG_NUTRITION[^\]]*\]", str(ans or ""), re.I)
-        audit_projection = parsed_tag or {}
-        legacy_trace = record_nutrition_estimate_audit(
-            _nutrition_estimate_audit_path(), model=str(getattr(res, "model", None) or "gpt-4o-mini"),
-            response={"food_name": audit_projection.get("name"),
-                      "nutrition_response_excerpt": raw_nutrition_tag.group(0) if raw_nutrition_tag else "",
-                      "calories_kcal": audit_projection.get("cal"), "protein_g": audit_projection.get("pro")},
-            operation_id=operation_key, outcome="legacy_nutrition_projection" if parsed_tag else "invalid_no_nutrition",
-        )
-    if parsed_tag and should_ai_create_food_log(user_msg):
-        if (
-            parsed_tag.get("name")
-            and parsed_tag.get("cal") is not None
-            and parsed_tag.get("pro") is not None
-        ):
-            draft = create_fixed_text_meal_draft(
-                user_id=user_id,
-                message_id=operation_key,
-                request={
-                    "food_name": parsed_tag["name"],
-                    "meal_slot": ai_estimate_meal_slot(user_msg) or current_meal_slot(),
-                    "calories_kcal": parsed_tag["cal"],
-                    "protein_g": parsed_tag["pro"],
-                    "source": {"provider": "openai", "model": str(getattr(res, "model", None) or "gpt-4o-mini"),
-                               "trace_id": legacy_trace},
-                },
-                method="legacy_ai_log_nutrition",
-            )
-            meal_log_flex = build_text_meal_estimate_flex(draft)
-            ans = "已建立一般估算草稿，請確認後才會記錄。"
-        else:
-            ans = "估算缺少完整熱量或蛋白質，這次沒有建立記餐草稿。"
-        parsed_tag = None
-    
-    if parsed_tag and should_ai_create_food_log(user_msg):
         try:
-            logged_cal = parsed_tag["cal"]
-            logged_pro = parsed_tag["pro"]
-            logged_name = parsed_tag["name"]
+            messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_msg}]
+            res = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2000, temperature=0.3)
+            ans = res.choices[0].message.content
+        except Exception as e:
+            if should_ai_create_food_log(user_msg):
+                record_nutrition_estimate_audit(
+                    _nutrition_estimate_audit_path(), model="gpt-4o-mini",
+                    response={"error": type(e).__name__}, operation_id=operation_key, outcome="provider_error",
+                )
+            print(f"⚠️ AI 大腦呼叫失敗：{type(e).__name__}")
+            return ("⚠️ AI 助理暫時忙碌中，請稍後再試；若持續發生請聯繫客服。", None)
 
-            # 至少要有品項，且熱量/蛋白至少有一個抓到，才視為有效記錄
-            if logged_name and (logged_cal is not None or logged_pro is not None):
-                meal_slot = ai_estimate_meal_slot(user_msg)
-                if not meal_slot:
-                    meal_hour = tw_now().hour
-                    meal_slot = "早餐" if meal_hour < 11 else ("午餐" if meal_hour < 15 else ("晚餐" if meal_hour < 21 else "點心"))
-                daily_log = create_daily_food_log(
-                    conn, user_id=user_id, product_name=logged_name,
-                    meal_slot=meal_slot, consumed_at=tw_now().isoformat(timespec="seconds"),
-                    servings=1,
-                    nutrition={"calories_kcal": logged_cal, "protein_g": logged_pro},
-                    source_type="ai_text_estimate", operation_key=operation_key,
+        # A model-emitted mutation marker is never authority.  Stop before LOG_NUTRITION
+        # parsing so compound nutrition + mutation output cannot partially write either side.
+        if re.search(r"\[SWAP_MEAL\b", str(ans or ""), flags=re.IGNORECASE):
+            ans = _meal_change_safe_mode_reply()
+            conn.close()
+            user_memory[user_id] = history + [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": ans},
+            ]
+            return (ans, None)
+        
+        meal_log_flex = None
+        parsed_tag = (
+            parse_log_nutrition_tag(ans)
+            or parse_log_nutrition_fallback(ans, user_msg)
+            or parse_ai_estimate_range_fallback(ans, user_msg)
+        )
+
+        # Legacy LOG_NUTRITION output is evidence for a confirmation draft only.
+        # It never authorizes a formal food_logs mutation by itself.
+        legacy_trace = ""
+        if parsed_tag or should_ai_create_food_log(user_msg):
+            raw_nutrition_tag = re.search(r"\[LOG_NUTRITION[^\]]*\]", str(ans or ""), re.I)
+            audit_projection = parsed_tag or {}
+            legacy_trace = record_nutrition_estimate_audit(
+                _nutrition_estimate_audit_path(), model=str(getattr(res, "model", None) or "gpt-4o-mini"),
+                response={"food_name": audit_projection.get("name"),
+                          "nutrition_response_excerpt": raw_nutrition_tag.group(0) if raw_nutrition_tag else "",
+                          "calories_kcal": audit_projection.get("cal"), "protein_g": audit_projection.get("pro")},
+                operation_id=operation_key, outcome="legacy_nutrition_projection" if parsed_tag else "invalid_no_nutrition",
+            )
+        if parsed_tag and should_ai_create_food_log(user_msg):
+            if (
+                parsed_tag.get("name")
+                and parsed_tag.get("cal") is not None
+                and parsed_tag.get("pro") is not None
+            ):
+                draft = create_fixed_text_meal_draft(
+                    user_id=user_id,
+                    message_id=operation_key,
+                    request={
+                        "food_name": parsed_tag["name"],
+                        "meal_slot": ai_estimate_meal_slot(user_msg) or current_meal_slot(),
+                        "calories_kcal": parsed_tag["cal"],
+                        "protein_g": parsed_tag["pro"],
+                        "source": {"provider": "openai", "model": str(getattr(res, "model", None) or "gpt-4o-mini"),
+                                   "trace_id": legacy_trace},
+                    },
+                    method="legacy_ai_log_nutrition",
                 )
-                if daily_log.get("replayed"):
-                    logged_name = daily_log["product_name"]
-                    logged_cal = daily_log["nutrition"].get("calories_kcal")
-                    logged_pro = daily_log["nutrition"].get("protein_g")
-                logged_cal = float(logged_cal) if logged_cal is not None else None
-                logged_pro = float(logged_pro) if logged_pro is not None else None
-                _sync_health_profile_from_ledger_conn(conn, user_id, tw_today().isoformat())
-                c.execute(
-                    "SELECT today_extra_cal,today_extra_pro,today_food_items FROM health_profile WHERE user_id=?",
-                    (user_id,),
-                )
-                projected = c.fetchone() or (0, 0, "")
-                new_extra_cal, new_extra_pro, new_food_items = (
-                    projected[0] or 0, projected[1] or 0, projected[2] or "",
-                )
+                meal_log_flex = build_text_meal_estimate_flex(draft)
+                ans = "已建立一般估算草稿，請確認後才會記錄。"
+            else:
+                ans = "估算缺少完整熱量或蛋白質，這次沒有建立記餐草稿。"
+            parsed_tag = None
+    
+        if parsed_tag and should_ai_create_food_log(user_msg):
+            try:
+                logged_cal = parsed_tag["cal"]
+                logged_pro = parsed_tag["pro"]
+                logged_name = parsed_tag["name"]
+
+                # 至少要有品項，且熱量/蛋白至少有一個抓到，才視為有效記錄
+                if logged_name and (logged_cal is not None or logged_pro is not None):
+                    meal_slot = ai_estimate_meal_slot(user_msg)
+                    if not meal_slot:
+                        meal_hour = tw_now().hour
+                        meal_slot = "早餐" if meal_hour < 11 else ("午餐" if meal_hour < 15 else ("晚餐" if meal_hour < 21 else "點心"))
+                    daily_log = create_daily_food_log(
+                        conn, user_id=user_id, product_name=logged_name,
+                        meal_slot=meal_slot, consumed_at=tw_now().isoformat(timespec="seconds"),
+                        servings=1,
+                        nutrition={"calories_kcal": logged_cal, "protein_g": logged_pro},
+                        source_type="ai_text_estimate", operation_key=operation_key,
+                    )
+                    if daily_log.get("replayed"):
+                        logged_name = daily_log["product_name"]
+                        logged_cal = daily_log["nutrition"].get("calories_kcal")
+                        logged_pro = daily_log["nutrition"].get("protein_g")
+                    logged_cal = float(logged_cal) if logged_cal is not None else None
+                    logged_pro = float(logged_pro) if logged_pro is not None else None
+                    _sync_health_profile_from_ledger_conn(conn, user_id, tw_today().isoformat())
+                    c.execute(
+                        "SELECT today_extra_cal,today_extra_pro,today_food_items FROM health_profile WHERE user_id=?",
+                        (user_id,),
+                    )
+                    projected = c.fetchone() or (0, 0, "")
+                    new_extra_cal, new_extra_pro, new_food_items = (
+                        projected[0] or 0, projected[1] or 0, projected[2] or "",
+                    )
                 
-                # 隱藏 tag 會在此區塊後統一移除。
+                    # 隱藏 tag 會在此區塊後統一移除。
 
-                # 存最近一筆，供 Task 3 份量修正使用
-                try:
-                    c.execute("""
+                    # 存最近一筆，供 Task 3 份量修正使用
+                    try:
+                        c.execute("""
                         INSERT INTO recent_meal_logs (user_id, meal_name, base_cal, base_pro, current_cal, current_pro, meal_date, source_text, updated_at, food_log_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(user_id) DO UPDATE SET
@@ -10663,117 +10672,117 @@ def get_ai_response_with_memory(user_id, user_msg, operation_key=""):
                             updated_at=excluded.updated_at,
                             food_log_id=excluded.food_log_id
                     """, (user_id, logged_name, logged_cal, logged_pro, logged_cal, logged_pro, tw_today().isoformat(), user_msg, tw_now().isoformat(), daily_log["log_id"]))
-                except Exception as _se:
-                    print(f'⚠️ 最近一筆記錄保存失敗: {_se}')
-                    raise
+                    except Exception as _se:
+                        print(f'⚠️ 最近一筆記錄保存失敗: {_se}')
+                        raise
 
-                # Commit the canonical log and its legacy edit pointer before rendering.
-                # Dashboard rendering is post-commit and cannot roll back or misreport the meal.
-                conn.commit()
-                meal_log_flex = build_post_commit_food_dashboard(user_id)
+                    # Commit the canonical log and its legacy edit pointer before rendering.
+                    # Dashboard rendering is post-commit and cannot roll back or misreport the meal.
+                    conn.commit()
+                    meal_log_flex = build_post_commit_food_dashboard(user_id)
 
-                if meal_log_flex is not None and operation_key:
-                    flex_payload = json.loads(meal_log_flex.as_json_string())
-                    replay_state = json.dumps(
-                        {
-                            "kind": "ai_estimate_log",
-                            "flex": flex_payload,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    created_at = tw_now().isoformat(timespec="seconds")
-                    c.execute(
-                        """INSERT OR IGNORE INTO ai_food_log_replay_snapshots
+                    if meal_log_flex is not None and operation_key:
+                        flex_payload = json.loads(meal_log_flex.as_json_string())
+                        replay_state = json.dumps(
+                            {
+                                "kind": "ai_estimate_log",
+                                "flex": flex_payload,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        created_at = tw_now().isoformat(timespec="seconds")
+                        c.execute(
+                            """INSERT OR IGNORE INTO ai_food_log_replay_snapshots
                            (operation_key,user_id,log_id,flex_json,created_at)
                            VALUES (?,?,?,?,?)""",
-                        (
-                            str(operation_key)[:180], user_id, daily_log["log_id"],
-                            json.dumps(flex_payload, ensure_ascii=False, separators=(",", ":")),
-                            created_at,
-                        ),
-                    )
-                    c.execute(
-                        """INSERT INTO daily_food_log_events
+                            (
+                                str(operation_key)[:180], user_id, daily_log["log_id"],
+                                json.dumps(flex_payload, ensure_ascii=False, separators=(",", ":")),
+                                created_at,
+                            ),
+                        )
+                        c.execute(
+                            """INSERT INTO daily_food_log_events
                            (event_id,user_id,log_id,action,result_json,created_at)
                            VALUES (?,?,?,?,?,?)
                            ON CONFLICT(event_id) DO UPDATE SET
                              user_id=excluded.user_id,log_id=excluded.log_id,
                              action=excluded.action,result_json=excluded.result_json,
                              created_at=excluded.created_at""",
-                        (
-                            str(operation_key)[:180], user_id, daily_log["log_id"],
-                            "ai_estimate_log", replay_state, created_at,
-                        ),
-                    )
-                conn.commit()
+                            (
+                                str(operation_key)[:180], user_id, daily_log["log_id"],
+                                "ai_estimate_log", replay_state, created_at,
+                            ),
+                        )
+                    conn.commit()
 
-                if parsed_tag.get("source") == "range_fallback":
-                    ans = (
-                        f"✅ 已用一般估算記錄：{logged_name}\n"
-                        f"🔥 熱量 {logged_cal if logged_cal is not None else '未知'} 大卡｜"
-                        f"🥩 蛋白質 {logged_pro if logged_pro is not None else '未知'} 克"
-                    )
+                    if parsed_tag.get("source") == "range_fallback":
+                        ans = (
+                            f"✅ 已用一般估算記錄：{logged_name}\n"
+                            f"🔥 熱量 {logged_cal if logged_cal is not None else '未知'} 大卡｜"
+                            f"🥩 蛋白質 {logged_pro if logged_pro is not None else '未知'} 克"
+                        )
 
-                # 核心 ledger 與 replay state 已提交後才執行非核心 mirror。
-                if not daily_log.get("replayed") and len(logged_name) <= 15:
-                    try:
-                        upsert_frequent_food(user_id, logged_name, logged_cal, logged_pro)
-                    except Exception as _ff:
-                        print(f"⚠️ 常吃清單同步失敗: {_ff}")
+                    # 核心 ledger 與 replay state 已提交後才執行非核心 mirror。
+                    if not daily_log.get("replayed") and len(logged_name) <= 15:
+                        try:
+                            upsert_frequent_food(user_id, logged_name, logged_cal, logged_pro)
+                        except Exception as _ff:
+                            print(f"⚠️ 常吃清單同步失敗: {_ff}")
                 
-                # 寫入 Google Sheet。啟用改期時，這個 legacy mirror 必須在
-                # 任何遠端存取前加入可信 outer scope，否則明確拒寫。
-                if not daily_log.get("replayed") and daily_rec and daily_rec[2] and gc:
-                    _require_controlled_workbook_writer("workout_food_tracking")
-                    try:
-                        sheet = gc.open_by_url(SHEET_URL)
-                        now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
-                        cal_text = f"+{logged_cal} kcal" if logged_cal is not None else "+熱量未知"
-                        pro_text = f"+{logged_pro} g" if logged_pro is not None else "+蛋白未知"
-                        note = f"{cal_text} / {pro_text} ({logged_name})"
-                        if parsed_tag.get("source") == "fallback":
-                            note += " [fallback]"
-                        sheet.worksheet(daily_rec[2]).append_row([now_str, "外食熱量與蛋白打卡", user_msg, note])
-                    except Exception:
-                        pass
-        except Exception as e:
-            conn.rollback()
-            meal_log_flex = None
-            print(f"❌ 標籤解析存入失敗: {e}")
-            if PAIR_RESCHEDULE_ENABLED:
-                raise RuntimeError("飲食追蹤 Sheet mirror 本次未寫入") from e
+                    # 寫入 Google Sheet。啟用改期時，這個 legacy mirror 必須在
+                    # 任何遠端存取前加入可信 outer scope，否則明確拒寫。
+                    if not daily_log.get("replayed") and daily_rec and daily_rec[2] and gc:
+                        _require_controlled_workbook_writer("workout_food_tracking")
+                        try:
+                            sheet = gc.open_by_url(SHEET_URL)
+                            now_str = tw_now().strftime("%Y-%m-%d %H:%M:%S")
+                            cal_text = f"+{logged_cal} kcal" if logged_cal is not None else "+熱量未知"
+                            pro_text = f"+{logged_pro} g" if logged_pro is not None else "+蛋白未知"
+                            note = f"{cal_text} / {pro_text} ({logged_name})"
+                            if parsed_tag.get("source") == "fallback":
+                                note += " [fallback]"
+                            sheet.worksheet(daily_rec[2]).append_row([now_str, "外食熱量與蛋白打卡", user_msg, note])
+                        except Exception:
+                            pass
+            except Exception as e:
+                conn.rollback()
+                meal_log_flex = None
+                print(f"❌ 標籤解析存入失敗: {e}")
+                if PAIR_RESCHEDULE_ENABLED:
+                    raise RuntimeError("飲食追蹤 Sheet mirror 本次未寫入") from e
 
-    # 防止模型未遵守提示詞時，把隱藏記錄標籤顯示給一般問句使用者。
-    ans = re.sub(
-        r'\[LOG_NUTRITION:.*?\]', '', str(ans or ''), flags=re.IGNORECASE
-    ).strip()
+        # 防止模型未遵守提示詞時，把隱藏記錄標籤顯示給一般問句使用者。
+        ans = re.sub(
+            r'\[LOG_NUTRITION:.*?\]', '', str(ans or ''), flags=re.IGNORECASE
+        ).strip()
 
-# 🔥 偵測呼叫老闆訊號 [CALL_BOSS]
-    match_call_boss = re.search(r'\[CALL_BOSS\]', ans)
-    if match_call_boss:
-        ans = ans.replace('[CALL_BOSS]', '').strip()
-        ans += "\n\n(系統提示：已為您暫停 AI 助理，並通知真人客服，請稍候我們會盡快回覆您！)"
+    # 🔥 偵測呼叫老闆訊號 [CALL_BOSS]
+        match_call_boss = re.search(r'\[CALL_BOSS\]', ans)
+        if match_call_boss:
+            ans = ans.replace('[CALL_BOSS]', '').strip()
+            ans += "\n\n(系統提示：已為您暫停 AI 助理，並通知真人客服，請稍候我們會盡快回覆您！)"
         
-        # 設定靜音 24 小時
-        silence_time = (tw_now() + timedelta(hours=24)).isoformat()
-        c.execute("UPDATE health_profile SET ai_silenced_until=? WHERE user_id=?", (silence_time, user_id))
-        conn.commit()
+            # 設定靜音 24 小時
+            silence_time = (tw_now() + timedelta(hours=24)).isoformat()
+            c.execute("UPDATE health_profile SET ai_silenced_until=? WHERE user_id=?", (silence_time, user_id))
+            conn.commit()
 
-        # 發送求救訊號給老闆
-        c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
-        admin_row = c.fetchone()
-        if admin_row:
-            customer_name = daily_rec[3] if daily_rec else "顧客"
-            boss_msg = f"🚨【客服呼叫】顧客 {customer_name} ({user_id[-4:]}) 需要真人協助！\nAI 已自動暫停 24 小時，請至 LINE 官方帳號處理。"
-            try: 
-                line_bot_api.push_message(admin_row[0], TextSendMessage(text=boss_msg))
-            except Exception: 
-                pass
+            # 發送求救訊號給老闆
+            c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+            admin_row = c.fetchone()
+            if admin_row:
+                customer_name = daily_rec[3] if daily_rec else "顧客"
+                boss_msg = f"🚨【客服呼叫】顧客 {customer_name} ({user_id[-4:]}) 需要真人協助！\nAI 已自動暫停 24 小時，請至 LINE 官方帳號處理。"
+                try: 
+                    line_bot_api.push_message(admin_row[0], TextSendMessage(text=boss_msg))
+                except Exception: 
+                    pass
 
-    conn.close()
-    user_memory[user_id] = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": ans}]
-    return (ans, meal_log_flex)
+        conn.close()
+        user_memory[user_id] = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": ans}]
+        return (ans, meal_log_flex)
 
 
 # ==========================================
@@ -13498,175 +13507,175 @@ def _generate_weekly_coach(uid, reply_token=None):
     _require_controlled_workbook_writer("weekly_coach")
 
     # 1. 從 SQLite 取得用戶個人設定
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    # 💡 順手幫你修復了一個隱藏 Bug：原本漏抓了 race_date，這裡補上了！
-    c.execute("SELECT name, goal, restrictions, active_days, tdee, protein, race_date FROM health_profile WHERE user_id=?", (uid,))
-    hp = c.fetchone()
-    conn.close()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        # 💡 順手幫你修復了一個隱藏 Bug：原本漏抓了 race_date，這裡補上了！
+        c.execute("SELECT name, goal, restrictions, active_days, tdee, protein, race_date FROM health_profile WHERE user_id=?", (uid,))
+        hp = c.fetchone()
+        conn.close()
 
-    if not hp:
-        msg = "找不到您的個人檔案，請先填寫體質評估表單喔！📝"
-        try:
-            if reply_token: line_bot_api.reply_message(reply_token, TextSendMessage(text=msg))
-            else: line_bot_api.push_message(uid, TextSendMessage(text=msg))
-        except: pass
-        return False, msg, {}
+        if not hp:
+            msg = "找不到您的個人檔案，請先填寫體質評估表單喔！📝"
+            try:
+                if reply_token: line_bot_api.reply_message(reply_token, TextSendMessage(text=msg))
+                else: line_bot_api.push_message(uid, TextSendMessage(text=msg))
+            except: pass
+            return False, msg, {}
     
-    # 解析健康檔案
-    name, goal, restrictions, active_days, tdee, protein, race_date = hp
+        # 解析健康檔案
+        name, goal, restrictions, active_days, tdee, protein, race_date = hp
 
-    # 2. 計算下週日期範圍（下週一到週日）
-    today = tw_today()
-    days_to_monday = (7 - today.weekday()) % 7 or 7
-    next_monday = today + timedelta(days=days_to_monday)
-    next_week_dates = [(next_monday + timedelta(days=i)).strftime("%Y/%m/%d") for i in range(7)]
-    weekday_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
-    week_range = f"{next_week_dates[0]} – {next_week_dates[6]}"
+        # 2. 計算下週日期範圍（下週一到週日）
+        today = tw_today()
+        days_to_monday = (7 - today.weekday()) % 7 or 7
+        next_monday = today + timedelta(days=days_to_monday)
+        next_week_dates = [(next_monday + timedelta(days=i)).strftime("%Y/%m/%d") for i in range(7)]
+        weekday_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+        week_range = f"{next_week_dates[0]} – {next_week_dates[6]}"
 
-    # 3. 從 Google Sheet 抓下週排餐 & 運動設定
-    next_week_meals, row_date_map = [], {}
-    intervals_id, intervals_key = "", ""
-    sport_type = training_freq = normal_train_time = long_train_day = "未設定"
-    run_pace = bike_ftp = swim_pace = "未提供"
+        # 3. 從 Google Sheet 抓下週排餐 & 運動設定
+        next_week_meals, row_date_map = [], {}
+        intervals_id, intervals_key = "", ""
+        sport_type = training_freq = normal_train_time = long_train_day = "未設定"
+        run_pace = bike_ftp = swim_pace = "未提供"
     
-    if gc:
-        try:
-            api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
-            all_records = api_sheet.get_all_records()
-            for i, row in enumerate(all_records):
-                if str(row.get("User_ID")) == uid and str(row.get("Date")) in next_week_dates:
-                    if sport_type == "未設定":
-                        sport_type = str(row.get("Sport_Type", "未設定"))
-                        training_freq = str(row.get("Training_Freq", "未設定"))
-                        normal_train_time = str(row.get("Normal_Train_Time", "未設定"))
-                        long_train_day = str(row.get("Long_Train_Day", "未設定"))
-                        run_pace = str(row.get("Run_Pace", "未提供"))
-                        bike_ftp = str(row.get("Bike_FTP", "未提供"))
-                        swim_pace = str(row.get("Swim_Pace", "未提供"))
+        if gc:
+            try:
+                api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
+                all_records = api_sheet.get_all_records()
+                for i, row in enumerate(all_records):
+                    if str(row.get("User_ID")) == uid and str(row.get("Date")) in next_week_dates:
+                        if sport_type == "未設定":
+                            sport_type = str(row.get("Sport_Type", "未設定"))
+                            training_freq = str(row.get("Training_Freq", "未設定"))
+                            normal_train_time = str(row.get("Normal_Train_Time", "未設定"))
+                            long_train_day = str(row.get("Long_Train_Day", "未設定"))
+                            run_pace = str(row.get("Run_Pace", "未提供"))
+                            bike_ftp = str(row.get("Bike_FTP", "未提供"))
+                            swim_pace = str(row.get("Swim_Pace", "未提供"))
 
-                    day_idx = next_week_dates.index(str(row.get("Date")))
-                    next_week_meals.append({
-                        "date": row.get("Date"),
-                        "weekday": weekday_names[day_idx],
-                        "lunch": row.get("Lunch_Item", ""),
-                        "dinner": row.get("Dinner_Item", "")
-                    })
-                    row_date_map[str(row.get("Date"))] = i + 2
-                    if not intervals_id and row.get("Intervals_ID"):
-                        intervals_id = str(row.get("Intervals_ID"))
-                        intervals_key = str(row.get("Intervals_API_Key", ""))
-        except Exception as e:
-            print(f"⚠️ 取得下週排餐與設定失敗: {e}")
-
-    # 4. 抓 Intervals.icu 本週體能數據與活動
-    icu_data = get_intervals_data(intervals_id, intervals_key) if (intervals_id and intervals_key) else None
-    this_week_activities = []
-    if intervals_id and intervals_key:
-        try:
-            week_start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
-            resp = requests.get(
-                f"https://intervals.icu/api/v1/athlete/{intervals_id}/activities?oldest={week_start}&newest={today.strftime('%Y-%m-%d')}&limit=10",
-                auth=('API_KEY', intervals_key), timeout=10
-            )
-            if resp.status_code == 200:
-                for a in resp.json():
-                    if isinstance(a, dict):
-                        this_week_activities.append({
-                            "date": str(a.get("start_date_local", ""))[:10],
-                            "type": a.get("type", ""),
-                            "distance_km": round(a.get("distance", 0) / 1000, 1),
-                            "duration_min": a.get("moving_time", 0) // 60,
-                            "tss": a.get("icu_training_load") or 0
+                        day_idx = next_week_dates.index(str(row.get("Date")))
+                        next_week_meals.append({
+                            "date": row.get("Date"),
+                            "weekday": weekday_names[day_idx],
+                            "lunch": row.get("Lunch_Item", ""),
+                            "dinner": row.get("Dinner_Item", "")
                         })
-        except Exception as e:
-            print(f"⚠️ 抓本週活動失敗: {e}")
+                        row_date_map[str(row.get("Date"))] = i + 2
+                        if not intervals_id and row.get("Intervals_ID"):
+                            intervals_id = str(row.get("Intervals_ID"))
+                            intervals_key = str(row.get("Intervals_API_Key", ""))
+            except Exception as e:
+                print(f"⚠️ 取得下週排餐與設定失敗: {e}")
 
-    # 5. Load training library
-    _this_dir = os.path.dirname(os.path.abspath(__file__))
-    _training_library = ""
-    try:
-        with open(os.path.join(_this_dir, "openclawbot", "training_library.md"), encoding="utf-8-sig") as _f:
-            _training_library = _f.read()
-    except:
-        pass
+        # 4. 抓 Intervals.icu 本週體能數據與活動
+        icu_data = get_intervals_data(intervals_id, intervals_key) if (intervals_id and intervals_key) else None
+        this_week_activities = []
+        if intervals_id and intervals_key:
+            try:
+                week_start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
+                resp = requests.get(
+                    f"https://intervals.icu/api/v1/athlete/{intervals_id}/activities?oldest={week_start}&newest={today.strftime('%Y-%m-%d')}&limit=10",
+                    auth=('API_KEY', intervals_key), timeout=10
+                )
+                if resp.status_code == 200:
+                    for a in resp.json():
+                        if isinstance(a, dict):
+                            this_week_activities.append({
+                                "date": str(a.get("start_date_local", ""))[:10],
+                                "type": a.get("type", ""),
+                                "distance_km": round(a.get("distance", 0) / 1000, 1),
+                                "duration_min": a.get("moving_time", 0) // 60,
+                                "tss": a.get("icu_training_load") or 0
+                            })
+            except Exception as e:
+                print(f"⚠️ 抓本週活動失敗: {e}")
 
-    # 6. 計算運動區間 (Zones) 與 eTSS 預算
-    run_zones = {}
-    if run_pace and run_pace != "未提供":
+        # 5. Load training library
+        _this_dir = os.path.dirname(os.path.abspath(__file__))
+        _training_library = ""
         try:
-            pace_val = run_pace.split("/")[0]
-            m, s = map(int, pace_val.split(":"))
-            pace_5k_sec = (m * 60 + s) / 5
-            threshold_sec = pace_5k_sec + 20
-            marathon_sec = pace_5k_sec + 37
-            easy_low_sec = threshold_sec + 58
-            easy_high_sec = threshold_sec + 74
-            interval_sec = pace_5k_sec - 8
-            rep_sec = pace_5k_sec - 23
-            def _sp(s): return f"{int(s//60)}:{int(s%60):02d}/km"
-            run_zones = {
-                "threshold_pace": _sp(threshold_sec),
-                "marathon_pace": _sp(marathon_sec),
-                "easy_pace_range": f"{_sp(easy_low_sec)}~{_sp(easy_high_sec)}",
-                "interval_pace": _sp(interval_sec),
-                "repetition_pace": _sp(rep_sec),
-            }
-        except: pass
+            with open(os.path.join(_this_dir, "openclawbot", "training_library.md"), encoding="utf-8-sig") as _f:
+                _training_library = _f.read()
+        except:
+            pass
 
-    bike_zones = {}
-    if bike_ftp and bike_ftp != "未提供":
-        try:
-            ftp = float(bike_ftp)
-            bike_zones = {
-                "z1_watts": f"<{int(ftp*0.55)}W", "z2_watts": f"{int(ftp*0.69)}W",
-                "z3_watts": f"{int(ftp*0.83)}~{int(ftp*0.90)}W", "threshold_watts": f"{int(ftp*0.95)}W",
-                "vo2max_watts": f"{int(ftp*1.13)}~{int(ftp*1.20)}W",
-            }
-        except: pass
+        # 6. 計算運動區間 (Zones) 與 eTSS 預算
+        run_zones = {}
+        if run_pace and run_pace != "未提供":
+            try:
+                pace_val = run_pace.split("/")[0]
+                m, s = map(int, pace_val.split(":"))
+                pace_5k_sec = (m * 60 + s) / 5
+                threshold_sec = pace_5k_sec + 20
+                marathon_sec = pace_5k_sec + 37
+                easy_low_sec = threshold_sec + 58
+                easy_high_sec = threshold_sec + 74
+                interval_sec = pace_5k_sec - 8
+                rep_sec = pace_5k_sec - 23
+                def _sp(s): return f"{int(s//60)}:{int(s%60):02d}/km"
+                run_zones = {
+                    "threshold_pace": _sp(threshold_sec),
+                    "marathon_pace": _sp(marathon_sec),
+                    "easy_pace_range": f"{_sp(easy_low_sec)}~{_sp(easy_high_sec)}",
+                    "interval_pace": _sp(interval_sec),
+                    "repetition_pace": _sp(rep_sec),
+                }
+            except: pass
 
-    swim_zones = {}
-    if swim_pace and swim_pace != "未提供":
-        try:
-            pace_val = swim_pace.split("/")[0]
-            m, s = map(int, pace_val.split(":"))
-            css_sec = m * 60 + s
-            easy_swim = css_sec + 10
-            swim_zones = {
-                "css_pace": f"{m}:{s:02d}/100m", "easy_swim_pace": f"{int(easy_swim//60)}:{int(easy_swim%60):02d}/100m",
-            }
-        except: pass
+        bike_zones = {}
+        if bike_ftp and bike_ftp != "未提供":
+            try:
+                ftp = float(bike_ftp)
+                bike_zones = {
+                    "z1_watts": f"<{int(ftp*0.55)}W", "z2_watts": f"{int(ftp*0.69)}W",
+                    "z3_watts": f"{int(ftp*0.83)}~{int(ftp*0.90)}W", "threshold_watts": f"{int(ftp*0.95)}W",
+                    "vo2max_watts": f"{int(ftp*1.13)}~{int(ftp*1.20)}W",
+                }
+            except: pass
 
-    # 賽事倒數計算
-    _race_weeks_left = 0
-    if race_date and race_date != "無":
-        try:
-            _rd = datetime.strptime(str(race_date), "%Y/%m/%d").date()
-            _race_weeks_left = max(0, (_rd - today).days // 7)
-        except: pass
+        swim_zones = {}
+        if swim_pace and swim_pace != "未提供":
+            try:
+                pace_val = swim_pace.split("/")[0]
+                m, s = map(int, pace_val.split(":"))
+                css_sec = m * 60 + s
+                easy_swim = css_sec + 10
+                swim_zones = {
+                    "css_pace": f"{m}:{s:02d}/100m", "easy_swim_pace": f"{int(easy_swim//60)}:{int(easy_swim%60):02d}/100m",
+                }
+            except: pass
 
-    if _race_weeks_left == 0 or not race_date or race_date == "無":
-        _period, _weekly_etss = "健康維持", 200
-    elif _race_weeks_left >= 12: _period, _weekly_etss = "基礎期", 220
-    elif _race_weeks_left >= 6: _period, _weekly_etss = "建設期", 280
-    elif _race_weeks_left >= 3: _period, _weekly_etss = "高峰期", 320
-    elif _race_weeks_left >= 1: _period, _weekly_etss = "減量週", 150
-    else: _period, _weekly_etss = "比賽週", 100
+        # 賽事倒數計算
+        _race_weeks_left = 0
+        if race_date and race_date != "無":
+            try:
+                _rd = datetime.strptime(str(race_date), "%Y/%m/%d").date()
+                _race_weeks_left = max(0, (_rd - today).days // 7)
+            except: pass
 
-    _etss_data = {"period": _period, "weeks_left": _race_weeks_left, "budget": _weekly_etss}
+        if _race_weeks_left == 0 or not race_date or race_date == "無":
+            _period, _weekly_etss = "健康維持", 200
+        elif _race_weeks_left >= 12: _period, _weekly_etss = "基礎期", 220
+        elif _race_weeks_left >= 6: _period, _weekly_etss = "建設期", 280
+        elif _race_weeks_left >= 3: _period, _weekly_etss = "高峰期", 320
+        elif _race_weeks_left >= 1: _period, _weekly_etss = "減量週", 150
+        else: _period, _weekly_etss = "比賽週", 100
 
-    # 7. 建立完美的、沒有遺漏的 Prompt 輸入資料
-    input_data = {
-        "athlete": name, "goal": goal, "active_days": active_days, "restrictions": restrictions or "無",
-        "tdee": tdee, "protein_target_g": int(protein) if protein else 0, "week_range": week_range,
-        "sport_type": sport_type, "training_freq": training_freq, "normal_train_time": normal_train_time, "long_train_day": long_train_day,
-        "run_pace": run_pace, "bike_ftp": bike_ftp, "swim_pace": swim_pace,
-        "next_week_meals": next_week_meals, "run_zones": run_zones, "bike_zones": bike_zones, "swim_zones": swim_zones,
-        "_etss_data": _etss_data, "_training_library": _training_library,
-        "this_week_activities": this_week_activities or "無紀錄", "intervals_fitness": icu_data
-    }
+        _etss_data = {"period": _period, "weeks_left": _race_weeks_left, "budget": _weekly_etss}
 
-    weekly_system_prompt = """# Role & Objective
+        # 7. 建立完美的、沒有遺漏的 Prompt 輸入資料
+        input_data = {
+            "athlete": name, "goal": goal, "active_days": active_days, "restrictions": restrictions or "無",
+            "tdee": tdee, "protein_target_g": int(protein) if protein else 0, "week_range": week_range,
+            "sport_type": sport_type, "training_freq": training_freq, "normal_train_time": normal_train_time, "long_train_day": long_train_day,
+            "run_pace": run_pace, "bike_ftp": bike_ftp, "swim_pace": swim_pace,
+            "next_week_meals": next_week_meals, "run_zones": run_zones, "bike_zones": bike_zones, "swim_zones": swim_zones,
+            "_etss_data": _etss_data, "_training_library": _training_library,
+            "this_week_activities": this_week_activities or "無紀錄", "intervals_fitness": icu_data
+        }
+
+        weekly_system_prompt = """# Role & Objective
 你是一位保守、科學化、以可持續執行為優先的運動教練與營養專家，任職於「一日樂食」。
 每週任務：根據顧客的目標、訓練頻率與長訓日，安排下週 7 天完整課表。
 首要原則：不是把課表寫得很猛，而是寫得安全、可恢復、可長期持續。
@@ -13942,107 +13951,107 @@ line_message 末尾必須標明：「本週總 eTSS：XXX（TSS/預算{budget}�
 在 E/LP 尾聲加入的 Strides（4-6×15s），eTSS 約 5-10，不列入計算
 
 - 直接輸出純 JSON 文字，不要用 ```json 包裝，不要用任何 markdown 包裝"""
-# 把 {period} 和 {budget} 置換為實際數值
-    _period = _etss_data["period"]
-    _budget = _etss_data["budget"]
-    weekly_system_prompt = weekly_system_prompt.replace("{period}", _period)
-    weekly_system_prompt = weekly_system_prompt.replace("{budget}", str(_budget))
-    # 7. 呼叫 LLM 生成課表
-    try:
-        res = client.chat.completions.create(
-            model="gpt-5.4-mini",
-            messages=[
-                {"role": "system", "content": weekly_system_prompt},
-                {"role": "user", "content": json.dumps(input_data, ensure_ascii=False)}
-            ],
-            temperature=0.6, max_completion_tokens=2000
-        )
-        raw_content = res.choices[0].message.content
-        # ── JSON 清洗防線（去除 ```json 包裝）────────────
-        raw_content = raw_content.strip()
-        if raw_content.startswith("\"\"\""):
-            raw_content = raw_content[3:]
-        if raw_content.startswith("```json"):
-            raw_content = raw_content[7:]
-        elif raw_content.startswith("\"\"\""):
-            raw_content = raw_content[3:]
-        if raw_content.rstrip().endswith("\"\"\""):
-            raw_content = raw_content.rstrip()[:-3]
-        if raw_content.rstrip().endswith("```"):
-            raw_content = raw_content.rstrip()[:-3]
-        raw_content = raw_content.strip()
-    except Exception as e:
-        error_msg = f"⚠️ 教練排課失敗，請稍後再試。（{str(e)[:50]}）"
+    # 把 {period} 和 {budget} 置換為實際數值
+        _period = _etss_data["period"]
+        _budget = _etss_data["budget"]
+        weekly_system_prompt = weekly_system_prompt.replace("{period}", _period)
+        weekly_system_prompt = weekly_system_prompt.replace("{budget}", str(_budget))
+        # 7. 呼叫 LLM 生成課表
         try:
-            if reply_token: line_bot_api.reply_message(reply_token, TextSendMessage(text=error_msg))
-            else: line_bot_api.push_message(uid, TextSendMessage(text=error_msg))
-        except: pass
-        return False, error_msg, {}
-
-    # 7b. 解析 LLM 回傳的 JSON
-    line_message = raw_content  # fallback
-    daily_plan = {}
-    try:
-        # 去除 ```json ... ``` 包裝（防禦）
-        clean = raw_content.strip()
-        if clean.startswith("```"):
-            clean = clean.split("```")[1]
-            if clean.startswith("json"):
-                clean = clean[4:]
-            clean = clean.rsplit("```", 1)[0].strip()
-        parsed = json.loads(clean)
-        line_message = parsed.get("line_message", raw_content)
-        daily_plan = parsed.get("daily_plan", {})
-        print(f"✅ JSON 解析成功，daily_plan 包含 {len(daily_plan)} 天")
-    except Exception as e:
-        print(f"⚠️ JSON 解析失敗，fallback 為純文字: {e}")
-        line_message = raw_content
-        daily_plan = {}
-
-    # ==========================================
-    # 🌟 8. 準備將課表寫回 Google Sheet (寫入 Plan_Week 第 10 欄)
-    # ==========================================
-    if gc and daily_plan:
-        try:
-            new_rows_to_add = [] 
-            cell_updates = []
-            for date_str, plan_text in daily_plan.items():
-                if date_str in row_date_map:
-                    # 狀況 A：原本就有的格子，先收集起來，等一下一次寫入 (第 10 欄 Plan_Week)
-                    row_idx = row_date_map[date_str]
-                    cell_updates.append({"range": f"J{row_idx}", "values": [[plan_text]]})
-                else:
-                    # 狀況 B：沒格子的週末，準備自動補齊 18 個欄位
-                    # ⚠️ 注意：這裡把 plan_text 放在第 10 個位子 (Plan_Week)
-                    new_rows_to_add.append([
-                        date_str, uid, 0, "無", "無", "", 1, 
-                        goal, sport_type, plan_text, intervals_id, intervals_key, 
-                        training_freq, normal_train_time, long_train_day, 
-                        run_pace, bike_ftp, swim_pace
-                    ])
-            
-            if cell_updates:
-                api_sheet.batch_update(cell_updates)
-            # 如果有沒訂餐的週末課表，一口氣加進 Sheet 裡
-            if new_rows_to_add:
-                print(f"📡 DEBUG: 準備寫入，長度為 {len(new_rows_to_add[0])} 欄")
-                api_sheet.append_rows(new_rows_to_add)
-                print(f"✅ [關鍵成功] Google Sheet 自動補齊了 {len(new_rows_to_add)} 天課表！")
-
+            res = client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": weekly_system_prompt},
+                    {"role": "user", "content": json.dumps(input_data, ensure_ascii=False)}
+                ],
+                temperature=0.6, max_completion_tokens=2000
+            )
+            raw_content = res.choices[0].message.content
+            # ── JSON 清洗防線（去除 ```json 包裝）────────────
+            raw_content = raw_content.strip()
+            if raw_content.startswith("\"\"\""):
+                raw_content = raw_content[3:]
+            if raw_content.startswith("```json"):
+                raw_content = raw_content[7:]
+            elif raw_content.startswith("\"\"\""):
+                raw_content = raw_content[3:]
+            if raw_content.rstrip().endswith("\"\"\""):
+                raw_content = raw_content.rstrip()[:-3]
+            if raw_content.rstrip().endswith("```"):
+                raw_content = raw_content.rstrip()[:-3]
+            raw_content = raw_content.strip()
         except Exception as e:
-            print(f"❌ [寫入失敗] Google Sheet 發生錯誤: {e}")
+            error_msg = f"⚠️ 教練排課失敗，請稍後再試。（{str(e)[:50]}）"
+            try:
+                if reply_token: line_bot_api.reply_message(reply_token, TextSendMessage(text=error_msg))
+                else: line_bot_api.push_message(uid, TextSendMessage(text=error_msg))
+            except: pass
+            return False, error_msg, {}
 
-    # ==========================================
-    # 🌟 9. 最後才把整理好的 LINE 訊息推播給客人
-    # ==========================================
-    try:
-        # 注意這裡用的是 uid，並推播解析出來的 line_message
-        line_bot_api.push_message(uid, TextSendMessage(text=line_message))
-        print(f"✅ LINE 訊息已順利推播給 UID: {uid}")
-    except Exception as e:
-        print(f"❌ LINE 推播失敗: {e}")
+        # 7b. 解析 LLM 回傳的 JSON
+        line_message = raw_content  # fallback
+        daily_plan = {}
+        try:
+            # 去除 ```json ... ``` 包裝（防禦）
+            clean = raw_content.strip()
+            if clean.startswith("```"):
+                clean = clean.split("```")[1]
+                if clean.startswith("json"):
+                    clean = clean[4:]
+                clean = clean.rsplit("```", 1)[0].strip()
+            parsed = json.loads(clean)
+            line_message = parsed.get("line_message", raw_content)
+            daily_plan = parsed.get("daily_plan", {})
+            print(f"✅ JSON 解析成功，daily_plan 包含 {len(daily_plan)} 天")
+        except Exception as e:
+            print(f"⚠️ JSON 解析失敗，fallback 為純文字: {e}")
+            line_message = raw_content
+            daily_plan = {}
 
-    return True, line_message, daily_plan
+        # ==========================================
+        # 🌟 8. 準備將課表寫回 Google Sheet (寫入 Plan_Week 第 10 欄)
+        # ==========================================
+        if gc and daily_plan:
+            try:
+                new_rows_to_add = [] 
+                cell_updates = []
+                for date_str, plan_text in daily_plan.items():
+                    if date_str in row_date_map:
+                        # 狀況 A：原本就有的格子，先收集起來，等一下一次寫入 (第 10 欄 Plan_Week)
+                        row_idx = row_date_map[date_str]
+                        cell_updates.append({"range": f"J{row_idx}", "values": [[plan_text]]})
+                    else:
+                        # 狀況 B：沒格子的週末，準備自動補齊 18 個欄位
+                        # ⚠️ 注意：這裡把 plan_text 放在第 10 個位子 (Plan_Week)
+                        new_rows_to_add.append([
+                            date_str, uid, 0, "無", "無", "", 1, 
+                            goal, sport_type, plan_text, intervals_id, intervals_key, 
+                            training_freq, normal_train_time, long_train_day, 
+                            run_pace, bike_ftp, swim_pace
+                        ])
+            
+                if cell_updates:
+                    api_sheet.batch_update(cell_updates)
+                # 如果有沒訂餐的週末課表，一口氣加進 Sheet 裡
+                if new_rows_to_add:
+                    print(f"📡 DEBUG: 準備寫入，長度為 {len(new_rows_to_add[0])} 欄")
+                    api_sheet.append_rows(new_rows_to_add)
+                    print(f"✅ [關鍵成功] Google Sheet 自動補齊了 {len(new_rows_to_add)} 天課表！")
+
+            except Exception as e:
+                print(f"❌ [寫入失敗] Google Sheet 發生錯誤: {e}")
+
+        # ==========================================
+        # 🌟 9. 最後才把整理好的 LINE 訊息推播給客人
+        # ==========================================
+        try:
+            # 注意這裡用的是 uid，並推播解析出來的 line_message
+            line_bot_api.push_message(uid, TextSendMessage(text=line_message))
+            print(f"✅ LINE 訊息已順利推播給 UID: {uid}")
+        except Exception as e:
+            print(f"❌ LINE 推播失敗: {e}")
+
+        return True, line_message, daily_plan
 
 
 _line_webhook_inbox = None
@@ -14129,7 +14138,7 @@ def _upsert_raw_sheet_row(ws, entity_id, row_values):
 
 
 def _sync_food_outbox(entity_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         food = conn.execute("""
             SELECT f.food_id, product_name, brand, barcode, source_type, owner_user_id,
                    visibility, package_amount, package_unit, servings_per_package,
@@ -14199,7 +14208,7 @@ def _sync_food_outbox(entity_id):
 
 
 def _sync_food_log_outbox(entity_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         log = conn.execute("""
             SELECT l.log_id, l.user_id, l.food_id, f.product_name, l.consumed_at,
                    l.meal_slot, l.consumed_servings, l.consumed_amount, l.consumed_unit,
@@ -14226,7 +14235,7 @@ def _sync_food_log_outbox(entity_id):
     )
     approval_valid = bool(approval["is_valid"])
     exch = approval["applied"] if approval_valid else {}
-    with sqlite3.connect(DB_PATH) as trust_conn:
+    with db_session(sqlite3.connect(DB_PATH)) as trust_conn:
         trust = user_confirmed_meal_photo_trust_projection(
             trust_conn, str(log[0] or ""), str(log[23] or "")
         )
@@ -14281,7 +14290,7 @@ def _flush_nutrition_sheet_outbox_locked(limit=50):
     claimed_at = tw_now().isoformat(timespec="seconds")
     lease_cutoff = (tw_now() - timedelta(minutes=5)).isoformat(timespec="seconds")
     with nutrition_sheet_sync_lock:
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_session(sqlite3.connect(DB_PATH, timeout=30)) as conn:
             ensure_nutrition_schema(conn)
             conn.execute("BEGIN IMMEDIATE")
             stale_sql = """UPDATE nutrition_sheet_outbox
@@ -14336,7 +14345,7 @@ def _flush_nutrition_sheet_outbox_locked(limit=50):
                     # retryable or claiming local confirmation.  This internal
                     # marker is durable staging, not a recovery state/enum.
                     staging_marker = "provider-applied:awaiting-local-confirmation:v1"
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with db_session(sqlite3.connect(DB_PATH)) as conn:
                         conn.execute("BEGIN IMMEDIATE")
                         cursor = conn.execute(
                             """UPDATE nutrition_sheet_outbox
@@ -14355,7 +14364,7 @@ def _flush_nutrition_sheet_outbox_locked(limit=50):
                             db_path=DB_PATH, workbook_id=SPREADSHEET_ID,
                             writer_id="nutrition_outbox", now=tw_now(),
                         )
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with db_session(sqlite3.connect(DB_PATH)) as conn:
                         staged = conn.execute(
                             """SELECT status,claimed_at,lease_owner,last_error
                                FROM nutrition_sheet_outbox WHERE outbox_id=?""",
@@ -14367,7 +14376,7 @@ def _flush_nutrition_sheet_outbox_locked(limit=50):
                     # Only verified durable staging may transition to the
                     # original synced/pending outcome. No post-commit readback
                     # is required, avoiding an unconfirmable final state.
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with db_session(sqlite3.connect(DB_PATH)) as conn:
                         conn.execute("BEGIN IMMEDIATE")
                         cursor = conn.execute(
                             """UPDATE nutrition_sheet_outbox
@@ -14392,7 +14401,7 @@ def _flush_nutrition_sheet_outbox_locked(limit=50):
                 # than converting the unknown outcome into a blind retry.
                 unknown = bool(writer_fence is not None and writer_fence.write_started)
                 if not unknown:
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with db_session(sqlite3.connect(DB_PATH)) as conn:
                         conn.execute(
                             """UPDATE nutrition_sheet_outbox
                                SET status='pending', attempts=attempts+1, last_error=?,
@@ -14433,7 +14442,7 @@ def handle_exchange_review_admin_command(msg, uid):
         raise PermissionError("管理員限定")
     msg = str(msg or "").strip()
     if msg == "#待審營養份量":
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             ensure_nutrition_schema(conn)
             rows = conn.execute(
                 """SELECT food_id,product_name,exchange_json
@@ -14455,7 +14464,7 @@ def handle_exchange_review_admin_command(msg, uid):
     match = re.fullmatch(r"#核准營養份量\s+(\S{1,80})", msg)
     if not match:
         return None
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_nutrition_schema(conn)
         result = approve_food_exchange_suggestion(
             conn, food_id=match.group(1), reviewer=uid
@@ -14482,14 +14491,14 @@ def apply_confirmed_nutrition_to_legacy_dashboard(user_id, result):
     consumed_at = str(result["log"].get("consumed_at") or "")
     log_id = result["log"]["log_id"]
     if consumed_at[:10] != tw_today().isoformat():
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             conn.execute("UPDATE food_logs SET legacy_applied_at='not_applicable' WHERE log_id=? AND legacy_applied_at=''", (log_id,))
             conn.commit()
         return None
     nutrition = result["log"]["nutrition"]
     cal = float(nutrition.get("calories_kcal", 0) or 0)
     pro = float(nutrition.get("protein_g", 0) or 0)
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.commit()
         conn.execute("BEGIN IMMEDIATE")
@@ -14529,7 +14538,7 @@ def apply_confirmed_nutrition_to_legacy_dashboard(user_id, result):
 
 
 def get_pending_nutrition_label(user_id, token):
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         result = update_pending_consumption(conn, user_id=user_id, token=token)
     return result["label"], result["consumed_servings"]
 
@@ -14617,7 +14626,7 @@ def arm_text_meal_input(user_id, source_message_id):
     now = tw_now()
     now_text = now.isoformat(timespec="seconds")
     expires = (now + timedelta(minutes=30)).isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         old = conn.execute(
@@ -14643,7 +14652,7 @@ def arm_text_meal_input(user_id, source_message_id):
 
 
 def get_text_meal_input(user_id):
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         row = conn.execute(
             "SELECT status,version,expires_at FROM pending_text_meal_inputs WHERE user_id=?",
@@ -14664,7 +14673,7 @@ def get_text_meal_input(user_id):
 def finish_text_meal_input(user_id, version, status):
     if status not in {"consumed", "cancelled"}:
         raise ValueError("記餐輸入狀態無效")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         changed = conn.execute(
             """UPDATE pending_text_meal_inputs SET status=?,updated_at=?
                WHERE user_id=? AND status='awaiting_food' AND version=?""",
@@ -14736,7 +14745,7 @@ def _claim_semantic_meal_batch(user_id, message_id):
     draft_token = _new_text_meal_token()
     quota_attempt_id = uuid.uuid4().hex
     now_text = tw_now().isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
@@ -14778,7 +14787,7 @@ def _claim_semantic_meal_batch(user_id, message_id):
 
 def _start_semantic_meal_provider(batch_id, user_id):
     started_at = tw_now().isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         batch = conn.execute(
@@ -14802,7 +14811,7 @@ def _record_semantic_provider_stage(batch_id, stage, payload):
     """Store each provider's returned raw structured payload under its own stage."""
     now_text = tw_now().isoformat(timespec="seconds")
     values = payload if isinstance(payload, list) else [payload]
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         for ordinal, value in enumerate(values):
@@ -14825,7 +14834,7 @@ def _record_semantic_provider_stage(batch_id, stage, payload):
 
 def _mark_semantic_meal_unknown(batch_id, user_id, exc):
     now_text = tw_now().isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
@@ -14886,7 +14895,7 @@ def _persist_semantic_meal_result(*, user_id, message_id, batch_id, result):
     now_text = now.isoformat(timespec="seconds")
     result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False)
     if status != "draft":
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
             ensure_daily_food_ledger_schema(conn)
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
@@ -14972,7 +14981,7 @@ def _persist_semantic_meal_result(*, user_id, message_id, batch_id, result):
     request_json = json.dumps(normalized_request, ensure_ascii=False, sort_keys=True)
     estimate_json = json.dumps(estimate, ensure_ascii=False, sort_keys=True, allow_nan=False)
     expires = (now + timedelta(minutes=30)).isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         batch = conn.execute(
@@ -15012,7 +15021,7 @@ def _persist_semantic_meal_result(*, user_id, message_id, batch_id, result):
 
 def _load_semantic_meal_replay(user_id, message_id):
     """Load only durable semantic state needed to decide replay before a new claim."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         return conn.execute(
             """SELECT status,result_json,draft_token FROM semantic_meal_batches
@@ -15195,7 +15204,7 @@ def create_fixed_text_meal_draft(*, user_id, message_id, request, method="user_p
     now_text = now.isoformat(timespec="seconds")
     expires = (now + timedelta(minutes=30)).isoformat(timespec="seconds")
     token = _new_text_meal_token()
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -15230,7 +15239,7 @@ def build_post_commit_food_dashboard(user_id, committed_log_id=None):
     try:
         dashboard = build_dashboard_flex(user_id)
         if dashboard is not None and committed_log_id:
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 row = conn.execute(
                     """SELECT fc.product_name,fl.consumed_at,fl.nutrition_snapshot_json
                        FROM food_logs fl JOIN food_catalog fc ON fc.food_id=fl.food_id
@@ -15285,7 +15294,7 @@ def build_post_commit_food_dashboard(user_id, committed_log_id=None):
 
 def build_food_log_success_messages(user_id, committed_log_id, *, source_label=""):
     """Return a committed-row record card followed by the unchanged Nanjing dashboard."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
             """SELECT fc.product_name,fl.nutrition_snapshot_json,fl.meal_slot,
                       fl.consumed_servings,fl.consumed_at,fl.consumed_amount,fl.consumed_unit
@@ -15332,7 +15341,7 @@ def build_food_log_success_messages(user_id, committed_log_id, *, source_label="
 def log_explicit_text_nutrition_once(*, user_id, message_id, request):
     """Commit one user-supplied meal idempotently, then render success + dashboard."""
     operation_key = f"line-text-nutrition:{user_id}:{message_id}"[:180]
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         result = create_daily_food_log(
@@ -15634,7 +15643,7 @@ def _text_meal_draft_from_row(row):
 
 
 def get_text_meal_estimate_draft(user_id, token):
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         row = conn.execute(
             """SELECT token,user_id,source_message_id,request_json,estimate_json,
@@ -15686,7 +15695,7 @@ def create_text_meal_estimate_draft(
     request_json = json.dumps(request, ensure_ascii=False, sort_keys=True, allow_nan=False)
     denied = False
     unknown = False
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         if bool(quota_batch_key) != bool(quota_batch_owner):
@@ -15829,7 +15838,7 @@ def create_text_meal_estimate_draft(
         raise PermissionError("AI估算額度不足或會員狀態無效")
 
     provider_started_at = tw_now().isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         if quota_batch_key:
@@ -15875,7 +15884,7 @@ def create_text_meal_estimate_draft(
         raise _unknown_error() from exc
 
     completed_at = tw_now().isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         updated = conn.execute(
@@ -16758,7 +16767,7 @@ def _semantic_text_meal_liff_projection(draft):
 def get_meal_draft_for_liff(user_id, token):
     token = str(token or "")
     if re.fullmatch(r"[0-9a-f]{12}", token):
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             return _photo_meal_liff_projection(
                 get_meal_photo_draft(conn, user_id=str(user_id), token=token)
             )
@@ -16784,7 +16793,7 @@ def save_photo_meal_draft_from_liff(
         raise ValueError("照片食材明細不可空白")
     now = tw_now()
     now_text = now.isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         ensure_meal_photo_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -16991,7 +17000,7 @@ def save_semantic_text_meal_draft_from_liff(
     ).encode()).hexdigest()
     now = tw_now()
     now_text = now.isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         replay = conn.execute(
@@ -17204,7 +17213,7 @@ def save_text_meal_draft_from_liff(
     ).encode()).hexdigest()
     now = tw_now()
     now_text = now.isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         replay = conn.execute(
@@ -17367,7 +17376,7 @@ def consume_meal_draft_return_command(user_id, command, *, source_type="user", s
     if not match:
         return None
     now_text = tw_now().isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         receipt_key = match.group(1)
         rows = conn.execute(
@@ -17566,7 +17575,7 @@ def apply_text_meal_custom_input(*, user_id, token, expected_version, mode, text
     """Apply deterministic owner/version-bound edits; never invokes a provider."""
     if mode not in {"amount", "nutrition"}:
         raise ValueError("草稿修改模式不支援")
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -17665,7 +17674,7 @@ def apply_text_meal_custom_input(*, user_id, token, expected_version, mode, text
 
 
 def apply_text_meal_estimate_action(*, user_id, token, expected_version, action, multiplier=None):
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_daily_food_ledger_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -18438,7 +18447,7 @@ def get_active_nutrition_target(user_id, meal_slot="", target_date=None):
 
 def retry_pending_nutrition_plan_links(limit=50):
     """重新連結因Google Sheet暫時失敗而未能判定的歷史計畫。"""
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_nutrition_schema(conn)
         rows = conn.execute(
             """SELECT log_id, user_id, meal_slot, consumed_at FROM food_logs
@@ -18454,7 +18463,7 @@ def retry_pending_nutrition_plan_links(limit=50):
             continue
         plan_id = plan["plan_id"] if plan else ""
         status = "linked" if plan else "no_plan"
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             changed = conn.execute(
                 """UPDATE food_logs SET plan_id=?, plan_link_status=?, updated_at=?
                    WHERE log_id=? AND plan_link_status='pending'""",
@@ -18471,14 +18480,14 @@ def nutrition_menu_recommendations(user_id, meal_slot=""):
     plan = get_active_nutrition_target(user_id, meal_slot, tw_today())
     if not plan:
         return None
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_nutrition_schema(conn)
         consumed = daily_consumed_totals(
             conn, user_id=user_id, date_iso=plan["target_date"],
             meal_slot=plan["consumption_meal_slot"],
         )
     remaining = remaining_targets(plan["targets"], consumed)
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         restriction_row = conn.execute("SELECT restrictions FROM health_profile WHERE user_id=?", (user_id,)).fetchone()
     restrictions = str(restriction_row[0] if restriction_row else "").strip()
     restriction_terms = [x.strip() for x in re.split(r"[,，、/]|不吃|過敏", restrictions) if len(x.strip()) >= 2]
@@ -18630,7 +18639,7 @@ def _authorize_meal_photo_image_request(
     if not hmac.compare_digest(expected, str(signature or "")):
         raise HTTPException(status_code=403, detail="invalid image signature")
 
-    with sqlite3.connect(DB_PATH, timeout=5) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=5)) as conn:
         row = conn.execute(
             """SELECT source_image_ref,status,expires_at FROM pending_meal_photo_drafts
                WHERE token=?""",
@@ -18864,7 +18873,7 @@ def cleanup_nutrition_images(*, _before_candidate_lock=None):
         except (TypeError, ValueError):
             return True
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_nutrition_schema(conn)
         ensure_meal_photo_schema(conn)
         pending_rows = conn.execute(
@@ -18885,7 +18894,7 @@ def cleanup_nutrition_images(*, _before_candidate_lock=None):
         if not eligible:
             continue
         before_lock("label", token)
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
                 """SELECT token,user_id,source_image_ref,status,expires_at,created_at
@@ -18918,7 +18927,7 @@ def cleanup_nutrition_images(*, _before_candidate_lock=None):
                 conn.commit()
 
     # 無標示餐點草稿同樣在逐候選 write lock 內重新驗證狀態、期限、owner、ref、version。
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_meal_photo_schema(conn)
         meal_photo_rows = conn.execute(
             """SELECT token,user_id,source_image_ref,status,expires_at,created_at,version
@@ -18938,7 +18947,7 @@ def cleanup_nutrition_images(*, _before_candidate_lock=None):
         if not eligible:
             continue
         before_lock("meal", token)
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
                 """SELECT token,user_id,source_image_ref,status,expires_at,created_at,version
@@ -18972,7 +18981,7 @@ def cleanup_nutrition_images(*, _before_candidate_lock=None):
                 conn.commit()
 
     meal_tombstone_cutoff = now_dt - timedelta(days=30)
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_meal_photo_schema(conn)
         old_events = conn.execute(
             """SELECT event_id,created_at FROM meal_photo_events
@@ -19003,7 +19012,7 @@ def cleanup_nutrition_images(*, _before_candidate_lock=None):
     # event以token外鍵連到草稿；最小tombstone須與event同保留30天，
     # 不能先刪父列而連帶提早移除尚未到期的冪等證據。
     tombstone_cutoff = event_cutoff
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         for message_id, created_at in conn.execute(
             "SELECT message_id,created_at FROM nutrition_message_events"
         ).fetchall():
@@ -19028,7 +19037,7 @@ def cleanup_nutrition_images(*, _before_candidate_lock=None):
                 conn.execute("DELETE FROM pending_nutrition_logs WHERE token=?", (token,))
         conn.commit()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         log_columns = {row[1] for row in conn.execute("PRAGMA table_info(food_logs)")}
         version_expr = "fl.version" if "version" in log_columns else "NULL"
         old_logs = conn.execute(
@@ -19045,7 +19054,7 @@ def cleanup_nutrition_images(*, _before_candidate_lock=None):
             catalog_owner, catalog_visibility, catalog_ref,
         ) = expected
         before_lock("90day", log_id)
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             conn.execute("BEGIN IMMEDIATE")
             version_expr = "fl.version" if version is not None else "NULL"
             current = conn.execute(
@@ -19115,7 +19124,7 @@ def handle_image_message(event):
     try:
         # Durable claim precedes download/model inference. Completed meal-photo events
         # rebuild their committed draft; expired unknown-outcome claims retry at most 3 times.
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             image_claim = claim_meal_photo_image_event(
                 conn, user_id=uid, source_message_id=str(message_id), lease_seconds=90,
             )
@@ -19261,7 +19270,7 @@ def handle_image_message(event):
         # Step 4：依圖片類型分流
         image_type = parsed.get("image_type", "unknown")
         if parsed.get("status") == "error":
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 release_meal_photo_image_event(
                     conn, user_id=uid, source_message_id=str(message_id),
                     claim_token=image_claim_token, abandon=True,
@@ -19275,7 +19284,7 @@ def handle_image_message(event):
 
         if image_type != "food_photo":
             # This claim protects only meal-photo inference; preserve every legacy image route.
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 release_meal_photo_image_event(
                     conn, user_id=uid, source_message_id=str(message_id),
                     claim_token=image_claim_token, abandon=True,
@@ -19290,7 +19299,7 @@ def handle_image_message(event):
             consumed_time, consumed_time_source = resolve_nutrition_consumed_at(
                 parsed, received_at=received_at
             )
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_nutrition_schema(conn)
                 staged = stage_nutrition_label(
                     conn,
@@ -19363,7 +19372,7 @@ def handle_image_message(event):
 
         if image_type == "product_front":
             try:
-                with sqlite3.connect(DB_PATH) as conn:
+                with db_session(sqlite3.connect(DB_PATH)) as conn:
                     ensure_nutrition_schema(conn)
                     paired = pair_product_front(
                         conn,
@@ -19414,7 +19423,7 @@ def handle_image_message(event):
             # flushed and atomically installed. A process death here can leave only an
             # opaque orphan handled by existing retention policy, not a broken draft.
             _store_nutrition_image(image_bytes, extension, proposed_ref)
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_meal_photo_schema(conn)
                 token = save_meal_photo_draft(
                     conn,
@@ -19433,7 +19442,7 @@ def handle_image_message(event):
             if not image_path:
                 raise RuntimeError("餐點圖片參照無效")
             _read_valid_nutrition_image(source_image_ref)
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 if not finish_meal_photo_image_event(
                     conn, user_id=uid, source_message_id=str(message_id),
                     claim_token=image_claim_token,
@@ -19478,7 +19487,7 @@ def handle_image_message(event):
         else:
             workout_date = tw_today().isoformat() # 如果沒有補登狀態，預設就是今天
             is_makeup = False
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             c = conn.cursor()
             c.execute('''
                 INSERT OR REPLACE INTO workout_records
@@ -19555,7 +19564,7 @@ def handle_image_message(event):
 
     except (json.JSONDecodeError, ValueError) as exc:
         if image_claim_token:
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 release_meal_photo_image_event(
                     conn, user_id=uid, source_message_id=str(message_id), claim_token=image_claim_token,
                     artifact_failure=image_artifact_recovery,
@@ -19572,7 +19581,7 @@ def handle_image_message(event):
     except Exception as exc:
         if image_claim_token:
             try:
-                with sqlite3.connect(DB_PATH) as conn:
+                with db_session(sqlite3.connect(DB_PATH)) as conn:
                     release_meal_photo_image_event(
                         conn, user_id=uid, source_message_id=str(message_id), claim_token=image_claim_token,
                         artifact_failure=image_artifact_recovery,
@@ -19784,7 +19793,7 @@ def _is_official_menu_item(item):
 
 
 def _catalog_food_item_by_id(user_id, food_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
             "SELECT product_name FROM food_catalog WHERE food_id=? AND (owner_user_id=? OR visibility='public')",
             (food_id, user_id),
@@ -19806,7 +19815,7 @@ def _quick_log_catalog_card_once(
     durable_event_id = "quick-relog:" + hashlib.sha256(
         str(event_ref or "").encode("utf-8")
     ).hexdigest()
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_nutrition_schema(conn)
         ensure_daily_food_ledger_schema(conn)
         _prepare_health_check_refresh_connection(conn)
@@ -19923,7 +19932,7 @@ def build_natural_food_log_reply(*, user_id, message_id, event, request):
             request["meal_slot"] = "點心"
         if request["amount"] is not None:
             _validate_natural_food_amount(request["amount"], request["unit"])
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             ensure_nutrition_schema(conn)
             candidates, match_kind = _natural_food_candidates(
                 conn, user_id, request["food_name"]
@@ -20222,7 +20231,7 @@ def build_pending_meal_photo_review_message(uid):
     configured_admin_uid = get_bound_admin_uid_for_authorization()
     if uid != configured_admin_uid:
         raise PermissionError("管理員限定")
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         drafts = list_pending_meal_photo_reviews(conn, limit=10)
     if not drafts:
         return TextSendMessage(text="✅ 目前沒有待審核的餐點照片。")
@@ -20293,7 +20302,7 @@ def _push_meal_photo_owner_notification_once(draft, notification_kind, text):
     if owner_uid == admin_uid:
         return True
     try:
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
             claim = claim_meal_photo_notification(
                 conn, token=token, notification_kind=notification_kind
             )
@@ -20324,7 +20333,7 @@ def _push_meal_photo_owner_notification_once(draft, notification_kind, text):
         )
         if not line_accepted:
             try:
-                with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
                     release_meal_photo_notification(
                         conn, token=token, notification_kind=notification_kind,
                         claim_token=claim_token, error=str(exc),
@@ -20338,7 +20347,7 @@ def _push_meal_photo_owner_notification_once(draft, notification_kind, text):
             f"{getattr(exc, 'accepted_request_id', '')}"
         )
     try:
-        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
             completed = complete_meal_photo_notification(
                 conn, token=token, notification_kind=notification_kind,
                 claim_token=claim_token,
@@ -20457,7 +20466,7 @@ def _build_latest_meal_photo_card(draft):
 def _meal_photo_owner_error_reply(user_id, token, exc):
     """Recover from retained/stale controls without exposing a foreign draft."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             draft = get_meal_photo_draft(
                 conn, user_id=user_id, token=token, allow_expired=True,
             )
@@ -20479,7 +20488,7 @@ def _apply_photo_duplicate_choice(
     event, *, user_id, token, expected_version, choice_id, item_index, decision,
 ):
     """Advance one durable collision decision; estimate/apply only after all choices."""
-    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+    with db_session(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         ensure_meal_photo_schema(conn)
         row = conn.execute(
             """SELECT token,draft_version,source_message_id,parsed_items_json,decisions_json,
@@ -20716,7 +20725,7 @@ def handle_meal_photo_postback(event):
         slot = natural_serving_choice.group(3)
         try:
             if serving_choice == "start":
-                with sqlite3.connect(DB_PATH) as conn:
+                with db_session(sqlite3.connect(DB_PATH)) as conn:
                     row = conn.execute(
                         """SELECT product_name FROM food_catalog
                            WHERE food_id=? AND (owner_user_id=? OR visibility='public')""",
@@ -20830,7 +20839,7 @@ def handle_meal_photo_postback(event):
                 if not state_matches and not (action == "confirm" and state is None):
                     raise ValueError("這份修改預覽已失效，請從最新餐點卡重新操作")
                 if action == "cancel":
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with db_session(sqlite3.connect(DB_PATH)) as conn:
                         cancel_meal_photo_revision_draft(
                             conn, user_id=uid, token=draft_token,
                             expected_version=draft_version,
@@ -21021,7 +21030,7 @@ def handle_meal_photo_postback(event):
             configured_admin_uid = get_bound_admin_uid_for_authorization()
             if uid != configured_admin_uid:
                 raise PermissionError("管理員限定")
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 draft = get_meal_photo_draft_for_admin(
                     conn, token=token, admin_user_id=uid,
                     required_admin_user_id=configured_admin_uid,
@@ -21155,7 +21164,7 @@ def handle_meal_photo_postback(event):
             token, version = matched.group(1), int(matched.group(2))
             from meal_photo_system import apply_meal_photo_review_action, next_meal_photo_review_step
             if review_resume:
-                with sqlite3.connect(DB_PATH) as conn:
+                with db_session(sqlite3.connect(DB_PATH)) as conn:
                     draft = get_meal_photo_draft_for_admin(
                         conn, token=token, admin_user_id=uid,
                         required_admin_user_id=configured_admin_uid,
@@ -21193,7 +21202,7 @@ def handle_meal_photo_postback(event):
                 action, field, value = "reject", "", ""
             else:
                 action, field, value = "approve", "", ""
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 admin_draft = get_meal_photo_draft_for_admin(
                     conn, token=token, admin_user_id=uid,
                     required_admin_user_id=configured_admin_uid,
@@ -21254,7 +21263,7 @@ def handle_meal_photo_postback(event):
                     reply = build_meal_photo_notification_retry_message(draft, "rejected")
             line_bot_api.reply_message(event.reply_token, reply)
             return
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             ensure_meal_photo_schema(conn)
             current_draft = get_meal_photo_draft(
                 conn, user_id=uid, token=token, allow_expired=True,
@@ -21434,7 +21443,7 @@ def handle_meal_photo_postback(event):
         elif kind == "cancel":
             image_ref = str(result.get("source_image_ref") or "")
             if image_ref and _delete_nutrition_image(image_ref):
-                with sqlite3.connect(DB_PATH) as conn:
+                with db_session(sqlite3.connect(DB_PATH)) as conn:
                     clear_meal_photo_image_ref(
                         conn, user_id=uid, token=token, expected_ref=image_ref
                     )
@@ -21497,7 +21506,7 @@ def _build_breakfast_combo_reply_once(
     event_id = "combo:" + hashlib.sha256(
         f"{user_id}|{message_id}|{combo_name}".encode("utf-8")
     ).hexdigest()
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_nutrition_schema(conn)
         _prepare_health_check_refresh_connection(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -22007,7 +22016,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                     )
             elif ledger_state["input_type"] == "meal_photo_revision_preview":
                 if ledger_state["payload"].get("message_id") == str(msg_id):
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with db_session(sqlite3.connect(DB_PATH)) as conn:
                         draft = get_meal_photo_draft(
                             conn, user_id=uid,
                             token=ledger_state["payload"]["draft_token"],
@@ -22083,7 +22092,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         return
 
     # AI 餐點估算的文字修正必須先於一般聊天與 quota 路由消耗。
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_meal_photo_schema(conn)
         adjustment_event_id = f"meal-photo-adjust:text:{msg_id}"
         replay_row = conn.execute(
@@ -22150,7 +22159,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             return
 
     # 「新增食材」文字輸入：舊卡保留分類流程；AI估算卡要求可追溯營養值。
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_meal_photo_schema(conn)
         clean = " ".join(msg.split())
         cancel_text_event_id = f"meal-photo-cancel-add:text:{msg_id}"
@@ -22574,7 +22583,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         return
 
     # Durable next-text meal input and draft replay run before generic parsing/chat.
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_daily_food_ledger_schema(conn)
         replay_row = conn.execute(
             """SELECT token,status,confirmed_log_id FROM pending_text_meal_estimates
@@ -22643,7 +22652,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                 TextSendMessage(text="請輸入一項實際吃下的食物與份量，或輸入「取消」。", quick_reply=text_meal_cancel_quick_reply()),
             )
             return
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             created = conn.execute(
                 """SELECT 1 FROM pending_text_meal_estimates
                    WHERE user_id=? AND source_message_id=? AND status='pending'""",
@@ -22735,7 +22744,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             from linebot.models import FlexSendMessage
             page_limit = 11  # LINE carousel 最多12個bubble，保留1格給下一頁
             offset = (page - 1) * page_limit
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_nutrition_schema(conn)
                 # "我的食物"：只搜用戶自己的卡片
                 if query == "_my":
@@ -22882,7 +22891,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
     name_edit_match = re.fullmatch(r"修改營養品名:([0-9a-f]{12})", msg)
     if name_edit_match:
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_nutrition_schema(conn)
                 set_nutrition_input_state(
                     conn, user_id=uid, token=name_edit_match.group(1), input_type="name"
@@ -22899,7 +22908,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
     nutrient_edit_match = re.fullmatch(r"修改營養數字:([0-9a-f]{12})", msg)
     if nutrient_edit_match:
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_nutrition_schema(conn)
                 set_nutrition_input_state(
                     conn, user_id=uid, token=nutrient_edit_match.group(1), input_type="nutrient"
@@ -22920,7 +22929,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         return
 
     if msg == "取消修改":
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             ensure_nutrition_schema(conn)
             clear_nutrition_input_state(conn, user_id=uid)
         line_bot_api.reply_message(
@@ -22934,7 +22943,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         confirmation_committed = False
         try:
             token = confirm_match.group(1)
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_nutrition_schema(conn)
                 pending_context = conn.execute(
                     "SELECT meal_slot, consumed_at FROM pending_nutrition_logs WHERE token=? AND user_id=?",
@@ -22952,7 +22961,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                         plan_link_status = "no_plan"
                 except Exception as plan_exc:
                     print(f"⚠️ 飲食紀錄連結營養計畫失敗，將由排程重試：{plan_exc}")
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_nutrition_schema(conn)
                 _prepare_health_check_refresh_connection(conn)
                 result = confirm_pending_label(
@@ -22992,7 +23001,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
     if cancel_match:
         image_ref = ""
         image_deleted = True
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             ensure_nutrition_schema(conn)
             cancelled = cancel_pending_label(
                 conn, user_id=uid, token=cancel_match.group(1)
@@ -23001,7 +23010,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
             image_ref = cancelled["source_image_ref"]
             image_deleted = _delete_nutrition_image(image_ref) if image_ref else True
             if image_ref and image_deleted:
-                with sqlite3.connect(DB_PATH) as conn:
+                with db_session(sqlite3.connect(DB_PATH)) as conn:
                     conn.execute(
                         """UPDATE pending_nutrition_logs SET source_image_ref=''
                            WHERE token=? AND user_id=? AND status='cancelled' AND source_image_ref=?""",
@@ -23062,7 +23071,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
                 "dinner": (now.replace(hour=18, minute=0, second=0, microsecond=0), "晚餐"),
             }
             consumed_time, meal_slot = choices[choice]
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_nutrition_schema(conn)
                 updated = update_pending_consumption(
                     conn,
@@ -23095,7 +23104,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         token, serving_text = serving_match.groups()
         try:
             servings = float(serving_text)
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_nutrition_schema(conn)
                 updated = update_pending_consumption(
                     conn, user_id=uid, token=token, consumed_servings=servings
@@ -23119,7 +23128,7 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
 
     # 已完成的營養文字修改若因 LINE 回覆失敗而重送，只重建原確認卡。
     nutrition_edit_replay = None
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_nutrition_schema(conn)
         replay_row = conn.execute(
             """SELECT e.token,p.label_payload_json,p.consumed_servings,p.consumed_at,
@@ -23181,14 +23190,14 @@ def _handle_message_impl(event, non_vip_subscription_quote_kind=None):
         return
 
     # 「修改品名／修正營養」按鈕後的下一則文字，由 SQLite 狀態綁定到同一用戶與 token。
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_session(sqlite3.connect(DB_PATH)) as conn:
         ensure_nutrition_schema(conn)
         nutrition_input_state = get_nutrition_input_state(conn, user_id=uid)
     if nutrition_input_state:
         input_type = nutrition_input_state["input_type"]
         edit_committed = False
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with db_session(sqlite3.connect(DB_PATH)) as conn:
                 ensure_nutrition_schema(conn)
                 if input_type == "name":
                     name_match = re.fullmatch(r"商品名稱\s+(.+)", msg)
@@ -24871,7 +24880,7 @@ def _handle_registered_pair_reschedule(event, raw_message):
 
     uid = str(event.source.user_id or "")
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with db_session(sqlite3.connect(DB_PATH)) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys=ON")
             policy_validator = None
@@ -25046,76 +25055,80 @@ def auto_expiry_reminder():
     RENEWAL_DISCOUNT = "【神秘續訂優惠】"  # TODO: 以後改為實際優惠內容
     REMINDER_DAYS_BEFORE = 3  # 到期前幾天開始提醒
 
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    today = tw_today()
-    remind_date = (today + timedelta(days=REMINDER_DAYS_BEFORE)).isoformat()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        today = tw_today()
+        remind_date = (today + timedelta(days=REMINDER_DAYS_BEFORE)).isoformat()
 
-    c.execute("""
+        c.execute("""
         SELECT u.user_id, COALESCE(h.name, '親愛的會員') AS name, u.expiry_date
         FROM usage u
         LEFT JOIN health_profile h ON h.user_id = u.user_id
         WHERE u.expiry_date=?
     """, (remind_date,))
-    expiring_users = c.fetchall()
-    conn.close()
+        expiring_users = c.fetchall()
+        conn.close()
 
-    count = 0
-    for uid, name, expiry in expiring_users:
-        msg = f"\u2605 {name} \u60a8\u597d\uff01\n\n\ud83d\udcc5 \u60a8\u7684\u5c08\u5c6c\u65b9\u6848\u5c07\u65bc {expiry} \u5230\u671f\n\u2728 \u73fe\u5728\u7e41\u8a02\u53ef\u4eab\u6709\u512a\u60e0\uff1a{RENEWAL_DISCOUNT}\n\n\u8acb\u76f4\u63a5\u56de\u8986\u300c\u6211\u8981\u7e31\u7d04\u300d\uff0c\u6211\u5011\u5c07\u70ba\u60a8\u7121\u7f1d\u5b89\u6392\u4e0b\u4e00\u671f\u83c1\u55ae\uff01"
-        try:
-            line_bot_api.push_message(uid, TextSendMessage(text=msg))
-            count += 1
-            print(f"✅ 已發送到期提醒給 {name}（UID: {uid}）")
-        except Exception as e:
-            print(f"⚠️ 發送失敗 {uid}: {e}")
+        count = 0
+        for uid, name, expiry in expiring_users:
+            msg = f"\u2605 {name} \u60a8\u597d\uff01\n\n\ud83d\udcc5 \u60a8\u7684\u5c08\u5c6c\u65b9\u6848\u5c07\u65bc {expiry} \u5230\u671f\n\u2728 \u73fe\u5728\u7e41\u8a02\u53ef\u4eab\u6709\u512a\u60e0\uff1a{RENEWAL_DISCOUNT}\n\n\u8acb\u76f4\u63a5\u56de\u8986\u300c\u6211\u8981\u7e31\u7d04\u300d\uff0c\u6211\u5011\u5c07\u70ba\u60a8\u7121\u7f1d\u5b89\u6392\u4e0b\u4e00\u671f\u83c1\u55ae\uff01"
+            try:
+                line_bot_api.push_message(uid, TextSendMessage(text=msg))
+                count += 1
+                print(f"✅ 已發送到期提醒給 {name}（UID: {uid}）")
+            except Exception as e:
+                print(f"⚠️ 發送失敗 {uid}: {e}")
 
-    print(f"📊 到期前提醒報告：共發送 {count} 封")
+        print(f"📊 到期前提醒報告：共發送 {count} 封")
 
 
 def auto_daily_meal_deduction():
     """每天自動扣除今日餐點，並發送續約通知"""
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     today_str = weekdays[tw_today().weekday()]
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{today_str}%",))
-    users = c.fetchall()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id, name FROM health_profile WHERE active_days LIKE ?", (f"%{today_str}%",))
+        users = c.fetchall()
     
-    count, notify_count = 0, 0
-    for u in users:
-        u_id, u_name = u
-        c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (u_id,))
-        res = c.fetchone()
-        if res and res[0] > 0:
-            new_meals = res[0] - 1
-            c.execute("UPDATE usage SET remaining_meals=? WHERE user_id=?", (new_meals, u_id))
-            count += 1
-            if new_meals <= 3 and new_meals > 0:
-                notify_msg = f"🎉 {u_name} 您好！您的專屬方案只剩最後 {new_meals} 餐囉！\n您可以直接回覆我「我要續約」，系統將為您無縫安排下一期菜單！"
-                try: line_bot_api.push_message(u_id, TextSendMessage(text=notify_msg)); notify_count += 1
+        count, notify_count = 0, 0
+        for u in users:
+            u_id, u_name = u
+            c.execute("SELECT remaining_meals FROM usage WHERE user_id=?", (u_id,))
+            res = c.fetchone()
+            if res and res[0] > 0:
+                new_meals = res[0] - 1
+                c.execute("UPDATE usage SET remaining_meals=? WHERE user_id=?", (new_meals, u_id))
+                count += 1
+                if new_meals <= 3 and new_meals > 0:
+                    notify_msg = f"🎉 {u_name} 您好！您的專屬方案只剩最後 {new_meals} 餐囉！\n您可以直接回覆我「我要續約」，系統將為您無縫安排下一期菜單！"
+                    try: line_bot_api.push_message(u_id, TextSendMessage(text=notify_msg)); notify_count += 1
+                    except: pass
+        conn.commit(); conn.close()
+    
+        # 任務完成，發報告給老闆
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+            admin_row = c.fetchone()
+            conn.close()
+            if admin_row:
+                try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】今日 ({today_str}) 出餐扣除自動完畢！\n共扣 {count} 份餐點，發送 {notify_count} 則續約推播！"))
                 except: pass
-    conn.commit(); conn.close()
-    
-    # 任務完成，發報告給老闆
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
-    admin_row = c.fetchone()
-    conn.close()
-    if admin_row:
-        try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】今日 ({today_str}) 出餐扣除自動完畢！\n共扣 {count} 份餐點，發送 {notify_count} 則續約推播！"))
-        except: pass
 
 def auto_send_tomorrow_reminders_to_boss():
     """每天自動發送明日提醒，並跟老闆回報"""
     result_msg = send_tomorrow_reminders() # 呼叫原本寫好的推播函數
     
     # 任務完成，發報告給老闆
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
-    admin_row = c.fetchone()
-    conn.close()
-    if admin_row:
-        try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】明日提醒推播完畢：\n{result_msg}"))
-        except: pass
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT value FROM admin_settings WHERE key='admin_id'")
+        admin_row = c.fetchone()
+        conn.close()
+        if admin_row:
+            try: line_bot_api.push_message(admin_row[0], TextSendMessage(text=f"🤖【隱形店長報告】明日提醒推播完畢：\n{result_msg}"))
+            except: pass
 def auto_daily_evening_report():
     _require_controlled_workbook_writer("workout_food_tracking")
     """每天 22:00（週一～週六）：自動扣餐 + 個人化晚報"""
@@ -25433,9 +25446,10 @@ async def get_lobster_targets(admin_secret: str, mode: str = "daily"):
 
     # 已付款開通的包月訂單是可靠的產品來源；pending/approved 不代表已付款，不能排除原有教練。
     # 只在自動 target 外層依精確 UID 排除，保留非包月 Garmin／手動 weekly 流程。
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    try:
-        c.execute("""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        try:
+            c.execute("""
             SELECT h.user_id, h.name, h.today_extra_cal, h.today_food_items, h.tdee
             FROM health_profile h
             WHERE h.is_coaching_enabled = 1
@@ -25446,100 +25460,100 @@ async def get_lobster_targets(admin_secret: str, mode: str = "daily"):
                     AND o.status = 'activated'
               )
         """)
-        users = c.fetchall()
-    except sqlite3.OperationalError:
-        return {"status": "success", "targets": []}
-    conn.close()
+            users = c.fetchall()
+        except sqlite3.OperationalError:
+            return {"status": "success", "targets": []}
+        conn.close()
 
-    if not users: return {"status": "success", "targets": []}
-    user_dict = {u[0]: {"name": u[1], "extra_cal": u[2], "food_items": u[3], "tdee": u[4]} for u in users}
+        if not users: return {"status": "success", "targets": []}
+        user_dict = {u[0]: {"name": u[1], "extra_cal": u[2], "food_items": u[3], "tdee": u[4]} for u in users}
 
-    # 2. 只有在 Google Sheet 成功連線時執行
-    if gc:
-        try:
-            sheet = gc.open_by_url(SHEET_URL)
-            api_sheet = sheet.worksheet("Master_API_View")
-            records = api_sheet.get_all_records()
-            sheet_data = {(str(r.get("User_ID")), str(r.get("Date"))): r for r in records}
+        # 2. 只有在 Google Sheet 成功連線時執行
+        if gc:
+            try:
+                sheet = gc.open_by_url(SHEET_URL)
+                api_sheet = sheet.worksheet("Master_API_View")
+                records = api_sheet.get_all_records()
+                sheet_data = {(str(r.get("User_ID")), str(r.get("Date"))): r for r in records}
 
-            for uid, u_info in user_dict.items():
-                row_today = sheet_data.get((uid, today_str), {})
-                plan_type = str(row_today.get("Plan_Type", "一般飲食"))
-                is_athlete = any(k in plan_type for k in ["運動", "鐵人", "三鐵"])
-                tdee = int(row_today.get("TDEE", 0)) if row_today.get("TDEE") else u_info["tdee"]
+                for uid, u_info in user_dict.items():
+                    row_today = sheet_data.get((uid, today_str), {})
+                    plan_type = str(row_today.get("Plan_Type", "一般飲食"))
+                    is_athlete = any(k in plan_type for k in ["運動", "鐵人", "三鐵"])
+                    tdee = int(row_today.get("TDEE", 0)) if row_today.get("TDEE") else u_info["tdee"]
 
-                # 從 Sheet 讀取個別 Intervals 設定
-                icu_id = str(row_today.get("Intervals_ID", ""))
-                icu_key = str(row_today.get("Intervals_API_Key", ""))
+                    # 從 Sheet 讀取個別 Intervals 設定
+                    icu_id = str(row_today.get("Intervals_ID", ""))
+                    icu_key = str(row_today.get("Intervals_API_Key", ""))
 
-                user_data = {
-                    "user_id": uid,
-                    "name": u_info["name"],
-                    "is_athlete": is_athlete,
-                    "sport_type": str(row_today.get("Sport_Type", "無")),
-                    "plan_week": str(row_today.get("Plan_Week", "計畫未開始")),
-                    "tdee": tdee
-                }
-
-                if mode == "daily":
-                    total_cal = 800 + u_info["extra_cal"]
-                    row_tomorrow = sheet_data.get((uid, tomorrow_str), {})
-                    user_data["today_summary"] = {
-                        "lunch": row_today.get("Lunch_Item", ""),
-                        "dinner": row_today.get("Dinner_Item", ""),
-                        "extra_food": u_info["food_items"] or "無",
-                        "total_consumed_cal": total_cal,
-                        "caloric_deficit": tdee - total_cal
+                    user_data = {
+                        "user_id": uid,
+                        "name": u_info["name"],
+                        "is_athlete": is_athlete,
+                        "sport_type": str(row_today.get("Sport_Type", "無")),
+                        "plan_week": str(row_today.get("Plan_Week", "計畫未開始")),
+                        "tdee": tdee
                     }
 
-                    # ==========================================
-                    # 🔄 功能三：Tomorrow_Workout 動態覆蓋機制
-                    # 優先使用客人手動輸入，用完後清空欄位
-                    # ==========================================
-                    manual_workout = str(row_today.get("Tomorrow_Workout", "")).strip()
-                    manual_intensity = str(row_today.get("Tomorrow_Intensity", "")).strip()
+                    if mode == "daily":
+                        total_cal = 800 + u_info["extra_cal"]
+                        row_tomorrow = sheet_data.get((uid, tomorrow_str), {})
+                        user_data["today_summary"] = {
+                            "lunch": row_today.get("Lunch_Item", ""),
+                            "dinner": row_today.get("Dinner_Item", ""),
+                            "extra_food": u_info["food_items"] or "無",
+                            "total_consumed_cal": total_cal,
+                            "caloric_deficit": tdee - total_cal
+                        }
 
-                    if manual_workout:
-                        # 有手動輸入 → 使用它，並清空（重置迎接下一天）
-                        tomorrow_workout = manual_workout
-                        tomorrow_intensity = manual_intensity or "MED"
-                        try:
-                            headers = api_sheet.row_values(1)
-                            today_records = api_sheet.get_all_records()
-                            today_target = next(
-                                (i + 2 for i, r in enumerate(today_records)
-                                 if str(r.get("User_ID")) == uid and str(r.get("Date")) == today_str),
-                                None
-                            )
-                            if today_target and "Tomorrow_Workout" in headers:
-                                tw_col = headers.index("Tomorrow_Workout") + 1
-                                ti_col = headers.index("Tomorrow_Intensity") + 1 if "Tomorrow_Intensity" in headers else None
-                                api_sheet.update_cell(today_target, tw_col, "")  # 清空
-                                if ti_col:
-                                    api_sheet.update_cell(today_target, ti_col, "")  # 清空
-                        except Exception as e:
-                            print(f"⚠️ 清空 Tomorrow_Workout 失敗: {e}")
-                    else:
-                        # 無手動輸入 → 退回原本邏輯，抓明天 row 的 Today_Workout
-                        tomorrow_workout = str(row_tomorrow.get("Today_Workout", "休息日"))
-                        tomorrow_intensity = str(row_tomorrow.get("Workout_Intensity", "LOW")).upper()
+                        # ==========================================
+                        # 🔄 功能三：Tomorrow_Workout 動態覆蓋機制
+                        # 優先使用客人手動輸入，用完後清空欄位
+                        # ==========================================
+                        manual_workout = str(row_today.get("Tomorrow_Workout", "")).strip()
+                        manual_intensity = str(row_today.get("Tomorrow_Intensity", "")).strip()
 
-                    user_data["tomorrow_preview"] = {
-                        "date": tomorrow_str,
-                        "workout": tomorrow_workout,
-                        "intensity": tomorrow_intensity
-                    }
-                    targets.append(user_data)
+                        if manual_workout:
+                            # 有手動輸入 → 使用它，並清空（重置迎接下一天）
+                            tomorrow_workout = manual_workout
+                            tomorrow_intensity = manual_intensity or "MED"
+                            try:
+                                headers = api_sheet.row_values(1)
+                                today_records = api_sheet.get_all_records()
+                                today_target = next(
+                                    (i + 2 for i, r in enumerate(today_records)
+                                     if str(r.get("User_ID")) == uid and str(r.get("Date")) == today_str),
+                                    None
+                                )
+                                if today_target and "Tomorrow_Workout" in headers:
+                                    tw_col = headers.index("Tomorrow_Workout") + 1
+                                    ti_col = headers.index("Tomorrow_Intensity") + 1 if "Tomorrow_Intensity" in headers else None
+                                    api_sheet.update_cell(today_target, tw_col, "")  # 清空
+                                    if ti_col:
+                                        api_sheet.update_cell(today_target, ti_col, "")  # 清空
+                            except Exception as e:
+                                print(f"⚠️ 清空 Tomorrow_Workout 失敗: {e}")
+                        else:
+                            # 無手動輸入 → 退回原本邏輯，抓明天 row 的 Today_Workout
+                            tomorrow_workout = str(row_tomorrow.get("Today_Workout", "休息日"))
+                            tomorrow_intensity = str(row_tomorrow.get("Workout_Intensity", "LOW")).upper()
 
-                elif mode == "weekly":
-                    # weekly 模式：額外抓 Intervals.icu CTL/ATL/Form
-                    user_data["intervals_icu"] = get_intervals_data(icu_id, icu_key) if (is_athlete and icu_id and icu_key) else None
-                    targets.append(user_data)
+                        user_data["tomorrow_preview"] = {
+                            "date": tomorrow_str,
+                            "workout": tomorrow_workout,
+                            "intensity": tomorrow_intensity
+                        }
+                        targets.append(user_data)
 
-        except Exception as e:
-            print(f"⚠️ 龍蝦通道讀取失敗: {e}")
+                    elif mode == "weekly":
+                        # weekly 模式：額外抓 Intervals.icu CTL/ATL/Form
+                        user_data["intervals_icu"] = get_intervals_data(icu_id, icu_key) if (is_athlete and icu_id and icu_key) else None
+                        targets.append(user_data)
 
-    return {"status": "success", "targets": targets}
+            except Exception as e:
+                print(f"⚠️ 龍蝦通道讀取失敗: {e}")
+
+        return {"status": "success", "targets": targets}
 
 @app.post("/api/lobster/send_message")
 async def lobster_send_message(payload: LobsterPayload):
