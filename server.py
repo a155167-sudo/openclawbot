@@ -2611,7 +2611,17 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("MAPS_API_KEY")
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "#GEN_CODES")
+# 管理 API 的密鑰只從環境變數讀；以前沒設定時會退回寫死在程式裡的預設值（任何看過程式碼的人都能呼叫）。
+ADMIN_SECRET = str(os.environ.get("ADMIN_SECRET") or "").strip()
+if not ADMIN_SECRET:
+    print("⚠️ ADMIN_SECRET 未設定：/api/lobster/* 管理 API 一律拒絕")
+
+
+def admin_secret_matches(candidate) -> bool:
+    """未設定密鑰時一律拒絕；比對用固定時間比較。"""
+    if not ADMIN_SECRET:
+        return False
+    return hmac.compare_digest(str(candidate or "").encode("utf-8"), ADMIN_SECRET.encode("utf-8"))
 PUBLIC_BASE_URL = APP_SETTINGS.public_base_url
 MEAL_PHOTO_IMAGE_SECRET = str(os.environ.get("MEAL_PHOTO_IMAGE_SECRET") or "")
 _configured_data_dir = APP_SETTINGS.data_dir
@@ -24811,7 +24821,7 @@ def get_intervals_data(athlete_id, api_key):
 @app.get("/api/lobster/daily_targets")
 async def get_lobster_targets(admin_secret: str, mode: str = "daily"):
     _require_controlled_workbook_writer("workout_food_tracking")
-    if admin_secret != ADMIN_SECRET:
+    if not admin_secret_matches(admin_secret):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     today_str = tw_today().strftime("%Y/%m/%d")
@@ -24931,7 +24941,7 @@ async def get_lobster_targets(admin_secret: str, mode: str = "daily"):
 
 @app.post("/api/lobster/send_message")
 async def lobster_send_message(payload: LobsterPayload):
-    if payload.admin_secret != ADMIN_SECRET:
+    if not admin_secret_matches(payload.admin_secret):
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         line_bot_api.push_message(payload.user_id, TextSendMessage(text=payload.coach_message))
@@ -24949,7 +24959,7 @@ class WeeklyCoachPayload(BaseModel):
 @app.post("/api/lobster/weekly_coach")
 async def lobster_weekly_coach(payload: WeeklyCoachPayload):
     """系統排程觸發每週教練排課，結果寫入 Plan_Week 並推播 LINE"""
-    if payload.admin_secret != ADMIN_SECRET:
+    if not admin_secret_matches(payload.admin_secret):
         raise HTTPException(status_code=401, detail="Unauthorized")
     success, result = run_weekly_coach(payload.user_id)
     if success:
