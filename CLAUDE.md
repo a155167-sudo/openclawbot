@@ -55,6 +55,14 @@ Jason（老闆）用中文溝通，回覆一律用中文、口語、先講結論
 - **指定品項**（`fixed_meal_picks.py`，2026-11-06）：包月表單選填題「想固定吃的餐點（選填，可複選）」，題型「核取方塊格狀」：列＝蛋白質（豆腐、鷹嘴豆、雞肉、豬肉、牛肉、番牛、鱸魚、鮭魚，**順序不能改**，`GRID_ROWS`）、欄＝便當、食蔬、低碳、沙拉、番茄麵、青蔬麵；品名＝列＋欄。也相容一般核取方塊（完整品名）。勾 2 樣以上輪流排（同天不重複）；只勾 1 樣＝每天午餐固定、晚餐自動配；含禁忌或菜單沒有的略過並通知；全部不能用就自動配餐。有指定的不強制每週食蔬。價格照實際排到的算。
 - 非 VIP 問營養問題不回應（只有包月方案介紹、我的方案、找客服、估價、開通）。
 
+## 後端整修（2026-11-12，分支 fix/backend-cleanup，只上 staging）
+
+- 週課表 `weekly_coach_runs.py`：同人同週只跑一次 AI／寫一次 Sheet；「重排下週課表」才重新生成。`run_weekly_coach` 回傳 (ok, 訊息)。
+- `user_memory` 存 SQLite（`user_memory_store.py`）：每人 12 則、每則 2000 字、7 天過期、最多 5000 人。
+- SQLite 連線一律用 `db_session(sqlite3.connect(...))` 或 `closing(...)`（`db_util.py`）；`with sqlite3.connect() as conn` 不會關連線，不要再用。啟動會檢查 DB 是否在 Railway Volume（兩邊都掛在 `/app/data`）。
+- `ADMIN_SECRET` 沒有預設值了，沒設定時 `/api/lobster/*` 一律 401。**推南京店前要先確認南京店有設 ADMIN_SECRET**（不能讀變數值，請 Jason 確認）。
+- 其他小模組還有約 40 處 `with sqlite3.connect` 沒改。
+
 ## 待辦
 
 - 健檢全流程（記三天→系統初稿→營養師撰寫核准→客人收到）還沒實測過；首批開跑前要在電腦營養跑通，再開南京店顧客健檢。電腦營養測試捷徑：管理員傳「#健檢測試 <UID>」或「#健檢測試 我」（`health_check_qa.py`，只在 APP_ENV=staging 有效）。
