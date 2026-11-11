@@ -46,6 +46,7 @@ from app_config import load_settings
 import first_batch_trial
 import fixed_meal_picks
 import weekly_coach_runs
+import user_memory_store
 from dispatch_authority_bridge import import_initial_published_version
 from workbook_write_lease import (
     FULL_REQUIRED_WRITER_INVENTORY,
@@ -3722,7 +3723,7 @@ def health_check():
 client = OpenAI(api_key=OPENAI_API_KEY)
 line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-user_memory = {}
+user_memory = user_memory_store.PersistentUserMemory(lambda: DB_PATH)
 processed_messages = set()
 
 # ==========================================
