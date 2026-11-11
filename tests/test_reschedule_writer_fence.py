@@ -266,7 +266,7 @@ def test_ast_reviewed_sheet_mutators_are_gated_or_trusted_inner():
     directly_gated = {
         "setup_garmin_test_sheet", "write_workout_to_sheet", "sync_customer_sheet",
         "update_student_group", "get_or_create_training_assignments_sheet",
-        "receive_form_data", "sync_user_sheet_from_master",
+        "sync_user_sheet_from_master",
         "update_4week_plan_background", "background_log_workout_to_sheet",
         "get_ai_response_with_memory", "replace_schedule", "_upsert_master_api_rows",
         "_generate_weekly_coach", "_nutrition_ws", "_upsert_raw_sheet_row",

@@ -62,7 +62,7 @@ def test_missing_raw_logs_fails_closed():
 def test_server_never_appends_order_history_to_first_tab():
     source = SERVER.read_text(encoding="utf-8")
     assert ".sheet1" not in source
-    assert source.count("main_sheet = _order_history_worksheet(sheet)") == 2
+    assert source.count("main_sheet = _order_history_worksheet(sheet)") == 1
 
 
 def test_payment_gate_resolves_history_tab_before_any_write():
