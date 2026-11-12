@@ -85,3 +85,68 @@ def test_api_endpoint_returns_success_instead_of_500(coach, monkeypatch):
     payload = server.WeeklyCoachPayload(admin_secret="s", user_id="U1")
     out = asyncio.run(server.lobster_weekly_coach(payload))
     assert out["status"] == "success" and out["plan_preview"].startswith("下週課表")
+
+
+class _FakeSheet:
+    def __init__(self, records):
+        self.records, self.batches, self.appended = records, [], []
+
+    def get_all_records(self):
+        return self.records
+
+    def batch_update(self, data):
+        self.batches.append(data)
+
+    def append_rows(self, rows):
+        self.appended.extend(rows)
+
+
+def _fake_gc(sheet):
+    return SimpleNamespace(open_by_key=lambda _id: SimpleNamespace(worksheet=lambda _name: sheet))
+
+
+def test_sheet_write_rereads_rows_and_batches(tmp_path, monkeypatch):
+    import server
+
+    sheet = _FakeSheet([
+        {"User_ID": "other", "Date": "2026/11/16"},
+        {"User_ID": "U1", "Date": "2026/11/16"},
+        {"User_ID": "U1", "Date": "2026/11/17"},
+    ])
+    monkeypatch.setattr(server, "gc", _fake_gc(sheet))
+    monkeypatch.setattr(server, "PAIR_RESCHEDULE_ENABLED", False)
+    monkeypatch.setattr(server, "DB_PATH", str(tmp_path / "w.db"))
+    plan = {"2026/11/16": "E 跑", "2026/11/17": "休息", "2026/11/21": "長跑"}
+    server._write_weekly_plan_to_sheet("U1", plan, lambda d, p: [d, "U1", p])
+    assert sheet.batches == [[
+        {"range": "J3", "values": [["E 跑"]]},
+        {"range": "J4", "values": [["休息"]]},
+    ]]
+    assert sheet.appended == [["2026/11/21", "U1", "長跑"]]
+
+
+def test_sheet_write_with_reschedule_mode_takes_and_releases_lease(tmp_path, monkeypatch):
+    import sqlite3 as _sqlite3
+
+    import server
+
+    db = str(tmp_path / "w.db")
+    sheet = _FakeSheet([{"User_ID": "U1", "Date": "2026/11/16"}])
+    monkeypatch.setattr(server, "gc", _fake_gc(sheet))
+    monkeypatch.setattr(server, "PAIR_RESCHEDULE_ENABLED", True)
+    monkeypatch.setattr(server, "DB_PATH", db)
+    from tests.test_workbook_write_lease import FULL_WRITER_INVENTORY
+    from workbook_write_lease import configure_workbook_writer_capability, ensure_workbook_lease_schema
+
+    conn = _sqlite3.connect(db)
+    ensure_workbook_lease_schema(conn)
+    configure_workbook_writer_capability(
+        conn, workbook_id=server.SPREADSHEET_ID, controlled_writers=FULL_WRITER_INVENTORY,
+        external_writer_state="controlled", cutover_evidence="fixture-only",
+    )
+    conn.commit(); conn.close()
+    server._write_weekly_plan_to_sheet("U1", {"2026/11/16": "E 跑"}, lambda d, p: [d])
+    assert sheet.batches == [[{"range": "J2", "values": [["E 跑"]]}]]
+    # 寫完要放掉保護，第二次才能再取得
+    server._write_weekly_plan_to_sheet("U1", {"2026/11/16": "T 跑"}, lambda d, p: [d])
+    assert len(sheet.batches) == 2

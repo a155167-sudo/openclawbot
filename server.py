@@ -12951,9 +12951,45 @@ def run_weekly_coach(uid, reply_token=None, force=False):
     return ok, message
 
 
+def _write_weekly_plan_to_sheet(uid, daily_plan, build_new_row):
+    """把課表寫進 Master_API_View 的 Plan_Week 欄（第 10 欄）。
+
+    - 改期功能開啟時（PAIR_RESCHEDULE_ENABLED）先取得試算表寫入保護，只在寫入這段持有。
+    - AI 生成要幾十秒，期間列的位置可能被改期動到，所以在保護內重新讀一次列號再寫。
+    - 取不到保護（別的寫入進行中）會丟例外，這次不寫 Sheet，課表照樣傳給客人。
+    """
+    with server_workbook_write_fence(
+        db_path=DB_PATH, workbook_id=SPREADSHEET_ID, writer_id="weekly_coach",
+        operation_id=f"weekly-coach:{uid}:{min(daily_plan)}",
+        enabled=PAIR_RESCHEDULE_ENABLED, now=tw_now(), ttl_seconds=180,
+    ) as fence:
+        api_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Master_API_View")
+        row_by_date = {}
+        for i, row in enumerate(api_sheet.get_all_records()):
+            if str(row.get("User_ID")) == uid and str(row.get("Date")) in daily_plan:
+                row_by_date.setdefault(str(row.get("Date")), i + 2)
+        cell_updates, new_rows = [], []
+        for date_str, plan_text in daily_plan.items():
+            if date_str in row_by_date:
+                cell_updates.append({"range": f"J{row_by_date[date_str]}", "values": [[plan_text]]})
+            else:
+                new_rows.append(build_new_row(date_str, plan_text))
+        if not cell_updates and not new_rows:
+            return
+        _require_controlled_workbook_writer("weekly_coach")
+        if cell_updates:
+            api_sheet.batch_update(cell_updates)
+        if new_rows:
+            api_sheet.append_rows(new_rows)
+        fence.confirm()
+    print(f"✅ 週課表已寫入 Sheet：更新 {len(cell_updates)} 天、補 {len(new_rows)} 天")
+
+
 def _generate_weekly_coach(uid, reply_token=None):
-    """實際流程：抓資料 → AI 生成 → 寫 Sheet → 推播 LINE。回傳 (ok, 訊息, daily_plan)。"""
-    _require_controlled_workbook_writer("weekly_coach")
+    """實際流程：抓資料 → AI 生成 → 寫 Sheet → 推播 LINE。回傳 (ok, 訊息, daily_plan)。
+
+    讀資料和 AI 生成不需要試算表寫入保護；只有最後寫回 Sheet 那一小段才取得（_write_weekly_plan_to_sheet）。
+    """
 
     # 1. 從 SQLite 取得用戶個人設定
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -13462,33 +13498,14 @@ line_message 末尾必須標明：「本週總 eTSS：XXX（TSS/預算{budget}�
         # ==========================================
         if gc and daily_plan:
             try:
-                new_rows_to_add = [] 
-                cell_updates = []
-                for date_str, plan_text in daily_plan.items():
-                    if date_str in row_date_map:
-                        # 狀況 A：原本就有的格子，先收集起來，等一下一次寫入 (第 10 欄 Plan_Week)
-                        row_idx = row_date_map[date_str]
-                        cell_updates.append({"range": f"J{row_idx}", "values": [[plan_text]]})
-                    else:
-                        # 狀況 B：沒格子的週末，準備自動補齊 18 個欄位
-                        # ⚠️ 注意：這裡把 plan_text 放在第 10 個位子 (Plan_Week)
-                        new_rows_to_add.append([
-                            date_str, uid, 0, "無", "無", "", 1, 
-                            goal, sport_type, plan_text, intervals_id, intervals_key, 
-                            training_freq, normal_train_time, long_train_day, 
-                            run_pace, bike_ftp, swim_pace
-                        ])
-            
-                if cell_updates:
-                    api_sheet.batch_update(cell_updates)
-                # 如果有沒訂餐的週末課表，一口氣加進 Sheet 裡
-                if new_rows_to_add:
-                    print(f"📡 DEBUG: 準備寫入，長度為 {len(new_rows_to_add[0])} 欄")
-                    api_sheet.append_rows(new_rows_to_add)
-                    print(f"✅ [關鍵成功] Google Sheet 自動補齊了 {len(new_rows_to_add)} 天課表！")
-
+                _write_weekly_plan_to_sheet(uid, daily_plan, lambda date_str, plan_text: [
+                    date_str, uid, 0, "無", "無", "", 1,
+                    goal, sport_type, plan_text, intervals_id, intervals_key,
+                    training_freq, normal_train_time, long_train_day,
+                    run_pace, bike_ftp, swim_pace
+                ])
             except Exception as e:
-                print(f"❌ [寫入失敗] Google Sheet 發生錯誤: {e}")
+                print(f"❌ [寫入失敗] Google Sheet 發生錯誤: {type(e).__name__}: {e}")
 
         # ==========================================
         # 🌟 9. 最後才把整理好的 LINE 訊息推播給客人
