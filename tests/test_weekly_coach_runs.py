@@ -102,7 +102,8 @@ class _FakeSheet:
     def batch_update(self, data):
         self.batches.append(data)
 
-    def append_rows(self, rows):
+    def append_rows(self, rows, table_range=None):
+        assert table_range == "A1"  # 一定要錨定 A 欄，不然會錯位
         self.appended.extend(rows)
 
 

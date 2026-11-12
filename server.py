@@ -12189,7 +12189,7 @@ def _upsert_master_api_rows(api_sheet, user_id: str, rows):
         else:
             missing.append(list(row))
     if missing:
-        api_sheet.append_rows(missing)
+        api_sheet.append_rows(missing, table_range="A1")  # 固定從 A 欄接，避免錯位到右邊欄位
 
 
 def _formalize_subscription_snapshot_unfenced(order_id: int, snapshot: dict):
@@ -12991,7 +12991,9 @@ def _write_weekly_plan_to_sheet(uid, daily_plan, build_new_row):
         if cell_updates:
             api_sheet.batch_update(cell_updates)
         if new_rows:
-            api_sheet.append_rows(new_rows)
+            # table_range="A1"：固定從 A 欄接在表格最後。不指定的話 Google 會自己猜「表格」在哪，
+            # 表裡有空白列時會把新資料貼到右邊的欄位（電腦營養的錯位列就是這樣來的）。
+            api_sheet.append_rows(new_rows, table_range="A1")
         fence.confirm()
     print(f"✅ 週課表已寫入 Sheet：更新 {len(cell_updates)} 天、補 {len(new_rows)} 天")
 

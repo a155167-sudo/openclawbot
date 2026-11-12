@@ -62,6 +62,8 @@ Jason（老闆）用中文溝通，回覆一律用中文、口語、先講結論
 - SQLite 連線一律用 `db_session(sqlite3.connect(...))` 或 `closing(...)`（`db_util.py`）；`with sqlite3.connect() as conn` 不會關連線，不要再用。啟動會檢查 DB 是否在 Railway Volume（兩邊都掛在 `/app/data`）。
 - `ADMIN_SECRET` 沒有預設值了，沒設定時 `/api/lobster/*` 一律 401。**推南京店前要先確認南京店有設 ADMIN_SECRET**（不能讀變數值，請 Jason 確認）。
 - 其他小模組還有約 40 處 `with sqlite3.connect` 沒改。
+- 週課表寫 Sheet 走 `_write_weekly_plan_to_sheet`（只在寫入時拿 workbook fence、保護內重讀列號）；讀表用 `_sheet_records_tolerant`（標題列空白欄不會炸）。
+- **Sheet 錯位的原因**：`append_rows` 沒帶 `table_range="A1"` 時 Google 會把新列貼到右邊欄位（staging Master_API_View 的 11 月訂單都錯位在 U 欄、AO 欄之後）。訂單正式化與週課表已改成錨定 A 欄；staging 舊的錯位列還沒清，南京店的表要請 Jason 確認有沒有同樣狀況。
 
 ## 待辦
 
