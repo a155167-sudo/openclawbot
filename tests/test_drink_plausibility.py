@@ -37,3 +37,20 @@ def test_tea_egg_is_an_egg_not_a_drink():
 def test_noodles_and_soy_milk_keep_their_categories():
     assert assess_per100({"food_name": "鍋燒烏龍麵", "unit": "g"}, _n(110, 5, 3, 16))["category"] == "主食澱粉類"
     assert assess_per100({"food_name": "無糖豆漿", "unit": "ml"}, _n(35, 3.6, 1.9, 1))["category"] == "豆漿類"
+
+
+@pytest.mark.parametrize("name,per100", [
+    ("蛋餅", _n(220, 7.5, 11, 23)),
+    ("蘿蔔糕", _n(130, 2.5, 4, 21)),
+    ("饅頭", _n(230, 7, 1, 48)),
+    ("蔥抓餅", _n(330, 6, 17, 38)),
+    ("雞排", _n(290, 18, 18, 14)),
+    ("油條", _n(520, 7, 38, 38)),
+])
+def test_common_breakfast_and_snacks_pass(name, per100):
+    result = assess_per100({"food_name": name, "unit": "g"}, per100)
+    assert result["status"] == "pass" and result["category"] == "早餐／小吃類"
+
+
+def test_snack_with_impossible_density_is_still_stopped():
+    assert assess_per100({"food_name": "蛋餅", "unit": "g"}, _n(900, 5, 90, 10))["status"] != "pass"

@@ -27,6 +27,12 @@ _CATEGORY_POLICIES = (
     # 拿鐵、柳橙汁全部擋成「類別不明」。上限 200 kcal/100 ml 仍能擋下把飲料估成正餐的錯誤。
     ("飲料類", ("飲料", "果汁", "汁", "茶", "汽水", "可樂", "咖啡", "拿鐵", "可可", "多多",
               "冰沙", "奶昔", "氣泡水", "運動飲"), Decimal("0"), Decimal("200")),
+    # 台式早餐、小吃、炸物：蛋餅、饅頭、蘿蔔糕這類名字裡沒有「飯／麵／便當」，以前全部被擋成
+    # 「類別不明」而記不進去。炸物和酥皮類熱量密度高，上限放到 550 kcal/100 g。
+    ("早餐／小吃類", ("餅", "饅頭", "包子", "蘿蔔糕", "油條", "鍋貼", "貝果", "鬆餅", "可頌",
+                   "薯條", "雞排", "鹹酥雞", "雞塊", "滷味", "關東煮", "肉圓", "春捲", "粽",
+                   "米糕", "碗粿", "蚵仔煎", "臭豆腐", "熱狗", "燒賣"),
+     Decimal("60"), Decimal("550")),
     # Last on purpose: only names no specific category claimed.  Typical Taiwan
     # 外食 mixed dishes (rice + meat + vegetables + sauce) sit around 120–250
     # kcal/100 g; 60–300 allows fried items yet withholds clear
