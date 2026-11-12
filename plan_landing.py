@@ -515,7 +515,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
     <div class="hero-grid">
       <div>
         <h1>不用想吃什麼，<br>拍照幫你算熱量。</h1>
-        <p class="lede">包月便當依你的目標排好四週午晚餐；外面吃的拍張照，熱量和蛋白質幫你算好。</p>
+        <p class="lede">吃得健康卻沒變化？每天幫你把熱量算清楚。包月便當依你的目標排好四週午晚餐；外面吃的拍張照，熱量和蛋白質幫你算好。</p>
         {_seat_block(status)}
         <a class="cta" href="{start}"><span class="line-badge">LINE</span>用 LINE 估價</a>
         <p class="cta-hint">會打開 LINE 並帶入「包月方案」，按送出就能開始估價。</p>
@@ -615,6 +615,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
       <tbody>{pickup_rows}</tbody>
     </table>
     <p class="note">外送午晚兩個便當一起送；自取每週 3 天以上送蛋白補充。</p>
+    <p class="note">🚗 順風車折扣：外送路線和現有客人順路，每趟再折 $10，估價時自動計算。</p>
     <details class="fees"><summary>看外送運費</summary>
       <table>
         <thead><tr><th>距離</th><th>一般外送／趟</th><th>晚鳥／趟</th></tr></thead>
@@ -634,6 +635,7 @@ def render_page(*, status: dict, meal_low: int, meal_high: int, fee_tiers, perio
       <details class="q"><summary>某一餐沒吃怎麼辦？</summary><p>在今日總覽點「沒吃」就好，當天晚上 11:59 前都能改。</p></details>
       <details class="q"><summary>三日飲食分析要另外付錢嗎？</summary><p>不用。第一次訂包月就送一次，AI 整理你的三天紀錄，店家看過後傳到你的 LINE。</p></details>
       <details class="q"><summary>我有不吃的食物</summary><p>填包月資料時寫上，排餐會避開。</p></details>
+      <details class="q"><summary>可以固定吃某幾樣嗎？</summary><p>可以。填包月資料時勾想固定吃的餐點（肉類 × 餐盒）：勾兩樣以上會輪流排；只勾一樣，每天午餐固定這道、晚餐照你的偏好搭配。不勾就由系統幫你配。</p></details>
       <details class="q"><summary>首批 9 折怎麼算？</summary><p>只打餐費，運費不折；適用第一期，續約恢復一般價格。限第一次訂包月的朋友。</p></details>
     </div>
   </div>

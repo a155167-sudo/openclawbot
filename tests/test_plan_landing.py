@@ -84,3 +84,14 @@ def test_usage_guide_lists_every_item_under_faq():
     for _title, items in plan_landing.GUIDE_GROUPS:
         for _icon, name, _body in items:
             assert name in html
+
+
+def test_landing_mentions_rideshare_discount_fixed_picks_and_pain_point():
+    import plan_landing
+
+    html = plan_landing.render_page(
+        status={"enabled": False, "limit": 15, "taken": 0, "left": 0}, meal_low=140, meal_high=220,
+        fee_tiers=[(1000, 30, ""), (3000, 60, "")], period_weeks=4, store_address="x")
+    assert "順風車折扣" in html
+    assert "<summary>可以固定吃某幾樣嗎？</summary>" in html
+    assert "吃得健康卻沒變化？" in html
