@@ -91,8 +91,13 @@ class _FakeSheet:
     def __init__(self, records):
         self.records, self.batches, self.appended = records, [], []
 
+    def get_all_values(self):
+        # 標題列故意帶兩個空白欄，模擬電腦營養那張表（get_all_records 會因此失敗）
+        header = ["Date", "User_ID", "", ""]
+        return [header] + [[r["Date"], r["User_ID"], "", "x"] for r in self.records]
+
     def get_all_records(self):
-        return self.records
+        raise AssertionError("標題列有重複空白時 get_all_records 會失敗，不能用")
 
     def batch_update(self, data):
         self.batches.append(data)

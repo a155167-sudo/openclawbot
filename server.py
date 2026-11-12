@@ -12942,6 +12942,26 @@ def run_weekly_coach(uid, reply_token=None, force=False):
     return ok, message
 
 
+def _sheet_records_tolerant(worksheet):
+    """像 get_all_records()，但標題列有空白或重複欄名時不會整個失敗。
+
+    gspread 的 get_all_records() 遇到標題列有兩個以上空白格就丟例外（表格右邊多出空欄時很常見）。
+    這裡自己讀全部儲存格：略過空白標題，重複的欄名取第一個。回傳的第 i 筆對應試算表第 i+2 列，值都是字串。
+    """
+    values = worksheet.get_all_values()
+    if not values:
+        return []
+    columns = {}
+    for index, header in enumerate(values[0]):
+        name = str(header).strip()
+        if name and name not in columns:
+            columns[name] = index
+    return [
+        {name: (row[index] if index < len(row) else "") for name, index in columns.items()}
+        for row in values[1:]
+    ]
+
+
 def _write_weekly_plan_to_sheet(uid, daily_plan, build_new_row):
     """把課表寫進 Master_API_View 的 Plan_Week 欄（第 10 欄）。
 
@@ -12956,7 +12976,7 @@ def _write_weekly_plan_to_sheet(uid, daily_plan, build_new_row):
     ) as fence:
         api_sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Master_API_View")
         row_by_date = {}
-        for i, row in enumerate(api_sheet.get_all_records()):
+        for i, row in enumerate(_sheet_records_tolerant(api_sheet)):
             if str(row.get("User_ID")) == uid and str(row.get("Date")) in daily_plan:
                 row_by_date.setdefault(str(row.get("Date")), i + 2)
         cell_updates, new_rows = [], []
@@ -13018,7 +13038,7 @@ def _generate_weekly_coach(uid, reply_token=None):
         if gc:
             try:
                 api_sheet = gc.open_by_url(SHEET_URL).worksheet("Master_API_View")
-                all_records = api_sheet.get_all_records()
+                all_records = _sheet_records_tolerant(api_sheet)
                 for i, row in enumerate(all_records):
                     if str(row.get("User_ID")) == uid and str(row.get("Date")) in next_week_dates:
                         if sport_type == "未設定":
