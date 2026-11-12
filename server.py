@@ -4848,7 +4848,7 @@ def ai_draft_dietitian_health_check(case_id: str, actor_id: str):
         detail = load_health_check_detail(conn, case_id=case_id)
         if detail is None:
             return None
-        names = ai_draft.meal_names_for(
+        names = ai_draft.meal_facts_for(
             conn, [log.get("log_id") for log in detail.get("source_logs") or ()])
     payload = ai_draft.build_ai_draft_input(detail, names)
     _health_check_ai_draft_last_by_case[case_id] = now
